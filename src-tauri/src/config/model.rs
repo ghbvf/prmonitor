@@ -42,11 +42,11 @@ impl Default for AppConfig {
 
 /// Serde wire-shape lock for `AppConfig`.
 ///
-/// This is the **Medium carrier** for the `config/model.rs` ↔ `src/types.ts`
+/// This is the **Medium carrier** for the `config/model.rs` ↔ `src/config/types.ts`
 /// serde contract per `.claude/rules/prmonitor/ai-robust.md` (same spirit as the
 /// `model.rs` lock). It is a contract LOCK (characterization) test: it passes on
 /// current code and only fails if a field is renamed or the camelCase
-/// serialization breaks. When a key here changes, the downstream `src/types.ts`
+/// serialization breaks. When a key here changes, the downstream `src/config/types.ts`
 /// `AppConfig` mirror must be updated in lockstep — that downstream is the open
 /// end of this funnel (no machine check on the TS side yet; future Hard path =
 /// codegen `types.ts` from the Rust models + `git diff --exit-code`).

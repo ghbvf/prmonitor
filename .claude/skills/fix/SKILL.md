@@ -150,11 +150,11 @@ large 问题先查参考再动手：Rust 标准库 / `tauri`·`serde`·`tokio` �
 > **改代码前自检（hook 拦截）**：进入 4.2 编辑前先跑 `bash "$CLAUDE_PROJECT_DIR/.claude/hooks/fix-self-audit.sh" emit`——PreToolUse hook 会 deny 并回喂「按方案设计原则（彻底/不向后兼容/优雅简洁）复审本次 fix」，复审后重发即放行（每个 /fix 一次）。
 
 ### 4.1 Commit 格式
-当前分支直接改。Commit：`fix(<scope>): <问题简述>` + 根因 + 复杂度 + Refs + `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`。scope 按切片：config/pr/codex/前端。安全约束：只 add 修复文件（不 add -A）；不 amend。
+当前分支直接改。Commit：`fix(<scope>): <问题简述>` + 根因 + 复杂度 + Refs + `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`。scope 按切片：config/pr/review/前端。安全约束：只 add 修复文件（不 add -A）；不 amend。
 
 ### 4.2 执行代码修改（逐编辑测试循环）
 
-> **批量并行**：4+ 条 finding 时按切片（config/pr/codex/前端）聚类派发 developer sub-agent（`subagent_type: general-purpose`；**同切片同 agent** 防写冲突，组内串行执行下面循环）；并发 4-9→2 / ≥10→3；≤3 条由主 agent 直接处理。triage 同理可按聚类并行（`subagent_type: Explore`）。
+> **批量并行**：4+ 条 finding 时按切片（config/pr/review/前端）聚类派发 developer sub-agent（`subagent_type: general-purpose`；**同切片同 agent** 防写冲突，组内串行执行下面循环）；并发 4-9→2 / ≥10→3；≤3 条由主 agent 直接处理。triage 同理可按聚类并行（`subagent_type: Explore`）。
 
 对每个任务执行 Edit-Test Loop：
 1. Read 目标文件 → 2. Edit/Write 修改代码 → 3. `cargo build --manifest-path src-tauri/Cargo.toml`（或 `pnpm build`）编译检查 → 4. `cargo test --manifest-path src-tauri/Cargo.toml`（含 1.4 复现测试）→ 5. 失败：当前编辑引入 → 立即修正重回 2；暴露后续依赖 → 记录继续 → 6. 通过 → 下一任务
