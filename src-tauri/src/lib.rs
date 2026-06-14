@@ -45,6 +45,7 @@ pub fn run() {
             pr::commands::poll_now,
             pr::commands::reschedule,
             pr::commands::gh_status,
+            pr::commands::get_prs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

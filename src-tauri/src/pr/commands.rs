@@ -45,8 +45,8 @@ fn build_view(row: GhRow, params: &MonitorParams, ledger: &Ledger, now: u64) -> 
 /// calls (review + check labels).
 ///
 /// This is the shared discovery body driven by the scheduler's poll loop
-/// (`scheduler::run_and_emit`); there is no manual-fetch command — the frontend
-/// triggers a refresh via `poll_now`.
+/// (`scheduler::discover_emit_snapshot`); there is no manual-fetch command — the
+/// frontend triggers a refresh via `poll_now`.
 pub(crate) async fn discover_views<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> AppResult<Vec<PullRequestView>> {
@@ -118,6 +118,14 @@ pub async fn reschedule(state: tauri::State<'_, crate::state::AppState>) -> AppR
 #[tauri::command]
 pub async fn gh_status() -> AppResult<GhStatus> {
     Ok(gh_auth_status("gh").await)
+}
+
+/// Returns the latest discovered PR list (the scheduler's snapshot) so the
+/// frontend can render current state on mount without waiting for the next
+/// `prs:updated` event (closes the startup lost-event race).
+#[tauri::command]
+pub fn get_prs(state: tauri::State<'_, crate::state::AppState>) -> AppResult<Vec<PullRequestView>> {
+    Ok(state.scheduler.snapshot())
 }
 
 #[cfg(test)]
