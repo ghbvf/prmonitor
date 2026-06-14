@@ -4,14 +4,24 @@
 import { onMounted, ref } from "vue";
 import { appVersion } from "./config/api";
 import ConfigPanel from "./config/ConfigPanel.vue";
+import PollControls from "./pr/PollControls.vue";
 import PrList from "./pr/PrList.vue";
 import StatusBar from "./pr/StatusBar.vue";
 import ReviewPanel from "./review/ReviewPanel.vue";
+import { reschedule } from "./pr/api";
 
 const version = ref("");
 onMounted(async () => {
   version.value = await appVersion();
 });
+
+// Cross-slice wiring (composition root only): a config save may change the poll
+// interval, so reschedule the backend timer.
+function onConfigSaved() {
+  // Non-blocking: a reschedule failure only delays the period rebuild (the next
+  // poll still runs on the old period), so log it rather than surfacing/throwing.
+  reschedule().catch((e) => console.error("reschedule failed", e));
+}
 </script>
 
 <template>
@@ -22,7 +32,8 @@ onMounted(async () => {
     </header>
     <div class="layout">
       <aside class="sidebar">
-        <ConfigPanel />
+        <ConfigPanel @saved="onConfigSaved" />
+        <PollControls />
         <PrList />
       </aside>
       <main class="content">

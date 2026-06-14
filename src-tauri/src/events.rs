@@ -5,6 +5,28 @@
 
 use serde::Serialize;
 
+use crate::model::PullRequestView;
+
+/// Tauri event name carrying a [`PrEvent`] (scheduled/manual PR-list refresh).
+pub const PRS_UPDATED_EVENT: &str = "prs:updated";
+
+/// Payload emitted on [`PRS_UPDATED_EVENT`] each poll cycle (scheduled or manual).
+///
+/// Like [`ReviewEvent`], the container `rename_all` camelCases the *variant*
+/// names into the `kind` tag and each struct variant carries its own
+/// `rename_all` (serde does not propagate the container rule to a variant's
+/// fields).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum PrEvent {
+    /// A fresh PR list (a successful discovery cycle).
+    #[serde(rename_all = "camelCase")]
+    Updated { prs: Vec<PullRequestView> },
+    /// A discovery cycle failed; the loop keeps running.
+    #[serde(rename_all = "camelCase")]
+    Error { message: String },
+}
+
 /// A single streamed unit of a review session, forwarded to the frontend.
 ///
 /// The container `rename_all` camelCases the *variant* names into the `kind`
@@ -47,9 +69,55 @@ pub enum ReviewEvent {
 /// updated in lockstep — that downstream is the open end of this funnel (no
 /// machine check on the TS side yet; future Hard path = codegen the TS union
 /// from `events.rs` + `git diff --exit-code`).
+///
+/// The same lock applies to the [`PrEvent`] union below: its downstream is the
+/// `PrEvent` discriminated union in `src/types.ts` — the open end of this funnel
+/// (no machine check on the TS side yet; future Hard path = codegen the TS union
+/// from `events.rs` + `git diff --exit-code`).
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::PullRequestView;
+
+    fn sample_view() -> PullRequestView {
+        PullRequestView {
+            number: 1,
+            title: "Add feature".to_string(),
+            labels: vec!["review".to_string()],
+            url: "https://example.com/pr/1".to_string(),
+            kind: "review".to_string(),
+            skip_reason: None,
+        }
+    }
+
+    #[test]
+    fn pr_updated_wire_shape_is_camel_case() {
+        let event = PrEvent::Updated {
+            prs: vec![sample_view()],
+        };
+
+        let v = serde_json::to_value(&event).expect("PrEvent serializes");
+
+        assert_eq!(v["kind"], "updated");
+        assert!(v.get("prs").is_some());
+    }
+
+    #[test]
+    fn pr_error_wire_shape_is_camel_case() {
+        let event = PrEvent::Error {
+            message: "boom".to_string(),
+        };
+
+        let v = serde_json::to_value(&event).expect("PrEvent serializes");
+
+        assert_eq!(v["kind"], "error");
+        assert!(v.get("message").is_some());
+    }
+
+    #[test]
+    fn prs_updated_event_name_is_pinned() {
+        assert_eq!(PRS_UPDATED_EVENT, "prs:updated");
+    }
 
     #[test]
     fn message_delta_wire_shape_is_camel_case() {

@@ -4,7 +4,8 @@
 //! These are pure predicates over a [`Candidate`], the [`MonitorParams`] config
 //! snapshot, the [`Ledger`], and a clock, so the discovery semantics are unit-
 //! tested without `gh`. The `gh` subprocess shells live in [`super::gh`]; the
-//! `fetch_prs_now` command in [`super::commands`] composes them.
+//! `discover_views` body in [`super::commands`] composes them, driven by the
+//! scheduler's poll loop (and the `poll_now` manual trigger).
 
 use crate::model::Candidate;
 
@@ -79,8 +80,8 @@ pub fn cooldown_skip(
 ///
 /// PR3 implements and tests it; it is invoked by the PR4 scheduler / PR5
 /// dispatch immediately before starting a turn (a second `gh` call per PR), not
-/// during the `fetch_prs_now` list display (which would double `gh` calls per
-/// fetch — the just-listed rows already are the live state there).
+/// during the scheduler-driven list display (which would double `gh` calls per
+/// poll — the just-listed rows already are the live state there).
 pub fn live_gate_skip(
     cand: &Candidate,
     params: &MonitorParams,

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// PR list slice view: the "立即拉取" control + the discovered rows. The store
-// owns the fetch/error plumbing; this component only renders its state.
+// PR list slice view: renders the discovered rows. The "立即拉取" control lives
+// in PollControls; this component only renders the store's PR state.
 import { onMounted } from "vue";
 import { usePrStore } from "./usePrStore";
 import PrRow from "./PrRow.vue";
@@ -15,9 +15,6 @@ onMounted(() => store.refreshGhStatus());
   <section class="pr-list">
     <header class="pr-head">
       <h2>Pull requests</h2>
-      <button type="button" :disabled="store.loading" @click="store.fetchNow()">
-        {{ store.loading ? "拉取中…" : "立即拉取" }}
-      </button>
     </header>
 
     <p v-if="store.error" class="error">{{ store.error }}</p>
@@ -46,10 +43,6 @@ onMounted(() => store.refreshGhStatus());
 }
 .pr-head h2 {
   margin: 0;
-}
-.pr-head button {
-  padding: 4px 8px;
-  font-size: 12px;
 }
 .muted {
   color: #888;

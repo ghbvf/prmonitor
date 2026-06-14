@@ -1,10 +1,40 @@
-// PR slice → backend adapter. Wraps the PR-discovery commands.
-import { invoke } from "../api";
-import type { PullRequestView } from "../types";
+// PR slice → backend adapter. Wraps the polling-scheduler commands and the
+// `prs:updated` event subscription.
+import { invoke, listen } from "../api";
+import type { PrEvent, PullRequestView } from "../types";
 import type { GhStatus } from "./types";
 
-export function fetchPrsNow(): Promise<PullRequestView[]> {
-  return invoke<PullRequestView[]>("fetch_prs_now");
+// Mirrors src-tauri/src/events.rs::PRS_UPDATED_EVENT (this TS side is the
+// open downstream end of the event-name funnel — keep in lockstep).
+const PRS_UPDATED_EVENT = "prs:updated" as const;
+
+export function pollNow(): Promise<void> {
+  return invoke<void>("poll_now");
+}
+
+export function startPolling(): Promise<void> {
+  return invoke<void>("start_polling");
+}
+
+export function stopPolling(): Promise<void> {
+  return invoke<void>("stop_polling");
+}
+
+export function reschedule(): Promise<void> {
+  return invoke<void>("reschedule");
+}
+
+// Subscribe to backend-pushed PR updates. Returns the `Promise<UnlistenFn>` so
+// the caller can await it for cleanup on unmount.
+export function onPrsUpdated(cb: (e: PrEvent) => void) {
+  return listen<PrEvent>(PRS_UPDATED_EVENT, (event) => cb(event.payload));
+}
+
+// Read the scheduler's latest PR snapshot. Used to baseline the list at startup
+// so the view is populated regardless of whether the first `prs:updated` event
+// raced ahead of the listener registration (#27 F3).
+export function getPrs(): Promise<PullRequestView[]> {
+  return invoke<PullRequestView[]>("get_prs");
 }
 
 export function ghStatus(): Promise<GhStatus> {

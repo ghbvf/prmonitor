@@ -20,3 +20,9 @@ export type ReviewEvent =
   | { kind: "reasoningDelta"; threadId: string; itemId: string; text: string }
   | { kind: "turnCompleted"; threadId: string; status: string }
   | { kind: "error"; threadId: string; message: string };
+
+// Mirrors `events.rs::PrEvent` (tagged `kind`, camelCase) — the funnel's
+// downstream end for the `prs:updated` Tauri event payload.
+export type PrEvent =
+  | { kind: "updated"; prs: PullRequestView[] }
+  | { kind: "error"; message: string };

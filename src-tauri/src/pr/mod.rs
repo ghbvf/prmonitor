@@ -1,10 +1,11 @@
 //! PR-monitoring slice: discover PRs from a source, gate, de-dup, and schedule.
 //!
 //! `source` defines the [`source::PrSource`] seam (issue #11); GitHub via the
-//! `gh` CLI is the MVP impl. PR3 fills `gh` (source and JSON parse), `discover`
-//! (gating and dedup, a port of `router.py`), `ledger` (dedup keys and
-//! cooldown), and `commands` (the `fetch_prs_now` and `gh_status` Tauri
-//! commands). PR4 fills `scheduler`.
+//! `gh` CLI is the MVP impl. `gh` (source and JSON parse), `discover` (gating
+//! and dedup, a port of `router.py`), and `ledger` (dedup keys and cooldown)
+//! supply the discovery body. `scheduler` drives that body on a poll loop;
+//! `commands` exposes the `poll_now` / `start_polling` / `stop_polling` /
+//! `reschedule` / `gh_status` Tauri commands.
 
 pub mod commands;
 pub mod discover;

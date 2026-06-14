@@ -7,11 +7,17 @@
 //! `router.py` discovery semantics are unit-tested without invoking `gh`.
 
 use serde::{Deserialize, Serialize};
+use tokio::process::Command;
 
 use crate::error::{AppError, AppResult};
 use crate::model::Candidate;
 
 use super::source::PrSource;
+
+/// Wall-clock budget for any single `gh` invocation. A hung subprocess (network
+/// stall, auth prompt) is bounded here; `kill_on_drop(true)` means dropping the
+/// timed-out (or cancelled) future kills the child — see [`GithubCli::run_pr_list`].
+const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `--json` field set requested from `gh pr list`. `router.py` only needs the
 /// gating fields; the prmonitor UI additionally needs `title,url,labels`.
@@ -151,34 +157,35 @@ impl GithubCli {
     }
 
     /// Runs `gh pr list` for one trigger label, returning raw stdout JSON.
-    /// The blocking subprocess runs off the async executor via `spawn_blocking`.
+    /// Uses async `tokio::process` with a [`GH_TIMEOUT`] bound and
+    /// `kill_on_drop(true)`: if this future is dropped (timeout, or the
+    /// scheduler's stop-select tearing down an in-flight cycle), the child `gh`
+    /// process is killed — closing the cancellation domain (F1).
     async fn run_pr_list(&self, label: &str) -> AppResult<String> {
-        let gh = self.gh_bin.clone();
-        let repo = self.repo.clone();
-        // Two owned copies: `label_arg` moves into the blocking closure while
-        // `label` stays available for the error message after the await point.
-        let label = label.to_string();
-        let label_arg = label.clone();
+        let mut cmd = Command::new(&self.gh_bin);
+        cmd.args([
+            "pr",
+            "list",
+            "--repo",
+            &self.repo,
+            "--state",
+            "open",
+            "--label",
+            label,
+            "--json",
+            PR_LIST_FIELDS,
+        ])
+        .kill_on_drop(true);
 
-        let output = tauri::async_runtime::spawn_blocking(move || {
-            std::process::Command::new(&gh)
-                .args([
-                    "pr",
-                    "list",
-                    "--repo",
-                    &repo,
-                    "--state",
-                    "open",
-                    "--label",
-                    &label_arg,
-                    "--json",
-                    PR_LIST_FIELDS,
-                ])
-                .output()
-        })
-        .await
-        .map_err(|e| AppError::new(format!("gh 子任务调度失败: {e}")))?
-        .map_err(|e| AppError::new(format!("无法运行 gh（未安装或不在 PATH？）: {e}")))?;
+        let output = match tokio::time::timeout(GH_TIMEOUT, cmd.output()).await {
+            Err(_) => return Err(AppError::new(format!("gh pr list 超时（label={label}）"))),
+            Ok(Err(e)) => {
+                return Err(AppError::new(format!(
+                    "无法运行 gh（未安装或不在 PATH？）: {e}"
+                )))
+            }
+            Ok(Ok(output)) => output,
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -224,13 +231,9 @@ impl PrSource for GithubCli {
 /// missing, not logged in, scheduling failure) maps to `authenticated: false`
 /// with a human-readable message.
 pub async fn gh_auth_status(gh_bin: &str) -> GhStatus {
-    let gh = gh_bin.to_string();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        std::process::Command::new(&gh)
-            .args(["auth", "status"])
-            .output()
-    })
-    .await;
+    let mut cmd = Command::new(gh_bin);
+    cmd.args(["auth", "status"]).kill_on_drop(true);
+    let result = tokio::time::timeout(GH_TIMEOUT, cmd.output()).await;
 
     match result {
         Ok(Ok(output)) if output.status.success() => {
@@ -257,7 +260,7 @@ pub async fn gh_auth_status(gh_bin: &str) -> GhStatus {
         },
         Err(_) => GhStatus {
             authenticated: false,
-            message: "gh 状态检查调度失败".to_string(),
+            message: "gh 状态检查超时".to_string(),
         },
     }
 }
