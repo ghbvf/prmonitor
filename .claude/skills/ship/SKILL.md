@@ -19,6 +19,8 @@ allowed-tools: [Read, Write, Edit, Glob, Grep, Bash, Agent, AskUserQuestion]
 | L2 | 1 explorer | 展示给用户 | 1-2 并行 | 1 reviewer |
 | L3（默认） | 3 并行 explorer | AskUserQuestion 确认 | ≤ 4 并行 | 1/2/3/6 reviewer（按 diff 行数自动，见阶段 7） |
 
+> **Agent 类型映射**（本仓 `.claude/agents/` 只内置 `reviewer.md` 一个自定义 agent）：探索（explorer 角色）→ `subagent_type: Explore`（只读检索）；实施（developer 角色）→ `subagent_type: general-purpose`（可编辑 + 跑测试）；审查 → `subagent_type: reviewer`（本仓 `.claude/agents/reviewer.md`）。下文沿用 explorer/developer/reviewer 角色名，dispatch 时按此映射取内置或本仓 agent。
+
 ---
 
 ## 阶段 1：探索（L1 跳过）
@@ -79,7 +81,7 @@ git worktree add worktrees/<Type>/<issue#-short-name> -b <Type>/<issue#-short-na
 在 worktree 中，对有可测逻辑的改动**先写测试**（Rust `#[cfg(test)]` / `*_test` 模块覆盖正常/边界/错误路径），运行确认测试先 **FAIL**，再进入实施：
 
 ```bash
-cargo test --manifest-path worktrees/<wt>/src-tauri/Cargo.toml
+cargo test --manifest-path worktrees/<wt>/src-tauri/Cargo.toml --locked
 ```
 
 前端暂无测试运行器 → 类型检查（`pnpm -C worktrees/<wt> build` 的 vue-tsc 步）是前端门。纯配置/纯 UI/纯文档改动无可测逻辑时跳过本阶段并注明。
@@ -120,7 +122,7 @@ cargo clippy --manifest-path worktrees/<wt>/src-tauri/Cargo.toml --all-targets -
 ```bash
 pnpm -C worktrees/<wt> build                                                       # vue-tsc + vite build
 cargo build  --manifest-path worktrees/<wt>/src-tauri/Cargo.toml --locked
-cargo test   --manifest-path worktrees/<wt>/src-tauri/Cargo.toml
+cargo test   --manifest-path worktrees/<wt>/src-tauri/Cargo.toml --locked
 cargo fmt    --manifest-path worktrees/<wt>/src-tauri/Cargo.toml --all -- --check
 cargo clippy --manifest-path worktrees/<wt>/src-tauri/Cargo.toml --all-targets --locked -- -D warnings   # 0 告警才进阶段 6
 ```

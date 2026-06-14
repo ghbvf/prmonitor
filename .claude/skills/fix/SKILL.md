@@ -52,7 +52,7 @@ CONFIRMED 后、修复前，先构造能**复现问题**的测试用例：
 | 无法在单测复现（需运行时 / UI 状态） | 标注 `RUNTIME_ONLY`，跳过此步 |
 
 ```bash
-cargo test --manifest-path src-tauri/Cargo.toml <test-name>   # 确认 FAIL
+cargo test --manifest-path src-tauri/Cargo.toml --locked <test-name>   # 确认 FAIL
 ```
 
 ---
@@ -152,7 +152,7 @@ large 问题先查参考再动手：Rust 标准库 / `tauri`·`serde`·`tokio` �
 
 ### 4.2 执行代码修改（逐编辑测试循环）
 
-> **批量并行**：4+ 条 finding 时按切片（config/pr/codex/前端）聚类派发 `developer` sub-agent（**同切片同 agent** 防写冲突，组内串行执行下面循环）；并发 4-9→2 / ≥10→3；≤3 条由主 agent 直接处理。triage 同理可按聚类并行（`Explore`）。
+> **批量并行**：4+ 条 finding 时按切片（config/pr/codex/前端）聚类派发 developer sub-agent（`subagent_type: general-purpose`；**同切片同 agent** 防写冲突，组内串行执行下面循环）；并发 4-9→2 / ≥10→3；≤3 条由主 agent 直接处理。triage 同理可按聚类并行（`subagent_type: Explore`）。
 
 对每个任务执行 Edit-Test Loop：
 1. Read 目标文件 → 2. Edit/Write 修改代码 → 3. `cargo build --manifest-path src-tauri/Cargo.toml`（或 `pnpm build`）编译检查 → 4. `cargo test --manifest-path src-tauri/Cargo.toml`（含 1.4 复现测试）→ 5. 失败：当前编辑引入 → 立即修正重回 2；暴露后续依赖 → 记录继续 → 6. 通过 → 下一任务
@@ -161,7 +161,7 @@ large 问题先查参考再动手：Rust 标准库 / `tauri`·`serde`·`tokio` �
 ```bash
 pnpm build                                                       # 前端类型检查 + build
 cargo build  --manifest-path src-tauri/Cargo.toml --locked
-cargo test   --manifest-path src-tauri/Cargo.toml
+cargo test   --manifest-path src-tauri/Cargo.toml --locked
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 cargo fmt    --manifest-path src-tauri/Cargo.toml --all -- --check
 ```

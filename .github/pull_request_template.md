@@ -20,4 +20,4 @@
 - [ ] `cargo build --manifest-path src-tauri/Cargo.toml --locked` 本地通过
 - [ ] `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D warnings` 0 告警
 - [ ] `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check` 干净
-- [ ] `cargo test --manifest-path src-tauri/Cargo.toml` 通过（涉及逻辑变更时）
+- [ ] `cargo test --manifest-path src-tauri/Cargo.toml --locked` 通过（涉及逻辑变更时）

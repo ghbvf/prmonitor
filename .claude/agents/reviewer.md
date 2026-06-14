@@ -30,7 +30,7 @@ permissionMode: auto
 - 跨切片契约只走 `src-tauri/src/model.rs`（`Candidate` / `PullRequestView` 等）
 - 扩展缝（trait seam）：PR 来源走 `pr/source.rs` 的 `PrSource`，review 引擎走 `codex/engine.rs` 的 `ReviewEngine`——新增来源/引擎实现 trait，不改调用方
 - 组装根（composition root）只在 `src-tauri/src/lib.rs`（注册 Tauri command + 装配切片）
-- 前后端类型契约对齐：`src/types.ts` 必须镜像 `src-tauri/src/model.rs`
+- 前后端类型契约对齐：`src/types.ts` 镜像 `src-tauri/src/model.rs`（跨切片契约 `Candidate`/`PullRequestView`）及各切片序列化模型（如 `config/model.rs` 的 `AppConfig`）
 - 错误统一走 `AppError` / `AppResult`（`src-tauri/src/error.rs`），事件走 `events.rs` 的 `ReviewEvent`
 
 ## 审查维度
@@ -39,13 +39,13 @@ permissionMode: auto
 切片自包含性、跨切片只走 model.rs 契约、trait seam（PrSource/ReviewEngine）扩展点不被绕过、lib.rs 组装职责单一、前后端类型对齐（types.ts ↔ model.rs）、Tauri command 注册正确
 
 ### 2. 安全/健壮
-Rust `unsafe` 块合理性、子进程调用（`gh` / `codex` app-server）的参数注入与转义、外部输入校验（PR 号/标签/codex 输出）、Tauri capability/权限范围最小化、敏感信息（token）不落日志不持久化
+Rust `unsafe` 块合理性、`gh` 子进程调用的参数注入/转义、`codex` app-server 的 JSON-RPC over stdio payload 构造与协议正确性、外部输入校验（PR 号/标签/codex 输出）、前端→后端 Tauri command 入参校验、Tauri capability/权限范围最小化、敏感信息（token）不落日志不持久化
 
 ### 3. 测试/回归
 关键逻辑有 `cargo test` 覆盖、边界用例（空值/极端值/并发）、复现测试、序列化往返（serde）测试
 
 ### 4. 可靠性/生命周期
-codex app-server 进程 spawn/kill 生命周期闭环（无僵尸/泄漏）、session 状态机正确性、scheduler 轮询循环（无忙等/无界增长）、错误传播经 `AppError`/`AppResult`、外部输入路径无 `unwrap`/`expect`/`panic`、流式事件不丢不乱序
+codex app-server 进程 spawn/kill 生命周期闭环（无僵尸/泄漏）、session 状态机正确性、scheduler 轮询循环（无忙等/无界增长）、**派发幂等/去重**（`pr/ledger.rs`：同一 `{number}@{headSha}:{kind}` 跨重启不重复派发）、错误传播经 `AppError`/`AppResult`、外部输入路径无 `unwrap`/`expect`/`panic`、流式事件不丢不乱序
 
 ### 5. 可维护性/DX
 clippy 零告警、命名规范（Rust snake_case / TS camelCase）、serde 属性正确、doc 注释清晰、无死代码、字符串常量抽取（≥3 次）
@@ -71,7 +71,7 @@ review 流式输出与 stop 按钮行为正确、错误提示透传到 UI（不�
 
 1. **Finding 清单**（P0→P3 排序，同级内 small→large）
 2. **复杂度汇总**：`small: N / large: N`
-3. **修复分流建议**：small → 派发 `developer` agent；large → 标注"需人工决策"
+3. **修复分流建议**：small → 派发 developer agent（`general-purpose`）；large → 标注"需人工决策"
 4. **总体结论**：LGTM / 需修复 / 需讨论
 
 ## 约束
