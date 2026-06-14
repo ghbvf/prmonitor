@@ -31,6 +31,8 @@ pub fn run() {
             config::commands::app_version,
             config::commands::get_config,
             config::commands::set_config,
+            pr::commands::fetch_prs_now,
+            pr::commands::gh_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

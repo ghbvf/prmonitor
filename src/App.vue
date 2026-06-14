@@ -5,6 +5,7 @@ import { onMounted, ref } from "vue";
 import { appVersion } from "./config/api";
 import ConfigPanel from "./config/ConfigPanel.vue";
 import PrList from "./pr/PrList.vue";
+import StatusBar from "./pr/StatusBar.vue";
 import ReviewPanel from "./review/ReviewPanel.vue";
 
 const version = ref("");
@@ -28,6 +29,7 @@ onMounted(async () => {
         <ReviewPanel />
       </main>
     </div>
+    <StatusBar />
   </div>
 </template>
 
