@@ -63,6 +63,11 @@ pub struct PullRequestView {
     pub title: String,
     pub labels: Vec<String>,
     pub url: String,
+    /// `"review"` or `"check"` — the trigger-label mode this PR maps to.
+    pub kind: String,
+    /// Why this PR would be skipped (not dispatched), or `None` when it would
+    /// dispatch. Serializes to `null` / a string for the frontend.
+    pub skip_reason: Option<String>,
 }
 
 /// Serde wire-shape locks for `model.rs`'s cross-slice types.
@@ -140,18 +145,39 @@ mod tests {
             title: "Add feature".to_string(),
             labels: vec!["review".to_string()],
             url: "https://example.com/pr/1".to_string(),
+            kind: "review".to_string(),
+            skip_reason: Some("draft PR".to_string()),
         };
 
         let v = serde_json::to_value(&view).expect("PullRequestView serializes");
 
-        // No snake_case negative assertions: every PullRequestView field name is
-        // single-word (no underscores), so camelCase serialization is a no-op and
-        // there is no snake_case form to guard against. If a multi-word field is
-        // added later, add `is_none()` guards like the Candidate test above.
         // camelCase / flat keys present.
         assert!(v.get("number").is_some());
         assert!(v.get("title").is_some());
         assert!(v.get("labels").is_some());
         assert!(v.get("url").is_some());
+        assert!(v.get("kind").is_some());
+        assert!(v.get("skipReason").is_some());
+
+        // snake_case form absent — a rename of the one multi-word field
+        // (`skip_reason`) would surface here.
+        assert!(v.get("skip_reason").is_none());
+    }
+
+    // A non-skipped PR serializes `skipReason` as JSON null (not omitted) so the
+    // frontend's `skipReason: string | null` mirror stays a closed contract.
+    #[test]
+    fn pull_request_view_none_skip_reason_serializes_to_null() {
+        let view = PullRequestView {
+            number: 2,
+            title: "Ready".to_string(),
+            labels: vec![],
+            url: "https://example.com/pr/2".to_string(),
+            kind: "check".to_string(),
+            skip_reason: None,
+        };
+
+        let v = serde_json::to_value(&view).expect("PullRequestView serializes");
+        assert_eq!(v["skipReason"], serde_json::Value::Null);
     }
 }

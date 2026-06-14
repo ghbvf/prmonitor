@@ -6,6 +6,8 @@ export interface PullRequestView {
   title: string;
   labels: string[];
   url: string;
+  kind: string; // "review" | "check" — the trigger-label mode
+  skipReason: string | null; // null = would dispatch; string = why it is skipped
 }
 
 // Discriminator unions mirroring the `SourceKind` / `EngineKind` Rust enums.
