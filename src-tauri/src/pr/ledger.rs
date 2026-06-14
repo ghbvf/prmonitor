@@ -201,4 +201,30 @@ mod tests {
         assert_eq!(ledger.last_dispatch_at(13, "review"), Some(500));
         assert_eq!(ledger.last_dispatch_at(99, "review"), None);
     }
+
+    // Wire-shape lock for the persisted `ledger.json` events (Medium carrier per
+    // ai-robust.md). A field rename would make `Ledger::load` silently drop the
+    // events (deserialize → `unwrap_or_default()`), wiping cooldown state and
+    // re-dispatching; this round-trip guards against that.
+    #[test]
+    fn dispatch_event_wire_shape_is_camel_case_and_round_trips() {
+        let e = event(12, "review", 1_700_000_000);
+        let v = serde_json::to_value(&e).expect("DispatchEvent serializes");
+
+        // camelCase keys present.
+        assert!(v.get("pr").is_some());
+        assert!(v.get("kind").is_some());
+        assert!(v.get("headSha").is_some());
+        assert!(v.get("key").is_some());
+        assert!(v.get("dispatchedAtEpoch").is_some());
+
+        // snake_case forms absent — a rename surfaces here.
+        assert!(v.get("head_sha").is_none());
+        assert!(v.get("dispatched_at_epoch").is_none());
+
+        // Round-trips without zeroing the cooldown epoch.
+        let back: DispatchEvent = serde_json::from_value(v).expect("round-trips");
+        assert_eq!(back.dispatched_at_epoch, 1_700_000_000);
+        assert_eq!(back.head_sha, "sha");
+    }
 }

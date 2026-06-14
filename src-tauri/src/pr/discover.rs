@@ -10,6 +10,11 @@ use crate::model::Candidate;
 
 use super::ledger::{cooldown_remaining, dispatch_key, Ledger};
 
+/// Skip reason for a PR carrying BOTH trigger labels (ambiguous mode). Single
+/// source shared by the live gate here and the discovery-stage drop in
+/// [`super::commands`] so the two call sites cannot drift.
+pub const BOTH_TRIGGER_LABELS_REASON: &str = "both review and check trigger labels are present";
+
 /// The config the gating needs, snapshotted from `AppConfig` by the command.
 ///
 /// The `pr` slice stays self-contained: it does not import the config slice's
@@ -102,7 +107,7 @@ pub fn live_gate_skip(
         return Some(format!("trigger label {want:?} no longer present"));
     }
     if live_labels.iter().any(|l| l == other) {
-        return Some("both review and check trigger labels are present".to_string());
+        return Some(BOTH_TRIGGER_LABELS_REASON.to_string());
     }
     None
 }
@@ -297,6 +302,42 @@ mod tests {
                 std::slice::from_ref(&p.review_label)
             ),
             None
+        );
+    }
+
+    #[test]
+    fn live_gate_skip_check_kind_uses_check_label() {
+        let c = cand("check");
+        let p = params();
+        // check label present, review absent → pass.
+        assert_eq!(
+            live_gate_skip(
+                &c,
+                &p,
+                &c.head_sha,
+                false,
+                std::slice::from_ref(&p.check_label)
+            ),
+            None
+        );
+        // check label gone → skip (the `else` branch wires `want` to check_label).
+        assert_eq!(
+            live_gate_skip(&c, &p, &c.head_sha, false, &["other".to_string()]),
+            Some(format!(
+                "trigger label {:?} no longer present",
+                p.check_label
+            ))
+        );
+        // both labels present → conflict.
+        assert_eq!(
+            live_gate_skip(
+                &c,
+                &p,
+                &c.head_sha,
+                false,
+                &[p.check_label.clone(), p.review_label.clone()]
+            ),
+            Some(BOTH_TRIGGER_LABELS_REASON.to_string())
         );
     }
 }

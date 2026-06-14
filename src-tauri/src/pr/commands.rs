@@ -24,7 +24,7 @@ fn now_epoch() -> u64 {
 /// dispatch-time check (PR4/PR5), not run here.
 fn build_view(row: GhRow, params: &MonitorParams, ledger: &Ledger, now: u64) -> PullRequestView {
     let skip_reason = if row.conflict {
-        Some("both review and check trigger labels are present".to_string())
+        Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string())
     } else {
         discover::should_skip(&row.candidate, params, ledger)
             .or_else(|| discover::cooldown_skip(&row.candidate, params, ledger, now))
@@ -137,5 +137,34 @@ mod tests {
         r.candidate.is_draft = true;
         let view = build_view(r, &params(), &Ledger::default(), 0);
         assert_eq!(view.skip_reason, Some("draft PR".to_string()));
+    }
+
+    #[test]
+    fn build_view_propagates_cooldown_skip() {
+        use crate::pr::ledger::{dispatch_key, DispatchEvent};
+        use std::collections::HashSet;
+
+        let r = row(4, "review", false);
+        let key = dispatch_key(4, &r.candidate.head_sha, "review");
+        let ledger = Ledger {
+            dispatched: HashSet::new(),
+            events: vec![DispatchEvent {
+                pr: 4,
+                kind: "review".to_string(),
+                head_sha: r.candidate.head_sha.clone(),
+                key,
+                dispatched_at_epoch: 1_000,
+            }],
+        };
+        // 1800s cooldown, dispatched 500s before `now` → within window.
+        let view = build_view(r, &params(), &ledger, 1_500);
+        assert!(
+            view.skip_reason
+                .as_deref()
+                .unwrap()
+                .contains("within cooldown"),
+            "{:?}",
+            view.skip_reason
+        );
     }
 }

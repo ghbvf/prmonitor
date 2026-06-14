@@ -22,9 +22,11 @@ onMounted(() => store.refreshGhStatus());
 
     <p v-if="store.error" class="error">{{ store.error }}</p>
 
-    <p v-else-if="!store.loading && store.prs.length === 0" class="muted">
-      暂无 PR / No PRs
+    <p v-else-if="store.loading && store.prs.length === 0" class="muted">
+      拉取中…
     </p>
+
+    <p v-else-if="store.prs.length === 0" class="muted">暂无 PR / No PRs</p>
 
     <ul v-else class="rows">
       <PrRow v-for="pr in store.prs" :key="pr.number" :pr="pr" />

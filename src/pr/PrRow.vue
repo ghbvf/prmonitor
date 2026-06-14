@@ -8,12 +8,16 @@ import type { PullRequestView } from "../types";
 const props = defineProps<{ pr: PullRequestView }>();
 
 function open() {
-  void openUrl(props.pr.url);
+  // Only follow web links (gh returns https PR urls); reject any other scheme,
+  // and surface a failure instead of dropping it silently.
+  const url = props.pr.url;
+  if (!/^https?:\/\//i.test(url)) return;
+  openUrl(url).catch((err) => console.error("打开链接失败", err));
 }
 </script>
 
 <template>
-  <li class="pr-row" :class="{ skipped: pr.skipReason !== null }">
+  <li class="pr-row" :class="{ skipped: pr.skipReason != null }">
     <div class="title-line">
       <button type="button" class="title" @click="open">
         #{{ pr.number }} — {{ pr.title }}
@@ -27,7 +31,7 @@ function open() {
       </span>
     </div>
 
-    <p v-if="pr.skipReason !== null" class="skip-note">
+    <p v-if="pr.skipReason != null" class="skip-note">
       已跳过：{{ pr.skipReason }}
     </p>
   </li>

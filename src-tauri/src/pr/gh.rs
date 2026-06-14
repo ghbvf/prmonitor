@@ -155,6 +155,8 @@ impl GithubCli {
     async fn run_pr_list(&self, label: &str) -> AppResult<String> {
         let gh = self.gh_bin.clone();
         let repo = self.repo.clone();
+        // Two owned copies: `label_arg` moves into the blocking closure while
+        // `label` stays available for the error message after the await point.
         let label = label.to_string();
         let label_arg = label.clone();
 
@@ -386,5 +388,27 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].candidate.kind, "check");
         assert!(!merged[0].conflict);
+    }
+
+    #[test]
+    fn merge_rows_review_only_keeps_review_kind() {
+        let merged = merge_rows(vec![row(1, "review")], vec![]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].candidate.kind, "review");
+        assert!(!merged[0].conflict);
+    }
+
+    // Wire-shape lock for `GhStatus` — the `gh_status` command's front/back wire
+    // type, mirrored in `src/pr/types.ts` (Medium carrier per ai-robust.md; a
+    // field rename would otherwise drift the TS mirror silently).
+    #[test]
+    fn gh_status_wire_shape_is_camel_case() {
+        let v = serde_json::to_value(GhStatus {
+            authenticated: true,
+            message: "ok".to_string(),
+        })
+        .expect("GhStatus serializes");
+        assert!(v.get("authenticated").is_some());
+        assert!(v.get("message").is_some());
     }
 }
