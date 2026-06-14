@@ -1,4 +1,6 @@
 // Config slice types. AppConfig is slice-private (mirrors src-tauri/src/config/model.rs).
+import type { SourceKind, EngineKind } from "../types";
+
 export interface AppConfig {
   repo: string;
   repoRoot: string;
@@ -8,4 +10,6 @@ export interface AppConfig {
   checkLabel: string;
   skillRelPath: string;
   prCooldownSeconds: number;
+  sourceKind: SourceKind;
+  engineKind: EngineKind;
 }

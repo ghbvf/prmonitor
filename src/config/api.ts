@@ -9,3 +9,7 @@ export function appVersion(): Promise<string> {
 export function getConfig(): Promise<AppConfig> {
   return invoke<AppConfig>("get_config");
 }
+
+export function setConfig(config: AppConfig): Promise<void> {
+  return invoke<void>("set_config", { config });
+}

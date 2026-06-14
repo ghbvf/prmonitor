@@ -8,6 +8,11 @@ export interface PullRequestView {
   url: string;
 }
 
+// Discriminator unions mirroring the `SourceKind` / `EngineKind` Rust enums.
+// Single-arm today; widening tracked by #11.
+export type SourceKind = "github"; // 未来 #11: | "gitlab" | "bitbucket"
+export type EngineKind = "codex"; // 未来 #11: | "claude"
+
 export type ReviewEvent =
   | { kind: "messageDelta"; threadId: string; itemId: string; text: string }
   | { kind: "reasoningDelta"; threadId: string; itemId: string; text: string }
