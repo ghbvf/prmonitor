@@ -5,6 +5,7 @@
 // Mirrors the option-store pattern set by useConfigStore.
 import { defineStore } from "pinia";
 import {
+  getPrs,
   ghStatus,
   onPrsUpdated,
   pollNow,
@@ -56,6 +57,25 @@ export const usePrStore = defineStore("pr", {
         }
         this.loading = false;
       });
+    },
+    // Read the backend's current PR snapshot into state. Tolerates a rejected
+    // command by surfacing the message (no list mutation) rather than throwing.
+    async loadSnapshot() {
+      try {
+        this.prs = await getPrs();
+      } catch (err) {
+        this.error = toMessage(err);
+      }
+    },
+    // Startup wiring: subscribe FIRST (await the listener registration) THEN read
+    // the snapshot, so no `prs:updated` event fired between snapshot-read and
+    // listener-registration is lost (#27 F3). Returns the `Promise<UnlistenFn>`
+    // for the component to await + invoke on unmount.
+    async init() {
+      const unlisten = this.subscribe(); // onPrsUpdated -> Promise<UnlistenFn>
+      await unlisten; // ensure the listener is registered
+      await this.loadSnapshot(); // baseline current state
+      return unlisten;
     },
     async pollNow() {
       if (this.loading) return;

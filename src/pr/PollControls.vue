@@ -14,13 +14,17 @@ const lastPulledText = computed(() =>
     : new Date(store.lastPulledAt).toLocaleTimeString(),
 );
 
-// Hold the Promise<UnlistenFn> so onUnmounted can await + invoke it.
-let unlisten: ReturnType<typeof store.subscribe> | null = null;
-onMounted(() => {
-  unlisten = store.subscribe();
+// Hold the resolved UnlistenFn so onUnmounted can invoke it.
+// init() subscribes (awaits the listener registration) then baselines the list
+// from the backend snapshot, closing the startup lost-event race (#27 F3).
+// As an async action, init() flattens its inner Promise<UnlistenFn>, so awaiting
+// it yields the UnlistenFn itself.
+let unlisten: Awaited<ReturnType<typeof store.init>> | null = null;
+onMounted(async () => {
+  unlisten = await store.init();
 });
-onUnmounted(async () => {
-  if (unlisten) (await unlisten)();
+onUnmounted(() => {
+  unlisten?.();
 });
 </script>
 
@@ -34,7 +38,7 @@ onUnmounted(async () => {
       >
         {{ store.loading ? "拉取中…" : "立即拉取" }}
       </button>
-      <button type="button" @click="store.toggle()">
+      <button type="button" :disabled="store.loading" @click="store.toggle()">
         {{ store.polling ? "暂停轮询" : "恢复轮询" }}
       </button>
     </div>
