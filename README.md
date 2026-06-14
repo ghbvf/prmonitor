@@ -23,6 +23,8 @@ This commit is the scaffold (PR1): Tauri v2 + Vue 3 + TypeScript + Vite, plus CI
 - [Node.js](https://nodejs.org/) 22+ and [pnpm](https://pnpm.io/) 11+
 - [`gh`](https://cli.github.com/) CLI, authenticated (`gh auth login`)
 - [`codex`](https://developers.openai.com/codex/) CLI, logged in (`codex login`)
+- [`jq`](https://jqlang.github.io/jq/) — used by the `.claude/hooks/` self-audit
+  hooks. They **fail open** (skip silently, never block) when `jq` is absent.
 
 ## Develop
 
