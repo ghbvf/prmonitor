@@ -1,0 +1,5 @@
+# pnpm settings. allowBuilds permits a package's install/build scripts to run
+# (pnpm blocks them by default). esbuild needs its build step to link the
+# platform-native binary that Vite uses.
+allowBuilds:
+  esbuild: true
