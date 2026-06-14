@@ -6,6 +6,7 @@
 //! `events` (notification → [`crate::events::ReviewEvent`] mapping) are filled
 //! in by PR5/PR6.
 
+pub mod commands;
 pub mod engine;
 pub mod engines;
 pub mod events;

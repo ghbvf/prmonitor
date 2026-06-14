@@ -5,9 +5,15 @@
 //! - `process` — spawn + manage the child, stdin/stdout pipes, stderr capture
 //! - `codec` — NDJSON line framing
 //! - `rpc` — request/response demux (`id` → oneshot) + notification broadcast
-//! - `protocol` — typed subset of the v2 protocol we use
+//! - `protocol` — typed subset of the protocol we use
+//! - `manager` — the resident connection handle held in `AppState`
 
 pub mod codec;
+pub mod manager;
 pub mod process;
 pub mod protocol;
 pub mod rpc;
+
+pub use manager::CodexManager;
+pub use process::{CodexProcess, CodexStatus};
+pub use rpc::{RpcClient, RpcError};

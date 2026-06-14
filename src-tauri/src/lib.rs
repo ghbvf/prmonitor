@@ -46,7 +46,16 @@ pub fn run() {
             pr::commands::reschedule,
             pr::commands::gh_status,
             pr::commands::get_prs,
+            review::commands::get_codex_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Kill the resident codex app-server when the app exits, so the child
+            // process never outlives the app ("软件关闭时一起关闭"). The manager's
+            // shutdown is idempotent and `kill_on_drop(true)` is the backstop.
+            if matches!(event, tauri::RunEvent::Exit) {
+                app_handle.state::<AppState>().codex.shutdown();
+            }
+        });
 }
