@@ -8,6 +8,10 @@ import type { AppConfig } from "./types";
 
 const store = useConfigStore();
 
+// Notify the composition root on a successful save so it can trigger a
+// backend reschedule (the poll interval may have changed).
+const emit = defineEmits<{ saved: [] }>();
+
 // Editable draft. `authors` is exposed to the user as a comma-joined string and
 // normalized back to string[] on save.
 const draft = reactive<AppConfig>({
@@ -57,12 +61,15 @@ function onEdit() {
   store.error = null;
 }
 
-function onSave() {
+async function onSave() {
   const authors = authorsInput.value
     .split(",")
     .map((a) => a.trim())
     .filter((a) => a.length > 0);
-  store.save({ ...draft, authors });
+  // store.save() resolves regardless of outcome (it catches and sets
+  // store.error / store.savedOk); gate the emit on the success flag.
+  await store.save({ ...draft, authors });
+  if (store.savedOk) emit("saved");
 }
 </script>
 
