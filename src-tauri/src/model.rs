@@ -19,6 +19,42 @@ pub struct Candidate {
     pub kind: String,
 }
 
+/// Which PR source backs the monitor.
+///
+/// **Hard carrier** (sealed enum): once PR3+ wires source selection through an
+/// exhaustive `match SourceKind { ... }`, adding a variant without handling it
+/// is a compile error — the missing arm cannot be expressed. Today it has one
+/// variant, so the seam is reserved but not yet load-bearing.
+///
+/// #11 design reservation: future variants `GitLab` / `Bitbucket`. Wire string
+/// for `Github` is pinned to `"github"` (cross-agent contract; the frontend
+/// mirrors it and a serde golden test locks it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum SourceKind {
+    #[default]
+    Github,
+    // future #11: GitLab, Bitbucket
+}
+
+/// Which review engine runs against a PR.
+///
+/// **Hard carrier** (sealed enum): once PR3+ wires engine selection through an
+/// exhaustive `match EngineKind { ... }`, adding a variant without handling it
+/// is a compile error — the missing arm cannot be expressed. Today it has one
+/// variant, so the seam is reserved but not yet load-bearing.
+///
+/// #11 design reservation: future variant `Claude`. Wire string for `Codex` is
+/// pinned to `"codex"` (cross-agent contract; the frontend mirrors it and a
+/// serde golden test locks it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum EngineKind {
+    #[default]
+    Codex,
+    // future #11: Claude
+}
+
 /// A PR row shown in the UI (display superset of [`Candidate`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -79,6 +115,20 @@ mod tests {
         assert!(v.get("head_ref").is_none());
         assert!(v.get("is_cross_repository").is_none());
         assert!(v.get("is_draft").is_none());
+    }
+
+    // Cross-agent wire contract lock: the frontend mirrors these exact strings.
+    // A variant rename or `rename_all` change surfaces here.
+    #[test]
+    fn discriminator_enums_serialize_to_pinned_wire_strings() {
+        assert_eq!(
+            serde_json::to_value(SourceKind::Github).expect("SourceKind serializes"),
+            "github"
+        );
+        assert_eq!(
+            serde_json::to_value(EngineKind::Codex).expect("EngineKind serializes"),
+            "codex"
+        );
     }
 
     // Front/back contract lock: `PullRequestView` is mirrored in `src/types.ts`;

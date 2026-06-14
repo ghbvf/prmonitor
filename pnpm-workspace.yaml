@@ -3,3 +3,6 @@
 # platform-native binary that Vite uses.
 allowBuilds:
   esbuild: true
+  # pinia → vue-demi: postinstall switches its Vue 2/3 shim to match the
+  # installed Vue (here Vue 3). Approve so the deps-status check in `build` passes.
+  vue-demi: true
