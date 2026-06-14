@@ -43,7 +43,7 @@ pub struct PullRequestView {
 ///   codegen `types.ts` from `model.rs` + `git diff --exit-code`).
 /// - [`Candidate`] is **backend-internal**, cross-Rust-slice only: per the
 ///   charter it is intentionally *not* mirrored in `src/types.ts`, so its lock
-///   guards the camelCase wire shape the `pr`/`codex` slices rely on, **not** a
+///   guards the camelCase wire shape the `pr`/`review` slices rely on, **not** a
 ///   front/back contract — do not sync it to the frontend.
 #[cfg(test)]
 mod tests {
