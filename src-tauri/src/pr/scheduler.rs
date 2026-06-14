@@ -79,10 +79,16 @@ impl Scheduler {
         }
     }
 
-    /// Triggers an immediate discovery on the running loop (no-op if stopped).
-    pub fn wake(&self) {
+    /// Triggers an immediate discovery on the running loop. Returns whether a
+    /// running task was actually woken: `false` when stopped (task is `None`),
+    /// so the caller (`poll_now`) can surface an error instead of leaving the
+    /// frontend waiting for a `prs:updated` event that will never arrive.
+    pub fn wake(&self) -> bool {
         if let Some(task) = self.task.lock().unwrap().as_ref() {
             task.wake.notify_one();
+            true
+        } else {
+            false
         }
     }
 

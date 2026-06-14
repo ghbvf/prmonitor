@@ -27,7 +27,11 @@ onUnmounted(async () => {
 <template>
   <section class="poll-controls">
     <div class="actions">
-      <button type="button" :disabled="store.loading" @click="store.pollNow()">
+      <button
+        type="button"
+        :disabled="store.loading || !store.polling"
+        @click="store.pollNow()"
+      >
         {{ store.loading ? "拉取中…" : "立即拉取" }}
       </button>
       <button type="button" @click="store.toggle()">

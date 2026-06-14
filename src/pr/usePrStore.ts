@@ -49,6 +49,8 @@ export const usePrStore = defineStore("pr", {
         if (e.kind === "updated") {
           this.prs = e.prs;
           this.lastPulledAt = Date.now();
+          // Clear any stale error banner so a recovered poll un-masks the list.
+          this.error = null;
         } else {
           this.error = e.message;
         }

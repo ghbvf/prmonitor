@@ -94,11 +94,17 @@ pub async fn stop_polling(state: tauri::State<'_, crate::state::AppState>) -> Ap
     Ok(())
 }
 
-/// Triggers an immediate discovery cycle ("立即拉取").
+/// Triggers an immediate discovery cycle ("立即拉取"). Returns an error when the
+/// scheduler is paused (stopped): `wake` is a no-op on a stopped loop and would
+/// emit no `prs:updated` event, leaving the frontend stuck in a loading state.
+/// Defense-in-depth alongside the disabled-while-paused button.
 #[tauri::command]
 pub async fn poll_now(state: tauri::State<'_, crate::state::AppState>) -> AppResult<()> {
-    state.scheduler.wake();
-    Ok(())
+    if state.scheduler.wake() {
+        Ok(())
+    } else {
+        Err(crate::error::AppError::new("轮询已暂停，请先恢复轮询"))
+    }
 }
 
 /// Re-reads the poll period and rebuilds the loop's ticker (after a config save).

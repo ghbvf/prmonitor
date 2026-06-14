@@ -18,7 +18,9 @@ onMounted(async () => {
 // Cross-slice wiring (composition root only): a config save may change the poll
 // interval, so reschedule the backend timer.
 function onConfigSaved() {
-  reschedule();
+  // Non-blocking: a reschedule failure only delays the period rebuild (the next
+  // poll still runs on the old period), so log it rather than surfacing/throwing.
+  reschedule().catch((e) => console.error("reschedule failed", e));
 }
 </script>
 
