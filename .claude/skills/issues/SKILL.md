@@ -138,9 +138,9 @@ gh pr edit <N> --add-label pr-status/needs-review-again --remove-label pr-status
 # review 有 findings（5-state：始终切 needs-fix）
 gh pr edit <N> --add-label pr-review/changes-requested --add-label pr-status/needs-fix \
   --remove-label pr-review/approved --remove-label pr-status/needs-review-again
-# review 无 findings → 终态
+# review 无 findings → 终态（撤两种合法入口 needs-review-again/needs-fix，保恰好一个 pr-status/*）
 gh pr edit <N> --add-label pr-review/approved --add-label pr-status/ready \
-  --remove-label pr-review/changes-requested --remove-label pr-status/needs-review-again
+  --remove-label pr-review/changes-requested --remove-label pr-status/needs-review-again --remove-label pr-status/needs-fix
 # /fix 修完 → 待验证（fix 不能直接 ready）
 gh pr edit <N> --add-label pr-status/needs-check-fix --remove-label pr-status/needs-fix
 # --check 全修复 → 终态
