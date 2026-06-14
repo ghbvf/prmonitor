@@ -1,5 +1,12 @@
 <script setup lang="ts">
 // Review streaming panel. PR6 renders streamed deltas + the Stop button.
+import { onMounted } from "vue";
+import { useReviewStore } from "./useReviewStore";
+
+const store = useReviewStore();
+
+// Hydrate the codex availability on mount so the StatusBar has data to show.
+onMounted(() => store.refreshCodexStatus());
 </script>
 
 <template>

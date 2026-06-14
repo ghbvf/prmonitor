@@ -1,10 +1,14 @@
 <script setup lang="ts">
 // Thin status strip: surfaces the `gh` CLI auth state (sourced from the pr store)
-// plus a codex placeholder. The codex status becomes real once the review slice
-// lands; this component is a placeholder for it for now.
+// plus the codex availability (sourced from the review store). This is App-shell
+// assembly — the codex line reads across into the review slice by design.
 import { usePrStore } from "./usePrStore";
+import { useReviewStore } from "../review/useReviewStore";
 
 const store = usePrStore();
+// Destructure the codex ref so the template auto-unwraps it (the review store is
+// a plain factory object, not a Pinia store, so `review.codex` would stay a Ref).
+const { codex } = useReviewStore();
 </script>
 
 <template>
@@ -18,8 +22,11 @@ const store = usePrStore();
     </span>
 
     <span class="item">
-      <span class="dot idle"></span>
-      <span class="text">codex —（真实状态随 review 切片落地，本组件暂为占位）</span>
+      <span
+        class="dot"
+        :class="codex?.available ? 'ok' : 'warn'"
+      ></span>
+      <span class="text">codex — {{ codex?.message ?? "未知 / unknown" }}</span>
     </span>
   </footer>
 </template>
