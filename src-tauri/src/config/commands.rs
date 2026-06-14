@@ -4,8 +4,7 @@ use super::model::AppConfig;
 use super::service;
 use crate::error::AppResult;
 
-/// Sample command proving slice → command → composition-root wiring (replaces
-/// the scaffold `greet`). Returns the app version from Cargo metadata.
+/// Returns the bundled app version (from Cargo metadata) for the UI header.
 #[tauri::command]
 pub fn app_version() -> AppResult<String> {
     Ok(env!("CARGO_PKG_VERSION").to_string())

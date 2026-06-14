@@ -50,6 +50,13 @@ watch(
 
 onMounted(() => store.load());
 
+// Clear the "Saved." banner / stale error the moment the user resumes editing.
+// Fires only on real DOM input, not the programmatic hydrate() above.
+function onEdit() {
+  store.savedOk = false;
+  store.error = null;
+}
+
 function onSave() {
   const authors = authorsInput.value
     .split(",")
@@ -64,8 +71,9 @@ function onSave() {
     <h2>Config</h2>
 
     <p v-if="store.loading" class="muted">Loading…</p>
+    <p v-else-if="store.error && !store.config" class="error">{{ store.error }}</p>
 
-    <form v-else class="form" @submit.prevent="onSave">
+    <form v-else class="form" @submit.prevent="onSave" @input="onEdit">
       <label>
         <span>Repo</span>
         <input v-model="draft.repo" type="text" />
@@ -93,12 +101,12 @@ function onSave() {
 
       <label>
         <span>Poll interval (secs)</span>
-        <input v-model.number="draft.pollIntervalSecs" type="number" />
+        <input v-model.number="draft.pollIntervalSecs" type="number" min="1" />
       </label>
 
       <label>
         <span>PR cooldown (secs)</span>
-        <input v-model.number="draft.prCooldownSeconds" type="number" />
+        <input v-model.number="draft.prCooldownSeconds" type="number" min="1" />
       </label>
 
       <label>
@@ -108,6 +116,7 @@ function onSave() {
 
       <label>
         <span>Source</span>
+        <!-- #11: add <option>s here as SourceKind widens (gitlab / bitbucket). -->
         <select v-model="draft.sourceKind">
           <option value="github">github</option>
         </select>
@@ -115,6 +124,7 @@ function onSave() {
 
       <label>
         <span>Engine</span>
+        <!-- #11: add <option>s here as EngineKind widens (claude). -->
         <select v-model="draft.engineKind">
           <option value="codex">codex</option>
         </select>

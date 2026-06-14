@@ -32,8 +32,11 @@ export const useConfigStore = defineStore("config", {
     async load() {
       if (this.loading) return;
       this.loading = true;
+      this.error = null;
       try {
         this.config = await getConfig();
+      } catch (err) {
+        this.error = toMessage(err);
       } finally {
         this.loading = false;
       }

@@ -58,25 +58,57 @@ impl Default for AppConfig {
     }
 }
 
-/// Validates filesystem-dependent config fields before persisting.
+/// Validates config fields before persisting (hard-reject on failure).
 ///
-/// Pure (no I/O beyond `stat`): `repo_root` must be a non-empty path to an
-/// existing directory, and `skill_rel_path` resolved against it must be an
-/// existing file. Errors funnel through [`AppError`] naming the offending field.
+/// Checks: positive poll/cooldown intervals; `repo_root` is a non-empty,
+/// **absolute** path to an existing directory (absolute so resolution never
+/// depends on the process CWD, matching the field's doc contract); and
+/// `skill_rel_path` resolves to an existing file that stays **inside**
+/// `repo_root`. The skill check defends two `Path::join` pitfalls: an absolute
+/// `skill_rel_path` would discard `repo_root`, and `..` traversal could escape
+/// the clone — both would let a later engine read arbitrary files. Errors
+/// funnel through [`AppError`] naming the offending field.
 pub fn validate(config: &AppConfig) -> AppResult<()> {
+    if config.poll_interval_secs == 0 {
+        return Err(AppError::new("pollIntervalSecs 必须大于 0"));
+    }
+    if config.pr_cooldown_seconds == 0 {
+        return Err(AppError::new("prCooldownSeconds 必须大于 0"));
+    }
+
     let repo_root = config.repo_root.trim();
-    if repo_root.is_empty() || !Path::new(repo_root).is_dir() {
+    let root = Path::new(repo_root);
+    if repo_root.is_empty() || !root.is_absolute() || !root.is_dir() {
         return Err(AppError::new(format!(
-            "repoRoot 路径不存在或不是目录: {}",
+            "repoRoot 必须是存在的绝对目录路径: {}",
             config.repo_root
         )));
     }
 
-    let skill = Path::new(repo_root).join(&config.skill_rel_path);
+    let skill_rel = Path::new(&config.skill_rel_path);
+    if skill_rel.is_absolute() {
+        return Err(AppError::new(format!(
+            "skillRelPath 必须是相对路径: {}",
+            config.skill_rel_path
+        )));
+    }
+    let skill = root.join(skill_rel);
     if !skill.is_file() {
         return Err(AppError::new(format!(
             "skill 路径不存在: {}",
             skill.display()
+        )));
+    }
+    let root_canon = root
+        .canonicalize()
+        .map_err(|e| AppError::new(format!("repoRoot 规范化失败: {e}")))?;
+    let skill_canon = skill
+        .canonicalize()
+        .map_err(|e| AppError::new(format!("skill 路径规范化失败: {e}")))?;
+    if !skill_canon.starts_with(&root_canon) {
+        return Err(AppError::new(format!(
+            "skillRelPath 不能逃逸 repoRoot: {}",
+            config.skill_rel_path
         )));
     }
 
@@ -177,6 +209,70 @@ mod tests {
             ..AppConfig::default()
         };
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_relative_repo_root() {
+        // `repo_root` must be absolute (doc contract) regardless of CWD.
+        let config = AppConfig {
+            repo_root: "src".to_string(),
+            skill_rel_path: "Cargo.toml".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_absolute_skill_rel_path() {
+        // An absolute skill path would let `Path::join` discard `repo_root`.
+        let config = AppConfig {
+            repo_root: env!("CARGO_MANIFEST_DIR").to_string(),
+            skill_rel_path: "/etc/hosts".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_skill_escaping_repo_root() {
+        // `repo_root`/src + `../Cargo.toml` resolves to repo_root/Cargo.toml,
+        // which is outside repo_root/src — must be rejected.
+        let config = AppConfig {
+            repo_root: format!("{}/src", env!("CARGO_MANIFEST_DIR")),
+            skill_rel_path: "../Cargo.toml".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_intervals() {
+        let base = AppConfig {
+            repo_root: env!("CARGO_MANIFEST_DIR").to_string(),
+            skill_rel_path: "Cargo.toml".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(validate(&AppConfig {
+            poll_interval_secs: 0,
+            ..base.clone()
+        })
+        .is_err());
+        assert!(validate(&AppConfig {
+            pr_cooldown_seconds: 0,
+            ..base
+        })
+        .is_err());
+    }
+
+    // Locks the serde-ignores-unknown-fields behavior the #11 reservation relies
+    // on (the "do not add deny_unknown_fields" comment is otherwise only a Soft
+    // note). An older/newer persisted config with extra keys must still load.
+    #[test]
+    fn unknown_fields_are_ignored() {
+        let parsed: AppConfig =
+            serde_json::from_value(serde_json::json!({"repo": "x/y", "futureField": 42}))
+                .expect("unknown fields are ignored");
+        assert_eq!(parsed.repo, "x/y");
     }
 
     // Forward-compat lock: `#[serde(default)]` lets older/partial persisted

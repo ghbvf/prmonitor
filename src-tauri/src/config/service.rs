@@ -19,11 +19,14 @@ const CONFIG_KEY: &str = "appConfig";
 pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResult<AppConfig> {
     let store = app
         .store(STORE_FILE)
-        .map_err(|e| AppError::new(e.to_string()))?;
+        .map_err(|e| AppError::new(format!("打开配置存储失败: {e}")))?;
 
     match store.get(CONFIG_KEY) {
         None => Ok(AppConfig::default()),
-        Some(value) => serde_json::from_value(value).map_err(|e| AppError::new(e.to_string())),
+        // Surface (don't silently discard) a corrupt/incompatible persisted
+        // config so the user can fix it rather than lose their settings.
+        Some(value) => serde_json::from_value(value)
+            .map_err(|e| AppError::new(format!("解析持久化配置失败: {e}"))),
     }
 }
 
@@ -33,10 +36,13 @@ pub fn save<R: tauri::Runtime>(app: &tauri::AppHandle<R>, config: AppConfig) -> 
 
     let store = app
         .store(STORE_FILE)
-        .map_err(|e| AppError::new(e.to_string()))?;
+        .map_err(|e| AppError::new(format!("打开配置存储失败: {e}")))?;
 
     let value = serde_json::to_value(&config).map_err(|e| AppError::new(e.to_string()))?;
+    // tauri-plugin-store 2.x: `Store::set` is infallible and returns `()`.
     store.set(CONFIG_KEY, value);
-    store.save().map_err(|e| AppError::new(e.to_string()))?;
+    store
+        .save()
+        .map_err(|e| AppError::new(format!("写入配置存储失败: {e}")))?;
     Ok(())
 }
