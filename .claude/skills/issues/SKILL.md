@@ -94,7 +94,7 @@ echo "✅ 已贴评论：$URL"                                   # 必须回显�
 🤖 PR #<N> · Generated with Claude Code · branch <head 分支> · worktree <路径|—> · session <会话id|—>
 ```
 
-> 两模板均**无机器块**（无尾部结构化块）。`pm:oos` 建单走 B1（朴素 title+body，无四轴 label）；incident/红线/归属不清 → 停下 AskUserQuestion，不静默自动建。
+> 两模板均**无机器块**（无尾部结构化块）。`pm:oos` 建单走 B1（朴素 title+body，无四轴 label）；incident/红线/归属不清 → 停下 AskUserQuestion，不静默自动建。新增**跨 skill 共享模板**（ship+fix+pr-review 共用）加本小节作单源；**单 skill 专属模板**（`pm:ship`/`pm:fix`/`pm:pr-review`）保持各自技能内联。
 
 ## B4. PR 冲突预检 + CI 跟进（ship/fix 共用）
 
@@ -117,7 +117,9 @@ gh run view <run-id> --job <job-id> --log-failed         # link 末段 job-id、
 
 ## B5. PR 状态 label 流转（编排）
 
-> 两正交轴的**切换命令单源**——ship/fix/pr-review 引用本节，不重印。**不变式**：PR 始终**恰好一个** `pr-status/*`；`pr-review` 轴 `approved` **XOR** `changes-requested`——**切一侧必 `--remove-label` 同轴对侧**。`/fix` 不能直接到 `ready`，必过 `/pr-review --check` 验证。`needs-review-again` 仅 ship 首审一次用；后续 review→changes-requested 始终切 `needs-fix`（5-state）。
+> 两正交轴的**切换命令单源**——ship/fix/pr-review 引用本节，不重印。**不变式**：PR 始终**恰好一个** `pr-status/*`；`pr-review` 轴 `approved` **XOR** `changes-requested`——**切一侧必 `--remove-label` 同轴对侧**（命令对对侧无条件 `--remove-label`，幂等：`gh` 移除不存在的 label 是无害空操作，故无需先查当前状态）。`/fix` 不能直接到 `ready`，必过 `/pr-review --check` 验证。`needs-review-again` 仅 ship 首审一次用；后续 review→changes-requested 始终切 `needs-fix`（5-state）。
+>
+> **入口前置**：full `/pr-review` 仅从 `needs-review-again`（首审）或 `needs-fix`（重审）发起；`needs-check-fix` 后的验证**一律走 `--check`**（其命令 remove `needs-check-fix`，full-review 命令不 remove 它 → 防同时挂两个 `pr-status/*`）。
 
 | 轴 | label | 何时 |
 |----|-------|------|
@@ -157,7 +159,9 @@ review↔fix 轮次 = 数 `pm:fix` 评论（每轮 fix 贴一条），机器可�
 gh pr view <N> --json comments --jq '[.comments[]|select(.body|contains("<!-- pm:fix -->"))]|length'
 ```
 
-`round >= 3` → 窗口提示「review↔fix 已达 3 轮，建议转人工」。本仓**无自动 dispatch 循环**（人工驱动 review→fix→check），故熔断是**人读指引**而非机器门——无失控风险，可接受（不引入机器块即不实现机器级熔断）。
+`round >= 3` → 窗口提示「review↔fix 已达 3 轮，建议转人工」。
+
+> 这是**行为说明，不是 enforcement 机制、不立项**——ai-robust 章程约束的是代码治理面（切片/契约/错误漏斗等），不含 workflow 工具。本仓人工驱动、无自动 dispatch 循环，无机器失控可言，故不设机器级熔断门。round 计数（上方命令）是机器可数的**数据来源**（Medium）；是否转人工由人按此数据判断。
 
 ## B6. 沟通规则
 
