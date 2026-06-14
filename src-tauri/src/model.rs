@@ -29,20 +29,28 @@ pub struct PullRequestView {
     pub url: String,
 }
 
-/// Serde wire-shape lock for the cross-slice contract.
+/// Serde wire-shape locks for `model.rs`'s cross-slice types.
 ///
-/// This is the **Medium carrier** for the `model.rs` ↔ `src/types.ts` serde
-/// contract per `.claude/rules/prmonitor/ai-robust.md`. It is a contract LOCK
-/// (characterization) test: it passes on current code and only fails if a field
-/// is renamed or the camelCase serialization breaks. When a key here changes,
-/// the downstream `src/types.ts` mirror must be updated in lockstep — that
-/// downstream is the open end of this funnel (no machine check on the TS side
-/// yet; future Hard path = codegen `types.ts` from `model.rs` + `git diff
-/// --exit-code`).
+/// The **Medium carrier** for these serde shapes per
+/// `.claude/rules/prmonitor/ai-robust.md`. Each is a LOCK (characterization)
+/// test: it passes on current code and only fails if a field is renamed or the
+/// camelCase serialization breaks. The two types differ in their *downstream*,
+/// so their contracts are not the same thing:
+///
+/// - [`PullRequestView`] is a **front/back contract** mirrored in
+///   `src/types.ts`; a key change must be synced there in lockstep — the open
+///   end of that funnel (no machine check on the TS side yet; future Hard path =
+///   codegen `types.ts` from `model.rs` + `git diff --exit-code`).
+/// - [`Candidate`] is **backend-internal**, cross-Rust-slice only: per the
+///   charter it is intentionally *not* mirrored in `src/types.ts`, so its lock
+///   guards the camelCase wire shape the `pr`/`codex` slices rely on, **not** a
+///   front/back contract — do not sync it to the frontend.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // Backend-internal cross-slice lock: `Candidate` is not exposed to the
+    // frontend and is intentionally absent from `src/types.ts` (per the charter).
     #[test]
     fn candidate_wire_shape_is_camel_case() {
         let candidate = Candidate {
@@ -73,6 +81,8 @@ mod tests {
         assert!(v.get("is_draft").is_none());
     }
 
+    // Front/back contract lock: `PullRequestView` is mirrored in `src/types.ts`;
+    // a field change here must be synced to that interface in lockstep.
     #[test]
     fn pull_request_view_wire_shape_is_camel_case() {
         let view = PullRequestView {
