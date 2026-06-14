@@ -3,7 +3,7 @@
 # 迫使重审计划后重新提交即放行。
 set -euo pipefail
 
-command -v jq >/dev/null 2>&1 || exit 0   # jq 缺失则放行，不阻塞退出 plan mode
+command -v jq >/dev/null 2>&1 || { echo "[exitplan-self-audit] jq 缺失，自检 hook 跳过" >&2; exit 0; }
 
 input=$(cat)
 sid=$(printf '%s' "$input" | jq -r '.session_id // "default"')

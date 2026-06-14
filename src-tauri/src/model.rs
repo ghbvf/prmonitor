@@ -84,6 +84,10 @@ mod tests {
 
         let v = serde_json::to_value(&view).expect("PullRequestView serializes");
 
+        // No snake_case negative assertions: every PullRequestView field name is
+        // single-word (no underscores), so camelCase serialization is a no-op and
+        // there is no snake_case form to guard against. If a multi-word field is
+        // added later, add `is_none()` guards like the Candidate test above.
         // camelCase / flat keys present.
         assert!(v.get("number").is_some());
         assert!(v.get("title").is_some());

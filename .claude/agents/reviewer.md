@@ -99,3 +99,5 @@ review 流式输出与 stop 按钮行为正确、错误提示透传到 UI（不�
 | `diff ≥ 1500` | 6 | 六维度各 1 agent 并行 |
 
 `diff < 200` 的两种调用方约定：**ship** 派 1 个 reviewer agent 跑全六维；**pr-review** 不派发，主 agent 在自身上下文自审全六维。其余档位两者一致。
+
+> 注：当按维度拆分多个 reviewer 时，enforcement 评级（Hard/Medium/Soft）由发现该 finding 的那个维度 reviewer 一并输出（任何维度都可能命中 enforcement finding）。

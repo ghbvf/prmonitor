@@ -8,9 +8,9 @@
 
 本章程**仅**适用于「新增 / 修改约束 enforcement 机制」，锚定 prmonitor 的真实治理面：
 
-- **垂直切片边界**：三切片 `config` / `pr` / `codex` 自包含，跨切片契约只走 `src-tauri/src/model.rs`（`Candidate` / `PullRequestView`）
+- **垂直切片边界**：三切片 `config` / `pr` / `codex` 自包含，跨切片契约只走 `src-tauri/src/model.rs`（`Candidate` / `PullRequestView`）。其中 `Candidate` 是 cross-Rust-slice 契约但 backend-internal（由 `PrSource::discover` 返回、未经 Tauri command 暴露给前端），故 `src/types.ts` 不镜像它属设计预期、非契约缺口；只有 `PullRequestView` 是前后端契约类型
 - **trait seam**：PR 来源 `pr/source.rs` 的 `PrSource`、review 引擎 `codex/engine.rs` 的 `ReviewEngine`——新增实现而非改调用方
-- **serde camelCase 契约**：`src-tauri/src/model.rs` ↔ `src/types.ts` 的 wire 形状对齐
+- **serde camelCase 契约**：所有序列化给前端的 Rust 类型 ↔ `src/types.ts` 的 wire 形状对齐——`model.rs`（`PullRequestView`）、`config/model.rs`（`AppConfig`）、`events.rs`（`ReviewEvent`）↔ `src/types.ts`
 - **Tauri command 注册**：组装根 `src-tauri/src/lib.rs` 的 command 暴露面
 - **错误漏斗**：`AppError` / `AppResult`（`src-tauri/src/error.rs`）的统一错误出口
 - **事件 union**：`events.rs` 的 `ReviewEvent`（tagged `kind` camelCase）与 `src/types.ts` 的 discriminated union
