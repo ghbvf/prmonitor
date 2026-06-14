@@ -1,4 +1,4 @@
-//! codex app-server adapter (the MVP [`super::engine::ReviewEngine`] impl).
+//! codex app-server adapter (the MVP [`crate::review::engine::ReviewEngine`] impl).
 //!
 //! Spawns `codex app-server --stdio` and speaks its newline-delimited JSON-RPC
 //! (no `jsonrpc` field). Implemented in PR5:
