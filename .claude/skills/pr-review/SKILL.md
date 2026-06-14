@@ -152,7 +152,7 @@ gh pr view <N> --json title,body,files,headRefOid
 🤖 PR #<N> · Generated with Claude Code · branch <head 分支> · worktree <路径|—> · session <会话id|—>
 ```
 
-贴失败（非 0 退出）则报错退出，不静默跳过。结论=需修复时窗口提示「下一步 `/fix #<N>`」；结论=通过则提示可合并。**不自动切 label、不自动启动监控**（人工驱动）。情况 B 创建的 worktree 在此提示清理。
+贴失败（非 0 退出）则报错退出，不静默跳过。**按结论切 label**（命令见 `issues` B5）：有 findings → `pr-review/changes-requested` + `pr-status/needs-fix`，窗口提示「下一步 `/fix #<N>`」；无 findings → `pr-review/approved` + `pr-status/ready`（终态），提示可合并。**不自动启动监控**（流转由人工触发的 review/fix/check 各步切 label，无后台轮询）。情况 B 创建的 worktree 在此提示清理。
 
 ---
 
@@ -189,7 +189,7 @@ gh pr view <N> --json title,body,files,headRefOid
 
 ### B5 贴 pm:pr-review（--check 留痕）
 
-窗口打印 B4 后，贴 `pm:pr-review` 评论（--check 变体：每条 finding 带 ✅/❌/⚠️/🔧 状态替代簇归属，summary 用 已修复N/未修复M/回归K；详表 `<details>` 记每条验证证据）。命令 + 回显见 `issues` B3。有遗留 → 窗口提示 `/fix #<N>`；全 ✅ → 提示可合并。**不自动切 label、不自动启动监控**。
+窗口打印 B4 后，贴 `pm:pr-review` 评论（--check 变体：每条 finding 带 ✅/❌/⚠️/🔧 状态替代簇归属，summary 用 已修复N/未修复M/回归K；详表 `<details>` 记每条验证证据）。命令 + 回显见 `issues` B3。**按验证结果切 label**（命令见 `issues` B5）：全 ✅ → `pr-status/ready` + `pr-review/approved`（终态），提示可合并；有 ❌/⚠️/🔧 → `pr-review/changes-requested` + `pr-status/needs-fix`，窗口提示 `/fix #<N>`（回修复循环）。**不自动启动监控**。
 
 ---
 
@@ -197,7 +197,7 @@ gh pr view <N> --json title,body,files,headRefOid
 
 - 默认模式不调用 `/fix`，不写代码，不评 CI（贴 pm:pr-review 评论=留痕，不算改代码）
 - `--check` 模式同样不写代码 / 不调 `/fix`；只读代码验证 + 贴评论
-- 不做 label 流转、不启动自动监控（人工驱动 review→fix→check）
+- review/--check 各步按结论切双轴 label（命令见 `issues` B5）；不启动后台自动监控（人工触发各步，无轮询循环）
 
 ---
 
@@ -208,4 +208,4 @@ gh pr view <N> --json title,body,files,headRefOid
 3. 无 worktree 自动创建 `worktrees/review-pr<N>`；既有 worktree 复用，不重建
 4. 主 agent 输出含 Read/Grep 证据 + 根因簇视图先于 Finding 详表；维度名内部一致
 5. 阶段 6 贴 `pm:pr-review` 评论（含 footer + 每条 finding 的 file:line）+ 回显 comment URL/id
-6. `--check` 模式：读上一轮 findings → 逐条 Read 验证 ✅/❌/⚠️/🔧（含抓回归）→ 窗口主输出验证表 + 贴 pm:pr-review（--check）→ 窗口给流转建议（不切 label）
+6. `--check` 模式：读上一轮 findings → 逐条 Read 验证 ✅/❌/⚠️/🔧（含抓回归）→ 窗口主输出验证表 + 贴 pm:pr-review（--check）→ 按结论切 label（全 ✅ → ready+approved；有遗留 → needs-fix+changes-requested，命令见 `issues` B5）
