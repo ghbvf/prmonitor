@@ -4,4 +4,7 @@
 //! (e.g. the scheduler handle in PR4, the review session manager in PR6).
 
 #[derive(Default)]
-pub struct AppState {}
+pub struct AppState {
+    /// The scheduled-pull loop handle (PR4). Long-lived; methods take `&self`.
+    pub scheduler: crate::pr::scheduler::Scheduler,
+}

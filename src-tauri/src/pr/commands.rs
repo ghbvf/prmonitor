@@ -43,14 +43,17 @@ fn build_view(row: GhRow, params: &MonitorParams, ledger: &Ledger, now: u64) -> 
 /// annotated with `kind` + skip reason for the PR list. Reads config (repo,
 /// labels, authors, cooldown) and the dedup ledger; performs two `gh pr list`
 /// calls (review + check labels).
-#[tauri::command]
-pub async fn fetch_prs_now<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
+///
+/// This is the shared discovery body driven by the scheduler's poll loop
+/// (`scheduler::run_and_emit`); there is no manual-fetch command — the frontend
+/// triggers a refresh via `poll_now`.
+pub(crate) async fn discover_views<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
 ) -> AppResult<Vec<PullRequestView>> {
     // Cross-slice read of the config slice's public service (function-level, not
     // a type contract — `AppConfig` stays config-private; we snapshot the fields
     // the pr slice needs into `MonitorParams`).
-    let cfg = config_service::load(&app)?;
+    let cfg = config_service::load(app)?;
     let params = MonitorParams {
         repo: cfg.repo,
         review_label: cfg.review_label,
@@ -59,7 +62,7 @@ pub async fn fetch_prs_now<R: tauri::Runtime>(
         pr_cooldown_seconds: cfg.pr_cooldown_seconds,
     };
 
-    let ledger = Ledger::load(&app)?;
+    let ledger = Ledger::load(app)?;
     let source = GithubCli::new(
         params.repo.clone(),
         params.review_label.clone(),
@@ -72,6 +75,37 @@ pub async fn fetch_prs_now<R: tauri::Runtime>(
         .into_iter()
         .map(|row| build_view(row, &params, &ledger, now))
         .collect())
+}
+
+/// Starts the scheduled-pull loop (idempotent: a no-op if already running).
+#[tauri::command]
+pub async fn start_polling<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> AppResult<()> {
+    state.scheduler.start(app);
+    Ok(())
+}
+
+/// Stops the scheduled-pull loop (no-op if not running).
+#[tauri::command]
+pub async fn stop_polling(state: tauri::State<'_, crate::state::AppState>) -> AppResult<()> {
+    state.scheduler.stop();
+    Ok(())
+}
+
+/// Triggers an immediate discovery cycle ("立即拉取").
+#[tauri::command]
+pub async fn poll_now(state: tauri::State<'_, crate::state::AppState>) -> AppResult<()> {
+    state.scheduler.wake();
+    Ok(())
+}
+
+/// Re-reads the poll period and rebuilds the loop's ticker (after a config save).
+#[tauri::command]
+pub async fn reschedule(state: tauri::State<'_, crate::state::AppState>) -> AppResult<()> {
+    state.scheduler.reconfigure();
+    Ok(())
 }
 
 /// Reports `gh` CLI auth status for the StatusBar.

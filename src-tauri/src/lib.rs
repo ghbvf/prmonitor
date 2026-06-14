@@ -20,6 +20,7 @@ pub mod review;
 pub mod state;
 
 use state::AppState;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -27,11 +28,22 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(AppState::default())
+        .setup(|app| {
+            // Auto-start the poll loop on launch ("启动即跑"): the first interval
+            // tick fires immediately, so this yields an initial PR list too.
+            app.state::<AppState>()
+                .scheduler
+                .start(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             config::commands::app_version,
             config::commands::get_config,
             config::commands::set_config,
-            pr::commands::fetch_prs_now,
+            pr::commands::start_polling,
+            pr::commands::stop_polling,
+            pr::commands::poll_now,
+            pr::commands::reschedule,
             pr::commands::gh_status,
         ])
         .run(tauri::generate_context!())
