@@ -9,7 +9,7 @@
 //! the real `ChildStdin` / `BufReader<ChildStdout>` into the same client.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,10 +42,20 @@ impl std::fmt::Display for RpcError {
     }
 }
 
-/// `id` → response-sender registry, shared between `request` and the reader task.
-/// `std::sync::Mutex` (not tokio's): every critical section completes without an
-/// `.await`, so an async mutex would only add overhead and a clippy hazard.
-type PendingMap = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, RpcError>>>>>;
+/// `id` → response-sender registry plus a `closed` flag, shared between `request`
+/// and the reader task under one `std::sync::Mutex` (every critical section
+/// completes without an `.await`). The shared lock makes the "register a request
+/// vs. the reader draining on disconnect" race impossible: the reader sets
+/// `closed` while draining, and `request` refuses to register once `closed`, so a
+/// request can never be left dangling to wait out its timeout.
+#[derive(Default)]
+struct Pending {
+    map: HashMap<i64, oneshot::Sender<Result<Value, RpcError>>>,
+    /// Set once the reader task exits (EOF / error). Drives [`RpcClient::is_connected`].
+    closed: bool,
+}
+
+type PendingMap = Arc<Mutex<Pending>>;
 
 /// JSON-RPC client over the app-server transport. Drop aborts the reader task.
 pub struct RpcClient<W> {
@@ -56,9 +66,6 @@ pub struct RpcClient<W> {
     next_id: AtomicI64,
     /// Notification fan-out; subscribers (PR6 session manager) call [`Self::subscribe`].
     notifications: broadcast::Sender<Arc<ServerNotification>>,
-    /// Liveness: `true` until the reader task exits (EOF / error). The manager
-    /// reads this to decide whether the resident connection needs respawning.
-    connected: Arc<AtomicBool>,
     reader: tauri::async_runtime::JoinHandle<()>,
 }
 
@@ -74,23 +81,17 @@ impl<W: AsyncWrite + Unpin + Send + 'static> RpcClient<W> {
     where
         R: AsyncBufRead + Unpin + Send + 'static,
     {
-        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(Pending::default()));
         let (notif_tx, _rx) = broadcast::channel(notif_capacity);
-        let connected = Arc::new(AtomicBool::new(true));
 
-        let reader = tauri::async_runtime::spawn(reader_loop(
-            read_half,
-            pending.clone(),
-            notif_tx.clone(),
-            connected.clone(),
-        ));
+        let reader =
+            tauri::async_runtime::spawn(reader_loop(read_half, pending.clone(), notif_tx.clone()));
 
         Self {
             writer: tokio::sync::Mutex::new(write_half),
             pending,
             next_id: AtomicI64::new(1),
             notifications: notif_tx,
-            connected,
             reader,
         }
     }
@@ -100,9 +101,9 @@ impl<W: AsyncWrite + Unpin + Send + 'static> RpcClient<W> {
         self.notifications.subscribe()
     }
 
-    /// Whether the reader task is still running (the connection is live).
+    /// Whether the connection is still live (the reader task has not exited).
     pub fn is_connected(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
+        !self.pending.lock().unwrap().closed
     }
 
     /// Send a request and await the matching response, bounded by [`REQUEST_TIMEOUT`].
@@ -110,18 +111,27 @@ impl<W: AsyncWrite + Unpin + Send + 'static> RpcClient<W> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
 
-        // Register BEFORE writing so a fast response can't race ahead of the insert.
-        self.pending.lock().unwrap().insert(id, tx);
+        // Register BEFORE writing so a fast response can't race ahead of the
+        // insert. Refuse to register if the reader has already closed the
+        // connection — the shared lock with the reader's drain makes this
+        // race-free (no request can be left dangling past the drain).
+        {
+            let mut pending = self.pending.lock().unwrap();
+            if pending.closed {
+                return Err(AppError::new("app-server 连接已关闭".to_string()));
+            }
+            pending.map.insert(id, tx);
+        }
 
         let line = match codec::encode_request(id, method, &params) {
             Ok(line) => line,
             Err(e) => {
-                self.pending.lock().unwrap().remove(&id);
+                self.pending.lock().unwrap().map.remove(&id);
                 return Err(e);
             }
         };
         if let Err(e) = self.write_line(&line).await {
-            self.pending.lock().unwrap().remove(&id);
+            self.pending.lock().unwrap().map.remove(&id);
             return Err(e);
         }
 
@@ -134,7 +144,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> RpcClient<W> {
                 "app-server 连接已关闭（请求未完成）".to_string(),
             )),
             Err(_) => {
-                self.pending.lock().unwrap().remove(&id);
+                self.pending.lock().unwrap().map.remove(&id);
                 Err(AppError::new(format!("app-server 请求超时: {method}")))
             }
         }
@@ -163,7 +173,10 @@ impl<W: AsyncWrite + Unpin + Send + 'static> RpcClient<W> {
 
 impl<W> Drop for RpcClient<W> {
     fn drop(&mut self) {
-        // The reader task must not outlive the client.
+        // The reader task must not outlive the client. Aborting it drops the
+        // pending map's `oneshot::Sender`s, so any in-flight `request().await`
+        // resolves with `RecvError` (the `Ok(Err(_))` "连接已关闭" arm) rather
+        // than hanging.
         self.reader.abort();
     }
 }
@@ -171,13 +184,12 @@ impl<W> Drop for RpcClient<W> {
 /// Reader task body. Owns the read half exclusively; loops reading NDJSON lines
 /// and routing responses to their oneshot, notifications to the broadcast. One
 /// malformed line is logged and skipped (never tears down the connection). On
-/// EOF / IO error it clears `connected` and drain-fails every pending request so
-/// no `request().await` hangs out its timeout.
+/// EOF / IO error it marks the connection closed and drain-fails every pending
+/// request so no `request().await` hangs out its timeout.
 async fn reader_loop<R>(
     read_half: R,
     pending: PendingMap,
     notif_tx: broadcast::Sender<Arc<ServerNotification>>,
-    connected: Arc<AtomicBool>,
 ) where
     R: AsyncBufRead + Unpin + Send + 'static,
 {
@@ -198,7 +210,7 @@ async fn reader_loop<R>(
         match codec::decode_line(&line) {
             Ok(None) => {} // blank line.
             Ok(Some(Inbound::Response { id, payload })) => {
-                if let Some(tx) = pending.lock().unwrap().remove(&id) {
+                if let Some(tx) = pending.lock().unwrap().map.remove(&id) {
                     let routed = match payload {
                         ResponsePayload::Ok(v) => Ok(v),
                         ResponsePayload::Err(e) => Err(e),
@@ -220,10 +232,12 @@ async fn reader_loop<R>(
         }
     }
 
-    connected.store(false, Ordering::Relaxed);
-    // Wake every awaiting request immediately instead of stalling to its timeout.
-    let mut map = pending.lock().unwrap();
-    for (_id, tx) in map.drain() {
+    // Mark closed + wake every awaiting request, under the same lock, so a request
+    // either registered before this drain (and is failed here) or sees `closed`
+    // and never registers — no request can be stranded waiting out its timeout.
+    let mut pending = pending.lock().unwrap();
+    pending.closed = true;
+    for (_id, tx) in pending.map.drain() {
         let _ = tx.send(Err(RpcError {
             code: -1,
             message: "app-server 连接已关闭".to_string(),

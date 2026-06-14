@@ -24,9 +24,11 @@ const { codex } = useReviewStore();
     <span class="item">
       <span
         class="dot"
-        :class="codex?.available ? 'ok' : 'warn'"
+        :class="codex == null ? 'idle' : codex.available ? 'ok' : 'warn'"
       ></span>
-      <span class="text">codex — {{ codex?.message ?? "未知 / unknown" }}</span>
+      <span class="text">
+        codex — {{ codex == null ? "初始化中… / starting" : codex.message }}
+      </span>
     </span>
   </footer>
 </template>

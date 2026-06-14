@@ -122,14 +122,38 @@ async fn unknown_notification_does_not_break_demux() {
     let _ = server.await;
 }
 
+/// A request must fail promptly (not hang to its 30s timeout) when the server
+/// disconnects, and `is_connected()` must flip to false — the reader's EOF drain.
+#[tokio::test]
+async fn request_fails_fast_when_server_disconnects() {
+    let (client_w, server_r) = tokio::io::duplex(8192);
+    let (server_w, client_r) = tokio::io::duplex(8192);
+
+    // Server reads the request, then drops its write half (EOF for the client)
+    // WITHOUT responding.
+    let server = tokio::spawn(async move {
+        let mut reader = BufReader::new(server_r).lines();
+        let _ = reader.next_line().await;
+        drop(server_w);
+    });
+
+    let client = RpcClient::connect(client_w, BufReader::new(client_r), 64);
+    assert!(client.is_connected());
+
+    let res = client.request("initialize", serde_json::json!({})).await;
+    assert!(
+        res.is_err(),
+        "request should fail on disconnect, not hang to timeout"
+    );
+    assert!(!client.is_connected(), "is_connected flips false after EOF");
+
+    let _ = server.await;
+}
+
 /// Local verification against the real binary. `#[ignore]` keeps it out of CI
 /// (which has no `codex`); run with `cargo test -- --ignored` where codex is
-/// installed.
-///
-/// Note: this does NOT call `CodexManager::shutdown()` — that uses
-/// `block_on`, which panics inside a `#[tokio::test]` runtime; shutdown's
-/// explicit-kill path runs in production from the sync `RunEvent` handler.
-/// Dropping the manager here exercises the `kill_on_drop` teardown instead.
+/// installed. Also exercises the production teardown path: `shutdown()` is now
+/// synchronous (`start_kill`, no `block_on`), so it is safe to call here.
 #[tokio::test]
 #[ignore = "requires the real codex binary; run with: cargo test -- --ignored"]
 async fn real_app_server_handshake_thread_and_reuse() {
@@ -165,5 +189,5 @@ async fn real_app_server_handshake_thread_and_reuse() {
         .await
         .expect("second reuses");
     assert_eq!(info1.user_agent, info2.user_agent);
-    drop(mgr); // kill_on_drop reaps the resident child.
+    mgr.shutdown(); // synchronous start_kill — exercises the production teardown.
 }

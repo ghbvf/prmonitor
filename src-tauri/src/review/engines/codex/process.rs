@@ -136,10 +136,12 @@ impl CodexProcess {
         self.client.is_connected()
     }
 
-    /// Explicitly kill the child (used by the manager on app shutdown). The
-    /// `kill_on_drop(true)` flag is the backstop; this makes teardown deterministic.
-    pub async fn kill(&mut self) {
-        let _ = self.child.kill().await;
+    /// Send SIGKILL to the child (used by the manager on app shutdown).
+    /// `start_kill` only signals — it does not await reaping — so it is synchronous
+    /// and safe to call from the sync `RunEvent` handler with no `block_on`.
+    /// `kill_on_drop(true)` is the backstop.
+    pub fn start_kill(&mut self) {
+        let _ = self.child.start_kill();
     }
 }
 

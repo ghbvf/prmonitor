@@ -84,9 +84,10 @@ pub struct ThreadRef {
 
 // ---- streaming server -> client notifications (v2 subset) ----
 
-/// Notification method strings (single source for [`ServerNotification::from_raw`]
-/// + tests).
-pub mod methods {
+/// Server→client notification method strings (single source for
+/// [`ServerNotification::from_raw`] + tests; named distinctly from the
+/// client→server [`rpc_methods`]).
+pub mod notif_methods {
     pub const AGENT_MESSAGE_DELTA: &str = "item/agentMessage/delta";
     pub const COMMAND_EXEC_OUTPUT_DELTA: &str = "command/exec/outputDelta";
     pub const PROCESS_OUTPUT_DELTA: &str = "process/outputDelta";
@@ -114,11 +115,11 @@ impl ServerNotification {
     /// Total classifier — never panics, never errors (degrades to [`Self::Other`]).
     pub fn from_raw(method: String, params: Value) -> Self {
         match method.as_str() {
-            methods::AGENT_MESSAGE_DELTA => match serde_json::from_value(params.clone()) {
+            notif_methods::AGENT_MESSAGE_DELTA => match serde_json::from_value(params.clone()) {
                 Ok(d) => Self::AgentMessageDelta(d),
                 Err(_) => Self::Other { method, params },
             },
-            methods::COMMAND_EXEC_OUTPUT_DELTA | methods::PROCESS_OUTPUT_DELTA => {
+            notif_methods::COMMAND_EXEC_OUTPUT_DELTA | notif_methods::PROCESS_OUTPUT_DELTA => {
                 match serde_json::from_value(params.clone()) {
                     Ok(d) => Self::OutputDelta(d),
                     Err(_) => Self::Other { method, params },
@@ -234,7 +235,7 @@ mod tests {
     #[test]
     fn from_raw_known_agent_message_delta_is_typed() {
         let n = ServerNotification::from_raw(
-            methods::AGENT_MESSAGE_DELTA.to_string(),
+            notif_methods::AGENT_MESSAGE_DELTA.to_string(),
             serde_json::json!({
                 "threadId": "t", "turnId": "u", "itemId": "i", "delta": "hi"
             }),
@@ -251,7 +252,7 @@ mod tests {
     #[test]
     fn from_raw_output_delta_handles_both_id_keys() {
         let exec = ServerNotification::from_raw(
-            methods::COMMAND_EXEC_OUTPUT_DELTA.to_string(),
+            notif_methods::COMMAND_EXEC_OUTPUT_DELTA.to_string(),
             serde_json::json!({
                 "processId": "ls-1", "stream": "stdout",
                 "deltaBase64": "dGhl", "capReached": false
@@ -267,7 +268,7 @@ mod tests {
         }
 
         let proc = ServerNotification::from_raw(
-            methods::PROCESS_OUTPUT_DELTA.to_string(),
+            notif_methods::PROCESS_OUTPUT_DELTA.to_string(),
             serde_json::json!({
                 "processHandle": "cargo-1", "stream": "stderr",
                 "deltaBase64": "Zm9v", "capReached": true
@@ -301,7 +302,7 @@ mod tests {
     fn from_raw_known_method_bad_params_degrades_to_other() {
         // `delta`/`itemId`/… missing → typed parse fails → Other (reader survives).
         let n = ServerNotification::from_raw(
-            methods::AGENT_MESSAGE_DELTA.to_string(),
+            notif_methods::AGENT_MESSAGE_DELTA.to_string(),
             serde_json::json!({}),
         );
         assert!(matches!(n, ServerNotification::Other { .. }));

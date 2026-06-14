@@ -88,14 +88,12 @@ impl CodexManager {
     }
 
     /// Kill the resident child on app shutdown (called from `lib.rs`'s sync
-    /// `RunEvent` handler). Explicit `kill().await` for determinism;
-    /// `kill_on_drop(true)` is the backstop. No-op if nothing is running.
+    /// `RunEvent` handler). Synchronous `start_kill` (no `block_on`) so it is safe
+    /// from any context; `kill_on_drop(true)` is the backstop. No-op if nothing is
+    /// running.
     pub fn shutdown(&self) {
-        let taken = self.inner.lock().unwrap().take();
-        if let Some(mut proc) = taken {
-            tauri::async_runtime::block_on(async move {
-                proc.kill().await;
-            });
+        if let Some(mut proc) = self.inner.lock().unwrap().take() {
+            proc.start_kill();
         }
     }
 }
