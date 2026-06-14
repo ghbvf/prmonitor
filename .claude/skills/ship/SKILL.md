@@ -136,13 +136,13 @@ git -C worktrees/<wt> push -u origin <branch>
 gh pr create --base develop --title "..." --body-file <填好的 .github/pull_request_template.md>
 ```
 
-PR body 结构单源 = `.github/pull_request_template.md`；读模版填占位（`Refs: Closes #<ID>` + `ref: 文件`），不在技能内重述结构。本仓 PR 全程 CLI 创建，必须 `--body-file` 读填好的模版。**不切 label**（本仓 review→fix 人工驱动，无 pr-status 状态机）。
+PR body 结构单源 = `.github/pull_request_template.md`；读模版填占位（`Refs: Closes #<ID>` + `ref: 文件`），不在技能内重述结构。本仓 PR 全程 CLI 创建，必须 `--body-file` 读填好的模版。**创建后切 `pr-status/in-progress`**（命令见 `issues` B5）。
 
 ---
 
 ## 阶段 7：Review（内置 reviewer）
 
-> ship 的 review 是内置首审（六维 reviewer）；外部再审走 `/pr-review <PR#>`，续修走 `/fix <PR#>`（人工驱动，无 label 自动流转）。
+> ship 的 review 是内置首审（六维 reviewer）；外部再审走 `/pr-review <PR#>`，续修走 `/fix <PR#>`（人工驱动触发，review→fix→check 走双轴 label 流转，命令见 `issues` B5）。
 
 **L1/L2**：1 个 `reviewer` agent（六维度）。
 
@@ -188,17 +188,19 @@ diff 行数 = X + Y（缺项按 0 计）。**reviewer 数 + 维度切分单源 =
    - 处置：⏸ 遗留（原因：<…>）
    </details>
 
-   **下一步**：跑 `/pr-review #<N>` 做外部再审（人工驱动；有需改再 `/fix #<N>`）。
+   **下一步**：切 `pr-status/needs-review-again`（待再审：codex / `/pr-review #<N>`；有需改再 `/fix #<N>`）。
 
    ---
    🤖 PR #<N> · Generated with Claude Code · branch <head 分支> · worktree <路径|—> · session <会话id|—>
    ```
 
-   > 评论是 `/fix` 与再审提取 findings 的来源——每条 Finding **必带 `file:line`**，根因 + 证据 + 建议 + 三级方案种子写进 `<details>`（人看摘要、fix 读详表）。OUT_OF_SCOPE finding 主列表给一行指针，详情入 `<details>` 或附 `gh issue create` 建议（见 `fix` 的 OOS 处理；本仓不做自动建单/四轴 label）。
+   > 评论是 `/fix` 与再审提取 findings 的来源——每条 Finding **必带 `file:line`**，根因 + 证据 + 建议 + 三级方案种子写进 `<details>`（人看摘要、fix 读详表）。OUT_OF_SCOPE finding 主列表给一行指针，详情贴独立 `pm:oos` 评论（模板见 `issues` B3；建单走 `issues` B1，朴素 title+body，无四轴 label；incident/红线/归属不清 → 停下 AskUserQuestion）。
 
-5. **CI 异步收敛（非阻塞，贴评论后执行）**：按 `issues` B4 ② 等 CI 收敛 + 失败回修复循环再推再等（≤3 轮，3 轮仍红 → 停下交人工）；CI 收敛后在窗口报告结果（全绿 / 仍红 + 失败 check 摘要 + run 链接）。
+5. **贴完切 label**：`pr-status/in-progress → needs-review-again`（命令见 `issues` B5；首审唯一使用点）。
 
-> ship 到此结束（内置审 + 修；评论 + CI 异步收敛）。外部再审走 `/pr-review #<N>`，续修走 `/fix #<N>`（人工驱动 review→fix→check）。
+6. **CI 异步收敛（非阻塞，切 label 后执行）**：按 `issues` B4 ② 等 CI 收敛 + 失败回修复循环再推再等（≤3 轮，3 轮仍红 → 停下交人工）；CI 收敛后**贴独立 `pm:ci` 评论**（模板见 `issues` B3）并在窗口报告结果（全绿 / 仍红 + 失败 check 摘要 + run 链接）。
+
+> ship 到此结束（内置审 + 修；评论 + 切 label + CI 异步收敛）。外部再审走 `/pr-review #<N>`，续修走 `/fix #<N>`（人工触发，review→fix→check 走双轴 label 流转，命令见 `issues` B5）。
 
 ---
 

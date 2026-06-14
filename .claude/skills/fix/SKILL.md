@@ -205,16 +205,18 @@ Round 1-2 当前方案迭代修正｜Round 3 `git stash` + 切备选方案重新
 - 遗留原因 + 升级窗口：<…>
 </details>
 
-**下一步**：跑 `/pr-review #<N> --check` 验证修复（fix 不自证完成）。
+**下一步**：切 `pr-status/needs-check-fix`，待 `/pr-review #<N> --check` 验证（fix 不自证完成）。
 
 ---
 🤖 PR #<N> · Generated with Claude Code · branch <head 分支> · worktree <路径|—> · session <会话id|—>
 ```
 
-- **OUT_OF_SCOPE finding** → 建议建 backlog issue（`issues` B1，朴素 title+body，无四轴 label）：body 无损填 现状（证据+三维根因+影响）/ 修复方向（三级方案种子）/ Files（file:line 全集）/ Source（`PR #<N> finding <Fk>`，`Discovered via /fix #<N>`）。先反思确认确实 OUT_OF_SCOPE 且非 small 搭车修；incident/红线或归属不清 → 停下 AskUserQuestion，不静默自动建。
+- **OUT_OF_SCOPE finding** → 详情贴独立 `pm:oos` 评论（模板见 `issues` B3），并建议建 backlog issue（`issues` B1，朴素 title+body，无四轴 label）：body 无损填 现状（证据+三维根因+影响）/ 修复方向（三级方案种子）/ Files（file:line 全集）/ Source（`PR #<N> finding <Fk>`，`Discovered via /fix #<N>`）。先反思确认确实 OUT_OF_SCOPE 且非 small 搭车修；incident/红线或归属不清 → 停下 AskUserQuestion，不静默自动建。
 - **未修 large / RELATED deferred** → 输出 `gh issue create` 建议命令（确认后跑，留 open）。
 
-**步骤 4 CI 异步收敛（非阻塞，步骤 3 完成后执行；有 push 时；命令见 `issues` B4 ②）**：等 CI 收敛 + 失败回阶段 1-4 修复循环再推再等（≤3 轮，3 轮仍红 → 停下交人工）；CI 收敛后在窗口报告结果（全绿 / 仍红 + 失败 check 摘要 + run 链接）。
+**贴完切 label**：`pr-status/needs-fix → needs-check-fix`（命令见 `issues` B5；fix 不能直接到 `ready`，必过 `/pr-review --check`）。review↔fix 轮次（数 `pm:fix` 评论）≥ 3 → 窗口提示「已达 3 轮，建议转人工」（人读指引，单源见 `issues` B5）。
+
+**步骤 4 CI 异步收敛（非阻塞，步骤 3 完成后执行；有 push 时；命令见 `issues` B4 ②）**：等 CI 收敛 + 失败回阶段 1-4 修复循环再推再等（≤3 轮，3 轮仍红 → 停下交人工）；CI 收敛后**贴独立 `pm:ci` 评论**（模板见 `issues` B3）并在窗口报告结果（全绿 / 仍红 + 失败 check 摘要 + run 链接）。
 
 ---
 
