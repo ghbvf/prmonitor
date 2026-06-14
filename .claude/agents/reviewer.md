@@ -57,6 +57,7 @@ review 流式输出与 stop 按钮行为正确、错误提示透传到 UI（不�
 
 - **严重度 P0–P3**：P0 发布阻塞/数据丢失/安全漏洞/编译失败（红线，仅 incident）｜P1 架构/安全/正确性关键｜P2 常规债务（默认档）｜P3 可延后/微调/文档
 - **复杂度 small | large**：`small` = 单文件/局部 ≤3 处、不改 trait 签名/不改跨切片契约/不动进程或并发语义 → 可自动修；`large` = 跨切片/改 trait 或 model 契约/改并发或进程生命周期语义 → 需人工决策。判定前用 `Grep` 确认受影响调用点数（1 处=局部 small，3+ 系统性多半 large）
+- **enforcement 评级 Hard | Medium | Soft**：涉及 enforcement 机制（新增/修改 trait seam、契约、codegen、type 约束、lint 规则等）的 Finding 额外给此评级（依据 `.claude/rules/prmonitor/ai-robust.md`）。新增 Soft 机制 → reject；Medium → 保留并指出 Hard 化路径；Funnel 须分别评上游与下游强度（只锁 callsite 不是闭环 funnel）。
 
 ## Finding 格式
 
