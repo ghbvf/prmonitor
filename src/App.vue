@@ -2,7 +2,7 @@
 // Composition-root layout: wires the slice views together. Slices own their
 // own UI + state; App only arranges them.
 import { onMounted, ref } from "vue";
-import { appVersion } from "./api";
+import { appVersion } from "./config/api";
 import ConfigPanel from "./config/ConfigPanel.vue";
 import PrList from "./pr/PrList.vue";
 import ReviewPanel from "./review/ReviewPanel.vue";

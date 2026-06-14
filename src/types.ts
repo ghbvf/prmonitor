@@ -1,16 +1,5 @@
-// Shared TS types mirroring `src-tauri/src/model.rs` (the contract boundary).
-// Slices import from here; they do not import each other's internals.
-
-export interface AppConfig {
-  repo: string;
-  repoRoot: string;
-  pollIntervalSecs: number;
-  authors: string[];
-  reviewLabel: string;
-  checkLabel: string;
-  skillRelPath: string;
-  prCooldownSeconds: number;
-}
+// Shared cross-slice contracts mirroring `src-tauri/src/model.rs` (the contract
+// boundary). Slices import from here; they do not import each other's internals.
 
 export interface PullRequestView {
   number: number;

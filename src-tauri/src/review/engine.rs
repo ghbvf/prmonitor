@@ -1,6 +1,6 @@
 //! `ReviewEngine` — the extensibility seam for review engines (issue #11).
 //!
-//! The codex app-server is the MVP impl (`super::app_server`); a Claude engine
+//! The codex app-server is the MVP impl (`super::engines::codex`); a Claude engine
 //! (`claude -p "/pr-review <N>"` headless, or the Agent SDK) plugs in by
 //! implementing this trait. The UI depends only on the streamed
 //! [`crate::events::ReviewEvent`]s, never a concrete engine.

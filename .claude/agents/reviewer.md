@@ -26,9 +26,9 @@ permissionMode: auto
 
 垂直切片（vertical slice）架构：
 
-- 三个切片 `config` / `pr` / `codex` 各自自包含；切片之间不直接 import 对方内部模块
+- 三个切片 `config` / `pr` / `review` 各自自包含；切片之间不直接 import 对方内部模块
 - 跨切片契约只走 `src-tauri/src/model.rs`（`Candidate` / `PullRequestView` 等）
-- 扩展缝（trait seam）：PR 来源走 `pr/source.rs` 的 `PrSource`，review 引擎走 `codex/engine.rs` 的 `ReviewEngine`——新增来源/引擎实现 trait，不改调用方
+- 扩展缝（trait seam）：PR 来源走 `pr/source.rs` 的 `PrSource`，review 引擎走 `review/engine.rs` 的 `ReviewEngine`——新增来源/引擎实现 trait，不改调用方
 - 组装根（composition root）只在 `src-tauri/src/lib.rs`（注册 Tauri command + 装配切片）
 - 前后端类型契约对齐：`src/types.ts` 镜像 `src-tauri/src/model.rs`（跨切片契约 `Candidate`/`PullRequestView`）及各切片序列化模型（如 `config/model.rs` 的 `AppConfig`）
 - 错误统一走 `AppError` / `AppResult`（`src-tauri/src/error.rs`），事件走 `events.rs` 的 `ReviewEvent`

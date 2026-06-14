@@ -1,7 +1,7 @@
 //! Payloads streamed to the frontend.
 //!
-//! The codex slice maps codex app-server notifications into [`ReviewEvent`]s
-//! (see `codex::events`); the frontend renders them in the review panel.
+//! The review slice maps codex app-server notifications into [`ReviewEvent`]s
+//! (see `review::events`); the frontend renders them in the review panel.
 
 use serde::Serialize;
 
