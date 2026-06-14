@@ -147,6 +147,8 @@ large 问题先查参考再动手：Rust 标准库 / `tauri`·`serde`·`tokio` �
 
 ## 阶段 4：执行修复
 
+> **改代码前自检（hook 拦截）**：进入 4.2 编辑前先跑 `bash "$CLAUDE_PROJECT_DIR/.claude/hooks/fix-self-audit.sh" emit`——PreToolUse hook 会 deny 并回喂「按方案设计原则（彻底/不向后兼容/优雅简洁）复审本次 fix」，复审后重发即放行（每个 /fix 一次）。
+
 ### 4.1 Commit 格式
 当前分支直接改。Commit：`fix(<scope>): <问题简述>` + 根因 + 复杂度 + Refs + `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`。scope 按切片：config/pr/codex/前端。安全约束：只 add 修复文件（不 add -A）；不 amend。
 
