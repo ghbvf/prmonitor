@@ -66,17 +66,37 @@ async function refreshCodexStatus() {
   }
 }
 
+// Coalesce overlapping refreshes. When N sessions start at once, `applyEvent`
+// fires a refresh per unseen threadId / terminal event; without coalescing those
+// race N `listReviewSessions` calls whose out-of-order responses could clobber
+// newer state. We run at most one refresh at a time and collapse any requests
+// arriving mid-flight into a single trailing run, so the last response always
+// reflects a list read taken after the latest request.
+let refreshInFlight = false;
+let refreshQueued = false;
+
 // Refresh the concurrent-session list from the backend. Tolerates a rejected
 // command by logging and keeping the prior value (a transient failure shouldn't
 // blank the list). Sorted by `threadId` for a stable render order.
 async function refreshSessions() {
+  // Already running: mark a single trailing refresh and let the active call run it.
+  if (refreshInFlight) {
+    refreshQueued = true;
+    return;
+  }
+  refreshInFlight = true;
   try {
-    const next = await listReviewSessions();
-    sessions.value = [...next].sort((a, b) =>
-      a.threadId.localeCompare(b.threadId),
-    );
+    do {
+      refreshQueued = false;
+      const next = await listReviewSessions();
+      sessions.value = [...next].sort((a, b) =>
+        a.threadId.localeCompare(b.threadId),
+      );
+    } while (refreshQueued); // a request arrived mid-flight → one more pass.
   } catch (err) {
     console.error("刷新 review 会话列表失败", err);
+  } finally {
+    refreshInFlight = false;
   }
 }
 
@@ -139,6 +159,9 @@ function applyEvent(ev: ReviewEvent) {
 
 // Start a review for a PR. Resets the panel, then records the returned session id.
 async function start(prNumber: number, kind: string) {
+  // Single-active MVP: one start at a time. A non-null buffer means a start is
+  // already in flight; bail so two overlapping starts can't race the shared buffer.
+  if (inFlightBuffer !== null) return;
   items.value = [];
   error.value = null;
   finalStatus.value = null;
@@ -184,7 +207,12 @@ async function stop() {
 // MVP is single-active, so the first active session wins.
 async function hydrateActiveSession() {
   try {
-    const sessions = await listReviewSessions();
+    // Sort by `threadId` (same order as `refreshSessions`) before picking the
+    // first active one: the backend list is a HashMap snapshot with nondeterministic
+    // order, so without this the reattached session could differ across restarts.
+    const sessions = [...(await listReviewSessions())].sort((a, b) =>
+      a.threadId.localeCompare(b.threadId),
+    );
     const active = sessions.find(
       (s) =>
         s.status === "running" ||

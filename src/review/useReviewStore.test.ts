@@ -429,4 +429,20 @@ describe("useReviewStore focus()", () => {
 
     expect(store.running.value).toBe(false);
   });
+
+  it("treats a starting session as running", () => {
+    const store = useReviewStore();
+
+    store.focus("th_starting", 7, "starting");
+
+    expect(store.running.value).toBe(true);
+  });
+
+  it("treats an interrupting session as running", () => {
+    const store = useReviewStore();
+
+    store.focus("th_interrupting", 7, "interrupting");
+
+    expect(store.running.value).toBe(true);
+  });
 });

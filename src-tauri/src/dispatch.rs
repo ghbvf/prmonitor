@@ -18,24 +18,17 @@
 //! reviews (and recording the dedup ledger). All GitHub writes — the `pm:` review
 //! comment and the status-label transition — are done by the codex pr-review skill
 //! the started turn runs, never by app code. The app's own `gh` surface stays
-//! read-only (`gh pr list` / `gh auth status`); a Medium guard test in
-//! `pr::gh` / `review` slice sources enforces that no write subcommand creeps in.
+//! read-only (`gh pr list` / `gh auth status`); a Medium guard test scanning all
+//! of `src` enforces that no write subcommand creeps in anywhere in the app.
 
 use tauri::Manager;
 
-use crate::error::AppResult;
 use crate::model::Candidate;
-use crate::pr::commands::now_epoch;
-use crate::pr::ledger::Ledger;
+use crate::review::commands::CODEX_BIN;
 use crate::review::engine::ReviewEngine;
 use crate::review::engines::codex::CodexEngine;
 use crate::review::session::{SessionInfo, SessionStatus};
 use crate::state::AppState;
-
-/// The codex binary name (PATH-resolved). Mirrors `review::commands::CODEX_BIN`
-/// (that const is slice-private; the dispatcher is composition glue and re-states
-/// it rather than widening the review slice's API).
-const CODEX_BIN: &str = "codex";
 
 /// Auto-start reviews for a cycle's dispatchable candidates, concurrently and
 /// unbounded, then land the dedup ledger for the ones that started.
@@ -57,8 +50,10 @@ const CODEX_BIN: &str = "codex";
 ///    borrows of the non-`Clone` resident `CodexManager`/`SessionRegistry`, so
 ///    spawning would force `'static` owned handles — `join_all` keeps the borrows).
 /// 5. **Batched ledger landing.** Only the candidates whose start returned `Ok`
-///    are recorded, in ONE persist ([`Ledger::record_many`]); a failed start is left
-///    unrecorded so it retries next cycle. Errors are logged, never propagated.
+///    are recorded, in ONE persist ([`crate::pr::ledger::record_dispatched`], which
+///    loads + stages + persists + stamps the clock inside the pr slice); a failed
+///    start is left unrecorded so it retries next cycle. Errors are logged, never
+///    propagated.
 pub async fn auto_dispatch<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     candidates: Vec<Candidate>,
@@ -90,6 +85,11 @@ pub async fn auto_dispatch<R: tauri::Runtime>(
     // Unbounded concurrent start, all in this one task. Each future borrows the
     // shared resident handles + config; `join_all` awaits them together. Pair each
     // result back with its candidate so the ledger lands only the started ones.
+    //
+    // The unbounded concurrency is intentional (per the design decision) and is
+    // transport-safe: `RpcClient` serializes every write through
+    // `Arc<tokio::sync::Mutex<W>>`, so concurrent `start`s can't interleave bytes
+    // on the codex stdin.
     let starts = candidates.iter().map(|c| {
         let engine = CodexEngine {
             app: &app,
@@ -117,21 +117,16 @@ pub async fn auto_dispatch<R: tauri::Runtime>(
         }
     }
     if !succeeded.is_empty() {
-        if let Err(e) = land_ledger(&app, &succeeded) {
+        // The pr slice owns the load + stage + persist + clock; the dispatcher
+        // passes only the started candidates. A persist failure here leaves those
+        // started sessions UNRECORDED in the ledger: the in-process registry guard
+        // still blocks a duplicate while each session lives, but if the store write
+        // failed a cross-restart re-dispatch becomes possible (rare). Logged, never
+        // propagated — a ledger write must not crash the poll loop.
+        if let Err(e) = crate::pr::ledger::record_dispatched(&app, &succeeded) {
             eprintln!("auto-dispatch 写入 ledger 失败：{}", e.message);
         }
     }
-}
-
-/// Load the ledger and batch-record the started candidates at one epoch (one
-/// persist). Split out so [`auto_dispatch`] reads linearly and the `?` error
-/// funnel stays local.
-fn land_ledger<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    succeeded: &[Candidate],
-) -> AppResult<()> {
-    let mut ledger = Ledger::load(app)?;
-    ledger.record_many(app, succeeded, now_epoch())
 }
 
 /// Drop candidates that already have an *active* session for the same `(pr, kind)`
@@ -255,30 +250,46 @@ mod tests {
         assert_eq!(kept.len(), 2);
     }
 
+    #[test]
+    fn guard_filters_across_multiple_sessions_and_candidates() {
+        // PR1/review and PR2/review are active; PR1/check is not. So only PR1/check
+        // survives — the guard keys on `(pr, kind)`, dropping per active session.
+        let candidates = vec![cand(1, "review"), cand(1, "check"), cand(2, "review")];
+        let active = [
+            session(1, "review", SessionStatus::Running),
+            session(2, "review", SessionStatus::Starting),
+        ];
+        let kept = dispatchable_after_guard(candidates, &active);
+        let kv: Vec<(u64, &str)> = kept.iter().map(|c| (c.number, c.kind.as_str())).collect();
+        assert_eq!(kv, vec![(1, "check")]);
+    }
+
     // ── Governance: "the app writes NO labels/comments" (Medium carrier) ────────
     //
     // The acceptance invariant per `.claude/rules/prmonitor/ai-robust.md`: only the
     // codex pr-review skill (run by a started turn) writes to GitHub — the pm:
     // review comment and the status-label transition. App code's own `gh` surface
     // stays read-only (`gh pr list`, `gh auth status`). A `gh` *write* subcommand
-    // creeping into the `pr` / `review` slice sources would silently make the app
-    // double-write labels/comments.
+    // creeping into ANY app source would silently make the app double-write
+    // labels/comments.
     //
-    // Carrier strength: **Medium** — a type-aware-ish scan over the slice `.rs`
+    // Carrier strength: **Medium** — a type-aware-ish scan over the app's `.rs`
     // sources at test time. (A Hard carrier would forbid the write at the type
     // level — e.g. a sealed gh-arg builder admitting only read subcommands — but
     // the `gh` args are plain `&str` slices, so the violation stays expressible;
     // this test is the machine check that catches it.) Funnel: the only gh
     // *callsites* are `pr::gh`'s `run_pr_list` / `gh_auth_status`; this scan closes
-    // the downstream by failing CI if ANY slice source names a write subcommand,
-    // not just those two callsites.
+    // the downstream by walking the WHOLE `src` tree (every slice plus the root
+    // composition modules — this `dispatch.rs` itself, and any future module), so a
+    // write subcommand anywhere in the app fails CI, not only at those callsites.
     //
     // The forbidden patterns are BUILT from fragments at runtime so the denylist
     // literals do not appear verbatim in this file — otherwise the scan would match
     // its own source.
     #[test]
-    fn pr_and_review_slices_use_no_gh_write_subcommands() {
-        // Built so e.g. "pr edit" never appears literally in this source file.
+    fn app_code_uses_no_gh_write_subcommands() {
+        // Built from split fragments so no forbidden subcommand appears verbatim in
+        // this source — the scan now walks all of `src`, including this file.
         let forbidden: Vec<String> = vec![
             format!("pr ed{}", "it"),
             format!("pr com{}", "ment"),
@@ -289,24 +300,21 @@ mod tests {
             format!("--remove-l{}", "abel"),
         ];
 
-        let slice_dirs = [
-            concat!(env!("CARGO_MANIFEST_DIR"), "/src/pr"),
-            concat!(env!("CARGO_MANIFEST_DIR"), "/src/review"),
-        ];
+        // Scan the entire app source tree (all slices + root modules), so this
+        // file and any future root module are covered too.
+        let src_root = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
 
         let mut offenders: Vec<String> = Vec::new();
-        for dir in slice_dirs {
-            for path in rs_files_under(std::path::Path::new(dir)) {
-                let src = std::fs::read_to_string(&path)
-                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-                for pat in &forbidden {
-                    if src.contains(pat.as_str()) {
-                        offenders.push(format!(
-                            "{} contains gh write pattern {:?}",
-                            path.display(),
-                            pat
-                        ));
-                    }
+        for path in rs_files_under(std::path::Path::new(src_root)) {
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            for pat in &forbidden {
+                if src.contains(pat.as_str()) {
+                    offenders.push(format!(
+                        "{} contains gh write pattern {:?}",
+                        path.display(),
+                        pat
+                    ));
                 }
             }
         }

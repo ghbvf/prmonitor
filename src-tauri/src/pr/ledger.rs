@@ -52,6 +52,30 @@ pub fn dispatch_key(number: u64, head_sha: &str, kind: &str) -> String {
     format!("{number}@{head_sha}:{kind}")
 }
 
+/// Wall-clock seconds since the Unix epoch (the cooldown / dispatch clock). A
+/// pre-epoch system clock degrades to 0 rather than panicking. `pub(crate)` so
+/// both the discovery gating and the dispatch landing ([`record_dispatched`])
+/// stamp the ledger with the same clock.
+pub(crate) fn now_epoch() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Load the ledger, batch-record the started candidates at one epoch, and persist
+/// — the dispatch-time landing in ONE call. Stamps the clock internally so callers
+/// (the dispatcher, [`crate::dispatch`]) pass only the candidates that started;
+/// the load + stage + persist + clock all stay in the pr slice.
+pub fn record_dispatched<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    cands: &[Candidate],
+) -> AppResult<()> {
+    let mut ledger = Ledger::load(app)?;
+    ledger.record_many(app, cands, now_epoch())
+}
+
 /// Remaining cooldown seconds when `last` is within `secs` of `now`, else `None`
 /// (cooldown elapsed). `saturating_sub` so a backwards clock (`last > now`) reads
 /// as age 0 rather than underflowing.
@@ -66,8 +90,9 @@ pub fn cooldown_remaining(now: u64, last: u64, secs: u64) -> Option<u64> {
 
 impl Ledger {
     /// Loads the persisted ledger, defaulting to empty when nothing is stored or
-    /// a value is corrupt (a corrupt ledger must never block discovery — the
-    /// worst case is a duplicate dispatch, which the live gate then re-checks).
+    /// a value is corrupt (a corrupt ledger must never block discovery — the worst
+    /// case is a duplicate dispatch, which the in-process registry guard then drops
+    /// for any still-active session).
     pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResult<Self> {
         let store = app
             .store(STORE_FILE)
@@ -209,6 +234,22 @@ mod tests {
         ledger.stage_all(&[], 1_000);
         assert!(ledger.dispatched.is_empty());
         assert!(ledger.events.is_empty());
+    }
+
+    // Staging the same candidate twice (e.g. two cycles before its head moves)
+    // documents the dedup-set vs event-log split: the `dispatched` key set is
+    // idempotent (one key), while the cooldown event log appends each time (so
+    // `last_dispatch_at` always tracks the most recent stamp).
+    #[test]
+    fn stage_all_repeat_call_dedups_key_but_appends_event() {
+        let mut ledger = Ledger::default();
+        let c = [cand(12, "review")];
+        ledger.stage_all(&c, 1_000);
+        ledger.stage_all(&c, 2_000);
+
+        assert_eq!(ledger.dispatched.len(), 1); // same key deduped in the set.
+        assert_eq!(ledger.events.len(), 2); // each stage appends a cooldown event.
+        assert_eq!(ledger.last_dispatch_at(12, "review"), Some(2_000)); // most recent.
     }
 
     #[test]

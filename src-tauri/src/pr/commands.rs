@@ -6,19 +6,7 @@ use crate::model::{Candidate, PullRequestView};
 
 use super::discover::{self, MonitorParams};
 use super::gh::{gh_auth_status, GhRow, GhStatus, GithubCli};
-use super::ledger::Ledger;
-
-/// Wall-clock seconds since the Unix epoch (the cooldown / dispatch clock). A
-/// pre-epoch system clock degrades to 0 rather than panicking. `pub(crate)` so
-/// the dispatcher ([`crate::dispatch`]) stamps the ledger with the same clock the
-/// discovery gating reads.
-pub(crate) fn now_epoch() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+use super::ledger::{now_epoch, Ledger};
 
 /// Annotates one discovered row for the PR list and surfaces its dispatchable
 /// [`Candidate`] when nothing gates it. Conflict (both trigger labels) skips
