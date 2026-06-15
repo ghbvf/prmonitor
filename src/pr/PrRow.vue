@@ -47,16 +47,16 @@ function open() {
 <style scoped>
 .pr-row {
   list-style: none;
-  padding: 6px 8px;
-  border-bottom: 1px solid rgba(128, 128, 128, 0.15);
-  border-radius: 4px;
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
   cursor: pointer;
 }
 .pr-row:hover {
-  background: rgba(128, 128, 128, 0.08);
+  background: var(--color-surface-hover);
 }
 .pr-row.selected {
-  background: rgba(37, 99, 235, 0.12);
+  background: var(--color-accent-bg);
 }
 .pr-row.skipped {
   opacity: 0.55;
@@ -64,7 +64,7 @@ function open() {
 .title-line {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
 }
 .title {
   flex: 1;
@@ -73,36 +73,36 @@ function open() {
   border: none;
   padding: 0;
   font: inherit;
-  color: #2563eb;
+  color: var(--color-accent);
   cursor: pointer;
 }
 .title:hover {
   text-decoration: underline;
 }
 .labels {
-  margin-top: 4px;
+  margin-top: var(--space-2);
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: var(--space-2);
 }
 .badge {
   display: inline-block;
-  padding: 1px 6px;
-  border-radius: 8px;
-  font-size: 11px;
+  padding: 1px var(--space-3);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-xs);
   line-height: 1.5;
 }
 .badge.label {
-  background: rgba(128, 128, 128, 0.18);
+  background: var(--color-neutral-bg);
   color: inherit;
 }
 .badge.kind {
-  background: rgba(37, 99, 235, 0.15);
-  color: #2563eb;
+  background: var(--color-accent-badge-bg);
+  color: var(--color-accent);
 }
 .skip-note {
-  margin: 4px 0 0;
-  font-size: 11px;
-  color: #888;
+  margin: var(--space-2) 0 0;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
 }
 </style>

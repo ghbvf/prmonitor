@@ -96,17 +96,17 @@ function onStart() {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .head h2 {
   margin: 0;
 }
 .actions {
   display: flex;
-  gap: 6px;
+  gap: var(--space-3);
 }
 .actions button {
-  padding: 4px 10px;
+  padding: var(--space-2) var(--space-5);
   font: inherit;
   cursor: pointer;
 }
@@ -115,15 +115,15 @@ function onStart() {
   opacity: 0.5;
 }
 .status {
-  margin: 8px 0 0;
-  font-size: 13px;
+  margin: var(--space-4) 0 0;
+  font-size: var(--font-size-md);
 }
 .muted {
-  color: #888;
+  color: var(--color-text-muted);
 }
 .error {
-  margin: 8px 0 0;
-  color: #c00;
-  font-size: 12px;
+  margin: var(--space-4) 0 0;
+  color: var(--color-danger);
+  font-size: var(--font-size-sm);
 }
 </style>

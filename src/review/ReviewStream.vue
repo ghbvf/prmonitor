@@ -20,10 +20,10 @@ defineProps<{ items: StreamItem[] }>();
 
 <style scoped>
 .stream {
-  margin-top: 8px;
+  margin-top: var(--space-4);
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .text {
   margin: 0;
@@ -35,16 +35,16 @@ defineProps<{ items: StreamItem[] }>();
   line-height: 1.5;
 }
 .reasoning {
-  border-left: 2px solid rgba(128, 128, 128, 0.3);
-  padding-left: 8px;
+  border-left: 2px solid var(--color-border-strong);
+  padding-left: var(--space-4);
 }
 .reasoning summary {
   cursor: pointer;
-  color: #888;
-  font-size: 12px;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
 }
 .reasoning .text {
-  margin-top: 4px;
-  color: #888;
+  margin-top: var(--space-2);
+  color: var(--color-text-muted);
 }
 </style>

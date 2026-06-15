@@ -45,28 +45,28 @@ onMounted(() => store.refreshGhStatus());
 
 <style scoped>
 .pr-list {
-  margin-bottom: 16px;
+  margin-bottom: var(--space-8);
 }
 .pr-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .pr-head h2 {
   margin: 0;
 }
 .muted {
-  color: #888;
-  font-size: 12px;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
 }
 .error {
-  color: #c00;
-  font-size: 12px;
+  color: var(--color-danger);
+  font-size: var(--font-size-sm);
 }
 .rows {
   list-style: none;
-  margin: 8px 0 0;
+  margin: var(--space-4) 0 0;
   padding: 0;
 }
 </style>

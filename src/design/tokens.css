@@ -1,0 +1,84 @@
+/* Single design-token source (#40). Linear-tuned light palette in :root; the dark
+   block redeclares ONLY the color tokens (font/space/radius are theme-invariant) so
+   components reference semantic vars and never branch on theme. Tinted-bg variants
+   are precomputed (no color-mix) for WebView safety. Changing a semantic color is a
+   one-line edit here. */
+:root {
+  --font-sans: "Inter", "Avenir", "Helvetica", "Arial", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "Menlo", monospace;
+
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-md: 13px;
+  --font-size-lg: 15px;
+
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 10px;
+  --space-6: 12px;
+  --space-8: 16px;
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-full: 50%;
+
+  --sidebar-width: 320px;
+
+  /* neutral / text */
+  --color-bg: #fbfbfc;
+  --color-surface: #ffffff;
+  --color-surface-hover: rgba(0, 0, 0, 0.035);
+  --color-text: #1c1d21;
+  --color-text-muted: #8a8f98;
+  --color-border: rgba(0, 0, 0, 0.08);
+  --color-border-strong: rgba(0, 0, 0, 0.12);
+
+  /* accent (low-sat indigo) */
+  --color-accent: #5e6ad2;
+  --color-accent-bg: rgba(94, 106, 210, 0.1);
+  --color-accent-badge-bg: rgba(94, 106, 210, 0.13);
+
+  /* neutral badge */
+  --color-neutral-bg: rgba(0, 0, 0, 0.06);
+
+  /* success / warn / danger + tinted bgs */
+  --color-success: #3a9d5d;
+  --color-success-bg: rgba(58, 157, 93, 0.13);
+  --color-warn: #b07400;
+  --color-warn-dot: #e0a000;
+  --color-warn-bg: rgba(224, 160, 0, 0.1);
+  --color-warn-bg-strong: rgba(224, 160, 0, 0.18);
+  --color-warn-border: rgba(224, 160, 0, 0.45);
+  --color-danger: #c5292a;
+  --color-danger-bg: rgba(197, 41, 42, 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #1c1d20;
+    --color-surface: #26272b;
+    --color-surface-hover: rgba(255, 255, 255, 0.05);
+    --color-text: #e9eaed;
+    --color-text-muted: #8a8f98;
+    --color-border: rgba(255, 255, 255, 0.08);
+    --color-border-strong: rgba(255, 255, 255, 0.13);
+
+    --color-accent: #8b93e6;
+    --color-accent-bg: rgba(94, 106, 210, 0.22);
+    --color-accent-badge-bg: rgba(94, 106, 210, 0.25);
+
+    --color-neutral-bg: rgba(255, 255, 255, 0.08);
+
+    --color-success: #5cc185;
+    --color-success-bg: rgba(58, 157, 93, 0.22);
+    --color-warn: #e0a83c;
+    --color-warn-dot: #e0a000;
+    --color-warn-bg: rgba(224, 160, 0, 0.14);
+    --color-warn-bg-strong: rgba(224, 160, 0, 0.24);
+    --color-warn-border: rgba(224, 160, 0, 0.4);
+    --color-danger: #e0686a;
+    --color-danger-bg: rgba(197, 41, 42, 0.2);
+  }
+}
