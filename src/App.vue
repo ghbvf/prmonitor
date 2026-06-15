@@ -6,7 +6,7 @@ import { appVersion } from "./config/api";
 import ConfigPanel from "./config/ConfigPanel.vue";
 import PollControls from "./pr/PollControls.vue";
 import PrList from "./pr/PrList.vue";
-import StatusBar from "./pr/StatusBar.vue";
+import StatusBar from "./StatusBar.vue";
 import ReviewPanel from "./review/ReviewPanel.vue";
 import { reschedule } from "./pr/api";
 

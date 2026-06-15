@@ -1,9 +1,10 @@
 <script setup lang="ts">
-// Thin status strip: surfaces the `gh` CLI auth state (sourced from the pr store)
-// plus the codex availability (sourced from the review store). This is App-shell
-// assembly — the codex line reads across into the review slice by design.
-import { usePrStore } from "./usePrStore";
-import { useReviewStore } from "../review/useReviewStore";
+// App-shell status strip (composition layer, sibling of App.vue): surfaces the
+// `gh` CLI auth state (pr store) and codex availability (review store). Living at
+// the shell layer — not inside a slice — is what makes reading across both slices
+// legitimate, exactly as App.vue does its cross-slice wiring.
+import { usePrStore } from "./pr/usePrStore";
+import { useReviewStore } from "./review/useReviewStore";
 
 const store = usePrStore();
 // Destructure the codex ref so the template auto-unwraps it (the review store is
