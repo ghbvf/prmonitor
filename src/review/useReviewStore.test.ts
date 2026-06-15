@@ -35,6 +35,8 @@ beforeEach(() => {
   s.error.value = null;
   s.activeThreadId.value = null;
   s.activePr.value = null;
+  s.listenerReady.value = false;
+  s.listenerError.value = null;
 });
 
 describe("useReviewStore refreshCodexStatus()", () => {
@@ -189,5 +191,101 @@ describe("useReviewStore init()", () => {
     const unlisten = await store.init();
     expect(api.onReviewEvent).toHaveBeenCalledOnce();
     expect(typeof unlisten).toBe("function");
+  });
+
+  it("marks listenerReady once the listener attaches (gates start)", async () => {
+    const store = useReviewStore();
+    expect(store.listenerReady.value).toBe(false);
+
+    await store.init();
+
+    expect(store.listenerReady.value).toBe(true);
+    expect(store.listenerError.value).toBeNull();
+  });
+
+  it("surfaces a listener registration failure and returns a noop unlisten", async () => {
+    vi.mocked(api.onReviewEvent).mockRejectedValueOnce(new Error("listen failed"));
+    const store = useReviewStore();
+
+    const unlisten = await store.init();
+
+    expect(store.listenerReady.value).toBe(false);
+    expect(store.listenerError.value).toBe("listen failed");
+    expect(typeof unlisten).toBe("function");
+  });
+
+  it("reattaches to a still-active backend session", async () => {
+    vi.mocked(api.listReviewSessions).mockResolvedValueOnce([
+      {
+        threadId: "th_live",
+        turnId: "tn",
+        prNumber: 42,
+        kind: "review",
+        status: "running",
+      },
+    ]);
+    const store = useReviewStore();
+
+    await store.init();
+
+    expect(store.activeThreadId.value).toBe("th_live");
+    expect(store.activePr.value).toBe(42);
+    expect(store.running.value).toBe(true);
+  });
+
+  it("leaves state clean when no backend session is active", async () => {
+    vi.mocked(api.listReviewSessions).mockResolvedValueOnce([
+      {
+        threadId: "th_done",
+        turnId: "tn",
+        prNumber: 1,
+        kind: "review",
+        status: "done",
+      },
+    ]);
+    const store = useReviewStore();
+
+    await store.init();
+
+    expect(store.activeThreadId.value).toBeNull();
+    expect(store.running.value).toBe(false);
+  });
+});
+
+describe("useReviewStore start() in-flight buffering", () => {
+  it("buffers events while the id is unknown and drops foreign sessions on replay", async () => {
+    // Hold startReview open so we can inject events into the id-unknown window.
+    let release!: (id: string) => void;
+    vi.mocked(api.startReview).mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        release = resolve;
+      }),
+    );
+    const store = useReviewStore();
+    const startPromise = store.start(7, "review");
+
+    // Events arriving before the id resolves: one foreign, one for our session.
+    store.applyEvent({
+      kind: "messageDelta",
+      threadId: "foreign",
+      itemId: "x",
+      text: "NOPE",
+    });
+    store.applyEvent({
+      kind: "messageDelta",
+      threadId: "th_1",
+      itemId: "i1",
+      text: "yes",
+    });
+    // Buffered, not yet applied.
+    expect(store.items.value).toEqual([]);
+
+    release("th_1");
+    await startPromise;
+
+    // Only our own session's event survives the filtered replay.
+    expect(store.items.value).toEqual([
+      { itemId: "i1", kind: "message", text: "yes" },
+    ]);
   });
 });

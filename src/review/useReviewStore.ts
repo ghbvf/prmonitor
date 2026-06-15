@@ -9,7 +9,13 @@
 // same refs. A fresh ref per call would silo those consumers.
 import { ref } from "vue";
 import type { ReviewEvent } from "../types";
-import { getCodexStatus, onReviewEvent, startReview, stopReview } from "./api";
+import {
+  getCodexStatus,
+  listReviewSessions,
+  onReviewEvent,
+  startReview,
+  stopReview,
+} from "./api";
 import type { CodexStatus, StreamItem } from "./types";
 
 // A rejected Tauri invoke throws the AppError object `{ message }`; fall back to
@@ -29,6 +35,18 @@ const running = ref(false);
 const finalStatus = ref<string | null>(null);
 const error = ref<string | null>(null);
 const items = ref<StreamItem[]>([]);
+// The `review:event` listener must be attached before a review can be started,
+// or the active session's earliest deltas (and even its terminal event) would be
+// missed. `listenerReady` gates the start button; `listenerError` surfaces a
+// failed registration.
+const listenerReady = ref(false);
+const listenerError = ref<string | null>(null);
+
+// While a start is in flight the session id is unknown, so an incoming event
+// can't yet be attributed. Buffer events for that window and, once `startReview`
+// resolves, replay only our own (a concurrent session's events must not pollute
+// this panel). `null` means "not currently buffering".
+let inFlightBuffer: ReviewEvent[] | null = null;
 
 // Hydrate codex availability. Tolerates a rejected command by surfacing an
 // unavailable status rather than throwing.
@@ -54,9 +72,14 @@ function appendDelta(kind: StreamItem["kind"], itemId: string, text: string) {
 // `never` default makes a new `ReviewEvent` variant a compile error (the
 // downstream exhaustiveness guard for the events.rs ↔ types.ts contract).
 function applyEvent(ev: ReviewEvent) {
-  // Single active panel: once our session id is known, ignore other sessions'
-  // events. Before it is known (start in flight) `activeThreadId` is null, so the
-  // active session's earliest deltas are still accepted.
+  // Start in flight (id not yet known): buffer rather than guess attribution —
+  // replayed (our id only) once `startReview` resolves, so a concurrent session's
+  // events can't pollute this panel.
+  if (inFlightBuffer && activeThreadId.value === null) {
+    inFlightBuffer.push(ev);
+    return;
+  }
+  // Single active panel: once our session id is known, ignore other sessions' events.
   if (activeThreadId.value && ev.threadId !== activeThreadId.value) return;
 
   switch (ev.kind) {
@@ -89,9 +112,16 @@ async function start(prNumber: number, kind: string) {
   activeThreadId.value = null;
   activePr.value = prNumber;
   running.value = true;
+  inFlightBuffer = []; // buffer events until the id is known (see applyEvent).
   try {
-    activeThreadId.value = await startReview(prNumber, kind);
+    const id = await startReview(prNumber, kind);
+    activeThreadId.value = id;
+    // Replay what arrived during the start; applyEvent now drops foreign sessions.
+    const buffered = inFlightBuffer;
+    inFlightBuffer = null;
+    for (const ev of buffered) applyEvent(ev);
   } catch (err) {
+    inFlightBuffer = null;
     running.value = false;
     error.value = toMessage(err);
     console.error("启动 review 失败", err);
@@ -114,9 +144,48 @@ async function stop() {
   }
 }
 
-// Attach the streamed-event listener; returns a Promise<UnlistenFn> for cleanup.
-function init() {
-  return onReviewEvent(applyEvent);
+// Reattach to a still-active backend review session (e.g. after the panel
+// remounts, or the app restarts, while codex streams on) so the UI doesn't show
+// "not started" over a live turn. Past deltas aren't replayed — the backend
+// doesn't buffer them — so `items` starts empty and new deltas append from here.
+// MVP is single-active, so the first active session wins.
+async function hydrateActiveSession() {
+  try {
+    const sessions = await listReviewSessions();
+    const active = sessions.find(
+      (s) =>
+        s.status === "running" ||
+        s.status === "starting" ||
+        s.status === "interrupting",
+    );
+    if (active) {
+      activeThreadId.value = active.threadId;
+      activePr.value = active.prNumber;
+      running.value = true; // non-terminal → still streaming; stop stays enabled.
+      finalStatus.value = null;
+      error.value = null;
+    }
+  } catch (err) {
+    console.error("恢复 review 会话失败", err);
+  }
+}
+
+// Attach the streamed-event listener, then reattach to any live session. Returns
+// a Promise<UnlistenFn> for cleanup. Marks `listenerReady` once attached (gates
+// the start button) so a review can't begin before events can be received.
+async function init() {
+  let unlisten: Awaited<ReturnType<typeof onReviewEvent>>;
+  try {
+    // Attach BEFORE hydrating so no event arriving in between is lost.
+    unlisten = await onReviewEvent(applyEvent);
+    listenerReady.value = true;
+  } catch (err) {
+    listenerError.value = toMessage(err);
+    console.error("review 事件监听注册失败", err);
+    return () => {};
+  }
+  await hydrateActiveSession();
+  return unlisten;
 }
 
 export function useReviewStore() {
@@ -129,6 +198,8 @@ export function useReviewStore() {
     finalStatus,
     error,
     items,
+    listenerReady,
+    listenerError,
     applyEvent,
     start,
     stop,

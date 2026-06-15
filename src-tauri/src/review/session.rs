@@ -71,6 +71,17 @@ pub struct SessionRegistry {
     inner: Arc<Mutex<HashMap<ThreadId, SessionInfo>>>,
 }
 
+/// Outcome of [`SessionRegistry::begin_interrupt`] — the atomic guard that makes
+/// `stop` race-free and idempotent.
+enum BeginInterrupt {
+    /// Was `Running`; flipped to `Interrupting`. Caller interrupts this `turn_id`.
+    Proceed(String),
+    /// Already interrupting / done / failed / starting — nothing to (re)interrupt.
+    AlreadyHandled,
+    /// No session with this id.
+    NotFound,
+}
+
 impl SessionRegistry {
     fn insert(&self, info: SessionInfo) {
         self.inner
@@ -94,12 +105,35 @@ impl SessionRegistry {
         }
     }
 
-    fn turn_id(&self, thread_id: &str) -> Option<String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(thread_id)
-            .map(|i| i.turn_id.clone())
+    /// Atomically begin an interrupt. Only a [`SessionStatus::Running`] session
+    /// transitions to [`SessionStatus::Interrupting`] and yields its `turn_id` to
+    /// interrupt; an already interrupting / terminal / still-starting session is a
+    /// no-op (so a double `stop` is idempotent), and a missing session is an error.
+    /// The check-and-set is one synchronous critical section, so two concurrent
+    /// stops can't both proceed.
+    fn begin_interrupt(&self, thread_id: &str) -> BeginInterrupt {
+        let mut map = self.inner.lock().unwrap();
+        match map.get_mut(thread_id) {
+            None => BeginInterrupt::NotFound,
+            Some(info) => match info.status {
+                SessionStatus::Running => {
+                    info.status = SessionStatus::Interrupting;
+                    BeginInterrupt::Proceed(info.turn_id.clone())
+                }
+                _ => BeginInterrupt::AlreadyHandled,
+            },
+        }
+    }
+
+    /// Revert a failed interrupt: [`SessionStatus::Interrupting`] →
+    /// [`SessionStatus::Running`], so a retry can stop the still-running turn. A
+    /// terminal status that raced in via the pump meanwhile is left untouched.
+    fn rollback_interrupt(&self, thread_id: &str) {
+        if let Some(info) = self.inner.lock().unwrap().get_mut(thread_id) {
+            if info.status == SessionStatus::Interrupting {
+                info.status = SessionStatus::Running;
+            }
+        }
     }
 
     /// Snapshot of all known sessions (for `list_review_sessions`).
@@ -199,15 +233,26 @@ pub async fn stop_review(
     repo_root: &str,
     session_id: &str,
 ) -> AppResult<()> {
-    let turn_id = registry
-        .turn_id(session_id)
-        .ok_or_else(|| AppError::new(format!("未找到 review 会话: {session_id}")))?;
-    // Acquire the connection BEFORE flipping to `Interrupting`, so a failure to
-    // reach the app-server leaves the session's status untouched (still `Running`)
-    // rather than stuck in a half-interrupted state.
-    let client = codex.connection(codex_bin, repo_root).await?;
-    registry.set_status(session_id, SessionStatus::Interrupting);
-    process::interrupt_turn(
+    // Atomic guard: only a `Running` session flips to `Interrupting` (and yields
+    // its turn id); a repeat stop is an idempotent no-op, an unknown id an error.
+    let turn_id = match registry.begin_interrupt(session_id) {
+        BeginInterrupt::Proceed(turn_id) => turn_id,
+        BeginInterrupt::AlreadyHandled => return Ok(()),
+        BeginInterrupt::NotFound => {
+            return Err(AppError::new(format!("未找到 review 会话: {session_id}")))
+        }
+    };
+    // We're now `Interrupting`. Any failure below must roll back to `Running` so a
+    // retry can interrupt again — never leave a half-interrupted, un-stoppable
+    // session (the pump still owns the real terminal transition on `turn/completed`).
+    let client = match codex.connection(codex_bin, repo_root).await {
+        Ok(client) => client,
+        Err(e) => {
+            registry.rollback_interrupt(session_id);
+            return Err(e);
+        }
+    };
+    if let Err(e) = process::interrupt_turn(
         &client,
         TurnInterruptParams {
             thread_id: session_id.to_string(),
@@ -215,6 +260,11 @@ pub async fn stop_review(
         },
     )
     .await
+    {
+        registry.rollback_interrupt(session_id);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Pump task: forward this session's notifications to the frontend as
@@ -239,9 +289,23 @@ async fn pump<R: tauri::Runtime>(
                 }
                 let _ = app.emit(REVIEW_EVENT, &event);
             }
-            // A slow consumer fell behind the ring; drop the gap and keep going.
+            // The pump fell behind the shared ring and `n` notifications were
+            // evicted. The terminal `turn/completed` may have been among them
+            // (another session can flood the ring after ours), which would hang
+            // this pump on `recv()` forever — and the dropped deltas already make
+            // the rendered stream incomplete. So end the session honestly with a
+            // Failed terminal + error rather than risk a stuck `Running`.
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 eprintln!("review pump（{thread_id}）滞后，丢弃 {n} 条通知");
+                registry.set_status(&thread_id, SessionStatus::Failed);
+                let _ = app.emit(
+                    REVIEW_EVENT,
+                    &ReviewEvent::Error {
+                        thread_id: thread_id.clone(),
+                        message: format!("codex 输出流滞后，丢弃 {n} 条消息（review 中断）"),
+                    },
+                );
+                break;
             }
             // The connection closed before the turn completed.
             Err(broadcast::error::RecvError::Closed) => {
@@ -443,12 +507,64 @@ mod tests {
             kind: "review".to_string(),
             status: SessionStatus::Running,
         });
-        assert_eq!(reg.turn_id("t1").as_deref(), Some("tn1"));
+        assert_eq!(reg.list()[0].turn_id, "tn1");
         reg.set_status("t1", SessionStatus::Done);
         let list = reg.list();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].status, SessionStatus::Done);
-        assert!(reg.turn_id("missing").is_none());
+        assert!(matches!(
+            reg.begin_interrupt("missing"),
+            BeginInterrupt::NotFound
+        ));
+    }
+
+    #[test]
+    fn begin_interrupt_is_atomic_and_idempotent() {
+        let reg = SessionRegistry::default();
+        reg.insert(SessionInfo {
+            thread_id: "t1".to_string(),
+            turn_id: "tn1".to_string(),
+            pr_number: 7,
+            kind: "review".to_string(),
+            status: SessionStatus::Running,
+        });
+        // Running → Proceed(turn_id), status flips to Interrupting.
+        match reg.begin_interrupt("t1") {
+            BeginInterrupt::Proceed(turn_id) => assert_eq!(turn_id, "tn1"),
+            _ => panic!("a Running session must Proceed"),
+        }
+        assert_eq!(reg.list()[0].status, SessionStatus::Interrupting);
+        // A repeat stop while Interrupting is an idempotent no-op.
+        assert!(matches!(
+            reg.begin_interrupt("t1"),
+            BeginInterrupt::AlreadyHandled
+        ));
+        // Unknown id is an error.
+        assert!(matches!(
+            reg.begin_interrupt("missing"),
+            BeginInterrupt::NotFound
+        ));
+    }
+
+    #[test]
+    fn rollback_interrupt_reverts_only_interrupting() {
+        let reg = SessionRegistry::default();
+        reg.insert(SessionInfo {
+            thread_id: "t1".to_string(),
+            turn_id: "tn1".to_string(),
+            pr_number: 7,
+            kind: "review".to_string(),
+            status: SessionStatus::Running,
+        });
+        reg.begin_interrupt("t1"); // → Interrupting
+        reg.rollback_interrupt("t1"); // failed interrupt → back to Running (retry-able)
+        assert_eq!(reg.list()[0].status, SessionStatus::Running);
+
+        // A terminal status that raced in via the pump must NOT be reverted.
+        reg.begin_interrupt("t1");
+        reg.set_status("t1", SessionStatus::Done);
+        reg.rollback_interrupt("t1");
+        assert_eq!(reg.list()[0].status, SessionStatus::Done);
     }
 
     #[test]
@@ -501,7 +617,7 @@ mod tests {
 
         // The success path fills the turn id and flips to Running.
         reg.set_running("t1", "tn9".to_string());
-        assert_eq!(reg.turn_id("t1").as_deref(), Some("tn9"));
+        assert_eq!(reg.list()[0].turn_id, "tn9");
         assert_eq!(reg.list()[0].status, SessionStatus::Running);
     }
 }

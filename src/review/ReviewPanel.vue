@@ -15,6 +15,8 @@ const {
   finalStatus,
   error,
   activePr,
+  listenerReady,
+  listenerError,
   start,
   stop,
   refreshCodexStatus,
@@ -56,7 +58,7 @@ function onStart() {
       <div class="actions">
         <button
           type="button"
-          :disabled="selectedPr == null || running"
+          :disabled="selectedPr == null || running || !listenerReady"
           @click="onStart"
         >
           开始 review
@@ -80,6 +82,8 @@ function onStart() {
     </p>
 
     <p v-if="error" class="error">{{ error }}</p>
+    <p v-if="listenerError" class="error">事件监听注册失败 / {{ listenerError }}</p>
+    <p v-else-if="!listenerReady" class="muted">正在连接事件流… / connecting</p>
 
     <p v-if="running && items.length === 0" class="muted">等待输出… / waiting</p>
 

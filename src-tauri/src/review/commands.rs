@@ -1,6 +1,6 @@
 //! Review slice Tauri commands.
 
-use crate::config::{model as config_model, service as config_service};
+use crate::config::service as config_service;
 use crate::error::AppResult;
 use crate::review::engine::{ReviewEngine, SessionId};
 use crate::review::engines::codex::{CodexEngine, CodexStatus};
@@ -37,11 +37,11 @@ pub async fn start_review<R: tauri::Runtime>(
     pr_number: u64,
     kind: String,
 ) -> AppResult<SessionId> {
-    let cfg = config_service::load(&app)?;
-    // `load` does not re-validate persisted config; validate here so an absent /
+    // `load_validated` re-checks the persisted config's paths so an absent /
     // escaping `skillRelPath` (e.g. a hand-edited config) fails before we attach
-    // the skill path to the turn, rather than handing codex a bad path.
-    config_model::validate(&cfg)?;
+    // the skill path to the turn, rather than handing codex a bad path. The review
+    // slice depends only on `config::service`, never `config::model`.
+    let cfg = config_service::load_validated(&app)?;
     let skill_abs = skill_abs_path(&cfg.repo_root, &cfg.skill_rel_path);
     let engine = CodexEngine {
         app: &app,

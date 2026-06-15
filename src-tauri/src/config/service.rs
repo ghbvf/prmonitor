@@ -30,6 +30,17 @@ pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResult<AppConfig
     }
 }
 
+/// Loads the persisted config and validates its filesystem-dependent fields, for
+/// callers that will *use* those paths (e.g. the review slice attaching the skill
+/// path to a codex turn). Keeps validation inside the config slice so callers
+/// depend only on `config::service`, never `config::model` — `load` stays lenient
+/// (no validation) for read-only consumers like `get_codex_status`.
+pub fn load_validated<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResult<AppConfig> {
+    let config = load(app)?;
+    super::model::validate(&config)?;
+    Ok(config)
+}
+
 /// Persists the configuration after validating filesystem-dependent fields.
 pub fn save<R: tauri::Runtime>(app: &tauri::AppHandle<R>, config: AppConfig) -> AppResult<()> {
     super::model::validate(&config)?;
