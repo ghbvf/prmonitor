@@ -171,6 +171,17 @@ mod tests {
         assert!(v.get("engine_kind").is_none());
     }
 
+    /// First-launch marker lock (Medium). The frontend routes a fresh install into
+    /// onboarding by detecting `config.repoRoot === ""` (src/App.vue) — that empty
+    /// default is the contract. If a future change gave `repo_root` a non-empty
+    /// default, the frontend would silently skip onboarding and the poll-loop gate
+    /// in lib.rs (`load_validated`) would change behavior; this assertion fails first
+    /// so the coupling is machine-checked rather than comment-only.
+    #[test]
+    fn default_repo_root_is_empty_first_launch_marker() {
+        assert_eq!(AppConfig::default().repo_root, "");
+    }
+
     #[test]
     fn validate_accepts_existing_repo_root_and_skill() {
         let config = AppConfig {

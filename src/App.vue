@@ -43,12 +43,14 @@ const showPrompt = computed(() => ghBlocked.value || codexBlocked.value);
 
 onMounted(async () => {
   version.value = await appVersion();
-  // First-launch detection: an empty repoRoot is the default config's only empty
-  // field and the backend gate (lib.rs) won't have auto-started the poll loop for
-  // it → route to onboarding. A valid config means the backend already started the
-  // loop → monitor.
+  // First-launch detection: a freshly-installed app loads AppConfig::default(),
+  // whose only empty field is repoRoot — the backend gate (lib.rs) won't have
+  // auto-started the poll loop for it → route to onboarding. Require config to be
+  // *present* and empty: a null config means the load itself failed (IPC error),
+  // and forcing a returning user back through onboarding on a transient error would
+  // be worse than degrading to the monitor view.
   await configStore.load();
-  if (!configStore.config || configStore.config.repoRoot === "") {
+  if (configStore.config && configStore.config.repoRoot === "") {
     goOnboarding();
   } else {
     goMonitor();
@@ -56,11 +58,18 @@ onMounted(async () => {
   booting.value = false;
 });
 
-// Cross-slice wiring (composition root only): a config save may change the poll
-// interval, so reschedule the backend timer. Non-blocking: a reschedule failure
-// only delays the period rebuild (the next poll still runs on the old period).
+// Cross-slice wiring (composition root only): a config save may both (a) fix a
+// previously-invalid config that left the loop gated off at launch and (b) change
+// the poll interval. start_polling is idempotent (no-op if already running), so it
+// recovers the gated-off case; reschedule then applies the new period. Non-blocking:
+// a failure only delays the rebuild (the next poll still runs on the old period).
 function onConfigSaved() {
-  reschedule().catch((e) => console.error("reschedule failed", e));
+  startPolling()
+    .then(() => {
+      prStore.polling = true;
+      return reschedule();
+    })
+    .catch((e) => console.error("post-save poll start/reschedule failed", e));
 }
 
 // Onboarding finished with a validated save. The backend gate did NOT auto-start
@@ -72,7 +81,10 @@ async function onOnboardingDone() {
     await startPolling();
     prStore.polling = true;
   } catch (e) {
+    // Keep the store's polling flag honest so PollControls doesn't claim the loop
+    // is running when start failed; the user can retry from the monitor controls.
     console.error("startPolling failed", e);
+    prStore.polling = false;
   }
   goMonitor();
 }

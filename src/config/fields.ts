@@ -6,7 +6,7 @@
 import type { AppConfig } from "./types";
 
 export type FieldKey = keyof AppConfig;
-export type FieldKind = "text" | "number" | "csv" | "select";
+type FieldKind = "text" | "number" | "csv" | "select";
 
 export interface FieldDef {
   key: FieldKey;
@@ -19,7 +19,7 @@ export interface FieldDef {
   readonly?: boolean;
 }
 
-export interface FieldGroup {
+interface FieldGroup {
   id: string;
   title: string;
   fields: FieldDef[];
@@ -133,10 +133,18 @@ export function validateStep(step: StepId, draft: AppConfig): string | null {
     case "source":
       // Single-option confirm step — nothing to validate.
       return null;
-    case "autoReview":
-      return draft.pollIntervalSecs <= 0 || draft.prCooldownSeconds <= 0
+    case "autoReview": {
+      // `Number.isFinite` rejects NaN (a blank number input yields NaN, and
+      // `NaN <= 0` is false — without this guard NaN would pass the frontend gate
+      // and then break the backend deserializer).
+      const { pollIntervalSecs: interval, prCooldownSeconds: cooldown } = draft;
+      return !Number.isFinite(interval) ||
+        !Number.isFinite(cooldown) ||
+        interval <= 0 ||
+        cooldown <= 0
         ? "轮询间隔与冷却必须大于 0"
         : null;
+    }
     case "done":
       return null;
   }
@@ -144,12 +152,15 @@ export function validateStep(step: StepId, draft: AppConfig): string | null {
 
 // Route a backend AppError message back to the wizard step that owns the field.
 // Substring match (the backend prefixes each message with the offending field
-// name); order matters because "skillRelPath" contains "skill" and the repoRoot
-// message must win before any narrower match. Returns null for unrecognized
-// messages so the caller can fall back to the `done` step.
+// name). Order matters: the path-escape error ("skillRelPath 不能逃逸 repoRoot")
+// names BOTH fields but is owned by the skill step, so "skill" is checked before
+// "repoRoot" — no genuine repoRoot message contains "skill", making skill-first
+// safe. Returns null for unrecognized messages so the caller falls back to `done`.
+// NOTE: the substrings here mirror src-tauri/src/config/model.rs error text; the
+// matching cases are locked in fields.test.ts (Medium) — keep all three in sync.
 export function errorToStep(message: string): StepId | null {
-  if (message.includes("repoRoot")) return "repoRoot";
   if (message.includes("skill")) return "skill";
+  if (message.includes("repoRoot")) return "repoRoot";
   if (message.includes("pollIntervalSecs") || message.includes("prCooldownSeconds")) {
     return "autoReview";
   }

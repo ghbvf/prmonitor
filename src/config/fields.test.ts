@@ -62,8 +62,8 @@ describe("validateStep — repoRoot", () => {
   it("accepts a non-empty path", () => {
     expect(validateStep("repoRoot", validDraft())).toBeNull();
   });
-  it("rejects empty", () => {
-    expect(validateStep("repoRoot", { ...validDraft(), repoRoot: "" })).toBeTruthy();
+  it.each(["", "   "])("rejects empty/whitespace-only %j", (repoRoot) => {
+    expect(validateStep("repoRoot", { ...validDraft(), repoRoot })).toBeTruthy();
   });
 });
 
@@ -90,7 +90,11 @@ describe("validateStep — autoReview (intervals)", () => {
   it.each([
     { pollIntervalSecs: 0 },
     { prCooldownSeconds: 0 },
-  ])("rejects non-positive %o", (patch) => {
+    { pollIntervalSecs: -1 },
+    { prCooldownSeconds: -5 },
+    { pollIntervalSecs: NaN },
+    { prCooldownSeconds: NaN },
+  ])("rejects non-positive / NaN %o", (patch) => {
     expect(validateStep("autoReview", { ...validDraft(), ...patch })).toBeTruthy();
   });
 });
@@ -121,6 +125,9 @@ describe("errorToStep — routes backend AppError messages", () => {
   it("skill message → skill step", () => {
     expect(errorToStep("skill 路径不存在: /x/y")).toBe("skill");
     expect(errorToStep("skillRelPath 必须是相对路径: /x")).toBe("skill");
+  });
+  it("path-escape message (names both fields) → skill step, not repoRoot", () => {
+    expect(errorToStep("skillRelPath 不能逃逸 repoRoot: ../x")).toBe("skill");
   });
   it("interval messages → autoReview step", () => {
     expect(errorToStep("pollIntervalSecs 必须大于 0")).toBe("autoReview");

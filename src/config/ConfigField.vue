@@ -32,7 +32,11 @@ function onText(e: Event) {
 }
 
 function onNumber(e: Event) {
-  emit("update:modelValue", (e.target as HTMLInputElement).valueAsNumber);
+  // A blank/invalid number input yields NaN; coerce to 0 so it fails the
+  // "必须大于 0" validation cleanly instead of serializing to JSON null and
+  // confusing the backend deserializer.
+  const n = (e.target as HTMLInputElement).valueAsNumber;
+  emit("update:modelValue", Number.isNaN(n) ? 0 : n);
   emit("edit");
 }
 
