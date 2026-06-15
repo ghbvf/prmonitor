@@ -222,6 +222,13 @@ pub enum ServerNotification {
     /// `command/exec/outputDelta` / `process/outputDelta` — base64 output chunk
     /// (`deltaBase64`, kept opaque; the review stream does not forward it yet).
     OutputDelta(OutputDelta),
+    /// Synthetic, **not** a wire notification: the rpc reader injects this on the
+    /// broadcast when its loop exits (codex EOF / IO error / oversized frame), so
+    /// every subscribed session pump sees the transport tearing down and ends with
+    /// a terminal `Failed` instead of hanging on `recv()` forever (the `RpcClient`
+    /// keeps the broadcast `Sender` alive across a dead reader, so `RecvError::Closed`
+    /// would otherwise never fire). [`Self::from_raw`] never produces it.
+    ConnectionClosed,
     /// Any other (unknown/future) notification — method + raw params preserved.
     Other { method: String, params: Value },
 }

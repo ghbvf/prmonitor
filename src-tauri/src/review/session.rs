@@ -278,6 +278,16 @@ async fn pump<R: tauri::Runtime>(
 ) {
     loop {
         match rx.recv().await {
+            // Synthetic signal the rpc reader broadcasts when its loop exits (codex
+            // EOF / IO error): the transport is gone, so every session dies with it
+            // regardless of thread. End this one as `Failed` rather than wait on
+            // deltas that will never arrive (the `RpcClient` keeps the broadcast
+            // `Sender` alive across a dead reader, so `RecvError::Closed` below never
+            // fires for a process-death; this is what catches that case).
+            Ok(note) if matches!(note.as_ref(), ServerNotification::ConnectionClosed) => {
+                fail_connection_closed(&registry, &app, &thread_id);
+                break;
+            }
             Ok(note) => {
                 let Some(event) = map_notification(&note, &thread_id) else {
                     continue;
@@ -307,20 +317,34 @@ async fn pump<R: tauri::Runtime>(
                 );
                 break;
             }
-            // The connection closed before the turn completed.
+            // The broadcast itself closed (every `Sender` dropped — i.e. the whole
+            // `RpcClient` was torn down, e.g. manager shutdown). Same terminal
+            // outcome as the synthetic `ConnectionClosed` above.
             Err(broadcast::error::RecvError::Closed) => {
-                registry.set_status(&thread_id, SessionStatus::Failed);
-                let _ = app.emit(
-                    REVIEW_EVENT,
-                    &ReviewEvent::Error {
-                        thread_id: thread_id.clone(),
-                        message: "codex 连接已关闭".to_string(),
-                    },
-                );
+                fail_connection_closed(&registry, &app, &thread_id);
                 break;
             }
         }
     }
+}
+
+/// End a session as `Failed` with a "connection closed" error event. Shared by the
+/// pump's two transport-teardown paths: the synthetic `ConnectionClosed` (reader
+/// exited but the `RpcClient` lives on) and `RecvError::Closed` (the whole client
+/// dropped).
+fn fail_connection_closed<R: tauri::Runtime>(
+    registry: &SessionRegistry,
+    app: &tauri::AppHandle<R>,
+    thread_id: &str,
+) {
+    registry.set_status(thread_id, SessionStatus::Failed);
+    let _ = app.emit(
+        REVIEW_EVENT,
+        &ReviewEvent::Error {
+            thread_id: thread_id.to_string(),
+            message: "codex 连接已关闭".to_string(),
+        },
+    );
 }
 
 /// Map one codex notification to a [`ReviewEvent`] for this session, or `None`

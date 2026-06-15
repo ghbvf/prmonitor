@@ -301,15 +301,24 @@ async fn reader_loop<R, W>(
     // Mark closed + wake every awaiting request, under the same lock, so a request
     // either registered before this drain (and is failed here) or sees `closed`
     // and never registers — no request can be stranded waiting out its timeout.
-    let mut pending = pending.lock().unwrap();
-    pending.closed = true;
-    for (_id, tx) in pending.map.drain() {
-        let _ = tx.send(Err(RpcError {
-            code: -1,
-            message: "app-server 连接已关闭".to_string(),
-            data: None,
-        }));
+    {
+        let mut pending = pending.lock().unwrap();
+        pending.closed = true;
+        for (_id, tx) in pending.map.drain() {
+            let _ = tx.send(Err(RpcError {
+                code: -1,
+                message: "app-server 连接已关闭".to_string(),
+                data: None,
+            }));
+        }
     }
+
+    // Wake every subscribed session pump too: the `RpcClient` still holds a
+    // broadcast `Sender`, so a dead reader never lets `recv()` return
+    // `RecvError::Closed`. Broadcasting a synthetic `ConnectionClosed` lets each
+    // pump end its session with a terminal `Failed` instead of hanging `Running`
+    // after codex dies. `send` errs only with zero subscribers — harmless.
+    let _ = notif_tx.send(Arc::new(ServerNotification::ConnectionClosed));
 }
 
 /// JSON-RPC "method not found" — the error code returned for a server→client
@@ -458,5 +467,36 @@ mod tests {
         assert_eq!(v["id"], 8);
         assert!(v.get("error").is_some());
         assert!(v.get("result").is_none());
+    }
+
+    /// Reader exit (here: the server end drops → the client read half hits EOF)
+    /// must broadcast a synthetic `ConnectionClosed` to every subscriber. Without
+    /// it, a session pump's `recv()` hangs forever — the `RpcClient` keeps the
+    /// broadcast `Sender` alive across a dead reader, so `RecvError::Closed` never
+    /// fires. This is the repro for the "codex dies → session stuck Running" bug:
+    /// pre-fix, the `recv().await` below never resolves.
+    #[tokio::test]
+    async fn reader_exit_broadcasts_connection_closed() {
+        let (client_w, _server_r) = tokio::io::duplex(64 * 1024);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let client = RpcClient::connect(client_w, tokio::io::BufReader::new(client_r), 16);
+
+        let mut sub = client.subscribe();
+
+        // Drop the server's write half → client read half hits EOF → reader exits.
+        drop(server_w);
+
+        let note = sub
+            .recv()
+            .await
+            .expect("subscriber must receive the synthetic close, not a RecvError");
+        assert!(
+            matches!(note.as_ref(), ServerNotification::ConnectionClosed),
+            "reader exit must broadcast ConnectionClosed"
+        );
+        assert!(
+            !client.is_connected(),
+            "is_connected flips false once the reader exits"
+        );
     }
 }
