@@ -16,7 +16,7 @@ import {
   startReview,
   stopReview,
 } from "./api";
-import type { CodexStatus, StreamItem } from "./types";
+import type { CodexStatus, ReviewSession, SessionStatus, StreamItem } from "./types";
 
 // A rejected Tauri invoke throws the AppError object `{ message }`; fall back to
 // a stringified form for any non-conforming throw.
@@ -25,6 +25,12 @@ function toMessage(err: unknown): string {
 }
 
 const codex = ref<CodexStatus | null>(null);
+
+// All review sessions the backend currently tracks (#8 auto-trigger can run
+// several concurrently). Drives the ReviewSessions list; refreshed event-driven
+// (no polling timer — see `refreshSessions` call sites). Keyed/sorted by
+// `threadId` for a stable render order.
+const sessions = ref<ReviewSession[]>([]);
 
 // Active session (single-active-panel model): the most recently started review.
 const activeThreadId = ref<string | null>(null);
@@ -60,6 +66,20 @@ async function refreshCodexStatus() {
   }
 }
 
+// Refresh the concurrent-session list from the backend. Tolerates a rejected
+// command by logging and keeping the prior value (a transient failure shouldn't
+// blank the list). Sorted by `threadId` for a stable render order.
+async function refreshSessions() {
+  try {
+    const next = await listReviewSessions();
+    sessions.value = [...next].sort((a, b) =>
+      a.threadId.localeCompare(b.threadId),
+    );
+  } catch (err) {
+    console.error("刷新 review 会话列表失败", err);
+  }
+}
+
 // Append a streamed delta, concatenating onto the existing item for `itemId`
 // (each `itemId` carries exactly one kind) or starting a new one.
 function appendDelta(kind: StreamItem["kind"], itemId: string, text: string) {
@@ -72,6 +92,19 @@ function appendDelta(kind: StreamItem["kind"], itemId: string, text: string) {
 // `never` default makes a new `ReviewEvent` variant a compile error (the
 // downstream exhaustiveness guard for the events.rs ↔ types.ts contract).
 function applyEvent(ev: ReviewEvent) {
+  // Sessions-list bookkeeping runs for EVERY event, ahead of the focused-panel
+  // attribution below — the concurrent list tracks ALL sessions, not just the
+  // focused one, so it must refresh even for events the panel filter drops.
+  // Refresh when: a threadId we haven't listed yet appears (a session — likely
+  // #8 auto-started — just started, surface it), or a terminal event fires (a
+  // session left the running set, flip its badge to done/failed). Fire-and-forget
+  // so `applyEvent` stays sync (the `void` keeps the in-flight buffer replay
+  // simple and the `never` exhaustiveness guard below meaningful).
+  const unseen = !sessions.value.some((s) => s.threadId === ev.threadId);
+  if (unseen || ev.kind === "turnCompleted" || ev.kind === "error") {
+    void refreshSessions();
+  }
+
   // Start in flight (id not yet known): buffer rather than guess attribution —
   // replayed (our id only) once `startReview` resolves, so a concurrent session's
   // events can't pollute this panel.
@@ -170,6 +203,20 @@ async function hydrateActiveSession() {
   }
 }
 
+// Point the single focused stream at a chosen session (from the ReviewSessions
+// list). The backend doesn't replay past deltas, so `items` starts empty and new
+// deltas append from here. `running` mirrors the picked session's non-terminal
+// status so the stop button + waiting state behave like a fresh start would.
+function focus(threadId: string, prNumber: number, status: SessionStatus) {
+  activeThreadId.value = threadId;
+  activePr.value = prNumber;
+  running.value =
+    status === "running" || status === "starting" || status === "interrupting";
+  items.value = [];
+  error.value = null;
+  finalStatus.value = null;
+}
+
 // Attach the streamed-event listener, then reattach to any live session. Returns
 // a Promise<UnlistenFn> for cleanup. Marks `listenerReady` once attached (gates
 // the start button) so a review can't begin before events can be received.
@@ -185,6 +232,9 @@ async function init() {
     return () => {};
   }
   await hydrateActiveSession();
+  // Seed the concurrent-session list now that the listener is live; subsequent
+  // refreshes are event-driven from applyEvent (no polling timer).
+  await refreshSessions();
   return unlisten;
 }
 
@@ -192,6 +242,9 @@ export function useReviewStore() {
   return {
     codex,
     refreshCodexStatus,
+    sessions,
+    refreshSessions,
+    focus,
     activeThreadId,
     activePr,
     running,

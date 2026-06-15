@@ -2,15 +2,17 @@
 
 use crate::config::service as config_service;
 use crate::error::AppResult;
-use crate::model::PullRequestView;
+use crate::model::{Candidate, PullRequestView};
 
 use super::discover::{self, MonitorParams};
 use super::gh::{gh_auth_status, GhRow, GhStatus, GithubCli};
 use super::ledger::Ledger;
 
-/// Wall-clock seconds since the Unix epoch (the cooldown clock). A pre-epoch
-/// system clock degrades to 0 rather than panicking.
-fn now_epoch() -> u64 {
+/// Wall-clock seconds since the Unix epoch (the cooldown / dispatch clock). A
+/// pre-epoch system clock degrades to 0 rather than panicking. `pub(crate)` so
+/// the dispatcher ([`crate::dispatch`]) stamps the ledger with the same clock the
+/// discovery gating reads.
+pub(crate) fn now_epoch() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -18,38 +20,56 @@ fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
-/// Annotates one discovered row with its static skip reason for the PR list.
-/// Conflict (both trigger labels) skips first, matching `router.py`'s discovery-
-/// stage drop; otherwise static gates then cooldown. The live gate is the
-/// dispatch-time check (PR4/PR5), not run here.
-fn build_view(row: GhRow, params: &MonitorParams, ledger: &Ledger, now: u64) -> PullRequestView {
+/// Annotates one discovered row for the PR list and surfaces its dispatchable
+/// [`Candidate`] when nothing gates it. Conflict (both trigger labels) skips
+/// first, matching `router.py`'s discovery-stage drop; otherwise static gates
+/// then cooldown. The live gate is reserved dead code (no second `gh` call per
+/// poll), so a `None` skip reason here *is* the dispatch decision: the candidate
+/// is returned for auto-trigger.
+///
+/// Returns `(view, Some(candidate))` for a clean row, `(view, None)` for a skipped
+/// one — so the caller partitions the cycle's rows into the emit list (all views)
+/// and the dispatch list (clean candidates) in one pass.
+fn build_view(
+    row: GhRow,
+    params: &MonitorParams,
+    ledger: &Ledger,
+    now: u64,
+) -> (PullRequestView, Option<Candidate>) {
     let skip_reason = if row.conflict {
         Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string())
     } else {
         discover::should_skip(&row.candidate, params, ledger)
             .or_else(|| discover::cooldown_skip(&row.candidate, params, ledger, now))
     };
-    PullRequestView {
+    // Clone the candidate for dispatch only when it passes every static + cooldown
+    // gate (skip_reason None); a skipped row contributes a view but no candidate.
+    let dispatchable = skip_reason.is_none().then(|| row.candidate.clone());
+    let view = PullRequestView {
         number: row.candidate.number,
         title: row.title,
         labels: row.labels,
         url: row.url,
         kind: row.candidate.kind,
         skip_reason,
-    }
+    };
+    (view, dispatchable)
 }
 
-/// Discovers the monitored repo's open trigger-labelled PRs now and returns them
-/// annotated with `kind` + skip reason for the PR list. Reads config (repo,
-/// labels, authors, cooldown) and the dedup ledger; performs two `gh pr list`
-/// calls (review + check labels).
+/// Discovers the monitored repo's open trigger-labelled PRs now, returning both
+/// the annotated views (for the PR list / snapshot) and the dispatchable
+/// [`Candidate`]s — the clean rows (`skip_reason` None), which already exclude
+/// conflict / draft / cross-repo / disallowed-author / already-dispatched /
+/// within-cooldown PRs. Reads config (repo, labels, authors, cooldown) and the
+/// dedup ledger; performs two `gh pr list` calls (review + check labels).
 ///
 /// This is the shared discovery body driven by the scheduler's poll loop
-/// (`scheduler::discover_emit_snapshot`); there is no manual-fetch command — the
-/// frontend triggers a refresh via `poll_now`.
-pub(crate) async fn discover_views<R: tauri::Runtime>(
+/// (`scheduler::discover_emit_dispatch`), its only caller; there is no
+/// manual-fetch command — the frontend triggers a refresh via `poll_now`. The
+/// dispatchable candidates flow to the auto-trigger dispatcher ([`crate::dispatch`]).
+pub(crate) async fn discover<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-) -> AppResult<Vec<PullRequestView>> {
+) -> AppResult<(Vec<PullRequestView>, Vec<Candidate>)> {
     // Cross-slice read of the config slice's public service (function-level, not
     // a type contract — `AppConfig` stays config-private; we snapshot the fields
     // the pr slice needs into `MonitorParams`).
@@ -71,10 +91,16 @@ pub(crate) async fn discover_views<R: tauri::Runtime>(
 
     let rows = source.discover_rows().await?;
     let now = now_epoch();
-    Ok(rows
-        .into_iter()
-        .map(|row| build_view(row, &params, &ledger, now))
-        .collect())
+    let mut views = Vec::with_capacity(rows.len());
+    let mut dispatchable = Vec::new();
+    for row in rows {
+        let (view, cand) = build_view(row, &params, &ledger, now);
+        if let Some(cand) = cand {
+            dispatchable.push(cand);
+        }
+        views.push(view);
+    }
+    Ok((views, dispatchable))
 }
 
 /// Starts the scheduled-pull loop (idempotent: a no-op if already running).
@@ -162,33 +188,40 @@ mod tests {
     }
 
     #[test]
-    fn build_view_clean_row_has_no_skip_reason() {
-        let view = build_view(row(1, "review", false), &params(), &Ledger::default(), 0);
+    fn build_view_clean_row_has_no_skip_reason_and_is_dispatchable() {
+        let (view, cand) = build_view(row(1, "review", false), &params(), &Ledger::default(), 0);
         assert_eq!(view.number, 1);
         assert_eq!(view.kind, "review");
         assert_eq!(view.title, "PR 1");
         assert_eq!(view.skip_reason, None);
+        // Clean row (skip_reason None) → surfaced as a dispatchable candidate.
+        let cand = cand.expect("clean row yields a dispatchable candidate");
+        assert_eq!(cand.number, 1);
+        assert_eq!(cand.kind, "review");
     }
 
     #[test]
-    fn build_view_conflict_row_skips_with_both_labels_reason() {
-        let view = build_view(row(2, "check", true), &params(), &Ledger::default(), 0);
+    fn build_view_conflict_row_skips_and_is_not_dispatchable() {
+        let (view, cand) = build_view(row(2, "check", true), &params(), &Ledger::default(), 0);
         assert_eq!(
             view.skip_reason,
             Some("both review and check trigger labels are present".to_string())
         );
+        // Skipped row → no candidate for dispatch.
+        assert!(cand.is_none());
     }
 
     #[test]
-    fn build_view_propagates_static_gate_skip() {
+    fn build_view_propagates_static_gate_skip_and_omits_candidate() {
         let mut r = row(3, "review", false);
         r.candidate.is_draft = true;
-        let view = build_view(r, &params(), &Ledger::default(), 0);
+        let (view, cand) = build_view(r, &params(), &Ledger::default(), 0);
         assert_eq!(view.skip_reason, Some("draft PR".to_string()));
+        assert!(cand.is_none());
     }
 
     #[test]
-    fn build_view_propagates_cooldown_skip() {
+    fn build_view_propagates_cooldown_skip_and_omits_candidate() {
         use crate::pr::ledger::{dispatch_key, DispatchEvent};
         use std::collections::HashSet;
 
@@ -205,7 +238,7 @@ mod tests {
             }],
         };
         // 1800s cooldown, dispatched 500s before `now` → within window.
-        let view = build_view(r, &params(), &ledger, 1_500);
+        let (view, cand) = build_view(r, &params(), &ledger, 1_500);
         assert!(
             view.skip_reason
                 .as_deref()
@@ -214,5 +247,6 @@ mod tests {
             "{:?}",
             view.skip_reason
         );
+        assert!(cand.is_none());
     }
 }

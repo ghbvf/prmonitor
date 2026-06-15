@@ -12,12 +12,15 @@
 // `pr::source::PrSource`, `review::engine::ReviewEngine`) count as reachable API
 // in this skeleton rather than tripping `dead_code` before their first use.
 pub mod config;
+pub mod dispatch;
 pub mod error;
 pub mod events;
 pub mod model;
 pub mod pr;
 pub mod review;
 pub mod state;
+
+use std::sync::Arc;
 
 use state::AppState;
 use tauri::Manager;
@@ -29,11 +32,22 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(AppState::default())
         .setup(|app| {
+            let state = app.state::<AppState>();
+            // Install the auto-trigger dispatcher BEFORE starting the loop, so the
+            // immediate first tick already auto-starts dispatchable reviews. The
+            // closure is the `pr` slice's review-agnostic `Dispatcher` seam; its
+            // body ([`dispatch::auto_dispatch`]) is the composition glue consuming
+            // both the pr (candidates/ledger) and review (engine) slices.
+            state.scheduler.set_dispatcher(Arc::new({
+                let app = app.handle().clone();
+                move |cands| {
+                    let app = app.clone();
+                    Box::pin(crate::dispatch::auto_dispatch(app, cands))
+                }
+            }));
             // Auto-start the poll loop on launch ("启动即跑"): the first interval
             // tick fires immediately, so this yields an initial PR list too.
-            app.state::<AppState>()
-                .scheduler
-                .start(app.handle().clone());
+            state.scheduler.start(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

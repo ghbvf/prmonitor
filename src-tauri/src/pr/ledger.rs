@@ -6,8 +6,10 @@
 //!
 //! PR3 uses the **read** path (`has_dispatched` / `last_dispatch_at`) to annotate
 //! the PR list with "already dispatched" / cooldown skip reasons. The **write**
-//! path (`record`) is invoked by the PR4 scheduler / PR5 dispatch once a review
-//! turn actually starts; recording it here keeps the dedup machinery complete.
+//! path (`record_many`) is invoked by the auto-trigger dispatcher
+//! ([`crate::dispatch`]) once review turns actually start; recording it here keeps
+//! the dedup machinery complete. The write is batched (one persist for the whole
+//! cycle's started candidates) so unbounded concurrent starts can't race the store.
 
 use std::collections::HashSet;
 
@@ -99,23 +101,22 @@ impl Ledger {
             .max()
     }
 
-    /// Records a dispatch (key + event) and persists. Invoked by the PR4/PR5
-    /// dispatch path once a review turn starts; PR3 itself never dispatches.
-    pub fn record<R: tauri::Runtime>(
+    /// Records a batch of dispatches (key + event per candidate) and persists
+    /// **once**. Invoked by the auto-trigger dispatcher ([`crate::dispatch`]) after
+    /// a poll cycle's reviews have started; PR discovery itself never dispatches.
+    ///
+    /// The single-persist shape matters under unbounded concurrent starts: staging
+    /// every candidate's key/event in memory and saving the store one time avoids
+    /// the interleaved store writes (and redundant saves) that per-candidate
+    /// `record` calls would produce. An empty `cands` slice still touches the store
+    /// (a harmless no-op save) — callers gate on non-empty before calling.
+    pub fn record_many<R: tauri::Runtime>(
         &mut self,
         app: &tauri::AppHandle<R>,
-        cand: &Candidate,
+        cands: &[Candidate],
         epoch: u64,
     ) -> AppResult<()> {
-        let key = dispatch_key(cand.number, &cand.head_sha, &cand.kind);
-        self.dispatched.insert(key.clone());
-        self.events.push(DispatchEvent {
-            pr: cand.number,
-            kind: cand.kind.clone(),
-            head_sha: cand.head_sha.clone(),
-            key,
-            dispatched_at_epoch: epoch,
-        });
+        self.stage_all(cands, epoch);
 
         let store = app
             .store(STORE_FILE)
@@ -133,6 +134,24 @@ impl Ledger {
             .map_err(|e| AppError::new(format!("写入 ledger 存储失败: {e}")))?;
         Ok(())
     }
+
+    /// Stages a batch into the in-memory ledger (the dedup key set + cooldown event
+    /// log) without persisting. Split out so the staging — what `record_many`
+    /// actually writes to the store — is unit-testable without a Tauri app /
+    /// `tauri-plugin-store` (the persistence itself is a thin `Store::save`).
+    fn stage_all(&mut self, cands: &[Candidate], epoch: u64) {
+        for cand in cands {
+            let key = dispatch_key(cand.number, &cand.head_sha, &cand.kind);
+            self.dispatched.insert(key.clone());
+            self.events.push(DispatchEvent {
+                pr: cand.number,
+                kind: cand.kind.clone(),
+                head_sha: cand.head_sha.clone(),
+                key,
+                dispatched_at_epoch: epoch,
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +166,49 @@ mod tests {
             key: dispatch_key(pr, "sha", kind),
             dispatched_at_epoch: epoch,
         }
+    }
+
+    fn cand(pr: u64, kind: &str) -> Candidate {
+        Candidate {
+            number: pr,
+            head_sha: "sha".to_string(),
+            head_ref: "ref".to_string(),
+            author: "octocat".to_string(),
+            is_cross_repository: false,
+            is_draft: false,
+            kind: kind.to_string(),
+        }
+    }
+
+    // `record_many` persists via `Store::save`, which needs a Tauri app; the
+    // batch's data effect is `stage_all`, which is what gets serialized. This
+    // round-trip asserts staging a batch records every candidate's dedup key and
+    // a cooldown event per candidate at the shared epoch (the persisted shape).
+    #[test]
+    fn record_many_stages_every_candidate_key_and_event() {
+        let mut ledger = Ledger::default();
+        let cands = [cand(12, "review"), cand(12, "check"), cand(13, "review")];
+        ledger.stage_all(&cands, 1_700_000_000);
+
+        // One dedup key per candidate (distinct (pr, head, kind) tuples).
+        assert!(ledger.has_dispatched(&dispatch_key(12, "sha", "review")));
+        assert!(ledger.has_dispatched(&dispatch_key(12, "sha", "check")));
+        assert!(ledger.has_dispatched(&dispatch_key(13, "sha", "review")));
+        assert_eq!(ledger.dispatched.len(), 3);
+
+        // One cooldown event per candidate, all at the shared epoch.
+        assert_eq!(ledger.events.len(), 3);
+        assert_eq!(ledger.last_dispatch_at(12, "review"), Some(1_700_000_000));
+        assert_eq!(ledger.last_dispatch_at(12, "check"), Some(1_700_000_000));
+        assert_eq!(ledger.last_dispatch_at(13, "review"), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn record_many_empty_batch_is_a_noop_stage() {
+        let mut ledger = Ledger::default();
+        ledger.stage_all(&[], 1_000);
+        assert!(ledger.dispatched.is_empty());
+        assert!(ledger.events.is_empty());
     }
 
     #[test]
