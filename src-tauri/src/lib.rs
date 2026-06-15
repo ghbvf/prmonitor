@@ -47,6 +47,9 @@ pub fn run() {
             pr::commands::gh_status,
             pr::commands::get_prs,
             review::commands::get_codex_status,
+            review::commands::start_review,
+            review::commands::stop_review,
+            review::commands::list_review_sessions,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

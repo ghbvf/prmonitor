@@ -20,6 +20,10 @@ pub mod rpc_methods {
     pub const INITIALIZED: &str = "initialized";
     /// v2 request opening a thread (expects [`super::ThreadStartResult`]).
     pub const THREAD_START: &str = "thread/start";
+    /// v2 request starting a turn within a thread (expects [`super::TurnStartResult`]).
+    pub const TURN_START: &str = "turn/start";
+    /// v2 request interrupting a running turn (empty result).
+    pub const TURN_INTERRUPT: &str = "turn/interrupt";
 }
 
 // ---- initialize (v1) ----
@@ -82,6 +86,111 @@ pub struct ThreadRef {
     pub id: String,
 }
 
+// ---- turn/start + turn/interrupt (v2) ----
+
+/// `turn/start` request params — launches the pr-review skill on a thread.
+/// Mirrors the proven `router.py` shape (verified against codex 0.139.0): the
+/// top level is camelCase, but a [`UserInput::Text`]'s `text_elements` is
+/// snake_case on the wire (we omit it — it defaults to `[]`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStartParams {
+    pub thread_id: String,
+    pub input: Vec<UserInput>,
+    /// `"never"` for unattended reviews (no human approval prompts).
+    pub approval_policy: String,
+    pub sandbox_policy: SandboxPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// One input item for `turn/start`. The pr-review turn sends a [`Self::Skill`]
+/// (attaches the local skill) followed by a [`Self::Text`] (the instruction).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum UserInput {
+    /// `{"type":"skill","name":…,"path":…}` — attach a local project skill.
+    Skill { name: String, path: String },
+    /// `{"type":"text","text":…}` — a plain instruction. `text_elements` is
+    /// omitted (defaults to `[]` server-side).
+    Text { text: String },
+}
+
+/// `turn/start` sandbox policy. `workspaceWrite` + network so the pr-review skill
+/// can run `git`/`gh` and write within the repo. `writable_roots` is snake_case
+/// in the nested object per the codex schema.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxPolicy {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub network_access: bool,
+    pub writable_roots: Vec<String>,
+}
+
+/// `turn/start` result — we extract only `turn.id`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStartResult {
+    pub turn: TurnRef,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnRef {
+    pub id: String,
+}
+
+/// `turn/interrupt` request params.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnInterruptParams {
+    pub thread_id: String,
+    pub turn_id: String,
+}
+
+// ---- reverse approval auto-response ----
+
+/// What to reply to a server→client request (a reverse approval prompt).
+///
+/// With `approvalPolicy: "never"` codex should not ask, but the protocol still
+/// permits it; auto-answering keeps a review from stalling on an unanswered
+/// prompt. The approve token differs by method family (verified against codex
+/// 0.139.0): the v1 exec/applyPatch prompts take `ReviewDecision` (`"approved"`),
+/// the v2 `item/*requestApproval` prompts take an accept decision (`"accept"`).
+pub enum ApprovalReply {
+    /// Reply `{"decision": "approved"}` (v1 `execCommandApproval`/`applyPatchApproval`).
+    Approved,
+    /// Reply `{"decision": "accept"}` (v2 `item/commandExecution|fileChange/requestApproval`).
+    Accept,
+    /// No auto-answer known — reply with a JSON-RPC error so codex does not hang.
+    Unhandled,
+}
+
+impl ApprovalReply {
+    /// The `result` body for an approving reply, or `None` for [`Self::Unhandled`].
+    pub fn result(&self) -> Option<Value> {
+        match self {
+            Self::Approved => Some(serde_json::json!({ "decision": "approved" })),
+            Self::Accept => Some(serde_json::json!({ "decision": "accept" })),
+            Self::Unhandled => None,
+        }
+    }
+}
+
+/// Map a server→client request method to its auto-response. Centralizes the
+/// approval policy (a wrong token would silently stall reviews — locked by a unit
+/// test below, the **Medium** carrier per `ai-robust.md`).
+pub fn auto_response(method: &str) -> ApprovalReply {
+    match method {
+        "execCommandApproval" | "applyPatchApproval" => ApprovalReply::Approved,
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            ApprovalReply::Accept
+        }
+        _ => ApprovalReply::Unhandled,
+    }
+}
+
 // ---- streaming server -> client notifications (v2 subset) ----
 
 /// Server→client notification method strings (single source for
@@ -89,6 +198,8 @@ pub struct ThreadRef {
 /// client→server [`rpc_methods`]).
 pub mod notif_methods {
     pub const AGENT_MESSAGE_DELTA: &str = "item/agentMessage/delta";
+    pub const REASONING_TEXT_DELTA: &str = "item/reasoning/textDelta";
+    pub const TURN_COMPLETED: &str = "turn/completed";
     pub const COMMAND_EXEC_OUTPUT_DELTA: &str = "command/exec/outputDelta";
     pub const PROCESS_OUTPUT_DELTA: &str = "process/outputDelta";
 }
@@ -104,6 +215,10 @@ pub mod notif_methods {
 pub enum ServerNotification {
     /// `item/agentMessage/delta` — incremental assistant text (`delta: String`).
     AgentMessageDelta(AgentMessageDelta),
+    /// `item/reasoning/textDelta` — incremental reasoning text (`delta: String`).
+    ReasoningTextDelta(ReasoningTextDelta),
+    /// `turn/completed` — the turn ended; status is nested in `turn.status`.
+    TurnCompleted(TurnCompletedNotification),
     /// `command/exec/outputDelta` / `process/outputDelta` — base64 output chunk
     /// (`deltaBase64`, kept opaque in PR5; PR6 decodes to bytes).
     OutputDelta(OutputDelta),
@@ -117,6 +232,14 @@ impl ServerNotification {
         match method.as_str() {
             notif_methods::AGENT_MESSAGE_DELTA => match serde_json::from_value(params.clone()) {
                 Ok(d) => Self::AgentMessageDelta(d),
+                Err(_) => Self::Other { method, params },
+            },
+            notif_methods::REASONING_TEXT_DELTA => match serde_json::from_value(params.clone()) {
+                Ok(d) => Self::ReasoningTextDelta(d),
+                Err(_) => Self::Other { method, params },
+            },
+            notif_methods::TURN_COMPLETED => match serde_json::from_value(params.clone()) {
+                Ok(d) => Self::TurnCompleted(d),
                 Err(_) => Self::Other { method, params },
             },
             notif_methods::COMMAND_EXEC_OUTPUT_DELTA | notif_methods::PROCESS_OUTPUT_DELTA => {
@@ -137,6 +260,30 @@ pub struct AgentMessageDelta {
     pub turn_id: String,
     pub item_id: String,
     pub delta: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReasoningTextDelta {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub delta: String,
+}
+
+/// `turn/completed` notification. The terminal status lives in `turn.status`
+/// (`completed` / `interrupted` / `failed`); other `turn` fields are ignored.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnCompletedNotification {
+    pub thread_id: String,
+    pub turn: TurnStatusRef,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStatusRef {
+    pub status: String,
 }
 
 /// Common shape of the two base64 output-delta notifications. They differ only
@@ -306,5 +453,128 @@ mod tests {
             serde_json::json!({}),
         );
         assert!(matches!(n, ServerNotification::Other { .. }));
+    }
+
+    #[test]
+    fn turn_start_params_serialize_camel_case_with_skill_and_text_input() {
+        let v = serde_json::to_value(TurnStartParams {
+            thread_id: "th_1".to_string(),
+            input: vec![
+                UserInput::Skill {
+                    name: "pr-review".to_string(),
+                    path: "/repo/.codex/skills/pr-review/SKILL.md".to_string(),
+                },
+                UserInput::Text {
+                    text: "do it".to_string(),
+                },
+            ],
+            approval_policy: "never".to_string(),
+            sandbox_policy: SandboxPolicy {
+                kind: "workspaceWrite".to_string(),
+                network_access: true,
+                writable_roots: vec!["/repo".to_string()],
+            },
+            cwd: Some("/repo".to_string()),
+        })
+        .expect("TurnStartParams serializes");
+
+        assert_eq!(v["threadId"], "th_1");
+        assert_eq!(v["approvalPolicy"], "never");
+        assert!(v.get("thread_id").is_none()); // snake_case absent.
+
+        // Skill input item.
+        assert_eq!(v["input"][0]["type"], "skill");
+        assert_eq!(v["input"][0]["name"], "pr-review");
+        assert!(v["input"][0]["path"].is_string());
+        // Text input item — `text_elements` omitted (server defaults to []).
+        assert_eq!(v["input"][1]["type"], "text");
+        assert_eq!(v["input"][1]["text"], "do it");
+
+        // Sandbox policy: `type` key (not `kind`) + camelCase networkAccess.
+        assert_eq!(v["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(v["sandboxPolicy"]["networkAccess"], true);
+        assert_eq!(v["sandboxPolicy"]["writableRoots"][0], "/repo");
+    }
+
+    #[test]
+    fn turn_interrupt_params_serialize_camel_case() {
+        let v = serde_json::to_value(TurnInterruptParams {
+            thread_id: "th_1".to_string(),
+            turn_id: "tn_1".to_string(),
+        })
+        .expect("TurnInterruptParams serializes");
+        assert_eq!(v["threadId"], "th_1");
+        assert_eq!(v["turnId"], "tn_1");
+        assert!(v.get("thread_id").is_none());
+    }
+
+    #[test]
+    fn turn_start_result_extracts_turn_id() {
+        let r: TurnStartResult = serde_json::from_value(serde_json::json!({
+            "turn": { "id": "tn_abc", "status": "inProgress" }
+        }))
+        .expect("TurnStartResult parses (extra fields ignored)");
+        assert_eq!(r.turn.id, "tn_abc");
+    }
+
+    #[test]
+    fn from_raw_reasoning_delta_is_typed() {
+        let n = ServerNotification::from_raw(
+            notif_methods::REASONING_TEXT_DELTA.to_string(),
+            serde_json::json!({
+                "threadId": "t", "turnId": "u", "itemId": "i", "delta": "why", "contentIndex": 0
+            }),
+        );
+        match n {
+            ServerNotification::ReasoningTextDelta(d) => {
+                assert_eq!(d.delta, "why");
+                assert_eq!(d.item_id, "i");
+            }
+            _ => panic!("expected ReasoningTextDelta"),
+        }
+    }
+
+    #[test]
+    fn from_raw_turn_completed_extracts_nested_status() {
+        let n = ServerNotification::from_raw(
+            notif_methods::TURN_COMPLETED.to_string(),
+            serde_json::json!({
+                "threadId": "t",
+                "turn": { "id": "u", "status": "interrupted", "items": [] }
+            }),
+        );
+        match n {
+            ServerNotification::TurnCompleted(d) => {
+                assert_eq!(d.thread_id, "t");
+                assert_eq!(d.turn.status, "interrupted");
+            }
+            _ => panic!("expected TurnCompleted"),
+        }
+    }
+
+    #[test]
+    fn auto_response_maps_methods_to_approve_tokens() {
+        // v1 exec/applyPatch → {"decision":"approved"}.
+        assert_eq!(
+            auto_response("execCommandApproval").result(),
+            Some(serde_json::json!({"decision": "approved"}))
+        );
+        assert_eq!(
+            auto_response("applyPatchApproval").result(),
+            Some(serde_json::json!({"decision": "approved"}))
+        );
+        // v2 item/*requestApproval → {"decision":"accept"}.
+        assert_eq!(
+            auto_response("item/commandExecution/requestApproval").result(),
+            Some(serde_json::json!({"decision": "accept"}))
+        );
+        assert_eq!(
+            auto_response("item/fileChange/requestApproval").result(),
+            Some(serde_json::json!({"decision": "accept"}))
+        );
+        // Unknown server request → no auto-answer (reader replies with an error).
+        assert!(auto_response("mcpServer/elicitation/request")
+            .result()
+            .is_none());
     }
 }

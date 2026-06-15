@@ -1,11 +1,14 @@
 <script setup lang="ts">
 // A single PR row: number/title (click to open in the external browser), the
 // label badges, the trigger-label `kind` badge, and a muted "skipped" treatment
-// carrying `skipReason` when the PR would not dispatch.
+// carrying `skipReason` when the PR would not dispatch. Clicking the row selects
+// the PR (for the Review panel); the title link opens the browser (`@click.stop`
+// so the two actions stay distinct).
 import { openUrl } from "@tauri-apps/plugin-opener";
 import type { PullRequestView } from "../types";
 
-const props = defineProps<{ pr: PullRequestView }>();
+const props = defineProps<{ pr: PullRequestView; selected: boolean }>();
+const emit = defineEmits<{ select: [pr: PullRequestView] }>();
 
 function open() {
   // Only follow web links (gh returns https PR urls); reject any other scheme,
@@ -17,9 +20,13 @@ function open() {
 </script>
 
 <template>
-  <li class="pr-row" :class="{ skipped: pr.skipReason != null }">
+  <li
+    class="pr-row"
+    :class="{ skipped: pr.skipReason != null, selected }"
+    @click="emit('select', pr)"
+  >
     <div class="title-line">
-      <button type="button" class="title" @click="open">
+      <button type="button" class="title" @click.stop="open">
         #{{ pr.number }} — {{ pr.title }}
       </button>
       <span class="badge kind">{{ pr.kind }}</span>
@@ -40,8 +47,16 @@ function open() {
 <style scoped>
 .pr-row {
   list-style: none;
-  padding: 6px 0;
+  padding: 6px 8px;
   border-bottom: 1px solid rgba(128, 128, 128, 0.15);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.pr-row:hover {
+  background: rgba(128, 128, 128, 0.08);
+}
+.pr-row.selected {
+  background: rgba(37, 99, 235, 0.12);
 }
 .pr-row.skipped {
   opacity: 0.55;

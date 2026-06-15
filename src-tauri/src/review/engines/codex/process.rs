@@ -1,11 +1,13 @@
 //! Spawn and manage a `codex app-server --stdio` child process (cwd =
 //! `repo_root`), owning its stdin/stdout pipes (wired into an [`RpcClient`]) and
-//! draining stderr. Provides the `initialize` → `initialized` handshake and a
-//! `thread/start` helper. The process is kept *resident* by
-//! [`super::manager::CodexManager`]; this module is just the per-connection
-//! lifecycle.
+//! draining stderr. Provides the `initialize` → `initialized` handshake plus the
+//! per-connection RPC ops the session layer drives over `client()`
+//! ([`start_thread`] / [`start_turn`] / [`interrupt_turn`]). The process is kept
+//! *resident* by [`super::manager::CodexManager`]; this module is just the
+//! per-connection lifecycle.
 
 use std::process::Stdio;
+use std::sync::Arc;
 
 use serde::Serialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, BufReader};
@@ -13,7 +15,7 @@ use tokio::process::{Child, ChildStderr, ChildStdin, Command};
 
 use super::protocol::{
     rpc_methods, ClientInfo, InitializeParams, InitializeResult, ThreadStartParams,
-    ThreadStartResult,
+    ThreadStartResult, TurnInterruptParams, TurnStartParams, TurnStartResult,
 };
 use super::rpc::RpcClient;
 use crate::error::{AppError, AppResult};
@@ -35,7 +37,10 @@ pub struct CodexStatus {
 /// A live, handshaken connection to a `codex app-server --stdio` child.
 pub struct CodexProcess {
     child: Child, // kill_on_drop(true) — killed on drop; manager also kills explicitly.
-    client: RpcClient<ChildStdin>,
+    /// `Arc` so the session layer can clone a callable handle out from under the
+    /// manager's `std::Mutex` without holding the lock across an `.await` (the
+    /// lock guard isn't `Send` across awaits; cloning an `Arc` is sync + cheap).
+    client: Arc<RpcClient<ChildStdin>>,
     /// `initialize` result captured at handshake (carries `userAgent`).
     pub info: InitializeResult,
 }
@@ -83,7 +88,7 @@ impl CodexProcess {
         let info = Self::handshake(&client).await?;
         Ok(Self {
             child,
-            client,
+            client: Arc::new(client),
             info,
         })
     }
@@ -123,20 +128,12 @@ impl CodexProcess {
         Ok(info)
     }
 
-    /// Open a thread, returning its id. Callable only on an already-handshaken
-    /// process, so `initialized` has necessarily been sent.
-    pub async fn start_thread(&self, params: ThreadStartParams) -> AppResult<String> {
-        let raw = self
-            .client
-            .request(
-                rpc_methods::THREAD_START,
-                serde_json::to_value(params)
-                    .map_err(|e| AppError::new(format!("编码 thread/start 失败: {e}")))?,
-            )
-            .await?;
-        let result: ThreadStartResult = serde_json::from_value(raw)
-            .map_err(|e| AppError::new(format!("解析 thread/start 失败: {e}")))?;
-        Ok(result.thread.id)
+    /// A cloned, callable handle to the JSON-RPC client. The session layer issues
+    /// `thread/start` / `turn/start` / `turn/interrupt` and subscribes to
+    /// notifications through this (see the [`start_thread`] / [`start_turn`] /
+    /// [`interrupt_turn`] free helpers), without holding the manager's lock.
+    pub fn client(&self) -> Arc<RpcClient<ChildStdin>> {
+        self.client.clone()
     }
 
     /// Whether the underlying connection is still live (reader task running).
@@ -158,6 +155,63 @@ impl CodexProcess {
             let _ = self.child.wait().await;
         });
     }
+}
+
+// ---- per-connection RPC ops (driven by the session layer over `client()`) ----
+//
+// Generic over the write half (`W`) so they're CI-testable over `tokio::io::duplex`
+// against an in-process fake server, exactly like the rest of the transport.
+
+/// Open a thread, returning its id. The handshake's `initialized` must precede it
+/// — guaranteed because the only `RpcClient` we hand out is from a handshaken
+/// [`CodexProcess`].
+pub async fn start_thread<W>(client: &RpcClient<W>, params: ThreadStartParams) -> AppResult<String>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let raw = client
+        .request(
+            rpc_methods::THREAD_START,
+            serde_json::to_value(params)
+                .map_err(|e| AppError::new(format!("编码 thread/start 失败: {e}")))?,
+        )
+        .await?;
+    let result: ThreadStartResult = serde_json::from_value(raw)
+        .map_err(|e| AppError::new(format!("解析 thread/start 失败: {e}")))?;
+    Ok(result.thread.id)
+}
+
+/// Start a turn (the pr-review skill invocation), returning its id.
+pub async fn start_turn<W>(client: &RpcClient<W>, params: TurnStartParams) -> AppResult<String>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let raw = client
+        .request(
+            rpc_methods::TURN_START,
+            serde_json::to_value(params)
+                .map_err(|e| AppError::new(format!("编码 turn/start 失败: {e}")))?,
+        )
+        .await?;
+    let result: TurnStartResult = serde_json::from_value(raw)
+        .map_err(|e| AppError::new(format!("解析 turn/start 失败: {e}")))?;
+    Ok(result.turn.id)
+}
+
+/// Interrupt a running turn. The terminal `turn/completed` (status `interrupted`)
+/// arrives as a notification, not in this response.
+pub async fn interrupt_turn<W>(client: &RpcClient<W>, params: TurnInterruptParams) -> AppResult<()>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    client
+        .request(
+            rpc_methods::TURN_INTERRUPT,
+            serde_json::to_value(params)
+                .map_err(|e| AppError::new(format!("编码 turn/interrupt 失败: {e}")))?,
+        )
+        .await?;
+    Ok(())
 }
 
 /// Max bytes logged per stderr line. Bounds memory against an unterminated flood

@@ -3,3 +3,29 @@ export interface CodexStatus {
   available: boolean;
   message: string;
 }
+
+// Mirrors `session.rs::SessionStatus` (serde camelCase). Slice-private.
+export type SessionStatus =
+  | "starting"
+  | "running"
+  | "interrupting"
+  | "done"
+  | "failed";
+
+// Mirrors `session.rs::SessionInfo` — one review session (list_review_sessions).
+export interface ReviewSession {
+  threadId: string;
+  turnId: string;
+  prNumber: number;
+  kind: string;
+  status: SessionStatus;
+}
+
+// A view-only aggregate of streamed deltas, keyed by codex `itemId`. Message and
+// reasoning items render differently (reasoning is collapsed); one `itemId` only
+// ever carries one kind.
+export interface StreamItem {
+  itemId: string;
+  kind: "message" | "reasoning";
+  text: string;
+}

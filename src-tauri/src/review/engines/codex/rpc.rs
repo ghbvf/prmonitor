@@ -64,11 +64,17 @@ struct Pending {
 
 type PendingMap = Arc<Mutex<Pending>>;
 
+/// Shared serial writer. `tokio::sync::Mutex` because its guard is held across the
+/// `write_all`/`flush` awaits; it is NEVER held across a response await. `Arc`
+/// because two tasks write: `RpcClient::write_line` (our requests/notifications)
+/// and the reader task (auto-answers to server→client approval requests). The
+/// mutex serializes them; neither holds it across a response await, so they can't
+/// deadlock.
+type SharedWriter<W> = Arc<tokio::sync::Mutex<W>>;
+
 /// JSON-RPC client over the app-server transport. Drop aborts the reader task.
 pub struct RpcClient<W> {
-    /// Serial writer. `tokio::sync::Mutex` because its guard is held across the
-    /// `write_all`/`flush` awaits; it is NEVER held across a response await.
-    writer: tokio::sync::Mutex<W>,
+    writer: SharedWriter<W>,
     pending: PendingMap,
     next_id: AtomicI64,
     /// Notification fan-out; subscribers (PR6 session manager) call [`Self::subscribe`].
@@ -104,16 +110,18 @@ impl<W: AsyncWrite + Unpin + Send + 'static> RpcClient<W> {
     {
         let pending: PendingMap = Arc::new(Mutex::new(Pending::default()));
         let (notif_tx, _rx) = broadcast::channel(notif_capacity);
+        let writer: SharedWriter<W> = Arc::new(tokio::sync::Mutex::new(write_half));
 
         let reader = tauri::async_runtime::spawn(reader_loop(
             read_half,
             pending.clone(),
             notif_tx.clone(),
+            writer.clone(),
             max_frame,
         ));
 
         Self {
-            writer: tokio::sync::Mutex::new(write_half),
+            writer,
             pending,
             next_id: AtomicI64::new(1),
             notifications: notif_tx,
@@ -181,19 +189,30 @@ impl<W: AsyncWrite + Unpin + Send + 'static> RpcClient<W> {
         self.write_line(&line).await
     }
 
-    /// The ONLY acquirer of the writer lock. The guard spans write+flush and is
-    /// released at scope end — never across the response await in [`Self::request`]
-    /// (the structural deadlock guard).
+    /// Acquire the writer lock and write one line. The guard spans write+flush and
+    /// is released at scope end — never across the response await in
+    /// [`Self::request`] (the structural deadlock guard). The reader task is the
+    /// only other writer (auto-answers to server requests, via [`write_line`]); the
+    /// shared mutex serializes the two and neither holds it across a response await.
     async fn write_line(&self, line: &str) -> AppResult<()> {
-        let mut w = self.writer.lock().await;
-        w.write_all(line.as_bytes())
-            .await
-            .map_err(|e| AppError::new(format!("写入 app-server 失败: {e}")))?;
-        w.flush()
-            .await
-            .map_err(|e| AppError::new(format!("刷新 app-server 失败: {e}")))?;
-        Ok(())
+        write_line(&self.writer, line).await
     }
+}
+
+/// Write one already-encoded line to the shared writer (used by both
+/// `RpcClient::write_line` and the reader task's auto-answer path).
+async fn write_line<W>(writer: &SharedWriter<W>, line: &str) -> AppResult<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut w = writer.lock().await;
+    w.write_all(line.as_bytes())
+        .await
+        .map_err(|e| AppError::new(format!("写入 app-server 失败: {e}")))?;
+    w.flush()
+        .await
+        .map_err(|e| AppError::new(format!("刷新 app-server 失败: {e}")))?;
+    Ok(())
 }
 
 impl<W> Drop for RpcClient<W> {
@@ -207,17 +226,21 @@ impl<W> Drop for RpcClient<W> {
 }
 
 /// Reader task body. Owns the read half exclusively; loops reading NDJSON lines
-/// and routing responses to their oneshot, notifications to the broadcast. One
-/// malformed line is logged and skipped (never tears down the connection). On
-/// EOF / IO error it marks the connection closed and drain-fails every pending
-/// request so no `request().await` hangs out its timeout.
-async fn reader_loop<R>(
+/// and routing responses to their oneshot, notifications to the broadcast, and
+/// server→client requests to the auto-answer path (so a reverse approval prompt
+/// never leaves codex blocked). One malformed line is logged and skipped (never
+/// tears down the connection). On EOF / IO error it marks the connection closed
+/// and drain-fails every pending request so no `request().await` hangs out its
+/// timeout.
+async fn reader_loop<R, W>(
     read_half: R,
     pending: PendingMap,
     notif_tx: broadcast::Sender<Arc<ServerNotification>>,
+    writer: SharedWriter<W>,
     max_frame: usize,
 ) where
     R: AsyncBufRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut reader = read_half;
     let mut buf: Vec<u8> = Vec::new();
@@ -266,6 +289,9 @@ async fn reader_loop<R>(
                 // no consumer yet; PR6 subscribes).
                 let _ = notif_tx.send(Arc::new(note));
             }
+            Ok(Some(Inbound::ServerRequest { id, method, params })) => {
+                auto_answer_server_request(&writer, id, &method, params).await;
+            }
             Err(e) => {
                 eprintln!("app-server 帧解析失败（跳过）: {e}");
             }
@@ -283,6 +309,39 @@ async fn reader_loop<R>(
             message: "app-server 连接已关闭".to_string(),
             data: None,
         }));
+    }
+}
+
+/// JSON-RPC "method not found" — the error code returned for a server→client
+/// request we have no auto-answer for, so codex gets a reply rather than hanging.
+const METHOD_NOT_FOUND: i64 = -32601;
+
+/// Auto-answer one server→client request. Approval prompts get an approving
+/// decision (so an unattended review never stalls); anything else gets a
+/// JSON-RPC error (still a reply — codex won't block). The approve token per
+/// method lives in [`super::protocol::auto_response`].
+async fn auto_answer_server_request<W>(
+    writer: &SharedWriter<W>,
+    id: i64,
+    method: &str,
+    _params: Value,
+) where
+    W: AsyncWrite + Unpin,
+{
+    let line = match super::protocol::auto_response(method).result() {
+        Some(result) => codec::encode_response(id, &result),
+        None => {
+            eprintln!("app-server 反向请求 {method}（id={id}）无自动应答，回 error");
+            codec::encode_error_response(id, METHOD_NOT_FOUND, "method not handled by client")
+        }
+    };
+    match line {
+        Ok(line) => {
+            if let Err(e) = write_line(writer, &line).await {
+                eprintln!("回复 app-server 反向请求 {method}（id={id}）失败: {e}");
+            }
+        }
+        Err(e) => eprintln!("编码 app-server 反向请求应答失败: {e}"),
     }
 }
 
@@ -320,5 +379,35 @@ mod tests {
             !client.is_connected(),
             "is_connected flips false once the cap is hit"
         );
+    }
+
+    /// A server→client approval request (`id` + `method`) must be auto-answered:
+    /// the reader replies `{"id": N, "result": {"decision": "approved"}}` so codex
+    /// never blocks. Guards the reverse-approval path end to end (decode →
+    /// auto_response → encode_response → write).
+    #[tokio::test]
+    async fn auto_answers_reverse_approval_request() {
+        use tokio::io::AsyncBufReadExt;
+
+        let (client_w, server_r) = tokio::io::duplex(64 * 1024);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let _client = RpcClient::connect(client_w, tokio::io::BufReader::new(client_r), 16);
+
+        // Server sends an exec approval request.
+        let mut sw = server_w;
+        sw.write_all(
+            b"{\"id\":99,\"method\":\"execCommandApproval\",\"params\":{\"command\":\"ls\"}}\n",
+        )
+        .await
+        .unwrap();
+        sw.flush().await.unwrap();
+
+        // Client must auto-reply with the approving response.
+        let mut sr = tokio::io::BufReader::new(server_r);
+        let mut line = String::new();
+        sr.read_line(&mut line).await.unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 99);
+        assert_eq!(v["result"]["decision"], "approved");
     }
 }

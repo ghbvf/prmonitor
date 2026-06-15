@@ -9,6 +9,7 @@ import PrList from "./pr/PrList.vue";
 import StatusBar from "./StatusBar.vue";
 import ReviewPanel from "./review/ReviewPanel.vue";
 import { reschedule } from "./pr/api";
+import type { PullRequestView } from "./types";
 
 const version = ref("");
 onMounted(async () => {
@@ -22,6 +23,11 @@ function onConfigSaved() {
   // poll still runs on the old period), so log it rather than surfacing/throwing.
   reschedule().catch((e) => console.error("reschedule failed", e));
 }
+
+// Cross-slice wiring: the pr slice selects a PR, the review slice reviews it.
+// Holding the selection here keeps the two slices decoupled (neither imports the
+// other) — App passes it down to both PrList (highlight) and ReviewPanel (target).
+const selectedPr = ref<PullRequestView | null>(null);
 </script>
 
 <template>
@@ -34,10 +40,13 @@ function onConfigSaved() {
       <aside class="sidebar">
         <ConfigPanel @saved="onConfigSaved" />
         <PollControls />
-        <PrList />
+        <PrList
+          :selected-number="selectedPr?.number ?? null"
+          @select="(pr) => (selectedPr = pr)"
+        />
       </aside>
       <main class="content">
-        <ReviewPanel />
+        <ReviewPanel :selected-pr="selectedPr" />
       </main>
     </div>
     <StatusBar />

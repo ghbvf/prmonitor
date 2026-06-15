@@ -10,6 +10,10 @@ use crate::model::PullRequestView;
 /// Tauri event name carrying a [`PrEvent`] (scheduled/manual PR-list refresh).
 pub const PRS_UPDATED_EVENT: &str = "prs:updated";
 
+/// Tauri event name carrying a [`ReviewEvent`] (one streamed unit of a review
+/// session). Mirrored by `REVIEW_EVENT` in `src/review/api.ts`.
+pub const REVIEW_EVENT: &str = "review:event";
+
 /// Payload emitted on [`PRS_UPDATED_EVENT`] each poll cycle (scheduled or manual).
 ///
 /// Like [`ReviewEvent`], the container `rename_all` camelCases the *variant*
@@ -117,6 +121,13 @@ mod tests {
     #[test]
     fn prs_updated_event_name_is_pinned() {
         assert_eq!(PRS_UPDATED_EVENT, "prs:updated");
+    }
+
+    #[test]
+    fn review_event_name_is_pinned() {
+        // Mirrored by `REVIEW_EVENT` in `src/review/api.ts`; a drift breaks the
+        // frontend's `listen` registration.
+        assert_eq!(REVIEW_EVENT, "review:event");
     }
 
     #[test]
