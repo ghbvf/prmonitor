@@ -32,6 +32,12 @@ const codex = ref<CodexStatus | null>(null);
 // `threadId` for a stable render order.
 const sessions = ref<ReviewSession[]>([]);
 
+// App-level auto-trigger (#8) notice, session-less: set from a `dispatchError`
+// event (the backend dispatcher hit a bad config, one/more start failures, or a
+// ledger-write failure). Surfaced in the availability banner; dismissed via
+// `clearDispatchError`. Not tied to any session, so it survives panel focus changes.
+const dispatchError = ref<string | null>(null);
+
 // Active session (single-active-panel model): the most recently started review.
 const activeThreadId = ref<string | null>(null);
 const activePr = ref<number | null>(null);
@@ -100,6 +106,12 @@ async function refreshSessions() {
   }
 }
 
+// Dismiss the auto-trigger notice (the banner's ✕). The next `dispatchError` event
+// re-sets it.
+function clearDispatchError() {
+  dispatchError.value = null;
+}
+
 // Append a streamed delta, concatenating onto the existing item for `itemId`
 // (each `itemId` carries exactly one kind) or starting a new one.
 function appendDelta(kind: StreamItem["kind"], itemId: string, text: string) {
@@ -112,6 +124,15 @@ function appendDelta(kind: StreamItem["kind"], itemId: string, text: string) {
 // `never` default makes a new `ReviewEvent` variant a compile error (the
 // downstream exhaustiveness guard for the events.rs ↔ types.ts contract).
 function applyEvent(ev: ReviewEvent) {
+  // App-level dispatch notice (#8 auto-trigger): session-less, no threadId — handle
+  // FIRST, before the threadId-keyed bookkeeping / attribution below would drop it.
+  // The early return narrows `ev` to the session-scoped variants, so the `never`
+  // exhaustiveness guard in the switch still covers the remaining four.
+  if (ev.kind === "dispatchError") {
+    dispatchError.value = ev.message;
+    return;
+  }
+
   // Sessions-list bookkeeping runs for EVERY event, ahead of the focused-panel
   // attribution below — the concurrent list tracks ALL sessions, not just the
   // focused one, so it must refresh even for events the panel filter drops.
@@ -272,6 +293,8 @@ export function useReviewStore() {
     refreshCodexStatus,
     sessions,
     refreshSessions,
+    dispatchError,
+    clearDispatchError,
     focus,
     activeThreadId,
     activePr,

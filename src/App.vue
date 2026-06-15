@@ -26,7 +26,10 @@ onMounted(async () => {
 // Hidden while either status is still loading (null) so a cold start doesn't flash
 // a false warning; shown only on a confirmed unavailable signal.
 const prStore = usePrStore();
-const { codex } = useReviewStore();
+// `dispatchError` is the session-less auto-trigger notice (#8): the backend
+// dispatcher emits it on a bad config / start failure / ledger-write failure, so
+// the same banner that warns "auto review paused" also reports "auto review failed".
+const { codex, dispatchError, clearDispatchError } = useReviewStore();
 const ghBlocked = computed(() => prStore.gh?.authenticated === false);
 const codexBlocked = computed(() => codex.value?.available === false);
 const showPrompt = computed(() => ghBlocked.value || codexBlocked.value);
@@ -61,15 +64,28 @@ const selectedPr = ref<PullRequestView | null>(null);
         />
       </aside>
       <main class="content">
-        <div v-if="showPrompt" class="availability" role="alert">
-          自动 review 已暂停 —
-          <template v-if="ghBlocked">
-            gh 未登录，请运行 <code>gh auth login</code>
-          </template>
-          <template v-if="ghBlocked && codexBlocked"> ；</template>
-          <template v-if="codexBlocked">
-            codex 不可用（{{ codex?.message }}）
-          </template>
+        <div v-if="showPrompt || dispatchError" class="availability" role="alert">
+          <p v-if="showPrompt" class="line">
+            自动 review 已暂停 —
+            <template v-if="ghBlocked">
+              gh 未登录，请运行 <code>gh auth login</code>
+            </template>
+            <template v-if="ghBlocked && codexBlocked"> ；</template>
+            <template v-if="codexBlocked">
+              codex 不可用（{{ codex?.message }}）
+            </template>
+          </p>
+          <p v-if="dispatchError" class="line dispatch-error">
+            <span>⚠ 自动 review 异常：{{ dispatchError }}</span>
+            <button
+              type="button"
+              class="dismiss"
+              aria-label="关闭 / dismiss"
+              @click="clearDispatchError"
+            >
+              ✕
+            </button>
+          </p>
         </div>
         <ReviewSessions />
         <ReviewPanel :selected-pr="selectedPr" />
@@ -149,5 +165,33 @@ body {
 .availability code {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
+}
+
+.availability .line {
+  margin: 0;
+}
+
+.availability .line + .line {
+  margin-top: 6px;
+}
+
+/* Dispatch failures are error-toned (vs the warning-toned availability prompt). */
+.availability .dispatch-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #c00;
+}
+
+.availability .dismiss {
+  flex: none;
+  padding: 0 4px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
 }
 </style>

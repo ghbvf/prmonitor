@@ -21,8 +21,9 @@
 //! read-only (`gh pr list` / `gh auth status`); a Medium guard test scanning all
 //! of `src` enforces that no write subcommand creeps in anywhere in the app.
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
+use crate::events::{ReviewEvent, REVIEW_EVENT};
 use crate::model::Candidate;
 use crate::review::commands::CODEX_BIN;
 use crate::review::engine::ReviewEngine;
@@ -68,7 +69,11 @@ pub async fn auto_dispatch<R: tauri::Runtime>(
     let cfg = match crate::config::service::load_validated(&app) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("auto-dispatch 跳过本轮：配置无效（{}）", e.message);
+            // Surface to the UI (the availability banner), not just stderr: a desktop
+            // user never sees stderr, and a bad config silently stalls auto-review.
+            let msg = format!("配置无效，自动 review 跳过本轮（{}）", e.message);
+            eprintln!("auto-dispatch 跳过本轮：{msg}");
+            emit_dispatch_error(&app, msg);
             return;
         }
     };
@@ -105,28 +110,55 @@ pub async fn auto_dispatch<R: tauri::Runtime>(
     let results = futures::future::join_all(starts).await;
 
     // Batched ledger landing: record only the candidates whose start succeeded
-    // (a failed start stays unrecorded → retried next cycle). One persist.
+    // (a failed start stays unrecorded → retried next cycle). One persist. Failed
+    // starts are aggregated into ONE UI notice (per-start stderr lines stay for logs)
+    // so N failures in a cycle don't fan out into N banner events.
     let mut succeeded: Vec<Candidate> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
     for (cand, result) in candidates.into_iter().zip(results) {
         match result {
             Ok(_session_id) => succeeded.push(cand),
-            Err(e) => eprintln!(
-                "auto-dispatch 启动 review 失败（PR {} {}）：{}",
-                cand.number, cand.kind, e.message
-            ),
+            Err(e) => {
+                eprintln!(
+                    "auto-dispatch 启动 review 失败（PR {} {}）：{}",
+                    cand.number, cand.kind, e.message
+                );
+                failures.push(format!("PR #{} {}", cand.number, cand.kind));
+            }
         }
+    }
+    if !failures.is_empty() {
+        emit_dispatch_error(
+            &app,
+            format!(
+                "{} 个 review 启动失败：{}",
+                failures.len(),
+                failures.join("、")
+            ),
+        );
     }
     if !succeeded.is_empty() {
         // The pr slice owns the load + stage + persist + clock; the dispatcher
         // passes only the started candidates. A persist failure here leaves those
         // started sessions UNRECORDED in the ledger: the in-process registry guard
         // still blocks a duplicate while each session lives, but if the store write
-        // failed a cross-restart re-dispatch becomes possible (rare). Logged, never
-        // propagated — a ledger write must not crash the poll loop.
+        // failed a cross-restart re-dispatch becomes possible (rare). Logged + a UI
+        // notice, never propagated — a ledger write must not crash the poll loop.
         if let Err(e) = crate::pr::ledger::record_dispatched(&app, &succeeded) {
             eprintln!("auto-dispatch 写入 ledger 失败：{}", e.message);
+            emit_dispatch_error(
+                &app,
+                format!("ledger 落账失败（重启后可能重复派发）：{}", e.message),
+            );
         }
     }
+}
+
+/// Emit a session-less [`ReviewEvent::DispatchError`] to the frontend's review
+/// area (the availability banner). The emit is best-effort — a gone window is not
+/// an error worth propagating from the poll loop.
+fn emit_dispatch_error<R: tauri::Runtime>(app: &tauri::AppHandle<R>, message: String) {
+    let _ = app.emit(REVIEW_EVENT, &ReviewEvent::DispatchError { message });
 }
 
 /// Drop candidates that already have an *active* session for the same `(pr, kind)`

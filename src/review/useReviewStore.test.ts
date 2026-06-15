@@ -40,6 +40,7 @@ beforeEach(() => {
   s.activePr.value = null;
   s.listenerReady.value = false;
   s.listenerError.value = null;
+  s.dispatchError.value = null;
 });
 
 // One backend session row; spread an override to vary a field.
@@ -145,6 +146,34 @@ describe("useReviewStore applyEvent()", () => {
 
     store.applyEvent(md("i1", "yes"));
     expect(store.items.value).toHaveLength(1);
+  });
+
+  it("dispatchError sets the session-less notice without touching the stream", () => {
+    const store = useReviewStore();
+    store.applyEvent(md("i1", "hi")); // an existing session item
+    store.applyEvent({ kind: "dispatchError", message: "配置无效" });
+
+    expect(store.dispatchError.value).toBe("配置无效");
+    // Session-less: must not be folded into the stream or the per-session error.
+    expect(store.items.value).toHaveLength(1);
+    expect(store.error.value).toBeNull();
+  });
+
+  it("dispatchError is surfaced even while a session is focused (not threadId-filtered)", () => {
+    const store = useReviewStore();
+    store.activeThreadId.value = "th_1"; // a focused session would drop foreign events
+    store.applyEvent({ kind: "dispatchError", message: "ledger 落账失败" });
+
+    expect(store.dispatchError.value).toBe("ledger 落账失败");
+  });
+
+  it("clearDispatchError dismisses the notice", () => {
+    const store = useReviewStore();
+    store.applyEvent({ kind: "dispatchError", message: "boom" });
+    expect(store.dispatchError.value).toBe("boom");
+
+    store.clearDispatchError();
+    expect(store.dispatchError.value).toBeNull();
   });
 });
 

@@ -19,7 +19,10 @@ export type ReviewEvent =
   | { kind: "messageDelta"; threadId: string; itemId: string; text: string }
   | { kind: "reasoningDelta"; threadId: string; itemId: string; text: string }
   | { kind: "turnCompleted"; threadId: string; status: string }
-  | { kind: "error"; threadId: string; message: string };
+  | { kind: "error"; threadId: string; message: string }
+  // Session-less auto-trigger (#8) notice — no threadId (mirrors
+  // `events.rs::ReviewEvent::DispatchError`; locked by a serde golden test).
+  | { kind: "dispatchError"; message: string };
 
 // Mirrors `events.rs::PrEvent` (tagged `kind`, camelCase) — the funnel's
 // downstream end for the `prs:updated` Tauri event payload.
