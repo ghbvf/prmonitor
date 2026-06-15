@@ -54,9 +54,16 @@ pub fn run() {
                     Box::pin(run_auto_dispatch(app, cands))
                 }
             }));
-            // Auto-start the poll loop on launch ("启动即跑"): the first interval
-            // tick fires immediately, so this yields an initial PR list too.
-            state.scheduler.start(app.handle().clone());
+            // Auto-start the poll loop only when the persisted config is valid. On first
+            // launch (empty repoRoot default) or an invalid hand-edit, load_validated()
+            // errors → we do NOT start the loop, so no gh poll fires and no per-cycle
+            // DispatchError spams the banner. The frontend onboarding/Settings save calls
+            // start_polling once a valid config lands, closing the funnel. The dispatcher
+            // hook above stays installed, so the first tick after a later start already
+            // dispatches.
+            if config::service::load_validated(app.handle()).is_ok() {
+                state.scheduler.start(app.handle().clone());
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
