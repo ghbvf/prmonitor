@@ -7,8 +7,11 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::process::ChildStdin;
+
 use super::process::{CodexProcess, CodexStatus};
 use super::protocol::InitializeResult;
+use super::rpc::RpcClient;
 use crate::error::{AppError, AppResult};
 
 /// Whole-handshake budget for the first `ensure_started` (spawn + initialize),
@@ -70,6 +73,25 @@ impl CodexManager {
             dead.kill_and_reap();
         }
         Ok(info)
+    }
+
+    /// Ensure the resident connection is live and return a cloned, callable handle
+    /// to its JSON-RPC client. The clone happens under the std `Mutex` (sync, no
+    /// await), so the session layer can issue `turn/start` etc. and subscribe to
+    /// notifications without holding the lock across an `.await`. Self-heals via
+    /// [`Self::ensure_started`]. The returned handle stays usable even if the
+    /// process later dies — its requests then fail fast and the next call respawns.
+    pub async fn connection(
+        &self,
+        codex_bin: &str,
+        repo_root: &str,
+    ) -> AppResult<Arc<RpcClient<ChildStdin>>> {
+        self.ensure_started(codex_bin, repo_root).await?;
+        let guard = self.inner.lock().unwrap();
+        let proc = guard
+            .as_ref()
+            .ok_or_else(|| AppError::new("codex app-server 连接不可用".to_string()))?;
+        Ok(proc.client())
     }
 
     /// Handshake info iff the resident connection is currently live. Synchronous

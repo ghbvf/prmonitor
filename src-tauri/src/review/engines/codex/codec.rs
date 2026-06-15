@@ -2,10 +2,18 @@
 //! value per line, with no `jsonrpc` field (the app-server omits it, MCP-style).
 //!
 //! Pure + stateless: encode an outbound frame to a line, and classify one
-//! already-read inbound line into a response (carries `id`) vs a notification
-//! (carries `method`, no `id`). Line *splitting* is delegated to the reader
-//! task's `AsyncBufReadExt::read_line` (which reassembles partial lines), so
-//! this module stays free of buffering state and trivially unit-testable.
+//! already-read inbound line into a response, a server→client *request*, or a
+//! notification. Line *splitting* is delegated to the reader task's
+//! `AsyncBufReadExt::read_line` (which reassembles partial lines), so this module
+//! stays free of buffering state and trivially unit-testable.
+//!
+//! Classification rule (order matters — a server request carries BOTH `id` and
+//! `method`): `method` present + `id` present → [`Inbound::ServerRequest`];
+//! `method` present, no `id` → [`Inbound::Notification`]; `id` present, no
+//! `method` → [`Inbound::Response`]. The server DOES send us requests (reverse
+//! approval prompts); a naive "`id` ⇒ response" check would misroute them onto a
+//! non-existent pending entry and leave codex blocked on a reply that never
+//! comes — the reader auto-answers them via [`encode_response`] instead.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -13,12 +21,20 @@ use serde_json::Value;
 use super::rpc::RpcError;
 use crate::error::{AppError, AppResult};
 
-/// A parsed inbound frame, classified by the presence of `id`. The server never
-/// sends us requests, so it is always one of these two.
+/// A parsed inbound frame. The server sends responses to our requests,
+/// notifications (no `id`), and its own requests (reverse approval prompts —
+/// `id` + `method`) that we must answer.
 #[derive(Debug)]
 pub(crate) enum Inbound {
-    /// `{"id": N, "result": …}` or `{"id": N, "error": {…}}`.
+    /// `{"id": N, "result": …}` or `{"id": N, "error": {…}}` — no `method`.
     Response { id: i64, payload: ResponsePayload },
+    /// `{"id": N, "method": "…", "params": …}` — a server→client request we must
+    /// answer with a matching `{"id": N, "result": …}` (or error).
+    ServerRequest {
+        id: i64,
+        method: String,
+        params: Value,
+    },
     /// `{"method": "…", "params": …}` — no `id`.
     Notification { method: String, params: Value },
 }
@@ -41,6 +57,22 @@ pub(crate) fn encode_notification(method: &str, params: &Value) -> AppResult<Str
     to_line(&OutboundNotification { method, params })
 }
 
+/// Encode a response to a server→client request (`{"id": N, "result": …}`). Used
+/// by the reader to auto-answer reverse approval prompts so codex never blocks.
+pub(crate) fn encode_response(id: i64, result: &Value) -> AppResult<String> {
+    to_line(&OutboundResponse { id, result })
+}
+
+/// Encode an error response to a server→client request
+/// (`{"id": N, "error": {code, message}}`) — sent when we have no auto-answer for
+/// a server request, so codex gets a reply rather than hanging.
+pub(crate) fn encode_error_response(id: i64, code: i64, message: &str) -> AppResult<String> {
+    to_line(&OutboundErrorResponse {
+        id,
+        error: OutboundError { code, message },
+    })
+}
+
 fn to_line<T: Serialize>(frame: &T) -> AppResult<String> {
     let mut s = serde_json::to_string(frame)
         .map_err(|e| AppError::new(format!("编码 app-server 请求失败: {e}")))?;
@@ -52,6 +84,9 @@ fn to_line<T: Serialize>(frame: &T) -> AppResult<String> {
 /// Whitespace-only lines return `Ok(None)` (skip). Malformed JSON or a frame
 /// with neither `id` nor `method` returns `Err` — the reader logs and skips it,
 /// never tearing down the connection over one bad line.
+///
+/// `method` is inspected BEFORE `id`: a server→client request carries both, so
+/// checking `id` first would misclassify it as a [`Inbound::Response`].
 pub(crate) fn decode_line(line: &str) -> AppResult<Option<Inbound>> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -60,26 +95,37 @@ pub(crate) fn decode_line(line: &str) -> AppResult<Option<Inbound>> {
     let v: Value = serde_json::from_str(trimmed)
         .map_err(|e| AppError::new(format!("解析 app-server 帧失败: {e}")))?;
 
-    if let Some(id) = v.get("id").and_then(Value::as_i64) {
-        let payload = if let Some(err) = v.get("error") {
-            ResponsePayload::Err(
-                serde_json::from_value(err.clone())
-                    .map_err(|e| AppError::new(format!("解析 app-server 错误体失败: {e}")))?,
-            )
-        } else {
-            ResponsePayload::Ok(v.get("result").cloned().unwrap_or(Value::Null))
-        };
-        Ok(Some(Inbound::Response { id, payload }))
-    } else if let Some(method) = v.get("method").and_then(Value::as_str) {
-        let params = v.get("params").cloned().unwrap_or(Value::Null);
-        Ok(Some(Inbound::Notification {
+    let id = v.get("id").and_then(Value::as_i64);
+    let method = v.get("method").and_then(Value::as_str);
+
+    match (id, method) {
+        // Server→client request: both `id` and `method`. Must precede the
+        // response check (a response has `id` but no `method`).
+        (Some(id), Some(method)) => Ok(Some(Inbound::ServerRequest {
+            id,
             method: method.to_string(),
-            params,
-        }))
-    } else {
-        Err(AppError::new(
+            params: v.get("params").cloned().unwrap_or(Value::Null),
+        })),
+        // Response to one of our requests: `id`, no `method`.
+        (Some(id), None) => {
+            let payload = if let Some(err) = v.get("error") {
+                ResponsePayload::Err(
+                    serde_json::from_value(err.clone())
+                        .map_err(|e| AppError::new(format!("解析 app-server 错误体失败: {e}")))?,
+                )
+            } else {
+                ResponsePayload::Ok(v.get("result").cloned().unwrap_or(Value::Null))
+            };
+            Ok(Some(Inbound::Response { id, payload }))
+        }
+        // Notification: `method`, no `id`.
+        (None, Some(method)) => Ok(Some(Inbound::Notification {
+            method: method.to_string(),
+            params: v.get("params").cloned().unwrap_or(Value::Null),
+        })),
+        (None, None) => Err(AppError::new(
             "app-server 帧既无 id 也无 method".to_string(),
-        ))
+        )),
     }
 }
 
@@ -95,6 +141,24 @@ struct OutboundNotification<'a> {
     method: &'a str,
     #[serde(skip_serializing_if = "Value::is_null")]
     params: &'a Value,
+}
+
+#[derive(Serialize)]
+struct OutboundResponse<'a> {
+    id: i64,
+    result: &'a Value,
+}
+
+#[derive(Serialize)]
+struct OutboundErrorResponse<'a> {
+    id: i64,
+    error: OutboundError<'a>,
+}
+
+#[derive(Serialize)]
+struct OutboundError<'a> {
+    code: i64,
+    message: &'a str,
 }
 
 #[cfg(test)]
@@ -157,6 +221,39 @@ mod tests {
             }
             other => panic!("expected error response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decode_classifies_server_request_not_response() {
+        // A frame with BOTH `id` and `method` is a server→client request, not a
+        // response — the regression guard for the reverse-approval misroute.
+        match decode_line(r#"{"id":5,"method":"execCommandApproval","params":{"command":"ls"}}"#)
+            .unwrap()
+            .unwrap()
+        {
+            Inbound::ServerRequest { id, method, params } => {
+                assert_eq!(id, 5);
+                assert_eq!(method, "execCommandApproval");
+                assert_eq!(params["command"], "ls");
+            }
+            other => panic!("expected server request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_response_and_error_shapes() {
+        let line = encode_response(5, &serde_json::json!({"decision": "approved"})).unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 5);
+        assert_eq!(v["result"]["decision"], "approved");
+        assert!(v.get("jsonrpc").is_none());
+
+        let line = encode_error_response(6, -32601, "method not found").unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 6);
+        assert_eq!(v["error"]["code"], -32601);
+        assert_eq!(v["error"]["message"], "method not found");
+        assert!(v.get("result").is_none());
     }
 
     #[test]

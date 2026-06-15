@@ -157,13 +157,15 @@ async fn request_fails_fast_when_server_disconnects() {
 #[tokio::test]
 #[ignore = "requires the real codex binary; run with: cargo test -- --ignored"]
 async fn real_app_server_handshake_thread_and_reuse() {
+    use prmonitor_lib::review::engines::codex::process::start_thread;
     use prmonitor_lib::review::engines::codex::protocol::ThreadStartParams;
     use prmonitor_lib::review::engines::codex::{CodexManager, CodexProcess};
 
     let repo_root = env!("CARGO_MANIFEST_DIR");
 
     // (a) Direct process: spawn + handshake yields a populated userAgent, and
-    // thread/start yields a non-empty thread id.
+    // thread/start (via the session-layer free helper over `client()`) yields a
+    // non-empty thread id.
     let proc = CodexProcess::spawn("codex", repo_root)
         .await
         .expect("spawn + handshake");
@@ -171,12 +173,14 @@ async fn real_app_server_handshake_thread_and_reuse() {
         !proc.info.user_agent.is_empty(),
         "userAgent populated by initialize"
     );
-    let tid = proc
-        .start_thread(ThreadStartParams {
+    let tid = start_thread(
+        &proc.client(),
+        ThreadStartParams {
             cwd: Some(repo_root.to_string()),
-        })
-        .await
-        .expect("thread/start");
+        },
+    )
+    .await
+    .expect("thread/start");
     assert!(!tid.is_empty(), "got a thread id");
     drop(proc);
 

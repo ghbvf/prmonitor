@@ -10,6 +10,10 @@ use crate::model::PullRequestView;
 /// Tauri event name carrying a [`PrEvent`] (scheduled/manual PR-list refresh).
 pub const PRS_UPDATED_EVENT: &str = "prs:updated";
 
+/// Tauri event name carrying a [`ReviewEvent`] (one streamed unit of a review
+/// session). Mirrored by `REVIEW_EVENT` in `src/review/api.ts`.
+pub const REVIEW_EVENT: &str = "review:event";
+
 /// Payload emitted on [`PRS_UPDATED_EVENT`] each poll cycle (scheduled or manual).
 ///
 /// Like [`ReviewEvent`], the container `rename_all` camelCases the *variant*
@@ -120,6 +124,13 @@ mod tests {
     }
 
     #[test]
+    fn review_event_name_is_pinned() {
+        // Mirrored by `REVIEW_EVENT` in `src/review/api.ts`; a drift breaks the
+        // frontend's `listen` registration.
+        assert_eq!(REVIEW_EVENT, "review:event");
+    }
+
+    #[test]
     fn message_delta_wire_shape_is_camel_case() {
         let event = ReviewEvent::MessageDelta {
             thread_id: "t1".to_string(),
@@ -140,6 +151,35 @@ mod tests {
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("thread_id").is_none());
         assert!(v.get("item_id").is_none());
+    }
+
+    #[test]
+    fn reasoning_delta_wire_shape_is_camel_case() {
+        let event = ReviewEvent::ReasoningDelta {
+            thread_id: "t1".to_string(),
+            item_id: "i1".to_string(),
+            text: "why".to_string(),
+        };
+        let v = serde_json::to_value(&event).expect("ReviewEvent serializes");
+        assert_eq!(v["kind"], "reasoningDelta");
+        assert!(v.get("threadId").is_some());
+        assert!(v.get("itemId").is_some());
+        assert!(v.get("text").is_some());
+        assert!(v.get("thread_id").is_none());
+        assert!(v.get("item_id").is_none());
+    }
+
+    #[test]
+    fn error_event_wire_shape_is_camel_case() {
+        let event = ReviewEvent::Error {
+            thread_id: "t1".to_string(),
+            message: "boom".to_string(),
+        };
+        let v = serde_json::to_value(&event).expect("ReviewEvent serializes");
+        assert_eq!(v["kind"], "error");
+        assert!(v.get("threadId").is_some());
+        assert!(v.get("message").is_some());
+        assert!(v.get("thread_id").is_none());
     }
 
     #[test]

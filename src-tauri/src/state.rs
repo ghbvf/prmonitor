@@ -10,4 +10,7 @@ pub struct AppState {
     /// The resident codex app-server connection (PR5). Lazily started, kept alive
     /// so reviews start fast; killed on app shutdown. Methods take `&self`.
     pub codex: crate::review::engines::codex::CodexManager,
+    /// Review sessions keyed by `threadId` (PR6). Shared (`Arc` inside) with each
+    /// session's streaming pump task; methods take `&self`.
+    pub sessions: crate::review::session::SessionRegistry,
 }
