@@ -1,118 +1,76 @@
-//! Auto-trigger dispatch seam — the reusable orchestrator that turns dispatchable
-//! [`Candidate`]s into running reviews.
+//! Auto-trigger dispatch — turns a cycle's dispatchable [`Candidate`]s into running
+//! reviews against an injected [`ReviewEngine`].
 //!
-//! This is a horizontal composition module (a peer of `events`/`state`/`model`,
-//! NOT a slice): it is the one place allowed to consume BOTH the `pr` slice
-//! (gating output `Candidate`, the ledger, the cooldown clock) and the `review`
-//! slice (the `CodexEngine` / `SessionRegistry`) public APIs and glue them.
-//! Keeping it here keeps the `pr` slice review-agnostic — the scheduler only knows
-//! the abstract [`crate::pr::scheduler::Dispatcher`] hook, whose real body is
-//! [`auto_dispatch`].
+//! **Engine-agnostic by construction.** This module names NO concrete engine and
+//! reaches into NO slice's internals: it depends only on the [`ReviewEngine`] trait
+//! (the extensibility seam reserved by #11) plus the [`Candidate`] cross-slice
+//! contract. The composition root (`lib.rs`) picks the concrete engine — codex
+//! today, a future Claude engine — and injects it together with the registry's
+//! active-session snapshot, the ledger recorder, and the UI error reporter. Adding
+//! an engine therefore never edits this file: it implements [`ReviewEngine`] and the
+//! root wires it in. This is what closes the "composition glue must not bypass the
+//! trait seam" gap (PR #31 finding F1).
 //!
-//! **Reused by multiple trigger sources.** The scheduler installs it today; a
-//! future webhook trigger (#…) will call the same `auto_dispatch` with the
-//! candidates a push event yields — that is why the trigger source is not baked in
-//! here.
+//! **Reused by multiple trigger sources.** The scheduler drives it today (via the
+//! `pr` slice's review-agnostic [`crate::pr::scheduler::Dispatcher`] hook); a future
+//! webhook trigger calls the same [`auto_dispatch`] with the candidates a push event
+//! yields.
 //!
 //! **The app writes NO labels / comments.** Its only side effect is *starting*
-//! reviews (and recording the dedup ledger). All GitHub writes — the `pm:` review
-//! comment and the status-label transition — are done by the codex pr-review skill
-//! the started turn runs, never by app code. The app's own `gh` surface stays
-//! read-only (`gh pr list` / `gh auth status`); a Medium guard test scanning all
-//! of `src` enforces that no write subcommand creeps in anywhere in the app.
+//! reviews (and recording the dedup ledger, via the injected recorder). All GitHub
+//! writes — the `pm:` review comment and the status-label transition — are done by
+//! the codex pr-review skill the started turn runs, never by app code. The app's own
+//! `gh` surface stays read-only (`gh pr list` / `gh auth status`); the Medium guard
+//! test below scans ALL of `src` so no write subcommand creeps in anywhere.
 
-use tauri::{Emitter, Manager};
-
-use crate::events::{ReviewEvent, REVIEW_EVENT};
+use crate::error::AppResult;
 use crate::model::Candidate;
-use crate::review::commands::CODEX_BIN;
 use crate::review::engine::ReviewEngine;
-use crate::review::engines::codex::CodexEngine;
-use crate::review::session::{SessionInfo, SessionStatus};
-use crate::state::AppState;
 
-/// Auto-start reviews for a cycle's dispatchable candidates, concurrently and
-/// unbounded, then land the dedup ledger for the ones that started.
+/// Auto-start reviews for a cycle's dispatchable candidates against `engine`,
+/// concurrently and unbounded, then land the dedup ledger for the ones that started.
 ///
-/// The flow:
-/// 1. Empty in → return (the scheduler already gates on non-empty, but this is the
-///    public entry every trigger source funnels through, so guard here too).
-/// 2. Load + validate config (skip the whole batch, logged, on error — never
-///    panic: a bad config must not crash the poll loop).
-/// 3. **Registry guard.** With no live gate (the fresh discovery list is the
-///    source of truth), the in-memory [`SessionRegistry`] is the safety net against
-///    starting a *second* review for a PR whose prior one is still in flight: drop
-///    any candidate that already has an active (`Starting`/`Running`/`Interrupting`)
-///    session for the same `(pr, kind)`. The cross-cycle dedup is the ledger; this
-///    guards the within/overlapping-cycle race the ledger (written only after a
-///    start) can't.
-/// 4. **Unbounded concurrent start.** One task; each candidate gets a borrowing
-///    `CodexEngine` and the starts are driven by `join_all` (the engines hold `&`
-///    borrows of the non-`Clone` resident `CodexManager`/`SessionRegistry`, so
-///    spawning would force `'static` owned handles — `join_all` keeps the borrows).
-/// 5. **Batched ledger landing.** Only the candidates whose start returned `Ok`
-///    are recorded, in ONE persist ([`crate::pr::ledger::record_dispatched`], which
-///    loads + stages + persists + stamps the clock inside the pr slice); a failed
-///    start is left unrecorded so it retries next cycle. Errors are logged, never
-///    propagated.
-pub async fn auto_dispatch<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
+/// Every slice-specific capability is injected so this stays engine-agnostic:
+/// - `engine` — the [`ReviewEngine`] the composition root chose (codex / future).
+/// - `active` — the `(pr, kind)` pairs already covered by an in-flight session (the
+///   registry guard); the review slice computes this so [`SessionStatus`] never
+///   leaks here. (`SessionStatus` lives in `crate::review::session`.)
+/// - `record` — lands the started candidates in the dedup ledger (pr slice).
+/// - `report_error` — surfaces a session-less failure notice to the UI.
+///
+/// Flow: registry guard → unbounded concurrent `engine.start` (`join_all`) → batched
+/// ledger landing. A failed start stays unrecorded (retried next cycle); a ledger
+/// write failure is reported, never propagated — it must not crash the poll loop.
+pub async fn auto_dispatch<E: ReviewEngine>(
     candidates: Vec<Candidate>,
+    engine: &E,
+    active: &[(u64, String)],
+    // `Send + Sync`: these are held across the concurrent-start `.await`, and the
+    // scheduler boxes this future as `Send` (the `Dispatcher` hook). The composition
+    // root's closures capture only `&AppHandle` (itself `Send + Sync`), so they fit.
+    record: &(dyn Fn(&[Candidate]) -> AppResult<()> + Send + Sync),
+    report_error: &(dyn Fn(String) + Send + Sync),
 ) {
+    // Registry guard: drop candidates already covered by an in-flight session. With
+    // no live gate (the fresh discovery list is the source of truth), this is the
+    // safety net against starting a *second* review for a PR whose prior one is still
+    // running — the within/overlapping-cycle race the ledger (written only after a
+    // start) can't cover.
+    let candidates = dispatchable_after_guard(candidates, active);
     if candidates.is_empty() {
         return;
     }
 
-    // Skip (logged) on a bad config rather than panic — a hand-edited / absent
-    // config must not take the poll loop down. `load_validated` re-checks the
-    // skill path before we attach it to a turn (same as the review command).
-    let cfg = match crate::config::service::load_validated(&app) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            // Surface to the UI (the availability banner), not just stderr: a desktop
-            // user never sees stderr, and a bad config silently stalls auto-review.
-            let msg = format!("配置无效，自动 review 跳过本轮（{}）", e.message);
-            eprintln!("auto-dispatch 跳过本轮：{msg}");
-            emit_dispatch_error(&app, msg);
-            return;
-        }
-    };
-    let skill_abs = skill_abs_path(&cfg.repo_root, &cfg.skill_rel_path);
-
-    let state = app.state::<AppState>();
-
-    // Registry guard: filter out candidates already covered by an active session.
-    let candidates = dispatchable_after_guard(candidates, &state.sessions.list());
-    if candidates.is_empty() {
-        return;
-    }
-
-    // Unbounded concurrent start, all in this one task. Each future borrows the
-    // shared resident handles + config; `join_all` awaits them together. Pair each
-    // result back with its candidate so the ledger lands only the started ones.
-    //
-    // The unbounded concurrency is intentional (per the design decision) and is
-    // transport-safe: `RpcClient` serializes every write through
-    // `Arc<tokio::sync::Mutex<W>>`, so concurrent `start`s can't interleave bytes
-    // on the codex stdin.
-    let starts = candidates.iter().map(|c| {
-        let engine = CodexEngine {
-            app: &app,
-            codex: &state.codex,
-            registry: &state.sessions,
-            codex_bin: CODEX_BIN,
-            repo: &cfg.repo,
-            repo_root: &cfg.repo_root,
-            skill_abs_path: &skill_abs,
-        };
-        async move { engine.start(c.number, &c.kind).await }
-    });
+    // Unbounded concurrent start, one task, all sharing `&engine`. Unbounded is the
+    // chosen design and is transport-safe: the codex `RpcClient` serializes every
+    // write through `Arc<tokio::sync::Mutex<W>>`, so concurrent starts can't
+    // interleave bytes on the engine's stdin.
+    let starts = candidates.iter().map(|c| engine.start(c.number, &c.kind));
     let results = futures::future::join_all(starts).await;
 
-    // Batched ledger landing: record only the candidates whose start succeeded
-    // (a failed start stays unrecorded → retried next cycle). One persist. Failed
-    // starts are aggregated into ONE UI notice (per-start stderr lines stay for logs)
-    // so N failures in a cycle don't fan out into N banner events.
+    // Record only the candidates whose start succeeded (a failure retries next
+    // cycle). Failed starts aggregate into ONE UI notice; per-start lines stay in
+    // logs (so N failures don't fan out into N banner events).
     let mut succeeded: Vec<Candidate> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     for (cand, result) in candidates.into_iter().zip(results) {
@@ -128,76 +86,46 @@ pub async fn auto_dispatch<R: tauri::Runtime>(
         }
     }
     if !failures.is_empty() {
-        emit_dispatch_error(
-            &app,
-            format!(
-                "{} 个 review 启动失败：{}",
-                failures.len(),
-                failures.join("、")
-            ),
-        );
+        report_error(format!(
+            "{} 个 review 启动失败：{}",
+            failures.len(),
+            failures.join("、")
+        ));
     }
     if !succeeded.is_empty() {
-        // The pr slice owns the load + stage + persist + clock; the dispatcher
-        // passes only the started candidates. A persist failure here leaves those
-        // started sessions UNRECORDED in the ledger: the in-process registry guard
-        // still blocks a duplicate while each session lives, but if the store write
-        // failed a cross-restart re-dispatch becomes possible (rare). Logged + a UI
-        // notice, never propagated — a ledger write must not crash the poll loop.
-        if let Err(e) = crate::pr::ledger::record_dispatched(&app, &succeeded) {
+        // A persist failure leaves the started sessions UNRECORDED: the in-process
+        // registry guard still blocks a duplicate while each session lives, but a
+        // cross-restart re-dispatch becomes possible if the store write failed
+        // (rare). Reported to the UI, never propagated. (A transactional / recoverable
+        // dedup — write-ahead + restart reconciliation — is tracked as a follow-up.)
+        if let Err(e) = record(&succeeded) {
             eprintln!("auto-dispatch 写入 ledger 失败：{}", e.message);
-            emit_dispatch_error(
-                &app,
-                format!("ledger 落账失败（重启后可能重复派发）：{}", e.message),
-            );
+            report_error(format!(
+                "ledger 落账失败（重启后可能重复派发）：{}",
+                e.message
+            ));
         }
     }
 }
 
-/// Emit a session-less [`ReviewEvent::DispatchError`] to the frontend's review
-/// area (the availability banner). The emit is best-effort — a gone window is not
-/// an error worth propagating from the poll loop.
-fn emit_dispatch_error<R: tauri::Runtime>(app: &tauri::AppHandle<R>, message: String) {
-    let _ = app.emit(REVIEW_EVENT, &ReviewEvent::DispatchError { message });
-}
-
-/// Drop candidates that already have an *active* session for the same `(pr, kind)`
-/// — the registry guard. Active = `Starting | Running | Interrupting` (a `Done` /
-/// `Failed` session is finished, so its PR is eligible to re-dispatch, gated only
-/// by the ledger/cooldown which discovery already applied). Pure over the
-/// candidate list + a session snapshot, so it is unit-tested without an app.
+/// Drop candidates already covered by an active session (the registry guard).
+/// `active` is the `(pr, kind)` set the caller computed from the live registry; a
+/// candidate matching one is in flight and must not start a second review. Pure over
+/// the candidate list + the pair set, so it is unit-tested without an app or any
+/// slice — the dedup key is `(pr, kind)`, not `pr` (a `review` and a `check` for the
+/// same PR are independent).
 fn dispatchable_after_guard(
     candidates: Vec<Candidate>,
-    active_sessions: &[SessionInfo],
+    active: &[(u64, String)],
 ) -> Vec<Candidate> {
-    use std::collections::HashSet;
-
-    let active: HashSet<(u64, &str)> = active_sessions
-        .iter()
-        .filter(|s| {
-            matches!(
-                s.status,
-                SessionStatus::Starting | SessionStatus::Running | SessionStatus::Interrupting
-            )
-        })
-        .map(|s| (s.pr_number, s.kind.as_str()))
-        .collect();
-
     candidates
         .into_iter()
-        .filter(|c| !active.contains(&(c.number, c.kind.as_str())))
+        .filter(|c| {
+            !active
+                .iter()
+                .any(|(pr, kind)| *pr == c.number && kind == &c.kind)
+        })
         .collect()
-}
-
-/// Resolve the absolute path to the pr-review skill file codex attaches to the
-/// turn. `repo_root` is an absolute dir and `skill_rel_path` a relative path under
-/// it (both config-validated), so the join is absolute and infallible. Mirrors
-/// `review::commands::skill_abs_path` (that helper is slice-private).
-fn skill_abs_path(repo_root: &str, skill_rel_path: &str) -> String {
-    std::path::Path::new(repo_root)
-        .join(skill_rel_path)
-        .to_string_lossy()
-        .into_owned()
 }
 
 #[cfg(test)]
@@ -216,81 +144,44 @@ mod tests {
         }
     }
 
-    fn session(pr: u64, kind: &str, status: SessionStatus) -> SessionInfo {
-        SessionInfo {
-            thread_id: format!("t{pr}"),
-            turn_id: format!("tn{pr}"),
-            pr_number: pr,
-            kind: kind.to_string(),
-            status,
-        }
+    fn pair(pr: u64, kind: &str) -> (u64, String) {
+        (pr, kind.to_string())
     }
 
     #[test]
-    fn guard_drops_candidate_with_active_same_kind_session() {
+    fn guard_drops_candidate_with_active_same_kind() {
         let candidates = vec![cand(1, "review"), cand(2, "check")];
-        // PR 1 review is already Running → dropped; PR 2 check has no session.
-        let active = [session(1, "review", SessionStatus::Running)];
+        // PR 1 review is in flight → dropped; PR 2 check has no active session.
+        let active = [pair(1, "review")];
         let kept = dispatchable_after_guard(candidates, &active);
         let nums: Vec<u64> = kept.iter().map(|c| c.number).collect();
         assert_eq!(nums, vec![2]);
     }
 
     #[test]
-    fn guard_keeps_candidate_when_session_is_different_kind() {
-        // A Running `review` session must NOT block a `check` dispatch for the same
-        // PR — the dedup key is `(pr, kind)`, not `pr`.
+    fn guard_keeps_candidate_of_different_kind() {
+        // An active `review` must NOT block a `check` for the same PR — key is
+        // `(pr, kind)`, not `pr`.
         let candidates = vec![cand(1, "check")];
-        let active = [session(1, "review", SessionStatus::Running)];
+        let active = [pair(1, "review")];
         let kept = dispatchable_after_guard(candidates, &active);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].kind, "check");
     }
 
     #[test]
-    fn guard_keeps_candidate_when_session_is_terminal() {
-        // Done / Failed are finished: the PR is eligible to re-dispatch (the ledger
-        // / cooldown — applied during discovery — is the cross-cycle gate, not this).
-        let candidates = vec![cand(1, "review"), cand(2, "review")];
-        let active = [
-            session(1, "review", SessionStatus::Done),
-            session(2, "review", SessionStatus::Failed),
-        ];
-        let kept = dispatchable_after_guard(candidates, &active);
-        let nums: Vec<u64> = kept.iter().map(|c| c.number).collect();
-        assert_eq!(nums, vec![1, 2]);
-    }
-
-    #[test]
-    fn guard_drops_for_every_active_status() {
-        // All three active statuses block a re-dispatch of the same (pr, kind).
-        for status in [
-            SessionStatus::Starting,
-            SessionStatus::Running,
-            SessionStatus::Interrupting,
-        ] {
-            let kept =
-                dispatchable_after_guard(vec![cand(7, "review")], &[session(7, "review", status)]);
-            assert!(kept.is_empty(), "active {status:?} must drop the candidate");
-        }
-    }
-
-    #[test]
-    fn guard_no_sessions_keeps_all() {
+    fn guard_no_active_keeps_all() {
         let candidates = vec![cand(1, "review"), cand(2, "check")];
         let kept = dispatchable_after_guard(candidates, &[]);
         assert_eq!(kept.len(), 2);
     }
 
     #[test]
-    fn guard_filters_across_multiple_sessions_and_candidates() {
-        // PR1/review and PR2/review are active; PR1/check is not. So only PR1/check
-        // survives — the guard keys on `(pr, kind)`, dropping per active session.
+    fn guard_filters_across_multiple_active_and_candidates() {
+        // PR1/review and PR2/review are active; PR1/check is not → only PR1/check
+        // survives (per-pair filtering).
         let candidates = vec![cand(1, "review"), cand(1, "check"), cand(2, "review")];
-        let active = [
-            session(1, "review", SessionStatus::Running),
-            session(2, "review", SessionStatus::Starting),
-        ];
+        let active = [pair(1, "review"), pair(2, "review")];
         let kept = dispatchable_after_guard(candidates, &active);
         let kv: Vec<(u64, &str)> = kept.iter().map(|c| (c.number, c.kind.as_str())).collect();
         assert_eq!(kv, vec![(1, "check")]);
@@ -359,7 +250,7 @@ mod tests {
     }
 
     /// All `.rs` files under `dir`, recursively. Used by the gh-write governance
-    /// scan to walk a slice's sources.
+    /// scan to walk the app's sources.
     fn rs_files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut out = Vec::new();
         let entries =
