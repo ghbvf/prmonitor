@@ -2,7 +2,7 @@
 // Review streaming panel: starts/stops a review for the selected PR and renders
 // the streamed deltas. The selected PR is passed down by the composition root
 // (App.vue) so the pr slice and review slice stay decoupled.
-import { onMounted, onUnmounted } from "vue";
+import { computed, onMounted, onUnmounted } from "vue";
 import type { PullRequestView } from "../types";
 import ReviewStream from "./ReviewStream.vue";
 import { useReviewStore } from "./useReviewStore";
@@ -20,6 +20,20 @@ const {
   refreshCodexStatus,
   init,
 } = useReviewStore();
+
+// Friendly label for the codex turn status ("interrupted" / "completed" / ...).
+const finalLabel = computed(() => {
+  switch (finalStatus.value) {
+    case "completed":
+      return "完成 / completed";
+    case "interrupted":
+      return "已停止 / interrupted";
+    case "failed":
+      return "失败 / failed";
+    default:
+      return finalStatus.value ?? "";
+  }
+});
 
 // Attach the streamed-event listener for the panel's lifetime; hydrate codex
 // availability for the StatusBar. Mirrors PollControls' mount/unmount pattern.
@@ -55,7 +69,8 @@ function onStart() {
       <template v-if="activePr != null">
         PR #{{ activePr }} —
         <span v-if="running">运行中… / running</span>
-        <span v-else-if="finalStatus">已结束 / {{ finalStatus }}</span>
+        <span v-else-if="finalStatus">已结束 / {{ finalLabel }}</span>
+        <span v-else-if="error">启动失败 / failed</span>
         <span v-else>未开始</span>
       </template>
       <span v-else-if="selectedPr">
@@ -65,6 +80,8 @@ function onStart() {
     </p>
 
     <p v-if="error" class="error">{{ error }}</p>
+
+    <p v-if="running && items.length === 0" class="muted">等待输出… / waiting</p>
 
     <ReviewStream :items="items" />
   </section>

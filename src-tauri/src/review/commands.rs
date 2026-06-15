@@ -1,6 +1,6 @@
 //! Review slice Tauri commands.
 
-use crate::config::service as config_service;
+use crate::config::{model as config_model, service as config_service};
 use crate::error::AppResult;
 use crate::review::engine::{ReviewEngine, SessionId};
 use crate::review::engines::codex::{CodexEngine, CodexStatus};
@@ -38,6 +38,10 @@ pub async fn start_review<R: tauri::Runtime>(
     kind: String,
 ) -> AppResult<SessionId> {
     let cfg = config_service::load(&app)?;
+    // `load` does not re-validate persisted config; validate here so an absent /
+    // escaping `skillRelPath` (e.g. a hand-edited config) fails before we attach
+    // the skill path to the turn, rather than handing codex a bad path.
+    config_model::validate(&cfg)?;
     let skill_abs = skill_abs_path(&cfg.repo_root, &cfg.skill_rel_path);
     let engine = CodexEngine {
         app: &app,
@@ -60,7 +64,6 @@ pub async fn stop_review<R: tauri::Runtime>(
     session_id: String,
 ) -> AppResult<()> {
     let cfg = config_service::load(&app)?;
-    let skill_abs = skill_abs_path(&cfg.repo_root, &cfg.skill_rel_path);
     let engine = CodexEngine {
         app: &app,
         codex: &state.codex,
@@ -68,7 +71,9 @@ pub async fn stop_review<R: tauri::Runtime>(
         codex_bin: CODEX_BIN,
         repo: &cfg.repo,
         repo_root: &cfg.repo_root,
-        skill_abs_path: &skill_abs,
+        // `stop` interrupts by session id; it needs neither the repo nor the skill
+        // path, so we skip resolving the skill path here.
+        skill_abs_path: "",
     };
     engine.stop(&session_id).await
 }

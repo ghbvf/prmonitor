@@ -154,6 +154,35 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_delta_wire_shape_is_camel_case() {
+        let event = ReviewEvent::ReasoningDelta {
+            thread_id: "t1".to_string(),
+            item_id: "i1".to_string(),
+            text: "why".to_string(),
+        };
+        let v = serde_json::to_value(&event).expect("ReviewEvent serializes");
+        assert_eq!(v["kind"], "reasoningDelta");
+        assert!(v.get("threadId").is_some());
+        assert!(v.get("itemId").is_some());
+        assert!(v.get("text").is_some());
+        assert!(v.get("thread_id").is_none());
+        assert!(v.get("item_id").is_none());
+    }
+
+    #[test]
+    fn error_event_wire_shape_is_camel_case() {
+        let event = ReviewEvent::Error {
+            thread_id: "t1".to_string(),
+            message: "boom".to_string(),
+        };
+        let v = serde_json::to_value(&event).expect("ReviewEvent serializes");
+        assert_eq!(v["kind"], "error");
+        assert!(v.get("threadId").is_some());
+        assert!(v.get("message").is_some());
+        assert!(v.get("thread_id").is_none());
+    }
+
+    #[test]
     fn turn_completed_wire_shape_is_camel_case() {
         let event = ReviewEvent::TurnCompleted {
             thread_id: "t1".to_string(),

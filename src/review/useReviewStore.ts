@@ -98,14 +98,17 @@ async function start(prNumber: number, kind: string) {
   }
 }
 
-// Interrupt the active session. `running` stays true until the terminal
-// `turnCompleted` (status `interrupted`) arrives on the stream.
+// Interrupt the active session. On success `running` stays true until the
+// terminal `turnCompleted` (status `interrupted`) arrives on the stream; on
+// failure we clear `running` so the panel doesn't get stuck (the interrupt never
+// took, so no terminal event is coming).
 async function stop() {
   const id = activeThreadId.value;
   if (!id) return;
   try {
     await stopReview(id);
   } catch (err) {
+    running.value = false;
     error.value = toMessage(err);
     console.error("停止 review 失败", err);
   }

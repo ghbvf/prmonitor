@@ -85,6 +85,15 @@ impl SessionRegistry {
         }
     }
 
+    /// Record the turn id and flip to [`SessionStatus::Running`] once `turn/start`
+    /// has returned (the session was inserted as `Starting` before the turn began).
+    fn set_running(&self, thread_id: &str, turn_id: String) {
+        if let Some(info) = self.inner.lock().unwrap().get_mut(thread_id) {
+            info.turn_id = turn_id;
+            info.status = SessionStatus::Running;
+        }
+    }
+
     fn turn_id(&self, thread_id: &str) -> Option<String> {
         self.inner
             .lock()
@@ -130,8 +139,19 @@ pub async fn start_review<R: tauri::Runtime>(
     )
     .await?;
 
+    // Register as `Starting` now we have a thread id, so a `turn/start` failure is
+    // visible to `list_review_sessions` as `Failed` (rather than the session
+    // vanishing). `turn_id` is filled once the turn starts.
+    registry.insert(SessionInfo {
+        thread_id: thread_id.clone(),
+        turn_id: String::new(),
+        pr_number,
+        kind: kind.to_string(),
+        status: SessionStatus::Starting,
+    });
+
     let prompt = review_prompt(repo, &skill_command(pr_number, kind));
-    let turn_id = process::start_turn(
+    let turn_id = match process::start_turn(
         &client,
         TurnStartParams {
             thread_id: thread_id.clone(),
@@ -154,15 +174,16 @@ pub async fn start_review<R: tauri::Runtime>(
             cwd: Some(repo_root.to_string()),
         },
     )
-    .await?;
+    .await
+    {
+        Ok(turn_id) => turn_id,
+        Err(e) => {
+            registry.set_status(&thread_id, SessionStatus::Failed);
+            return Err(e);
+        }
+    };
 
-    registry.insert(SessionInfo {
-        thread_id: thread_id.clone(),
-        turn_id,
-        pr_number,
-        kind: kind.to_string(),
-        status: SessionStatus::Running,
-    });
+    registry.set_running(&thread_id, turn_id);
 
     tauri::async_runtime::spawn(pump(rx, thread_id.clone(), app.clone(), registry.clone()));
 
@@ -181,8 +202,11 @@ pub async fn stop_review(
     let turn_id = registry
         .turn_id(session_id)
         .ok_or_else(|| AppError::new(format!("未找到 review 会话: {session_id}")))?;
-    registry.set_status(session_id, SessionStatus::Interrupting);
+    // Acquire the connection BEFORE flipping to `Interrupting`, so a failure to
+    // reach the app-server leaves the session's status untouched (still `Running`)
+    // rather than stuck in a half-interrupted state.
     let client = codex.connection(codex_bin, repo_root).await?;
+    registry.set_status(session_id, SessionStatus::Interrupting);
     process::interrupt_turn(
         &client,
         TurnInterruptParams {
@@ -302,7 +326,8 @@ fn review_prompt(repo: &str, skill_command: &str) -> String {
 mod tests {
     use super::*;
     use crate::review::engines::codex::protocol::{
-        AgentMessageDelta, ReasoningTextDelta, TurnCompletedNotification, TurnStatusRef,
+        AgentMessageDelta, OutputDelta, ReasoningTextDelta, TurnCompletedNotification,
+        TurnStatusRef,
     };
 
     fn msg_delta(thread: &str) -> ServerNotification {
@@ -334,6 +359,26 @@ mod tests {
     fn map_notification_drops_other_thread() {
         // A delta for a different session must not leak into this pump.
         assert!(map_notification(&msg_delta("other"), "t1").is_none());
+    }
+
+    #[test]
+    fn map_notification_ignores_non_forwarded_notifications() {
+        // OutputDelta (command/exec output) and Other (unknown) are not streamed
+        // to the UI in PR6 — the `_ => None` arm must hold for them.
+        let output = ServerNotification::OutputDelta(OutputDelta {
+            process_id: Some("p".to_string()),
+            process_handle: None,
+            stream: "stdout".to_string(),
+            delta_base64: "dGhl".to_string(),
+            cap_reached: false,
+        });
+        assert!(map_notification(&output, "t1").is_none());
+
+        let other = ServerNotification::Other {
+            method: "thread/futureThing".to_string(),
+            params: serde_json::json!({}),
+        };
+        assert!(map_notification(&other, "t1").is_none());
     }
 
     #[test]
@@ -422,5 +467,41 @@ mod tests {
         assert_eq!(v["prNumber"], 7);
         assert_eq!(v["status"], "running");
         assert!(v.get("thread_id").is_none());
+    }
+
+    #[test]
+    fn session_status_wire_strings_are_pinned() {
+        // Every variant's wire string is mirrored by `SessionStatus` in
+        // `src/review/types.ts`; a rename here must be matched there (Medium lock).
+        for (status, wire) in [
+            (SessionStatus::Starting, "starting"),
+            (SessionStatus::Running, "running"),
+            (SessionStatus::Interrupting, "interrupting"),
+            (SessionStatus::Done, "done"),
+            (SessionStatus::Failed, "failed"),
+        ] {
+            assert_eq!(serde_json::to_value(status).unwrap(), wire);
+        }
+    }
+
+    #[test]
+    fn start_failure_marks_session_failed() {
+        // The two-phase start: a session inserted as `Starting` is flipped to
+        // `Failed` if the turn never starts (so it stays visible, not vanished).
+        let reg = SessionRegistry::default();
+        reg.insert(SessionInfo {
+            thread_id: "t1".to_string(),
+            turn_id: String::new(),
+            pr_number: 7,
+            kind: "review".to_string(),
+            status: SessionStatus::Starting,
+        });
+        reg.set_status("t1", SessionStatus::Failed);
+        assert_eq!(reg.list()[0].status, SessionStatus::Failed);
+
+        // The success path fills the turn id and flips to Running.
+        reg.set_running("t1", "tn9".to_string());
+        assert_eq!(reg.turn_id("t1").as_deref(), Some("tn9"));
+        assert_eq!(reg.list()[0].status, SessionStatus::Running);
     }
 }

@@ -285,8 +285,8 @@ async fn reader_loop<R, W>(
             }
             Ok(Some(Inbound::Notification { method, params })) => {
                 let note = ServerNotification::from_raw(method, params);
-                // `send` errs only with zero receivers — fine to ignore (PR5 has
-                // no consumer yet; PR6 subscribes).
+                // `send` errs only with zero receivers — fine to ignore when no
+                // review session is currently subscribed.
                 let _ = notif_tx.send(Arc::new(note));
             }
             Ok(Some(Inbound::ServerRequest { id, method, params })) => {
@@ -409,5 +409,54 @@ mod tests {
         let v: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(v["id"], 99);
         assert_eq!(v["result"]["decision"], "approved");
+    }
+
+    /// A v2 `item/*requestApproval` reverse request is auto-answered with the
+    /// `accept` decision (distinct from the v1 `approved` token).
+    #[tokio::test]
+    async fn auto_answers_v2_request_approval_with_accept() {
+        use tokio::io::AsyncBufReadExt;
+
+        let (client_w, server_r) = tokio::io::duplex(64 * 1024);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let _client = RpcClient::connect(client_w, tokio::io::BufReader::new(client_r), 16);
+
+        let mut sw = server_w;
+        sw.write_all(b"{\"id\":7,\"method\":\"item/fileChange/requestApproval\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        sw.flush().await.unwrap();
+
+        let mut sr = tokio::io::BufReader::new(server_r);
+        let mut line = String::new();
+        sr.read_line(&mut line).await.unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["result"]["decision"], "accept");
+    }
+
+    /// An unhandled server→client request is answered with a JSON-RPC error (not
+    /// silence), so codex never blocks waiting for a reply.
+    #[tokio::test]
+    async fn unhandled_server_request_gets_error_reply() {
+        use tokio::io::AsyncBufReadExt;
+
+        let (client_w, server_r) = tokio::io::duplex(64 * 1024);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let _client = RpcClient::connect(client_w, tokio::io::BufReader::new(client_r), 16);
+
+        let mut sw = server_w;
+        sw.write_all(b"{\"id\":8,\"method\":\"mcpServer/elicitation/request\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        sw.flush().await.unwrap();
+
+        let mut sr = tokio::io::BufReader::new(server_r);
+        let mut line = String::new();
+        sr.read_line(&mut line).await.unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 8);
+        assert!(v.get("error").is_some());
+        assert!(v.get("result").is_none());
     }
 }

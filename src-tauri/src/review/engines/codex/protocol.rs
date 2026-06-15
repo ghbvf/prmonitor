@@ -62,9 +62,9 @@ pub struct InitializeResult {
 
 // ---- thread/start (v2) ----
 
-/// `thread/start` request params. All fields are optional in the protocol; PR5
-/// only sets `cwd` (the repo the review runs against). The rich turn/sandbox
-/// params belong to PR6's actual review invocation.
+/// `thread/start` request params. All fields are optional in the protocol; we
+/// only set `cwd` (the repo the review runs against). The rich turn/sandbox params
+/// live on [`TurnStartParams`], set when the review turn starts.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadStartParams {
@@ -117,8 +117,8 @@ pub enum UserInput {
 }
 
 /// `turn/start` sandbox policy. `workspaceWrite` + network so the pr-review skill
-/// can run `git`/`gh` and write within the repo. `writable_roots` is snake_case
-/// in the nested object per the codex schema.
+/// can run `git`/`gh` and write within the repo. Serializes camelCase
+/// (`networkAccess` / `writableRoots`); the `type` tag stays `type`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxPolicy {
@@ -220,7 +220,7 @@ pub enum ServerNotification {
     /// `turn/completed` — the turn ended; status is nested in `turn.status`.
     TurnCompleted(TurnCompletedNotification),
     /// `command/exec/outputDelta` / `process/outputDelta` — base64 output chunk
-    /// (`deltaBase64`, kept opaque in PR5; PR6 decodes to bytes).
+    /// (`deltaBase64`, kept opaque; the review stream does not forward it yet).
     OutputDelta(OutputDelta),
     /// Any other (unknown/future) notification — method + raw params preserved.
     Other { method: String, params: Value },
@@ -298,7 +298,7 @@ pub struct OutputDelta {
     pub process_handle: Option<String>,
     #[serde(default)]
     pub stream: String,
-    /// Opaque in PR5 — preserved verbatim; PR6 decodes to bytes.
+    /// Kept opaque — preserved verbatim; not yet decoded to bytes.
     pub delta_base64: String,
     #[serde(default)]
     pub cap_reached: bool,

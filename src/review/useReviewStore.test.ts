@@ -169,4 +169,25 @@ describe("useReviewStore start()/stop()", () => {
     await store.stop();
     expect(api.stopReview).not.toHaveBeenCalled();
   });
+
+  it("stop on a rejected invoke clears running and surfaces the error", async () => {
+    vi.mocked(api.stopReview).mockRejectedValueOnce({ message: "gone" });
+    const store = useReviewStore();
+    store.activeThreadId.value = "th_1";
+    store.running.value = true;
+
+    await store.stop();
+
+    expect(store.running.value).toBe(false); // not stuck.
+    expect(store.error.value).toBe("gone");
+  });
+});
+
+describe("useReviewStore init()", () => {
+  it("registers the review-event listener and returns an unlisten fn", async () => {
+    const store = useReviewStore();
+    const unlisten = await store.init();
+    expect(api.onReviewEvent).toHaveBeenCalledOnce();
+    expect(typeof unlisten).toBe("function");
+  });
 });
