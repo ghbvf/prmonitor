@@ -74,14 +74,14 @@ pub fn cooldown_skip(
     ))
 }
 
-/// Live-state re-validation (`router.py` `live_gate_skip`) — the DISPATCH-time
-/// gate, given a fresh `gh pr view` of the PR: head moved → draft → trigger
-/// label removed → both labels present.
+/// Live-state re-validation (`router.py` `live_gate_skip`) — a fresh-`gh-pr-view`
+/// gate: head moved → draft → trigger label removed → both labels present.
 ///
-/// PR3 implements and tests it; it is invoked by the PR4 scheduler / PR5
-/// dispatch immediately before starting a turn (a second `gh` call per PR), not
-/// during the scheduler-driven list display (which would double `gh` calls per
-/// poll — the just-listed rows already are the live state there).
+/// **Currently reserved / unused in the dispatch path.** #8 deliberately declined
+/// the live gate: the dispatcher trusts the just-fetched discovery list as the
+/// live state rather than spending a second `gh pr view` per PR per poll. This fn
+/// (and its tests) is kept for a future webhook real-time trigger, where a push
+/// event would re-validate one PR's live state before starting a turn.
 pub fn live_gate_skip(
     cand: &Candidate,
     params: &MonitorParams,

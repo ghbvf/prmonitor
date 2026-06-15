@@ -1,13 +1,16 @@
 <script setup lang="ts">
 // Composition-root layout: wires the slice views together. Slices own their
 // own UI + state; App only arranges them.
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { appVersion } from "./config/api";
 import ConfigPanel from "./config/ConfigPanel.vue";
 import PollControls from "./pr/PollControls.vue";
 import PrList from "./pr/PrList.vue";
+import { usePrStore } from "./pr/usePrStore";
 import StatusBar from "./StatusBar.vue";
 import ReviewPanel from "./review/ReviewPanel.vue";
+import ReviewSessions from "./review/ReviewSessions.vue";
+import { useReviewStore } from "./review/useReviewStore";
 import { reschedule } from "./pr/api";
 import type { PullRequestView } from "./types";
 
@@ -15,6 +18,21 @@ const version = ref("");
 onMounted(async () => {
   version.value = await appVersion();
 });
+
+// Login / availability banner (composition layer only): #8 auto-triggers reviews,
+// which silently stall if `gh` isn't authenticated or codex is unavailable.
+// Reading BOTH slices' status (gh from the pr store, codex from the review store)
+// is legitimate here — App is the cross-slice wiring point, exactly like StatusBar.
+// Hidden while either status is still loading (null) so a cold start doesn't flash
+// a false warning; shown only on a confirmed unavailable signal.
+const prStore = usePrStore();
+// `dispatchError` is the session-less auto-trigger notice (#8): the backend
+// dispatcher emits it on a bad config / start failure / ledger-write failure, so
+// the same banner that warns "auto review paused" also reports "auto review failed".
+const { codex, dispatchError, clearDispatchError } = useReviewStore();
+const ghBlocked = computed(() => prStore.gh?.authenticated === false);
+const codexBlocked = computed(() => codex.value?.available === false);
+const showPrompt = computed(() => ghBlocked.value || codexBlocked.value);
 
 // Cross-slice wiring (composition root only): a config save may change the poll
 // interval, so reschedule the backend timer.
@@ -46,6 +64,30 @@ const selectedPr = ref<PullRequestView | null>(null);
         />
       </aside>
       <main class="content">
+        <div v-if="showPrompt || dispatchError" class="availability" role="alert">
+          <p v-if="showPrompt" class="line">
+            自动 review 已暂停 —
+            <template v-if="ghBlocked">
+              gh 未登录，请运行 <code>gh auth login</code>
+            </template>
+            <template v-if="ghBlocked && codexBlocked"> ；</template>
+            <template v-if="codexBlocked">
+              codex 不可用（{{ codex?.message }}）
+            </template>
+          </p>
+          <p v-if="dispatchError" class="line dispatch-error">
+            <span>⚠ 自动 review 异常：{{ dispatchError }}</span>
+            <button
+              type="button"
+              class="dismiss"
+              aria-label="关闭 / dismiss"
+              @click="clearDispatchError"
+            >
+              ✕
+            </button>
+          </p>
+        </div>
+        <ReviewSessions />
         <ReviewPanel :selected-pr="selectedPr" />
       </main>
     </div>
@@ -108,5 +150,48 @@ body {
   flex: 1;
   overflow-y: auto;
   padding: 12px;
+}
+
+.availability {
+  margin-bottom: 12px;
+  padding: 8px 12px;
+  border: 1px solid rgba(224, 160, 0, 0.5);
+  border-radius: 4px;
+  background: rgba(224, 160, 0, 0.1);
+  font-size: 13px;
+  color: #b87900;
+}
+
+.availability code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.availability .line {
+  margin: 0;
+}
+
+.availability .line + .line {
+  margin-top: 6px;
+}
+
+/* Dispatch failures are error-toned (vs the warning-toned availability prompt). */
+.availability .dispatch-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #c00;
+}
+
+.availability .dismiss {
+  flex: none;
+  padding: 0 4px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
 }
 </style>

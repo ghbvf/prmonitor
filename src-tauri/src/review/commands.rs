@@ -7,8 +7,10 @@ use crate::review::engines::codex::{CodexEngine, CodexStatus};
 use crate::review::session::SessionInfo;
 use crate::state::AppState;
 
-/// The codex binary name (PATH-resolved). Single source for every review command.
-const CODEX_BIN: &str = "codex";
+/// The codex binary name (PATH-resolved). Single source for every review command
+/// and the composition-layer dispatcher ([`crate::dispatch`]), which imports this
+/// `pub(crate)` const rather than re-stating the literal.
+pub(crate) const CODEX_BIN: &str = "codex";
 
 /// Reports codex app-server availability for the StatusBar. Ensures the resident
 /// connection (lazy start: first call spawns + handshakes, later calls reuse) and

@@ -3,6 +3,7 @@
 // src/pr/usePrStore.test.ts.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReviewEvent } from "../types";
+import type { ReviewSession } from "./types";
 
 vi.mock("./api", () => ({
   getCodexStatus: vi.fn(() =>
@@ -26,9 +27,11 @@ beforeEach(() => {
   });
   vi.mocked(api.startReview).mockResolvedValue("th_1");
   vi.mocked(api.stopReview).mockResolvedValue();
+  vi.mocked(api.listReviewSessions).mockResolvedValue([]);
   // Module-level singleton state: reset between tests so each starts clean.
   const s = useReviewStore();
   s.codex.value = null;
+  s.sessions.value = [];
   s.items.value = [];
   s.running.value = false;
   s.finalStatus.value = null;
@@ -37,7 +40,20 @@ beforeEach(() => {
   s.activePr.value = null;
   s.listenerReady.value = false;
   s.listenerError.value = null;
+  s.dispatchError.value = null;
 });
+
+// One backend session row; spread an override to vary a field.
+function session(over: Partial<ReviewSession> = {}): ReviewSession {
+  return {
+    threadId: "th_1",
+    turnId: "tn_1",
+    prNumber: 7,
+    kind: "review",
+    status: "running",
+    ...over,
+  };
+}
 
 describe("useReviewStore refreshCodexStatus()", () => {
   it("writes codex.value from getCodexStatus on success", async () => {
@@ -67,6 +83,13 @@ describe("useReviewStore applyEvent()", () => {
     threadId: "th_1",
     itemId,
     text,
+  });
+
+  // The stream only renders the FOCUSED session (see applyEvent's drop-when-unfocused
+  // guard), so these tests focus `th_1` — the threadId `md`/the terminal events use —
+  // before asserting on stream state.
+  beforeEach(() => {
+    useReviewStore().activeThreadId.value = "th_1";
   });
 
   it("concatenates message deltas sharing an itemId", () => {
@@ -130,6 +153,48 @@ describe("useReviewStore applyEvent()", () => {
 
     store.applyEvent(md("i1", "yes"));
     expect(store.items.value).toHaveLength(1);
+  });
+
+  it("drops stream deltas when no session is focused (concurrent auto-sessions don't mix)", () => {
+    const store = useReviewStore();
+    // Override the describe's focus: nothing focused and no manual start in flight,
+    // so an auto-started session's deltas must NOT pile into the (unfocused) panel.
+    store.activeThreadId.value = null;
+    store.applyEvent({
+      kind: "messageDelta",
+      threadId: "auto_1",
+      itemId: "i1",
+      text: "x",
+    });
+    expect(store.items.value).toEqual([]);
+  });
+
+  it("dispatchError sets the session-less notice without touching the stream", () => {
+    const store = useReviewStore();
+    store.applyEvent(md("i1", "hi")); // an existing session item
+    store.applyEvent({ kind: "dispatchError", message: "配置无效" });
+
+    expect(store.dispatchError.value).toBe("配置无效");
+    // Session-less: must not be folded into the stream or the per-session error.
+    expect(store.items.value).toHaveLength(1);
+    expect(store.error.value).toBeNull();
+  });
+
+  it("dispatchError is surfaced even while a session is focused (not threadId-filtered)", () => {
+    const store = useReviewStore();
+    store.activeThreadId.value = "th_1"; // a focused session would drop foreign events
+    store.applyEvent({ kind: "dispatchError", message: "ledger 落账失败" });
+
+    expect(store.dispatchError.value).toBe("ledger 落账失败");
+  });
+
+  it("clearDispatchError dismisses the notice", () => {
+    const store = useReviewStore();
+    store.applyEvent({ kind: "dispatchError", message: "boom" });
+    expect(store.dispatchError.value).toBe("boom");
+
+    store.clearDispatchError();
+    expect(store.dispatchError.value).toBeNull();
   });
 });
 
@@ -287,5 +352,166 @@ describe("useReviewStore start() in-flight buffering", () => {
     expect(store.items.value).toEqual([
       { itemId: "i1", kind: "message", text: "yes" },
     ]);
+  });
+});
+
+describe("useReviewStore refreshSessions()", () => {
+  it("populates sessions from listReviewSessions, sorted by threadId", async () => {
+    vi.mocked(api.listReviewSessions).mockResolvedValueOnce([
+      session({ threadId: "th_b", prNumber: 2 }),
+      session({ threadId: "th_a", prNumber: 1 }),
+    ]);
+    const store = useReviewStore();
+
+    await store.refreshSessions();
+
+    expect(api.listReviewSessions).toHaveBeenCalledOnce();
+    expect(store.sessions.value.map((s) => s.threadId)).toEqual([
+      "th_a",
+      "th_b",
+    ]);
+  });
+
+  it("keeps the prior value when the command rejects", async () => {
+    const store = useReviewStore();
+    store.sessions.value = [session({ threadId: "th_prior" })];
+    vi.mocked(api.listReviewSessions).mockRejectedValueOnce({ message: "boom" });
+
+    await store.refreshSessions();
+
+    expect(store.sessions.value.map((s) => s.threadId)).toEqual(["th_prior"]);
+  });
+});
+
+describe("useReviewStore applyEvent() sessions refresh", () => {
+  // The refresh is fire-and-forget (`void refreshSessions()`); a microtask flush
+  // lets the awaited list assignment settle before assertions.
+  const flush = () => Promise.resolve();
+
+  it("refreshes when an event arrives for an unseen threadId", async () => {
+    vi.mocked(api.listReviewSessions).mockResolvedValue([
+      session({ threadId: "th_new", prNumber: 9 }),
+    ]);
+    const store = useReviewStore();
+    expect(store.sessions.value).toEqual([]); // th_new not yet listed.
+
+    store.applyEvent({
+      kind: "messageDelta",
+      threadId: "th_new",
+      itemId: "i1",
+      text: "hi",
+    });
+    await flush();
+
+    expect(api.listReviewSessions).toHaveBeenCalledOnce();
+    expect(store.sessions.value.map((s) => s.threadId)).toEqual(["th_new"]);
+  });
+
+  it("does not refresh for an event whose threadId is already listed", async () => {
+    const store = useReviewStore();
+    store.sessions.value = [session({ threadId: "th_1" })];
+
+    store.applyEvent({
+      kind: "messageDelta",
+      threadId: "th_1",
+      itemId: "i1",
+      text: "hi",
+    });
+    await flush();
+
+    expect(api.listReviewSessions).not.toHaveBeenCalled();
+  });
+
+  it("refreshes on a terminal turnCompleted event", async () => {
+    vi.mocked(api.listReviewSessions).mockResolvedValue([
+      session({ threadId: "th_1", status: "done" }),
+    ]);
+    const store = useReviewStore();
+    store.sessions.value = [session({ threadId: "th_1", status: "running" })];
+
+    store.applyEvent({
+      kind: "turnCompleted",
+      threadId: "th_1",
+      status: "completed",
+    });
+    await flush();
+
+    expect(api.listReviewSessions).toHaveBeenCalledOnce();
+    expect(store.sessions.value[0]?.status).toBe("done");
+  });
+
+  it("refreshes on a terminal error event", async () => {
+    vi.mocked(api.listReviewSessions).mockResolvedValue([
+      session({ threadId: "th_1", status: "failed" }),
+    ]);
+    const store = useReviewStore();
+    store.sessions.value = [session({ threadId: "th_1", status: "running" })];
+
+    store.applyEvent({ kind: "error", threadId: "th_1", message: "boom" });
+    await flush();
+
+    expect(api.listReviewSessions).toHaveBeenCalledOnce();
+    expect(store.sessions.value[0]?.status).toBe("failed");
+  });
+});
+
+describe("useReviewStore focus()", () => {
+  it("points the focused stream at a session and clears prior stream state", () => {
+    const store = useReviewStore();
+    store.items.value = [{ itemId: "stale", kind: "message", text: "old" }];
+    store.error.value = "old error";
+    store.finalStatus.value = "completed";
+
+    store.focus("th_pick", 42, "running");
+
+    expect(store.activeThreadId.value).toBe("th_pick");
+    expect(store.activePr.value).toBe(42);
+    expect(store.running.value).toBe(true);
+    expect(store.items.value).toEqual([]);
+    expect(store.error.value).toBeNull();
+    expect(store.finalStatus.value).toBeNull();
+  });
+
+  it("marks a terminal session as not running", () => {
+    const store = useReviewStore();
+
+    store.focus("th_done", 7, "done");
+
+    expect(store.running.value).toBe(false);
+  });
+
+  it("treats a starting session as running", () => {
+    const store = useReviewStore();
+
+    store.focus("th_starting", 7, "starting");
+
+    expect(store.running.value).toBe(true);
+  });
+
+  it("treats an interrupting session as running", () => {
+    const store = useReviewStore();
+
+    store.focus("th_interrupting", 7, "interrupting");
+
+    expect(store.running.value).toBe(true);
+  });
+
+  it("renders a focused done session as ended, not 未开始", () => {
+    const store = useReviewStore();
+
+    store.focus("th_done", 7, "done");
+
+    // A terminal status must surface so ReviewPanel shows "已结束", not "未开始".
+    expect(store.running.value).toBe(false);
+    expect(store.finalStatus.value).toBe("completed");
+  });
+
+  it("renders a focused failed session with a failed terminal status", () => {
+    const store = useReviewStore();
+
+    store.focus("th_failed", 7, "failed");
+
+    expect(store.running.value).toBe(false);
+    expect(store.finalStatus.value).toBe("failed");
   });
 });

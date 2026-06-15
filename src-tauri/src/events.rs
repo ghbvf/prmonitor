@@ -60,6 +60,14 @@ pub enum ReviewEvent {
     /// A session-level error.
     #[serde(rename_all = "camelCase")]
     Error { thread_id: String, message: String },
+    /// An auto-trigger dispatch-level notice NOT tied to any one session — config
+    /// invalid, one/more `start_review` failures, or a ledger-write failure during
+    /// `crate::dispatch::auto_dispatch`. Carries no `threadId`; the frontend
+    /// surfaces it as an app-level "auto review" notice (the availability banner),
+    /// not a session stream event. `message` is single-word so no per-variant
+    /// `rename_all` is needed (the container tag rename still maps the variant name
+    /// to the camelCase `"dispatchError"`).
+    DispatchError { message: String },
 }
 
 /// Serde wire-shape lock for the `ReviewEvent` discriminated union.
@@ -179,6 +187,21 @@ mod tests {
         assert_eq!(v["kind"], "error");
         assert!(v.get("threadId").is_some());
         assert!(v.get("message").is_some());
+        assert!(v.get("thread_id").is_none());
+    }
+
+    #[test]
+    fn dispatch_error_wire_shape_is_camel_case_and_session_less() {
+        let event = ReviewEvent::DispatchError {
+            message: "boom".to_string(),
+        };
+        let v = serde_json::to_value(&event).expect("ReviewEvent serializes");
+        // Variant tag camelCased by the container rule; carries only `message`.
+        assert_eq!(v["kind"], "dispatchError");
+        assert!(v.get("message").is_some());
+        // Session-less: no thread id (a rename / accidental field would surface here,
+        // and the `src/types.ts` mirror must stay session-less in lockstep).
+        assert!(v.get("threadId").is_none());
         assert!(v.get("thread_id").is_none());
     }
 

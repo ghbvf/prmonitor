@@ -140,6 +140,28 @@ impl SessionRegistry {
     pub fn list(&self) -> Vec<SessionInfo> {
         self.inner.lock().unwrap().values().cloned().collect()
     }
+
+    /// The `(pr_number, kind)` of every session still in flight
+    /// (`Starting`/`Running`/`Interrupting`) — the auto-trigger registry guard's
+    /// view. A PR with an in-flight session of a given kind must not be
+    /// re-dispatched; a terminal (`Done`/`Failed`) session is finished and excluded.
+    /// Owning the "what counts as active" rule here keeps [`SessionStatus`] inside
+    /// the review slice — the composition-layer dispatcher consumes only the pairs,
+    /// so it never imports the session state machine.
+    pub fn active_pairs(&self) -> Vec<(u64, String)> {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    SessionStatus::Starting | SessionStatus::Running | SessionStatus::Interrupting
+                )
+            })
+            .map(|s| (s.pr_number, s.kind.clone()))
+            .collect()
+    }
 }
 
 /// Start a review for `pr_number` and stream its output. Returns the codex
@@ -540,6 +562,36 @@ mod tests {
             reg.begin_interrupt("missing"),
             BeginInterrupt::NotFound
         ));
+    }
+
+    #[test]
+    fn active_pairs_returns_only_in_flight_sessions() {
+        let reg = SessionRegistry::default();
+        let info = |thread: &str, pr: u64, kind: &str, status| {
+            reg.insert(SessionInfo {
+                thread_id: thread.to_string(),
+                turn_id: String::new(),
+                pr_number: pr,
+                kind: kind.to_string(),
+                status,
+            });
+        };
+        info("a", 1, "review", SessionStatus::Starting);
+        info("b", 2, "check", SessionStatus::Running);
+        info("c", 3, "review", SessionStatus::Interrupting);
+        info("d", 4, "review", SessionStatus::Done); // terminal → excluded
+        info("e", 5, "check", SessionStatus::Failed); // terminal → excluded
+
+        let mut pairs = reg.active_pairs();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                (1, "review".to_string()),
+                (2, "check".to_string()),
+                (3, "review".to_string()),
+            ]
+        );
     }
 
     #[test]

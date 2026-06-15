@@ -17,7 +17,16 @@
 //! shared `snapshot` *before* emitting `prs:updated`. The frontend reads it on
 //! mount via the `get_prs` command, so a `prs:updated` lost to a not-yet-mounted
 //! listener no longer strands the UI on an empty list for a full period.
+//!
+//! **Auto-trigger (#8).** Each cycle also passes its dispatchable candidates (the
+//! clean rows) to an injected [`Dispatcher`] hook. The hook is the seam that keeps
+//! the `pr` slice review-agnostic: the loop knows nothing about how a review
+//! starts, only that a closure consumes `Vec<Candidate>`. The composition root
+//! ([`crate::dispatch`]) installs the real dispatcher via [`Scheduler::set_dispatcher`]
+//! before `start`, so even the immediate first tick dispatches.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -29,6 +38,16 @@ use tokio::time::MissedTickBehavior;
 use crate::config::service as config_service;
 use crate::error::AppResult;
 use crate::events::{PrEvent, PRS_UPDATED_EVENT};
+use crate::model::Candidate;
+
+/// Abstract per-cycle dispatch hook: consumes the cycle's dispatchable
+/// [`Candidate`]s and drives them to completion (in practice: auto-start their
+/// reviews concurrently). Boxed-future + `Arc` so it is `Clone`able into the cycle
+/// closure and erased of the review slice's types — the `pr` slice stays
+/// review-agnostic (the only cross-slice contract it sees is `Candidate`). The
+/// real implementation lives in the composition root ([`crate::dispatch`]).
+pub type Dispatcher =
+    Arc<dyn Fn(Vec<Candidate>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Default poll period when config is unreadable or non-positive. Mirrors
 /// `AppConfig::default().poll_interval_secs`. A 0 period would make
@@ -45,6 +64,11 @@ pub struct Scheduler {
     /// writes it before each emit; read by `get_prs` so the frontend renders
     /// current state on mount without waiting for the next `prs:updated`.
     snapshot: Arc<StdMutex<Vec<crate::model::PullRequestView>>>,
+    /// The auto-trigger dispatch hook (#8), installed by the composition root via
+    /// [`Self::set_dispatcher`] before `start`. `Mutex<Option<_>>` defaults to
+    /// `None` (so `#[derive(Default)]` still holds) — a `None` dispatcher means a
+    /// cycle discovers + emits but starts no reviews (the pre-#8 behavior).
+    dispatcher: StdMutex<Option<Dispatcher>>,
 }
 
 /// The live task plus the channels the loop selects on.
@@ -56,6 +80,14 @@ struct RunningTask {
 }
 
 impl Scheduler {
+    /// Installs the auto-trigger dispatch hook (#8). Called once by the composition
+    /// root *before* `start`, so the immediate first tick already dispatches.
+    /// Replaces any prior hook (last writer wins); a never-set dispatcher leaves
+    /// cycles discover-and-emit only.
+    pub fn set_dispatcher(&self, d: Dispatcher) {
+        *self.dispatcher.lock().unwrap() = Some(d);
+    }
+
     /// Spawns the poll loop. Idempotent: if a task is already live this is a
     /// no-op (no double-spawn). A finished task slot is replaced.
     pub fn start<R: tauri::Runtime>(&self, app: tauri::AppHandle<R>) {
@@ -70,9 +102,14 @@ impl Scheduler {
         let reconfigure = Arc::new(Notify::new());
         let stop = Arc::new(Notify::new());
 
+        // Snapshot the installed dispatcher once into the cycle closure: the loop
+        // task outlives this `start` call, so it captures an owned `Option<Dispatcher>`
+        // rather than re-locking `self` each cycle. `None` ⇒ no auto-trigger.
+        let dispatcher = self.dispatcher.lock().unwrap().clone();
+
         // Production wiring: the period comes from the live config each rebuild,
-        // and each cycle discovers → writes the snapshot → emits. Both are
-        // injected into the generic `run_loop` so the lifecycle is testable (F4).
+        // and each cycle discovers → writes the snapshot → emits → dispatches. Both
+        // are injected into the generic `run_loop` so the lifecycle is testable (F4).
         let period_provider = {
             let app = app.clone();
             move || resolve_period(config_service::load(&app).map(|c| c.poll_interval_secs))
@@ -83,7 +120,8 @@ impl Scheduler {
             move || {
                 let app = app.clone();
                 let snapshot = Arc::clone(&snapshot);
-                async move { discover_emit_snapshot(&app, &snapshot).await }
+                let dispatcher = dispatcher.clone();
+                async move { discover_emit_dispatch(&app, &snapshot, dispatcher.as_ref()).await }
             }
         };
 
@@ -182,23 +220,50 @@ async fn run_loop<P, C, Fut>(
     }
 }
 
-/// Runs one discovery cycle: writes the snapshot (F3) then emits the result. A
-/// discovery failure folds into a [`PrEvent::Error`] (the loop survives it) and
-/// leaves the snapshot intact — the last good list stays readable via `get_prs`.
-/// Writing the snapshot *before* the emit means a lost `prs:updated` is still
-/// covered by `get_prs`.
-async fn discover_emit_snapshot<R: tauri::Runtime>(
+/// Runs one discovery cycle: writes the snapshot (F3), emits the result, then
+/// auto-triggers the dispatchable candidates (#8). A discovery failure folds into
+/// a [`PrEvent::Error`] (the loop survives it) and leaves the snapshot intact —
+/// the last good list stays readable via `get_prs` — and yields no dispatchable
+/// candidates (nothing is auto-started on a failed cycle). Writing the snapshot
+/// *before* the emit means a lost `prs:updated` is still covered by `get_prs`.
+///
+/// The dispatch is *spawned detached* (not awaited) after the emit — see the body
+/// for why the scheduler's stop must not be able to cancel a start in flight; an
+/// empty dispatchable list skips the hook entirely.
+async fn discover_emit_dispatch<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     snapshot: &Arc<StdMutex<Vec<crate::model::PullRequestView>>>,
+    dispatcher: Option<&Dispatcher>,
 ) {
-    let event = match super::commands::discover_views(app).await {
-        Ok(prs) => {
+    let (event, dispatchable) = match super::commands::discover(app).await {
+        Ok((prs, dispatchable)) => {
             *snapshot.lock().unwrap() = prs.clone();
-            PrEvent::Updated { prs }
+            (PrEvent::Updated { prs }, dispatchable)
         }
-        Err(e) => PrEvent::Error { message: e.message },
+        // On discovery error the dispatchable list is empty — nothing auto-starts.
+        Err(e) => (PrEvent::Error { message: e.message }, Vec::new()),
     };
     let _ = app.emit(PRS_UPDATED_EVENT, &event); // ignore emit error (window may be gone)
+
+    if let Some(d) = dispatcher {
+        if !dispatchable.is_empty() {
+            // Spawn the dispatch DETACHED rather than awaiting it inline. This cycle
+            // runs inside the loop's stop-cancellable `select!` (the F1 cancellation
+            // domain that lets a stop reap the in-flight `gh` child). Awaiting
+            // `start_review` here would put it in that same domain, so a
+            // `stop_polling` landing mid-start would drop a half-started review —
+            // leaving a `Starting` session that `stop_review` can't interrupt
+            // (`begin_interrupt` is a no-op on `Starting`). The dispatcher future is
+            // `Send + 'static`, so the spawned task runs to its terminal
+            // (`Running`/`Failed`) regardless of the poll loop. Cross-cycle dedup is
+            // unaffected: an in-flight dispatch is still covered by the next
+            // discovery's ledger gate and the dispatcher's own in-flight registry
+            // guard. Discovery itself stays cancellable (it is awaited above), so a
+            // stop still reaps `gh`. The JoinHandle is dropped explicitly (detached):
+            // the task runs to completion regardless of the poll loop.
+            drop(tauri::async_runtime::spawn(d(dispatchable)));
+        }
+    }
 }
 
 /// Clamps a loaded poll period to a usable value: a positive load passes
@@ -239,6 +304,63 @@ mod tests {
     fn default_scheduler_is_not_running() {
         let scheduler = Scheduler::default();
         assert!(scheduler.task.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn default_scheduler_has_no_dispatcher() {
+        // `#[derive(Default)]` must keep working with the new field: an
+        // un-installed dispatcher is `None`, so cycles discover-and-emit only.
+        let scheduler = Scheduler::default();
+        assert!(scheduler.dispatcher.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn set_dispatcher_stores_and_retrieves_the_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // The hook plumbing in isolation: `set_dispatcher` stores a counting
+        // closure; retrieving it (the same `lock().clone()` `start` does) and
+        // invoking it with sample candidates must run the closure. This verifies
+        // storage/retrieval without needing an `AppHandle` or real dispatch.
+        let scheduler = Scheduler::default();
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(AtomicUsize::new(0));
+        let dispatcher: Dispatcher = {
+            let count = Arc::clone(&count);
+            let seen = Arc::clone(&seen);
+            Arc::new(move |cands: Vec<Candidate>| {
+                let count = Arc::clone(&count);
+                let seen = Arc::clone(&seen);
+                Box::pin(async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    seen.fetch_add(cands.len(), Ordering::SeqCst);
+                })
+            })
+        };
+        scheduler.set_dispatcher(dispatcher);
+
+        let stored = scheduler
+            .dispatcher
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("set_dispatcher stores the hook");
+        stored(vec![candidate(1, "review"), candidate(2, "check")]).await;
+
+        assert_eq!(count.load(Ordering::SeqCst), 1, "hook ran once");
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "hook saw both candidates");
+    }
+
+    fn candidate(number: u64, kind: &str) -> Candidate {
+        Candidate {
+            number,
+            head_sha: "sha".to_string(),
+            head_ref: "ref".to_string(),
+            author: "octocat".to_string(),
+            is_cross_repository: false,
+            is_draft: false,
+            kind: kind.to_string(),
+        }
     }
 
     // ── Lifecycle tests (F4) ───────────────────────────────────────────────
