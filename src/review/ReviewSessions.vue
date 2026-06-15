@@ -1,7 +1,8 @@
 <script setup lang="ts">
-// Active-sessions list: the concurrent-aware companion to ReviewPanel's single
+// Review-sessions list: the concurrent-aware companion to ReviewPanel's single
 // focused stream. #8 can auto-trigger several review sessions at once; this lists
-// them all (from the shared store's `sessions` ref) and lets the user point the
+// them all — running AND finished (the backend's `list_review_sessions` returns
+// both) — from the shared store's `sessions` ref, and lets the user point the
 // focused panel at any one. Reads the module-level singleton store — no second
 // instance, no props. Mirrors PrList/PrRow's badge + muted conventions.
 import { useReviewStore } from "./useReviewStore";
@@ -33,10 +34,10 @@ function statusLabel(status: SessionStatus): string {
 <template>
   <section class="review-sessions">
     <header class="head">
-      <h2>活跃会话 / Active reviews</h2>
+      <h2>Review 会话 / Review sessions</h2>
     </header>
 
-    <p v-if="sessions.length === 0" class="muted">无活跃会话 / No active reviews</p>
+    <p v-if="sessions.length === 0" class="muted">暂无会话 / No review sessions</p>
 
     <ul v-else class="rows">
       <li

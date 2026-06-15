@@ -153,8 +153,13 @@ function applyEvent(ev: ReviewEvent) {
     inFlightBuffer.push(ev);
     return;
   }
-  // Single active panel: once our session id is known, ignore other sessions' events.
-  if (activeThreadId.value && ev.threadId !== activeThreadId.value) return;
+  // Single focused panel: the stream renders ONLY the focused session. Drop the
+  // event when nothing is focused (else auto-started sessions, which the user never
+  // selected, would pile their deltas into the panel) or when it belongs to another
+  // session. The manual-start in-flight window (id not yet known) was already
+  // handled by the buffer block above, so reaching here with no focus means an
+  // unfocused background session — not ours.
+  if (!activeThreadId.value || ev.threadId !== activeThreadId.value) return;
 
   switch (ev.kind) {
     case "messageDelta":
@@ -259,11 +264,16 @@ async function hydrateActiveSession() {
 function focus(threadId: string, prNumber: number, status: SessionStatus) {
   activeThreadId.value = threadId;
   activePr.value = prNumber;
-  running.value =
+  const active =
     status === "running" || status === "starting" || status === "interrupting";
-  items.value = [];
+  running.value = active;
+  items.value = []; // backend doesn't replay past deltas; the stream starts empty.
   error.value = null;
-  finalStatus.value = null;
+  // A terminal session must render as ended, not "未开始": map its lifecycle status
+  // to a turn-status string ReviewPanel can label (`done` collapses completed /
+  // interrupted — that distinction isn't kept in SessionInfo). An active session
+  // keeps `finalStatus` null (it shows "运行中").
+  finalStatus.value = active ? null : status === "failed" ? "failed" : "completed";
 }
 
 // Attach the streamed-event listener, then reattach to any live session. Returns

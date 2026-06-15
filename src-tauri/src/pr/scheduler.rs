@@ -227,8 +227,8 @@ async fn run_loop<P, C, Fut>(
 /// candidates (nothing is auto-started on a failed cycle). Writing the snapshot
 /// *before* the emit means a lost `prs:updated` is still covered by `get_prs`.
 ///
-/// The `dispatcher` is awaited *after* the emit so the UI's PR list updates
-/// promptly regardless of how long the dispatch (starting N reviews) takes; an
+/// The dispatch is *spawned detached* (not awaited) after the emit — see the body
+/// for why the scheduler's stop must not be able to cancel a start in flight; an
 /// empty dispatchable list skips the hook entirely.
 async fn discover_emit_dispatch<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
@@ -247,7 +247,21 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
 
     if let Some(d) = dispatcher {
         if !dispatchable.is_empty() {
-            d(dispatchable).await;
+            // Spawn the dispatch DETACHED rather than awaiting it inline. This cycle
+            // runs inside the loop's stop-cancellable `select!` (the F1 cancellation
+            // domain that lets a stop reap the in-flight `gh` child). Awaiting
+            // `start_review` here would put it in that same domain, so a
+            // `stop_polling` landing mid-start would drop a half-started review —
+            // leaving a `Starting` session that `stop_review` can't interrupt
+            // (`begin_interrupt` is a no-op on `Starting`). The dispatcher future is
+            // `Send + 'static`, so the spawned task runs to its terminal
+            // (`Running`/`Failed`) regardless of the poll loop. Cross-cycle dedup is
+            // unaffected: an in-flight dispatch is still covered by the next
+            // discovery's ledger gate and the dispatcher's own in-flight registry
+            // guard. Discovery itself stays cancellable (it is awaited above), so a
+            // stop still reaps `gh`. The JoinHandle is dropped explicitly (detached):
+            // the task runs to completion regardless of the poll loop.
+            drop(tauri::async_runtime::spawn(d(dispatchable)));
         }
     }
 }

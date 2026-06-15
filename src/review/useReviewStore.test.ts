@@ -85,6 +85,13 @@ describe("useReviewStore applyEvent()", () => {
     text,
   });
 
+  // The stream only renders the FOCUSED session (see applyEvent's drop-when-unfocused
+  // guard), so these tests focus `th_1` — the threadId `md`/the terminal events use —
+  // before asserting on stream state.
+  beforeEach(() => {
+    useReviewStore().activeThreadId.value = "th_1";
+  });
+
   it("concatenates message deltas sharing an itemId", () => {
     const store = useReviewStore();
     store.applyEvent(md("i1", "Hel"));
@@ -146,6 +153,20 @@ describe("useReviewStore applyEvent()", () => {
 
     store.applyEvent(md("i1", "yes"));
     expect(store.items.value).toHaveLength(1);
+  });
+
+  it("drops stream deltas when no session is focused (concurrent auto-sessions don't mix)", () => {
+    const store = useReviewStore();
+    // Override the describe's focus: nothing focused and no manual start in flight,
+    // so an auto-started session's deltas must NOT pile into the (unfocused) panel.
+    store.activeThreadId.value = null;
+    store.applyEvent({
+      kind: "messageDelta",
+      threadId: "auto_1",
+      itemId: "i1",
+      text: "x",
+    });
+    expect(store.items.value).toEqual([]);
   });
 
   it("dispatchError sets the session-less notice without touching the stream", () => {
@@ -473,5 +494,24 @@ describe("useReviewStore focus()", () => {
     store.focus("th_interrupting", 7, "interrupting");
 
     expect(store.running.value).toBe(true);
+  });
+
+  it("renders a focused done session as ended, not 未开始", () => {
+    const store = useReviewStore();
+
+    store.focus("th_done", 7, "done");
+
+    // A terminal status must surface so ReviewPanel shows "已结束", not "未开始".
+    expect(store.running.value).toBe(false);
+    expect(store.finalStatus.value).toBe("completed");
+  });
+
+  it("renders a focused failed session with a failed terminal status", () => {
+    const store = useReviewStore();
+
+    store.focus("th_failed", 7, "failed");
+
+    expect(store.running.value).toBe(false);
+    expect(store.finalStatus.value).toBe("failed");
   });
 });

@@ -2,11 +2,18 @@
 //!
 //! Vertical-slice layout: each slice (`config`, `pr`, `review`) is self-contained
 //! and sits directly under `src/` (no `features/` wrapper). Horizontal concerns
-//! are flat files (`error`, `events`, `model`, `state`). Slices never import each
-//! other's internals — cross-slice types live in [`model`], the only contract.
+//! are flat files (`error`, `events`, `model`, `state`, `dispatch`). Slices never
+//! import each other's internals — cross-slice types live in [`model`], the only
+//! contract.
 //!
-//! This file is the *only* place that wires slices together and registers their
-//! Tauri commands.
+//! Slice *assembly* is the composition layer's job: this file (the root — it
+//! `manage`s [`state::AppState`], registers Tauri commands, and installs the
+//! scheduler's dispatch hook) plus the root-level horizontal modules it enables —
+//! notably [`dispatch`], which glues the `pr` slice's gating output to the
+//! `review` engine. Those composition modules may consume several slices' public
+//! APIs (that is what makes them composition, not slices); the invariant that
+//! stays structural is that *slices* never cross slice lines — only the
+//! composition layer does.
 
 // Modules are `pub` so forward-looking seams and shared types (e.g.
 // `pr::source::PrSource`, `review::engine::ReviewEngine`) count as reachable API
