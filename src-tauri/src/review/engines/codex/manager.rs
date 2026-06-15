@@ -20,6 +20,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Default)]
 pub struct CodexManager {
     inner: Arc<Mutex<Option<CodexProcess>>>,
+    /// Serializes the cold-start slow path so concurrent `ensure_started` calls
+    /// spawn at most one app-server. The std `Mutex` above can't be held across
+    /// the spawn/handshake await; this async lock fills that gap while leaving the
+    /// fast path and `shutdown` synchronous on the std `Mutex`.
+    start_lock: tokio::sync::Mutex<()>,
 }
 
 impl CodexManager {
@@ -32,35 +37,47 @@ impl CodexManager {
         codex_bin: &str,
         repo_root: &str,
     ) -> AppResult<InitializeResult> {
-        // Fast path: an already-live resident connection.
-        {
-            let guard = self.inner.lock().unwrap();
-            if let Some(proc) = guard.as_ref() {
-                if proc.is_connected() {
-                    return Ok(proc.info.clone());
-                }
-            }
+        // Fast path: an already-live resident connection (sync std-Mutex read).
+        if let Some(info) = self.live_info() {
+            return Ok(info);
         }
 
-        // Slow path: spawn OUTSIDE the lock (a std mutex can't be held across the
-        // spawn/handshake await).
+        // Slow path: serialize cold start so concurrent callers spawn at most one
+        // app-server. The first caller spawns while holding `start_lock`; the
+        // others block here, then the re-check below sees the live connection.
+        let _start = self.start_lock.lock().await;
+
+        // Re-check under the start lock: a prior holder may have just established
+        // the connection while we waited.
+        if let Some(info) = self.live_info() {
+            return Ok(info);
+        }
+
+        // Spawn OUTSIDE the std Mutex (it can't be held across the await) but
+        // UNDER `start_lock`, so no other task spawns concurrently.
         let proc =
             tokio::time::timeout(HANDSHAKE_TIMEOUT, CodexProcess::spawn(codex_bin, repo_root))
                 .await
                 .map_err(|_| AppError::new("codex app-server 握手超时".to_string()))??;
         let info = proc.info.clone();
 
-        let mut guard = self.inner.lock().unwrap();
-        // Double-check: another task may have established a live connection while
-        // we were spawning. If so, drop ours (kill_on_drop reaps the redundant
-        // child) and reuse theirs.
-        if let Some(existing) = guard.as_ref() {
-            if existing.is_connected() {
-                return Ok(existing.info.clone());
-            }
+        // Install the new connection. We only reach here when the cell was empty
+        // or held a dead process (the re-check returned early otherwise) and
+        // `start_lock` keeps this path single-writer — so reap any dead
+        // predecessor explicitly rather than leaning on drop alone.
+        let dead = self.inner.lock().unwrap().replace(proc);
+        if let Some(dead) = dead {
+            dead.kill_and_reap();
         }
-        *guard = Some(proc);
         Ok(info)
+    }
+
+    /// Handshake info iff the resident connection is currently live. Synchronous
+    /// (std `Mutex`); the critical section never `.await`s.
+    fn live_info(&self) -> Option<InitializeResult> {
+        let guard = self.inner.lock().unwrap();
+        let proc = guard.as_ref()?;
+        proc.is_connected().then(|| proc.info.clone())
     }
 
     /// Probe codex availability for the StatusBar: ensure the resident connection
@@ -88,12 +105,13 @@ impl CodexManager {
     }
 
     /// Kill the resident child on app shutdown (called from `lib.rs`'s sync
-    /// `RunEvent` handler). Synchronous `start_kill` (no `block_on`) so it is safe
-    /// from any context; `kill_on_drop(true)` is the backstop. No-op if nothing is
-    /// running.
+    /// `RunEvent` handler). `kill_and_reap` sends SIGKILL synchronously (safe from
+    /// any context, no `block_on`) then reaps on a detached task; `kill_on_drop`
+    /// and OS-on-exit are the backstops. No-op if nothing is running.
     pub fn shutdown(&self) {
-        if let Some(mut proc) = self.inner.lock().unwrap().take() {
-            proc.start_kill();
+        let proc = self.inner.lock().unwrap().take();
+        if let Some(proc) = proc {
+            proc.kill_and_reap();
         }
     }
 }

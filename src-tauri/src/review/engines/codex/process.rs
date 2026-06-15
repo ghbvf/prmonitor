@@ -8,7 +8,7 @@
 use std::process::Stdio;
 
 use serde::Serialize;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
 
 use super::protocol::{
@@ -91,7 +91,15 @@ impl CodexProcess {
     /// `initialize` request → response, then the `initialized` notification. The
     /// notification MUST precede any `thread/start` (the server rejects
     /// pre-initialized requests with `-32016`).
-    async fn handshake(client: &RpcClient<ChildStdin>) -> AppResult<InitializeResult> {
+    ///
+    /// Generic over the write half so CI-safe tests drive this *production*
+    /// orchestration over `tokio::io::duplex()` (no real binary) — a dropped
+    /// `initialized` or a reshaped `initialize` regresses in CI, not only in the
+    /// `#[ignore]`d real-binary test. `spawn` calls it with `W = ChildStdin`.
+    pub async fn handshake<W>(client: &RpcClient<W>) -> AppResult<InitializeResult>
+    where
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
         let params = InitializeParams {
             client_info: ClientInfo {
                 name: "prmonitor".to_string(),
@@ -136,22 +144,77 @@ impl CodexProcess {
         self.client.is_connected()
     }
 
-    /// Send SIGKILL to the child (used by the manager on app shutdown).
-    /// `start_kill` only signals — it does not await reaping — so it is synchronous
-    /// and safe to call from the sync `RunEvent` handler with no `block_on`.
-    /// `kill_on_drop(true)` is the backstop.
-    pub fn start_kill(&mut self) {
-        let _ = self.child.start_kill();
+    /// Kill the child and reap it. Sends SIGKILL synchronously (immediate, safe
+    /// from any context including the sync `RunEvent` shutdown handler with no
+    /// `block_on`), then reaps the child on a detached task so it can't linger as
+    /// a zombie during a long-running session — the self-heal path drops a dead
+    /// process, and `start_kill` alone never `wait`s (Tokio's docs note the child
+    /// stays a zombie until waited on or the orphan reaper runs). `kill_on_drop`
+    /// and the OS reaping on app exit are the backstops if the reaper can't run.
+    pub fn kill_and_reap(mut self) {
+        let _ = self.child.start_kill(); // immediate SIGKILL — synchronous.
+        tauri::async_runtime::spawn(async move {
+            // Move `self` in so the child (and its pipes) live until reaped.
+            let _ = self.child.wait().await;
+        });
     }
 }
 
+/// Max bytes logged per stderr line. Bounds memory against an unterminated flood
+/// and caps how much child diagnostic context reaches the app log — codex is a
+/// trusted local child, so truncation (not redaction) suffices.
+const STDERR_MAX_LINE: usize = 512;
+
 fn spawn_stderr_drain(stderr: ChildStderr) {
-    tauri::async_runtime::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            eprintln!("[codex app-server stderr] {line}");
+    tauri::async_runtime::spawn(drain_stderr(BufReader::new(stderr)));
+}
+
+/// Drain and log the child's stderr, capping each line so a never-terminating
+/// line can't grow the read buffer without bound. Generic over the reader so it
+/// is unit-testable without spawning a real child.
+async fn drain_stderr<R: AsyncBufRead + Unpin>(mut reader: R) {
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        // `take(STDERR_MAX_LINE)` yields EOF once the cap is hit, so one read can
+        // never buffer more than the cap.
+        let n = match (&mut reader)
+            .take(STDERR_MAX_LINE as u64)
+            .read_until(b'\n', &mut buf)
+            .await
+        {
+            Ok(0) | Err(_) => break, // EOF or read error: child gone.
+            Ok(n) => n,
+        };
+        let overflowed = !buf.ends_with(b"\n") && n >= STDERR_MAX_LINE;
+        eprintln!(
+            "[codex app-server stderr] {}{}",
+            String::from_utf8_lossy(&buf).trim_end(),
+            if overflowed { " …(已截断)" } else { "" }
+        );
+        if overflowed {
+            discard_to_newline(&mut reader).await;
         }
-    });
+    }
+}
+
+/// Drop the rest of an over-long stderr line (bounded reads) so it is logged once,
+/// not as a flood of fixed-size chunks.
+async fn discard_to_newline<R: AsyncBufRead + Unpin>(reader: &mut R) {
+    let mut sink: Vec<u8> = Vec::new();
+    loop {
+        sink.clear();
+        match (&mut *reader)
+            .take(STDERR_MAX_LINE as u64)
+            .read_until(b'\n', &mut sink)
+            .await
+        {
+            Ok(0) => break,                          // EOF
+            Ok(_) if sink.ends_with(b"\n") => break, // consumed through the newline
+            Ok(_) => continue,                       // more of the long line
+            Err(_) => break,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -169,5 +232,20 @@ mod tests {
         assert!(v.get("available").is_some());
         assert!(v.get("message").is_some());
         assert_eq!(v["available"], true);
+    }
+
+    /// An unterminated stderr line (no newline) must not hang or buffer without
+    /// bound: the capped reader terminates at EOF.
+    #[tokio::test]
+    async fn drain_stderr_terminates_on_unterminated_flood() {
+        let blob = vec![b'x'; STDERR_MAX_LINE * 4];
+        drain_stderr(tokio::io::BufReader::new(&blob[..])).await;
+    }
+
+    /// Normal multi-line stderr drains fully and terminates at EOF.
+    #[tokio::test]
+    async fn drain_stderr_handles_multiple_lines() {
+        let data = b"first line\nsecond line\n".to_vec();
+        drain_stderr(tokio::io::BufReader::new(&data[..])).await;
     }
 }

@@ -9,7 +9,7 @@
 //! - `real_app_server_*` — `#[ignore]`d: spawns the real `codex app-server` for
 //!   local verification (run with `cargo test -- --ignored`).
 
-use prmonitor_lib::review::engines::codex::RpcClient;
+use prmonitor_lib::review::engines::codex::{CodexProcess, RpcClient};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 /// The acceptance test, runnable in CI: handshake + thread id over an in-process
@@ -20,10 +20,14 @@ async fn handshake_then_thread_start_over_duplex() {
     let (client_w, server_r) = tokio::io::duplex(8192);
     let (server_w, client_r) = tokio::io::duplex(8192);
 
-    // Fake app-server: scripts responses by echoing the request id.
+    // Fake app-server: scripts responses by echoing the request id, and enforces
+    // the protocol precondition — `thread/start` before `initialized` is rejected
+    // with `-32016` (as the real server does). So a regression in the production
+    // handshake that drops the `initialized` notification fails this test.
     let server = tokio::spawn(async move {
         let mut reader = BufReader::new(server_r).lines();
         let mut out = server_w;
+        let mut initialized = false;
         while let Ok(Some(line)) = reader.next_line().await {
             let v: serde_json::Value = match serde_json::from_str(&line) {
                 Ok(v) => v,
@@ -38,10 +42,16 @@ async fn handshake_then_thread_start_over_duplex() {
                     out.write_all(resp.as_bytes()).await.unwrap();
                     out.write_all(b"\n").await.unwrap();
                 }
-                "initialized" => { /* notification: no response */ }
+                "initialized" => initialized = true, // notification: no response
                 "thread/start" => {
                     let id = v["id"].as_i64().unwrap();
-                    let resp = format!(r#"{{"id":{id},"result":{{"thread":{{"id":"th_abc"}}}}}}"#);
+                    let resp = if initialized {
+                        format!(r#"{{"id":{id},"result":{{"thread":{{"id":"th_abc"}}}}}}"#)
+                    } else {
+                        format!(
+                            r#"{{"id":{id},"error":{{"code":-32016,"message":"not initialized"}}}}"#
+                        )
+                    };
                     out.write_all(resp.as_bytes()).await.unwrap();
                     out.write_all(b"\n").await.unwrap();
                 }
@@ -53,25 +63,15 @@ async fn handshake_then_thread_start_over_duplex() {
     // The real client over the in-process transport.
     let client = RpcClient::connect(client_w, BufReader::new(client_r), 64);
 
-    // initialize round-trip.
-    let raw = client
-        .request(
-            "initialize",
-            serde_json::json!({
-                "clientInfo": {"name": "prmonitor", "title": "t", "version": "1"}
-            }),
-        )
+    // Drive the PRODUCTION handshake orchestration (initialize → initialized), not
+    // a hand-rolled copy — a regression in `CodexProcess::handshake` surfaces here.
+    let info = CodexProcess::handshake(&client)
         .await
-        .expect("initialize");
-    assert_eq!(raw["userAgent"], "codex/0.139.0");
+        .expect("production handshake");
+    assert_eq!(info.user_agent, "codex/0.139.0");
 
-    // initialized notification (no response).
-    client
-        .notify("initialized", serde_json::Value::Null)
-        .await
-        .expect("initialized");
-
-    // thread/start -> thread id (the acceptance assertion).
+    // thread/start -> thread id (the acceptance assertion). The fake server only
+    // answers it once `initialized` has arrived, so the handshake above is required.
     let raw = client
         .request("thread/start", serde_json::json!({"cwd": "/repo"}))
         .await
@@ -152,8 +152,8 @@ async fn request_fails_fast_when_server_disconnects() {
 
 /// Local verification against the real binary. `#[ignore]` keeps it out of CI
 /// (which has no `codex`); run with `cargo test -- --ignored` where codex is
-/// installed. Also exercises the production teardown path: `shutdown()` is now
-/// synchronous (`start_kill`, no `block_on`), so it is safe to call here.
+/// installed. Also exercises the production teardown path: `shutdown()` kills
+/// synchronously then reaps (`kill_and_reap`, no `block_on`), so it is safe here.
 #[tokio::test]
 #[ignore = "requires the real codex binary; run with: cargo test -- --ignored"]
 async fn real_app_server_handshake_thread_and_reuse() {
@@ -189,5 +189,5 @@ async fn real_app_server_handshake_thread_and_reuse() {
         .await
         .expect("second reuses");
     assert_eq!(info1.user_agent, info2.user_agent);
-    mgr.shutdown(); // synchronous start_kill — exercises the production teardown.
+    mgr.shutdown(); // synchronous kill + detached reap — exercises the teardown.
 }

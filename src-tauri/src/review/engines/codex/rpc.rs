@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, oneshot};
 
 use super::codec::{self, Inbound, ResponsePayload};
@@ -25,6 +25,13 @@ use crate::error::{AppError, AppResult};
 /// Per-request budget. A response that never arrives (server stall) fails the
 /// awaiting `request` here rather than hanging forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Max bytes per inbound NDJSON frame. The reader caps each line at this via
+/// `take`, so a never-terminating line from the (external) child can't grow the
+/// read buffer without bound; a frame that fills the cap with no closing newline
+/// is a protocol violation that tears the connection down. 16 MiB is generous for
+/// review payloads.
+const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// JSON-RPC 2.0 error object (the `jsonrpc` field is omitted on the wire, but the
 /// error shape is standard: `{code, message, data?}`).
@@ -81,11 +88,29 @@ impl<W: AsyncWrite + Unpin + Send + 'static> RpcClient<W> {
     where
         R: AsyncBufRead + Unpin + Send + 'static,
     {
+        Self::connect_with_max_frame(write_half, read_half, notif_capacity, MAX_FRAME_BYTES)
+    }
+
+    /// As [`Self::connect`] but with an explicit inbound-frame cap (tests inject a
+    /// small cap to exercise the oversized-frame teardown without writing 16 MiB).
+    fn connect_with_max_frame<R>(
+        write_half: W,
+        read_half: R,
+        notif_capacity: usize,
+        max_frame: usize,
+    ) -> Self
+    where
+        R: AsyncBufRead + Unpin + Send + 'static,
+    {
         let pending: PendingMap = Arc::new(Mutex::new(Pending::default()));
         let (notif_tx, _rx) = broadcast::channel(notif_capacity);
 
-        let reader =
-            tauri::async_runtime::spawn(reader_loop(read_half, pending.clone(), notif_tx.clone()));
+        let reader = tauri::async_runtime::spawn(reader_loop(
+            read_half,
+            pending.clone(),
+            notif_tx.clone(),
+            max_frame,
+        ));
 
         Self {
             writer: tokio::sync::Mutex::new(write_half),
@@ -190,23 +215,38 @@ async fn reader_loop<R>(
     read_half: R,
     pending: PendingMap,
     notif_tx: broadcast::Sender<Arc<ServerNotification>>,
+    max_frame: usize,
 ) where
     R: AsyncBufRead + Unpin + Send + 'static,
 {
     let mut reader = read_half;
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
 
     loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
+        buf.clear();
+        // Cap each frame: `take(max_frame)` yields EOF once the cap is hit, so a
+        // never-terminating line can't grow `buf` without bound. A frame that
+        // fills the cap with no closing newline is a protocol violation → tear the
+        // connection down (the drain below fails every pending request).
+        let read = (&mut reader)
+            .take(max_frame as u64)
+            .read_until(b'\n', &mut buf)
+            .await;
+        match read {
             Ok(0) => break, // EOF: child closed stdout.
-            Ok(_) => {}
+            Ok(_) => {
+                if !buf.ends_with(b"\n") && buf.len() >= max_frame {
+                    eprintln!("app-server 帧超过 {max_frame} 字节上限，断开连接");
+                    break;
+                }
+            }
             Err(e) => {
                 eprintln!("app-server 读取错误: {e}");
                 break;
             }
         }
 
+        let line = String::from_utf8_lossy(&buf);
         match codec::decode_line(&line) {
             Ok(None) => {} // blank line.
             Ok(Some(Inbound::Response { id, payload })) => {
@@ -243,5 +283,42 @@ async fn reader_loop<R>(
             message: "app-server 连接已关闭".to_string(),
             data: None,
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame that fills the cap with no closing newline tears the connection
+    /// down: the reader stops, marks the connection closed, drains pending, and a
+    /// concurrent request fails fast (not a 30s timeout) rather than buffering the
+    /// runaway line.
+    #[tokio::test]
+    async fn oversized_frame_tears_down_connection() {
+        let (client_w, _server_r) = tokio::io::duplex(64 * 1024);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let max = 1024usize;
+        let client = RpcClient::connect_with_max_frame(
+            client_w,
+            tokio::io::BufReader::new(client_r),
+            16,
+            max,
+        );
+
+        // Flood > cap with no newline.
+        let mut sw = server_w;
+        sw.write_all(&vec![b'x'; max * 2]).await.unwrap();
+        sw.flush().await.unwrap();
+
+        let res = client.request("initialize", serde_json::json!({})).await;
+        assert!(
+            res.is_err(),
+            "oversized frame must close the reader and fail the request"
+        );
+        assert!(
+            !client.is_connected(),
+            "is_connected flips false once the cap is hit"
+        );
     }
 }
