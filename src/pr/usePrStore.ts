@@ -39,7 +39,11 @@ export const usePrStore = defineStore("pr", {
     gh: null,
     ghLoading: false,
     lastPulledAt: null,
-    // Reflects the backend auto-start in lib.rs setup.
+    // Reflects the backend's *conditional* auto-start (lib.rs): the loop starts at
+    // launch only when the persisted config is valid. The monitor view is reached
+    // either with a valid config (loop already running) or right after onboarding
+    // calls startPolling — so `true` holds on both paths. (A non-empty but invalid
+    // hand-edited repoRoot is the lone exception; the user fixes it in Settings.)
     polling: true,
   }),
   actions: {

@@ -38,30 +38,30 @@ const { codex } = useReviewStore();
 .status-bar {
   display: flex;
   align-items: center;
-  gap: 16px;
-  padding: 6px 16px;
-  border-top: 1px solid rgba(128, 128, 128, 0.3);
-  font-size: 12px;
-  color: #888;
+  gap: var(--space-8);
+  padding: var(--space-3) var(--space-8);
+  border-top: 1px solid var(--color-border-strong);
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
 }
 .item {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
 }
 .dot {
   width: 8px;
   height: 8px;
-  border-radius: 50%;
-  background: #888;
+  border-radius: var(--radius-full);
+  background: var(--color-text-muted);
 }
 .dot.ok {
-  background: #2a7;
+  background: var(--color-success);
 }
 .dot.warn {
-  background: #e0a000;
+  background: var(--color-warn-dot);
 }
 .dot.idle {
-  background: #888;
+  background: var(--color-text-muted);
 }
 </style>

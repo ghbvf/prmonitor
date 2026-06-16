@@ -1,9 +1,12 @@
 <script setup lang="ts">
-// Composition-root layout: wires the slice views together. Slices own their
-// own UI + state; App only arranges them.
+// Composition-root layout: wires the slice views together and switches between the
+// monitor / settings / onboarding views. Slices own their own UI + state; App only
+// arranges them.
 import { computed, onMounted, ref } from "vue";
 import { appVersion } from "./config/api";
-import ConfigPanel from "./config/ConfigPanel.vue";
+import { useConfigStore } from "./config/useConfigStore";
+import SettingsView from "./config/SettingsView.vue";
+import OnboardingWizard from "./config/OnboardingWizard.vue";
 import PollControls from "./pr/PollControls.vue";
 import PrList from "./pr/PrList.vue";
 import { usePrStore } from "./pr/usePrStore";
@@ -11,13 +14,18 @@ import StatusBar from "./StatusBar.vue";
 import ReviewPanel from "./review/ReviewPanel.vue";
 import ReviewSessions from "./review/ReviewSessions.vue";
 import { useReviewStore } from "./review/useReviewStore";
-import { reschedule } from "./pr/api";
+import { reschedule, startPolling } from "./pr/api";
+import { useAppView } from "./useAppView";
 import type { PullRequestView } from "./types";
 
 const version = ref("");
-onMounted(async () => {
-  version.value = await appVersion();
-});
+// Gate view selection until the config load resolves, so a first-launch user never
+// flashes the monitor (and its poll-triggering children) before onboarding mounts.
+const booting = ref(true);
+
+const prStore = usePrStore();
+const configStore = useConfigStore();
+const { currentView, goMonitor, goSettings, goOnboarding } = useAppView();
 
 // Login / availability banner (composition layer only): #8 auto-triggers reviews,
 // which silently stall if `gh` isn't authenticated or codex is unavailable.
@@ -25,7 +33,6 @@ onMounted(async () => {
 // is legitimate here — App is the cross-slice wiring point, exactly like StatusBar.
 // Hidden while either status is still loading (null) so a cold start doesn't flash
 // a false warning; shown only on a confirmed unavailable signal.
-const prStore = usePrStore();
 // `dispatchError` is the session-less auto-trigger notice (#8): the backend
 // dispatcher emits it on a bad config / start failure / ledger-write failure, so
 // the same banner that warns "auto review paused" also reports "auto review failed".
@@ -33,13 +40,75 @@ const { codex, dispatchError, clearDispatchError } = useReviewStore();
 const ghBlocked = computed(() => prStore.gh?.authenticated === false);
 const codexBlocked = computed(() => codex.value?.available === false);
 const showPrompt = computed(() => ghBlocked.value || codexBlocked.value);
+// A config LOAD failure leaves `config` null; surface it instead of silently
+// degrading to an empty monitor (finding F3). The user can open Settings to retry
+// (SettingsView re-loads on mount) or re-save.
+const configError = computed(() => (configStore.config ? null : configStore.error));
 
-// Cross-slice wiring (composition root only): a config save may change the poll
-// interval, so reschedule the backend timer.
-function onConfigSaved() {
-  // Non-blocking: a reschedule failure only delays the period rebuild (the next
-  // poll still runs on the old period), so log it rather than surfacing/throwing.
-  reschedule().catch((e) => console.error("reschedule failed", e));
+// A rejected Tauri invoke throws the AppError object `{ message }`; fall back to a
+// stringified form for any non-conforming throw (mirrors the slice stores).
+function toMsg(e: unknown): string {
+  return (e as { message?: string })?.message ?? String(e);
+}
+
+onMounted(async () => {
+  version.value = await appVersion();
+  // First-launch detection: a freshly-installed app loads AppConfig::default(),
+  // whose only empty field is repoRoot — the backend gate (lib.rs) won't have
+  // auto-started the poll loop for it → route to onboarding. Require config to be
+  // *present* and empty: a null config means the load itself failed (IPC error),
+  // and forcing a returning user back through onboarding on a transient error would
+  // be worse than degrading to the monitor view.
+  await configStore.load();
+  if (configStore.config && configStore.config.repoRoot === "") {
+    goOnboarding();
+  } else {
+    goMonitor();
+  }
+  booting.value = false;
+});
+
+// Cross-slice wiring (composition root only): a config save may both (a) fix a
+// previously-invalid config that left the loop gated off at launch and (b) change
+// the poll interval. start_polling is idempotent (no-op if already running) and
+// recovers the gated-off case; reschedule then applies the new period.
+async function onConfigSaved() {
+  try {
+    await startPolling();
+    prStore.polling = true;
+  } catch (e) {
+    // start_polling now rejects under an invalid config (finding F1). Keep the flag
+    // honest and surface the error (finding F3) so a saved-but-not-running monitor is
+    // visible — not just a console line implying the loop resumed.
+    prStore.polling = false;
+    prStore.error = toMsg(e);
+    return;
+  }
+  // The loop is running; a reschedule failure only delays the period rebuild (the
+  // next poll still runs on the old period), so surface it without claiming a stop.
+  try {
+    await reschedule();
+  } catch (e) {
+    prStore.error = toMsg(e);
+  }
+}
+
+// Onboarding finished with a validated save. The backend gate did NOT auto-start
+// the loop (config was invalid at launch), so start it now and reflect it in the pr
+// store before entering the monitor view — this is the downstream that closes the
+// poll-gate funnel (upstream = the lib.rs validity gate).
+async function onOnboardingDone() {
+  try {
+    await startPolling();
+    prStore.polling = true;
+  } catch (e) {
+    // Keep the polling flag honest (PollControls won't claim the loop is running)
+    // AND surface the error (finding F3) so the user sees why the monitor didn't
+    // start — not just a console line — and can retry from the monitor controls.
+    prStore.polling = false;
+    prStore.error = toMsg(e);
+  }
+  goMonitor();
 }
 
 // Cross-slice wiring: the pr slice selects a PR, the review slice reviews it.
@@ -53,10 +122,42 @@ const selectedPr = ref<PullRequestView | null>(null);
     <header class="app-bar">
       <strong>prmonitor</strong>
       <small v-if="version">v{{ version }}</small>
+      <span class="spacer" />
+      <button
+        v-if="!booting && currentView === 'monitor'"
+        type="button"
+        class="nav-btn"
+        @click="goSettings"
+      >
+        设置
+      </button>
+      <button
+        v-else-if="currentView === 'settings'"
+        type="button"
+        class="nav-btn"
+        @click="goMonitor"
+      >
+        ← 返回监控
+      </button>
     </header>
-    <div class="layout">
+
+    <div v-if="booting" class="view booting" />
+
+    <OnboardingWizard
+      v-else-if="currentView === 'onboarding'"
+      class="view"
+      @done="onOnboardingDone"
+    />
+
+    <SettingsView
+      v-else-if="currentView === 'settings'"
+      class="view"
+      @saved="onConfigSaved"
+      @close="goMonitor"
+    />
+
+    <div v-else class="layout">
       <aside class="sidebar">
-        <ConfigPanel @saved="onConfigSaved" />
         <PollControls />
         <PrList
           :selected-number="selectedPr?.number ?? null"
@@ -64,7 +165,17 @@ const selectedPr = ref<PullRequestView | null>(null);
         />
       </aside>
       <main class="content">
-        <div v-if="showPrompt || dispatchError" class="availability" role="alert">
+        <div
+          v-if="showPrompt || dispatchError || configError"
+          class="availability"
+          role="alert"
+        >
+          <p v-if="configError" class="line dispatch-error">
+            <span>⚠ 配置加载失败：{{ configError }}</span>
+            <button type="button" class="dismiss" @click="goSettings">
+              打开设置
+            </button>
+          </p>
           <p v-if="showPrompt" class="line">
             自动 review 已暂停 —
             <template v-if="ghBlocked">
@@ -91,26 +202,20 @@ const selectedPr = ref<PullRequestView | null>(null);
         <ReviewPanel :selected-pr="selectedPr" />
       </main>
     </div>
+
     <StatusBar />
   </div>
 </template>
 
 <style>
 :root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  color: #0f0f0f;
-  background-color: #f6f6f6;
+  font-family: var(--font-sans);
+  color: var(--color-text);
+  background-color: var(--color-bg);
 }
 
 body {
   margin: 0;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
 }
 </style>
 
@@ -123,14 +228,39 @@ body {
 
 .app-bar {
   display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 10px 16px;
-  border-bottom: 1px solid rgba(128, 128, 128, 0.3);
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-5) var(--space-8);
+  border-bottom: 1px solid var(--color-border-strong);
 }
 
 .app-bar small {
-  color: #888;
+  color: var(--color-text-muted);
+}
+
+.spacer {
+  flex: 1;
+}
+
+.nav-btn {
+  padding: var(--space-2) var(--space-4);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  color: var(--color-accent);
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.nav-btn:hover {
+  background: var(--color-surface-hover);
+}
+
+.view {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .layout {
@@ -140,31 +270,31 @@ body {
 }
 
 .sidebar {
-  width: 320px;
-  border-right: 1px solid rgba(128, 128, 128, 0.3);
+  width: var(--sidebar-width);
+  border-right: 1px solid var(--color-border-strong);
   overflow-y: auto;
-  padding: 12px;
+  padding: var(--space-6);
 }
 
 .content {
   flex: 1;
   overflow-y: auto;
-  padding: 12px;
+  padding: var(--space-6);
 }
 
 .availability {
-  margin-bottom: 12px;
-  padding: 8px 12px;
-  border: 1px solid rgba(224, 160, 0, 0.5);
-  border-radius: 4px;
-  background: rgba(224, 160, 0, 0.1);
-  font-size: 13px;
-  color: #b87900;
+  margin-bottom: var(--space-6);
+  padding: var(--space-4) var(--space-6);
+  border: 1px solid var(--color-warn-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-warn-bg);
+  font-size: var(--font-size-md);
+  color: var(--color-warn);
 }
 
 .availability code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
 }
 
 .availability .line {
@@ -172,7 +302,7 @@ body {
 }
 
 .availability .line + .line {
-  margin-top: 6px;
+  margin-top: var(--space-3);
 }
 
 /* Dispatch failures are error-toned (vs the warning-toned availability prompt). */
@@ -180,13 +310,13 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  color: #c00;
+  gap: var(--space-4);
+  color: var(--color-danger);
 }
 
 .availability .dismiss {
   flex: none;
-  padding: 0 4px;
+  padding: 0 var(--space-2);
   border: none;
   background: transparent;
   color: inherit;

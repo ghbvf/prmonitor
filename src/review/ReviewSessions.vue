@@ -59,76 +59,76 @@ function statusLabel(status: SessionStatus): string {
 
 <style scoped>
 .review-sessions {
-  margin-bottom: 16px;
+  margin-bottom: var(--space-8);
 }
 .head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .head h2 {
   margin: 0;
-  font-size: 15px;
+  font-size: var(--font-size-lg);
 }
 .muted {
-  color: #888;
-  font-size: 12px;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
 }
 .rows {
   list-style: none;
-  margin: 8px 0 0;
+  margin: var(--space-4) 0 0;
   padding: 0;
 }
 .session-row {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  border-bottom: 1px solid rgba(128, 128, 128, 0.15);
-  border-radius: 4px;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
   cursor: pointer;
 }
 .session-row:hover {
-  background: rgba(128, 128, 128, 0.08);
+  background: var(--color-surface-hover);
 }
 .session-row.focused {
-  background: rgba(37, 99, 235, 0.12);
+  background: var(--color-accent-bg);
 }
 .pr {
-  font-size: 13px;
+  font-size: var(--font-size-md);
 }
 .badge {
   display: inline-block;
-  padding: 1px 6px;
-  border-radius: 8px;
-  font-size: 11px;
+  padding: 1px var(--space-3);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-xs);
   line-height: 1.5;
 }
 .badge.kind {
-  background: rgba(37, 99, 235, 0.15);
-  color: #2563eb;
+  background: var(--color-accent-badge-bg);
+  color: var(--color-accent);
 }
 .badge.status {
-  background: rgba(128, 128, 128, 0.18);
+  background: var(--color-neutral-bg);
   color: inherit;
 }
 /* Distinct status styling: in-flight states tinted, terminal states colored. */
 .badge.status-running,
 .badge.status-starting {
-  background: rgba(42, 119, 0, 0.15);
-  color: #2a7700;
+  background: var(--color-success-bg);
+  color: var(--color-success);
 }
 .badge.status-interrupting {
-  background: rgba(224, 160, 0, 0.18);
-  color: #b87900;
+  background: var(--color-warn-bg-strong);
+  color: var(--color-warn);
 }
 .badge.status-done {
-  background: rgba(128, 128, 128, 0.18);
-  color: #888;
+  background: var(--color-neutral-bg);
+  color: var(--color-text-muted);
 }
 .badge.status-failed {
-  background: rgba(204, 0, 0, 0.12);
-  color: #c00;
+  background: var(--color-danger-bg);
+  color: var(--color-danger);
 }
 </style>

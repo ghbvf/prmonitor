@@ -48,19 +48,19 @@ onUnmounted(() => {
 
 <style scoped>
 .poll-controls {
-  margin-bottom: 16px;
+  margin-bottom: var(--space-8);
 }
 .actions {
   display: flex;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .actions button {
-  padding: 4px 8px;
-  font-size: 12px;
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--font-size-sm);
 }
 .muted {
-  color: #888;
-  font-size: 12px;
-  margin: 8px 0 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  margin: var(--space-4) 0 0;
 }
 </style>
