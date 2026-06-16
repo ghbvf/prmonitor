@@ -31,11 +31,15 @@ pub struct CodexManager {
     start_lock: tokio::sync::Mutex<()>,
     /// 用户显式停止标记（来自 `stop`/`stop_codex`）。true 时：
     /// - 被动 `status` 探测短路为「已停止」，不自动拉起；
-    /// - auto-dispatch 在上游 `run_auto_dispatch` 经 `is_stopped()` gate 静默跳过本轮（PR #47 F1），不复活；
+    /// - `connection`（每个 review start 的统一收口）直接拒绝（返回 Err），不复活——这是
+    ///   auto-dispatch「停止后不复活」的**race-free 真值源**（PR #47 F1）；`run_auto_dispatch`
+    ///   的 `is_stopped()` 仅作快路径优化；
+    /// - `ensure_started` 在装载进程前于 inner 锁内复查此位，停止则丢弃刚 spawn 的进程，
+    ///   闭合 cold-start 竞态（PR #47 F1）；
     /// - 中断（`stop_review`）走 `existing_client()`，只对在跑的进程有意义、不复活（PR #47 F2）。
     ///
-    /// 只有**手动** review 路径会清此位强制启动：`connection`（手动 `start_review` 调用）与
-    /// `start`（手动 `start_codex`）——「用户显式停止 → 自动派发尊重之，手动 review 仍强制启动」。
+    /// 只有**手动** review 路径清此位（`resume`）强制启动：`start_review` / `start_codex`
+    /// 命令在取连接前显式 `resume()`——「用户显式停止 → 自动派发尊重之，手动 review 仍强制启动」。
     /// 默认 false = 保持现状 lazy 行为。
     stopped: AtomicBool,
 }
@@ -81,11 +85,30 @@ impl CodexManager {
                 .map_err(|_| AppError::new("codex app-server 握手超时".to_string()))??;
         let info = proc.info.clone();
 
-        // Install the new connection. We only reach here when the cell was empty
-        // or held a dead process (the re-check returned early otherwise) and
-        // `start_lock` keeps this path single-writer — so reap any dead
-        // predecessor explicitly rather than leaning on drop alone.
-        let dead = self.inner.lock().unwrap().replace(proc);
+        // Install the new connection, re-checking the user-stop flag in the SAME std
+        // Mutex critical section (PR #47 F1 cold-start race close). A `stop` can land
+        // during our spawn/handshake await: `start_lock` serializes cold starts but
+        // `stop` deliberately does NOT take it (it must stay sync). `stop` stores
+        // `stopped = true` BEFORE taking this lock (see `stop`/`shutdown`), so:
+        //   - if its store happened-before this read, we observe it here and DISCARD
+        //     the freshly-spawned process (kill it, return) rather than resurrecting a
+        //     server the user just stopped;
+        //   - if `stop` instead lands just after we install, its own `take()` reaps our
+        //     process.
+        // Either ordering ⇒ no orphan child, no stale `stopped`+running combination.
+        // We only reach here when the cell was empty or held a dead process and
+        // `start_lock` keeps this path single-writer — so reap any dead predecessor
+        // explicitly rather than leaning on drop alone.
+        let mut guard = self.inner.lock().unwrap();
+        if self.stopped.load(Ordering::SeqCst) {
+            drop(guard);
+            proc.kill_and_reap();
+            return Err(AppError::new(
+                "codex app-server 在启动期间被停止".to_string(),
+            ));
+        }
+        let dead = guard.replace(proc);
+        drop(guard);
         if let Some(dead) = dead {
             dead.kill_and_reap();
         }
@@ -103,14 +126,21 @@ impl CodexManager {
         codex_bin: &str,
         repo_root: &str,
     ) -> AppResult<Arc<RpcClient<ChildStdin>>> {
-        // This is the MANUAL-review force-start path (manual `start_review`). A user
-        // who asks to review overrides a prior `stop`, so clear the user-stop flag
-        // to force a start. Auto-dispatch does NOT come here when stopped — it is
-        // gated upstream by `is_stopped()` in `run_auto_dispatch` (PR #47 F1), so it
-        // never clears the flag / revives a stopped server. Interrupts use
-        // `existing_client()` (no spawn, no flag-clear; PR #47 F2). `ensure_started`
-        // itself is unchanged (still lazy / self-heal).
-        self.stopped.store(false, Ordering::SeqCst);
+        // Authoritative stop funnel (PR #47 F1, race-free close). This is the single
+        // acquisition path every review start (manual `start_review` AND auto-dispatch)
+        // funnels through (`session::start_review`). A user-stopped server must never be
+        // revived here, so REFUSE when stopped rather than clear-the-flag-and-spawn.
+        //
+        // The manual entries (`start_review` / `start_codex` commands) call `resume()`
+        // BEFORE reaching here, so a manual review still force-starts (overrides a prior
+        // `stop`). Auto-dispatch never calls `resume()`, so even if a `stop` lands after
+        // `run_auto_dispatch`'s upstream `is_stopped()` fast-path gate but before we get
+        // here (the old TOCTOU), this refusal blocks the revive. `ensure_started` adds
+        // the symmetric cold-start guard (re-check under the install lock). Interrupts
+        // use `existing_client()` (no spawn, no flag change; PR #47 F2).
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(AppError::new("codex app-server 已停止".to_string()));
+        }
         self.ensure_started(codex_bin, repo_root).await?;
         let guard = self.inner.lock().unwrap();
         let proc = guard
@@ -125,6 +155,15 @@ impl CodexManager {
     /// (`connection`) and manual `start` force a restart.
     pub(crate) fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// Clear the user-stop flag (manual force-start intent). Called by the MANUAL
+    /// entries (`start_review` / `start_codex` commands) BEFORE acquiring the
+    /// connection, so a manual review/start overrides a prior `stop`. Auto-dispatch
+    /// never calls this — that is what makes `connection`'s refuse-if-stopped keep a
+    /// stopped server from being auto-revived (PR #47 F1 race close).
+    pub(crate) fn resume(&self) {
+        self.stopped.store(false, Ordering::SeqCst);
     }
 
     /// 返回当前**已存活**连接的可调用 client；不存在/已死则 None。
@@ -190,7 +229,7 @@ impl CodexManager {
     /// Explicitly (re)start the resident server: clear the user-stop flag and
     /// ensure the connection. Returns the latest status (`desired_running: true`).
     pub async fn start(&self, codex_bin: &str, repo_root: &str) -> CodexStatus {
-        self.stopped.store(false, Ordering::SeqCst);
+        self.resume();
         self.status_inner(codex_bin, repo_root).await
     }
 
@@ -255,21 +294,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_clears_stopped_then_starts() {
-        // The MANUAL-review path force-starts: even after a `stop`, `connection`
-        // clears `stopped` before attempting the spawn. The spawn itself fails (no
-        // real binary) and returns Err, but the flag must already be cleared — that
-        // is the "manual review overrides a prior stop" semantics (PR #47 F1/F8).
+    async fn connection_refuses_when_stopped_and_does_not_clear() {
+        // Race-free F1 close (reproduction test for the TOCTOU): every review start —
+        // including auto-dispatch — funnels through `connection`. When stopped it must
+        // REFUSE (Err) and leave `stopped` set, NOT clear-the-flag-and-spawn. (The old
+        // behavior cleared `stopped` here, which let auto-dispatch revive a stopped
+        // server if a stop landed after the upstream `is_stopped()` gate.)
         let m = CodexManager::default();
         m.stop();
         assert!(m.is_stopped());
         let r = m.connection("prmonitor-no-such-codex-bin", "").await;
-        assert!(r.is_err(), "no real binary → spawn fails");
+        assert!(r.is_err(), "stopped → connection refuses");
         assert!(
-            !m.is_stopped(),
-            "connection clears the user-stop flag (force-start) before spawning"
+            m.is_stopped(),
+            "connection must NOT clear the user-stop flag (auto-dispatch revive guard)"
         );
     }
+
+    #[tokio::test]
+    async fn resume_clears_stopped() {
+        // The manual entries (`start_review` / `start_codex` commands) call `resume()`
+        // before acquiring the connection, so a manual review/start overrides a prior
+        // stop and `connection` no longer refuses.
+        let m = CodexManager::default();
+        m.stop();
+        assert!(m.is_stopped());
+        m.resume();
+        assert!(!m.is_stopped());
+    }
+
+    // NOTE: the cold-start install guard in `ensure_started` (re-check `stopped` under
+    // the inner lock, discard the freshly-spawned process if a stop landed during the
+    // spawn/handshake await) is RUNTIME_ONLY — reaching the post-handshake install path
+    // requires a real `codex app-server` binary, so it can't be exercised CI-safe with
+    // a bogus bin name (which fails at spawn, before install). It is defended by
+    // construction (atomic re-check inside the std-Mutex critical section) and is the
+    // companion of the `#[ignore]`d real-binary test in `tests/codex_handshake.rs`.
 
     #[tokio::test]
     async fn existing_client_is_none_when_never_started() {

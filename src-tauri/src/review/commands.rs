@@ -62,6 +62,11 @@ pub async fn start_review<R: tauri::Runtime>(
     // slice depends only on `config::service`, never `config::model`.
     let cfg = config_service::load_validated(&app)?;
     let skill_abs = skill_abs_path(&cfg.repo_root, &cfg.skill_rel_path);
+    // MANUAL force-start: a user asking to review overrides a prior `stop_codex`.
+    // `resume()` clears the user-stop flag BEFORE `engine.start()` reaches the
+    // `connection()` funnel (which refuses when stopped). Auto-dispatch does NOT
+    // resume, so a stopped server is never auto-revived (PR #47 F1).
+    state.codex.resume();
     let engine = CodexEngine {
         app: &app,
         codex: &state.codex,
