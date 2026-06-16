@@ -34,6 +34,7 @@ const draft = reactive<AppConfig>({
   prCooldownSeconds: 0,
   sourceKind: "github",
   engineKind: "codex",
+  autoReview: true,
 });
 
 const authorsInput = ref("");
@@ -49,6 +50,7 @@ function hydrate(cfg: AppConfig) {
   draft.prCooldownSeconds = cfg.prCooldownSeconds;
   draft.sourceKind = cfg.sourceKind;
   draft.engineKind = cfg.engineKind;
+  draft.autoReview = cfg.autoReview;
   authorsInput.value = cfg.authors.join(", ");
 }
 
@@ -88,7 +90,7 @@ const STEP_FIELDS: Record<StepId, FieldKey[]> = {
   repoRoot: ["repoRoot"],
   skill: ["skillRelPath"],
   source: ["sourceKind"],
-  autoReview: ["pollIntervalSecs", "prCooldownSeconds", "reviewLabel", "checkLabel", "authors"],
+  autoReview: ["autoReview", "pollIntervalSecs", "prCooldownSeconds", "reviewLabel", "checkLabel", "authors"],
   done: [],
 };
 
@@ -96,12 +98,12 @@ const currentFields = computed<FieldDef[]>(() =>
   STEP_FIELDS[currentStep.value].map(defOf),
 );
 
-function fieldValue(def: FieldDef): string | number | string[] {
+function fieldValue(def: FieldDef): string | number | boolean | string[] {
   if (def.key === "authors") return authorsInput.value;
   return draft[def.key];
 }
 
-function setField(def: FieldDef, value: string | number | string[]) {
+function setField(def: FieldDef, value: string | number | boolean | string[]) {
   if (def.key === "authors") {
     authorsInput.value = Array.isArray(value) ? value.join(", ") : String(value);
     return;
@@ -216,6 +218,7 @@ async function finish() {
           <div><dt>仓库</dt><dd>{{ draft.repo }}</dd></div>
           <div><dt>本地路径</dt><dd>{{ draft.repoRoot }}</dd></div>
           <div><dt>Skill</dt><dd>{{ draft.skillRelPath }}</dd></div>
+          <div><dt>自动 review</dt><dd>{{ draft.autoReview ? "自动" : "手动" }}</dd></div>
           <div><dt>轮询间隔</dt><dd>{{ draft.pollIntervalSecs }} 秒</dd></div>
           <div><dt>PR 冷却</dt><dd>{{ draft.prCooldownSeconds }} 秒</dd></div>
           <div><dt>Review 标签</dt><dd>{{ draft.reviewLabel || "—" }}</dd></div>

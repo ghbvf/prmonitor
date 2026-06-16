@@ -3,13 +3,21 @@
 // `gh` CLI auth state (pr store) and codex availability (review store). Living at
 // the shell layer — not inside a slice — is what makes reading across both slices
 // legitimate, exactly as App.vue does its cross-slice wiring.
+import { onMounted } from "vue";
 import { usePrStore } from "./pr/usePrStore";
 import { useReviewStore } from "./review/useReviewStore";
 
 const store = usePrStore();
 // Destructure the codex ref so the template auto-unwraps it (the review store is
 // a plain factory object, not a Pinia store, so `review.codex` would stay a Ref).
-const { codex } = useReviewStore();
+const { codex, refreshCodexStatus, startCodexServer, stopCodexServer } =
+  useReviewStore();
+// Self-refresh codex status on mount so the StatusBar shows the real state even
+// when the user never opened ReviewPanel. Only refresh when still null to avoid
+// clobbering a fresher value from another source (e.g. ReviewPanel's own poll).
+onMounted(() => {
+  if (codex.value == null) refreshCodexStatus();
+});
 </script>
 
 <template>
@@ -25,11 +33,31 @@ const { codex } = useReviewStore();
     <span class="item">
       <span
         class="dot"
-        :class="codex == null ? 'idle' : codex.available ? 'ok' : 'warn'"
+        :class="
+          codex == null
+            ? 'idle'
+            : codex.desiredRunning === false
+              ? 'idle'
+              : codex.available
+                ? 'ok'
+                : 'warn'
+        "
       ></span>
       <span class="text">
         codex — {{ codex == null ? "初始化中… / starting" : codex.message }}
       </span>
+      <button
+        v-if="codex != null"
+        type="button"
+        class="codex-btn"
+        @click="
+          codex.desiredRunning === false
+            ? startCodexServer()
+            : stopCodexServer()
+        "
+      >
+        {{ codex.desiredRunning === false ? "启动" : "停止" }}
+      </button>
     </span>
   </footer>
 </template>
@@ -63,5 +91,20 @@ const { codex } = useReviewStore();
 }
 .dot.idle {
   background: var(--color-text-muted);
+}
+.codex-btn {
+  margin-left: var(--space-3);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+  line-height: 1.6;
+  cursor: pointer;
+}
+.codex-btn:hover {
+  color: var(--color-text);
+  border-color: var(--color-text-muted);
 }
 </style>

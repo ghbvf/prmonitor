@@ -77,6 +77,8 @@ pub fn run() {
             pr::commands::get_prs,
             pr::commands::set_pr_archived,
             review::commands::get_codex_status,
+            review::commands::start_codex,
+            review::commands::stop_codex,
             review::commands::start_review,
             review::commands::stop_review,
             review::commands::list_review_sessions,
@@ -122,6 +124,13 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
     };
     let skill_abs = skill_abs_path(&cfg.repo_root, &cfg.skill_rel_path);
     let state = app.state::<AppState>();
+    // Respect an explicit user `stop_codex`: a stopped codex is NOT auto-revived by a
+    // dispatchable PR. Skip this batch silently (same as the autoReview-off skip — no
+    // emit, no spawn). Only MANUAL review (`start_review`) and manual `start_codex`
+    // force a restart; auto-dispatch defers to the user's stop (PR #47 F1).
+    if state.codex.is_stopped() {
+        return;
+    }
     let engine = review::engines::codex::CodexEngine {
         app: &app,
         codex: &state.codex,

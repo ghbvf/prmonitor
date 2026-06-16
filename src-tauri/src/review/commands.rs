@@ -29,6 +29,23 @@ pub async fn get_codex_status<R: tauri::Runtime>(
     Ok(state.codex.status(CODEX_BIN, &cfg.repo_root).await)
 }
 
+/// 显式启动常驻 codex app-server（清除「已停止」标记并拉起握手）。返回最新状态。
+#[tauri::command]
+pub async fn start_codex<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<CodexStatus> {
+    let cfg = config_service::load(&app)?;
+    Ok(state.codex.start(CODEX_BIN, &cfg.repo_root).await)
+}
+
+/// 显式停止常驻 codex app-server（设「已停止」标记 + 杀进程；被动状态探测此后不再自动拉起，显式 review 仍会强制启动）。
+/// 走统一错误漏斗 `AppResult`（与其余命令一致；`stop` 不会失败，故恒 `Ok`。前端 `invoke<CodexStatus>` 不变——`AppResult` 成功序列化为 `T`）。
+#[tauri::command]
+pub fn stop_codex(state: tauri::State<'_, AppState>) -> AppResult<CodexStatus> {
+    Ok(state.codex.stop())
+}
+
 /// Start a review for `pr_number` (`kind` = `"review"` or `"check"`), returning
 /// the session id (codex `threadId`). Output streams out-of-band via the
 /// `review:event` Tauri event ([`crate::events::ReviewEvent`]).
@@ -45,6 +62,11 @@ pub async fn start_review<R: tauri::Runtime>(
     // slice depends only on `config::service`, never `config::model`.
     let cfg = config_service::load_validated(&app)?;
     let skill_abs = skill_abs_path(&cfg.repo_root, &cfg.skill_rel_path);
+    // MANUAL force-start: a user asking to review overrides a prior `stop_codex`.
+    // `resume()` clears the user-stop flag BEFORE `engine.start()` reaches the
+    // `connection()` funnel (which refuses when stopped). Auto-dispatch does NOT
+    // resume, so a stopped server is never auto-revived (PR #47 F1).
+    state.codex.resume();
     let engine = CodexEngine {
         app: &app,
         codex: &state.codex,

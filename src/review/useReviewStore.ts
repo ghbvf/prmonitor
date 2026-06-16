@@ -13,7 +13,9 @@ import {
   getCodexStatus,
   listReviewSessions,
   onReviewEvent,
+  startCodex,
   startReview,
+  stopCodex,
   stopReview,
 } from "./api";
 import type { CodexStatus, ReviewSession, SessionStatus, StreamItem } from "./types";
@@ -68,7 +70,41 @@ async function refreshCodexStatus() {
   } catch (err) {
     const message = toMessage(err);
     console.error("codex 状态获取失败", err);
-    codex.value = { available: false, message: message || "codex 状态获取失败" };
+    // A failed probe doesn't mean the user stopped it: keep desiredRunning true.
+    codex.value = {
+      available: false,
+      desiredRunning: true,
+      message: message || "codex 状态获取失败",
+    };
+  }
+}
+
+// Explicitly (re)start the resident codex app-server, reflecting the result in
+// `codex` (drives the StatusBar dot + 启动/停止 button). Tolerates a rejected
+// command by surfacing an intent-to-run failure status.
+async function startCodexServer() {
+  try {
+    codex.value = await startCodex();
+  } catch (err) {
+    codex.value = {
+      available: false,
+      desiredRunning: true,
+      message: toMessage(err) || "codex 启动失败",
+    };
+  }
+}
+
+// Explicitly stop the resident codex app-server. On failure still mark it stopped
+// (the user's intent) so the StatusBar offers a 启动 action to retry.
+async function stopCodexServer() {
+  try {
+    codex.value = await stopCodex();
+  } catch (err) {
+    codex.value = {
+      available: false,
+      desiredRunning: false,
+      message: toMessage(err) || "codex 停止失败",
+    };
   }
 }
 
@@ -301,6 +337,8 @@ export function useReviewStore() {
   return {
     codex,
     refreshCodexStatus,
+    startCodexServer,
+    stopCodexServer,
     sessions,
     refreshSessions,
     dispatchError,

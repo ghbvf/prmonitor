@@ -248,6 +248,14 @@ pub async fn start_review<R: tauri::Runtime>(
 
 /// Interrupt a running review session. The terminal `turn/completed` (status
 /// `interrupted`) arrives on the stream and the pump finishes the session.
+///
+/// `codex_bin`/`repo_root` are no longer used to build the connection: interrupting
+/// only makes sense against an already-live process, so we use
+/// [`CodexManager::existing_client`] (no spawn, no `stopped`-clear) rather than
+/// `connection` — interrupting a dead/stopped session must NOT revive the
+/// app-server (PR #47 F2). The params stay in the signature because the
+/// `ReviewEngine` impl (`engine.rs`) passes them; Rust does not lint unused fn
+/// params, so this is clippy-clean.
 pub async fn stop_review(
     codex: &CodexManager,
     registry: &SessionRegistry,
@@ -255,8 +263,11 @@ pub async fn stop_review(
     repo_root: &str,
     session_id: &str,
 ) -> AppResult<()> {
-    // Atomic guard: only a `Running` session flips to `Interrupting` (and yields
-    // its turn id); a repeat stop is an idempotent no-op, an unknown id an error.
+    // `codex_bin`/`repo_root` are unused since the `existing_client` switch (F2); bind
+    // them to `_` so the intent is explicit (the signature keeps them for the engine).
+    let _ = (codex_bin, repo_root);
+    // Atomic guard: only a `Running` session flips to `Interrupting` (and yields its
+    // turn id); a repeat stop is an idempotent no-op, an unknown id an error.
     let turn_id = match registry.begin_interrupt(session_id) {
         BeginInterrupt::Proceed(turn_id) => turn_id,
         BeginInterrupt::AlreadyHandled => return Ok(()),
@@ -264,16 +275,23 @@ pub async fn stop_review(
             return Err(AppError::new(format!("未找到 review 会话: {session_id}")))
         }
     };
-    // We're now `Interrupting`. Any failure below must roll back to `Running` so a
-    // retry can interrupt again — never leave a half-interrupted, un-stoppable
-    // session (the pump still owns the real terminal transition on `turn/completed`).
-    let client = match codex.connection(codex_bin, repo_root).await {
-        Ok(client) => client,
-        Err(e) => {
+    // We're now `Interrupting`. Take ONLY an already-live connection; never spawn.
+    let client = match codex.existing_client() {
+        Some(client) => client,
+        // No live process → the session is already terminated (a dead transport
+        // makes the pump fail it via `ConnectionClosed`/`Closed`), and there is
+        // nothing live to interrupt. Don't spawn / revive the app-server just to
+        // interrupt a gone turn (PR #47 F2). Roll back our optimistic
+        // `Interrupting` mark so we never leave a half-interrupted, un-stoppable
+        // session, then report success — the stop's intent (no running turn) holds.
+        None => {
             registry.rollback_interrupt(session_id);
-            return Err(e);
+            return Ok(());
         }
     };
+    // Any failure below must roll back to `Running` so a retry can interrupt again —
+    // never leave a half-interrupted, un-stoppable session (the pump still owns the
+    // real terminal transition on `turn/completed`).
     if let Err(e) = process::interrupt_turn(
         &client,
         TurnInterruptParams {

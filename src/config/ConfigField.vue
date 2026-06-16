@@ -10,7 +10,7 @@ import type { FieldDef } from "./fields";
 // csv is carried as a comma-joined string), number, or string[] (an authors array
 // passed through untouched; the csv path joins/splits it). string[] is accepted so
 // callers may bind the raw array and let the parent normalize.
-type FieldValue = string | number | string[];
+type FieldValue = string | number | boolean | string[];
 
 const props = defineProps<{ def: FieldDef; modelValue: FieldValue }>();
 const emit = defineEmits<{
@@ -51,6 +51,11 @@ function onSelect(e: Event) {
   emit("update:modelValue", (e.target as HTMLSelectElement).value);
   emit("edit");
 }
+
+function onCheckbox(e: Event) {
+  emit("update:modelValue", (e.target as HTMLInputElement).checked);
+  emit("edit");
+}
 </script>
 
 <template>
@@ -87,6 +92,13 @@ function onSelect(e: Event) {
     >
       <option v-for="opt in def.options" :key="opt" :value="opt">{{ opt }}</option>
     </select>
+
+    <input
+      v-else-if="def.kind === 'checkbox'"
+      type="checkbox"
+      :checked="modelValue === true"
+      @change="onCheckbox"
+    />
 
     <small v-if="def.hint" class="hint">{{ def.hint }}</small>
   </label>

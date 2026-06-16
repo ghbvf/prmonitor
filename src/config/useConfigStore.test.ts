@@ -25,6 +25,7 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
   prCooldownSeconds: 1800,
   sourceKind: "github",
   engineKind: "codex",
+  autoReview: true,
   ...over,
 });
 
