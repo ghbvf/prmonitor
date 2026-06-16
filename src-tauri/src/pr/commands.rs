@@ -1,5 +1,7 @@
 //! PR slice Tauri commands: manual fetch + `gh` auth status.
 
+use tauri::Emitter; // for app.emit
+
 use crate::config::service as config_service;
 use crate::error::AppResult;
 use crate::model::{Candidate, PullRequestView};
@@ -158,12 +160,50 @@ pub async fn gh_status() -> AppResult<GhStatus> {
     Ok(gh_auth_status("gh").await)
 }
 
-/// Returns the latest discovered PR list (the scheduler's snapshot) so the
-/// frontend can render current state on mount without waiting for the next
-/// `prs:updated` event (closes the startup lost-event race).
+/// Returns the retained tracked-PR list (the persisted `prs.json` set projected at
+/// the current epoch) so the frontend can render current state on mount without
+/// waiting for the next `prs:updated` event (closes the startup lost-event race).
+/// Reads only `app` — the persisted set survives restarts, so this no longer
+/// depends on the scheduler having run this session.
 #[tauri::command]
-pub fn get_prs(state: tauri::State<'_, crate::state::AppState>) -> AppResult<Vec<PullRequestView>> {
-    Ok(state.scheduler.snapshot())
+pub fn get_prs<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> AppResult<Vec<crate::model::TrackedPrView>> {
+    let tracked = super::registry::TrackedPrs::load(&app)?;
+    Ok(super::registry::project(&tracked, &app))
+}
+
+/// Sets a tracked PR's `archived` flag and re-emits the retained list immediately
+/// so the UI reflects the archive/unarchive without waiting for the next poll
+/// round. PRs are never auto-evicted; archiving is how users retire inactive rows.
+///
+/// Routes through the registry's single serialized write seam ([`registry::mutate_tracked`],
+/// F1) so this can't interleave with a poll-cycle upsert and lose a write. An unknown
+/// / raced `number` is a benign no-op: `set_archived` reports no change, the closure
+/// returns `persist == false` so the seam skips the store write, and we emit nothing —
+/// no phantom write/event — returning `Ok` rather than erroring. On a real change we
+/// re-emit the retained projection (built inside the seam, under the lock) so the list
+/// updates immediately.
+#[tauri::command]
+pub fn set_pr_archived<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    number: u64,
+    archived: bool,
+) -> AppResult<()> {
+    let emitted = super::registry::mutate_tracked(&app, |tracked| {
+        if tracked.set_archived(number, archived) {
+            (true, Some(super::registry::project(tracked, &app)))
+        } else {
+            (false, None) // unknown number — nothing changed, skip persist + emit.
+        }
+    })?;
+    if let Some(list) = emitted {
+        let _ = app.emit(
+            crate::events::PRS_UPDATED_EVENT,
+            &crate::events::PrEvent::Updated { prs: list },
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

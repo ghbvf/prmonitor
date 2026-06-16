@@ -11,5 +11,6 @@ pub mod commands;
 pub mod discover;
 pub mod gh;
 pub mod ledger;
+pub mod registry;
 pub mod scheduler;
 pub mod source;

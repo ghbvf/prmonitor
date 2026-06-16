@@ -16,7 +16,6 @@ import ReviewSessions from "./review/ReviewSessions.vue";
 import { useReviewStore } from "./review/useReviewStore";
 import { reschedule, startPolling } from "./pr/api";
 import { useAppView } from "./useAppView";
-import type { PullRequestView } from "./types";
 
 const version = ref("");
 // Gate view selection until the config load resolves, so a first-launch user never
@@ -114,7 +113,19 @@ async function onOnboardingDone() {
 // Cross-slice wiring: the pr slice selects a PR, the review slice reviews it.
 // Holding the selection here keeps the two slices decoupled (neither imports the
 // other) — App passes it down to both PrList (highlight) and ReviewPanel (target).
-const selectedPr = ref<PullRequestView | null>(null);
+// Selection is keyed by PR *number*, not list identity (#38): the retained list
+// re-emits stable rows, so resolving the selected PR from the live store keeps the
+// highlight + review target pinned across refreshes — and auto-clears to null when
+// the selected PR drops out of the list entirely. Resolve against the *non-archived*
+// rows: archiving the selected PR retires it, so the review target clears and
+// ReviewPanel's "开始 review" doesn't stay enabled on an archived PR.
+const selectedNumber = ref<number | null>(null);
+const selectedPr = computed(
+  () =>
+    prStore.prs.find(
+      (p) => !p.archived && p.number === selectedNumber.value,
+    ) ?? null,
+);
 </script>
 
 <template>
@@ -160,8 +171,8 @@ const selectedPr = ref<PullRequestView | null>(null);
       <aside class="sidebar">
         <PollControls />
         <PrList
-          :selected-number="selectedPr?.number ?? null"
-          @select="(pr) => (selectedPr = pr)"
+          :selected-number="selectedNumber"
+          @select="(pr) => (selectedNumber = pr.number)"
         />
       </aside>
       <main class="content">

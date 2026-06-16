@@ -75,6 +75,7 @@ pub fn run() {
             pr::commands::reschedule,
             pr::commands::gh_status,
             pr::commands::get_prs,
+            pr::commands::set_pr_archived,
             review::commands::get_codex_status,
             review::commands::start_review,
             review::commands::stop_review,

@@ -5,7 +5,7 @@
 
 use serde::Serialize;
 
-use crate::model::PullRequestView;
+use crate::model::TrackedPrView;
 
 /// Tauri event name carrying a [`PrEvent`] (scheduled/manual PR-list refresh).
 pub const PRS_UPDATED_EVENT: &str = "prs:updated";
@@ -23,9 +23,11 @@ pub const REVIEW_EVENT: &str = "review:event";
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum PrEvent {
-    /// A fresh PR list (a successful discovery cycle).
+    /// The retained tracked-PR list (the persisted-retention view, not a raw
+    /// per-round discovery — a transient miss flips presence rather than dropping
+    /// a row).
     #[serde(rename_all = "camelCase")]
-    Updated { prs: Vec<PullRequestView> },
+    Updated { prs: Vec<TrackedPrView> },
     /// A discovery cycle failed; the loop keeps running.
     #[serde(rename_all = "camelCase")]
     Error { message: String },
@@ -89,16 +91,20 @@ pub enum ReviewEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::PullRequestView;
+    use crate::model::{PrPresence, PullRequestView, TrackedPrView};
 
-    fn sample_view() -> PullRequestView {
-        PullRequestView {
-            number: 1,
-            title: "Add feature".to_string(),
-            labels: vec!["review".to_string()],
-            url: "https://example.com/pr/1".to_string(),
-            kind: "review".to_string(),
-            skip_reason: None,
+    fn sample_view() -> TrackedPrView {
+        TrackedPrView {
+            pr: PullRequestView {
+                number: 1,
+                title: "Add feature".to_string(),
+                labels: vec!["review".to_string()],
+                url: "https://example.com/pr/1".to_string(),
+                kind: "review".to_string(),
+                skip_reason: None,
+            },
+            presence: PrPresence::Current,
+            archived: false,
         }
     }
 
@@ -112,6 +118,19 @@ mod tests {
 
         assert_eq!(v["kind"], "updated");
         assert!(v.get("prs").is_some());
+        // The row carries the flattened `PullRequestView` keys plus the retention
+        // fields — a drift in `TrackedPrView`'s wire shape surfaces here too.
+        let row = &v["prs"][0];
+        assert_eq!(row["number"], 1);
+        assert!(row.get("title").is_some());
+        assert!(row.get("url").is_some());
+        assert!(row.get("kind").is_some());
+        // `sample_view` has `skip_reason: None` → JSON null at the flattened depth;
+        // the snake_case form must not leak through the union either.
+        assert_eq!(row["skipReason"], serde_json::Value::Null);
+        assert!(row.get("skip_reason").is_none());
+        assert_eq!(row["presence"], "current");
+        assert_eq!(row["archived"], false);
     }
 
     #[test]
