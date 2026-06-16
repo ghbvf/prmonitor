@@ -29,7 +29,14 @@ pub struct CodexManager {
     /// the spawn/handshake await; this async lock fills that gap while leaving the
     /// fast path and `shutdown` synchronous on the std `Mutex`.
     start_lock: tokio::sync::Mutex<()>,
-    /// 用户显式停止标记。true=被动探测不再自动拉起；任何显式 review（connection）会清此位强制启动。默认 false=保持现状 lazy 行为。
+    /// 用户显式停止标记（来自 `stop`/`stop_codex`）。true 时：
+    /// - 被动 `status` 探测短路为「已停止」，不自动拉起；
+    /// - auto-dispatch 在上游 `run_auto_dispatch` 经 `is_stopped()` gate 静默跳过本轮（PR #47 F1），不复活；
+    /// - 中断（`stop_review`）走 `existing_client()`，只对在跑的进程有意义、不复活（PR #47 F2）。
+    ///
+    /// 只有**手动** review 路径会清此位强制启动：`connection`（手动 `start_review` 调用）与
+    /// `start`（手动 `start_codex`）——「用户显式停止 → 自动派发尊重之，手动 review 仍强制启动」。
+    /// 默认 false = 保持现状 lazy 行为。
     stopped: AtomicBool,
 }
 
@@ -38,6 +45,13 @@ impl CodexManager {
     /// Reuses an existing connected process; otherwise spawns + handshakes once
     /// and caches it. Self-heals: if the prior process died (reader cleared its
     /// liveness flag), this respawns.
+    ///
+    /// Stays `pub` (not `pub(crate)`): the `#[ignore]`d integration test
+    /// `tests/codex_handshake.rs::real_app_server_handshake_thread_and_reuse` calls
+    /// `CodexManager::ensure_started` directly, and `tests/` is a separate crate that
+    /// can only reach `pub` items (`#[ignore]` skips at run time, not compile time).
+    /// Narrowing it would break that test's compile (PR #47 F8 — visibility tightening
+    /// blocked by the live external-crate use).
     pub async fn ensure_started(
         &self,
         codex_bin: &str,
@@ -89,9 +103,13 @@ impl CodexManager {
         codex_bin: &str,
         repo_root: &str,
     ) -> AppResult<Arc<RpcClient<ChildStdin>>> {
-        // Any review (manual `start_review` or auto dispatch) needs a live process,
-        // so clear the user-stop flag to force a start: an explicit review overrides
-        // a prior `stop`. `ensure_started` itself is unchanged (still lazy / self-heal).
+        // This is the MANUAL-review force-start path (manual `start_review`). A user
+        // who asks to review overrides a prior `stop`, so clear the user-stop flag
+        // to force a start. Auto-dispatch does NOT come here when stopped — it is
+        // gated upstream by `is_stopped()` in `run_auto_dispatch` (PR #47 F1), so it
+        // never clears the flag / revives a stopped server. Interrupts use
+        // `existing_client()` (no spawn, no flag-clear; PR #47 F2). `ensure_started`
+        // itself is unchanged (still lazy / self-heal).
         self.stopped.store(false, Ordering::SeqCst);
         self.ensure_started(codex_bin, repo_root).await?;
         let guard = self.inner.lock().unwrap();
@@ -99,6 +117,23 @@ impl CodexManager {
             .as_ref()
             .ok_or_else(|| AppError::new("codex app-server 连接不可用".to_string()))?;
         Ok(proc.client())
+    }
+
+    /// Whether the user has explicitly stopped codex (`stop`/`stop_codex`). Read by
+    /// the composition root's `run_auto_dispatch` (PR #47 F1) to gate auto-dispatch:
+    /// a stopped codex is NOT auto-revived by a dispatchable PR — only manual review
+    /// (`connection`) and manual `start` force a restart.
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// 返回当前**已存活**连接的可调用 client；不存在/已死则 None。
+    /// 不 spawn、不清 `stopped`——用于中断等「只对在跑的进程有意义」的操作，
+    /// 避免为一个已死会话复活 app-server（见 PR #47 F2）。
+    pub(crate) fn existing_client(&self) -> Option<Arc<RpcClient<ChildStdin>>> {
+        let guard = self.inner.lock().unwrap();
+        let proc = guard.as_ref()?;
+        proc.is_connected().then(|| proc.client())
     }
 
     /// Handshake info iff the resident connection is currently live. Synchronous
@@ -217,5 +252,40 @@ mod tests {
         let s = m.start("prmonitor-no-such-codex-bin", "").await;
         assert!(s.desired_running);
         assert!(!s.available);
+    }
+
+    #[tokio::test]
+    async fn connection_clears_stopped_then_starts() {
+        // The MANUAL-review path force-starts: even after a `stop`, `connection`
+        // clears `stopped` before attempting the spawn. The spawn itself fails (no
+        // real binary) and returns Err, but the flag must already be cleared — that
+        // is the "manual review overrides a prior stop" semantics (PR #47 F1/F8).
+        let m = CodexManager::default();
+        m.stop();
+        assert!(m.is_stopped());
+        let r = m.connection("prmonitor-no-such-codex-bin", "").await;
+        assert!(r.is_err(), "no real binary → spawn fails");
+        assert!(
+            !m.is_stopped(),
+            "connection clears the user-stop flag (force-start) before spawning"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_client_is_none_when_never_started() {
+        // No process was ever spawned, so there is no live connection to interrupt.
+        let m = CodexManager::default();
+        assert!(m.existing_client().is_none());
+    }
+
+    #[tokio::test]
+    async fn existing_client_does_not_clear_stopped() {
+        // The interrupt path must NOT revive a stopped server: `existing_client`
+        // only returns a live connection and never clears `stopped`. After `stop`
+        // there is no process AND the flag stays set (PR #47 F2).
+        let m = CodexManager::default();
+        m.stop();
+        assert!(m.existing_client().is_none());
+        assert!(m.is_stopped());
     }
 }

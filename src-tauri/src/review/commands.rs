@@ -40,9 +40,10 @@ pub async fn start_codex<R: tauri::Runtime>(
 }
 
 /// 显式停止常驻 codex app-server（设「已停止」标记 + 杀进程；被动状态探测此后不再自动拉起，显式 review 仍会强制启动）。
+/// 走统一错误漏斗 `AppResult`（与其余命令一致；`stop` 不会失败，故恒 `Ok`。前端 `invoke<CodexStatus>` 不变——`AppResult` 成功序列化为 `T`）。
 #[tauri::command]
-pub fn stop_codex(state: tauri::State<'_, AppState>) -> CodexStatus {
-    state.codex.stop()
+pub fn stop_codex(state: tauri::State<'_, AppState>) -> AppResult<CodexStatus> {
+    Ok(state.codex.stop())
 }
 
 /// Start a review for `pr_number` (`kind` = `"review"` or `"check"`), returning
