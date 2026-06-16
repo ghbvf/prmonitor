@@ -60,20 +60,38 @@ impl Default for AppConfig {
 
 /// Validates config fields before persisting (hard-reject on failure).
 ///
-/// Checks: positive poll/cooldown intervals; `repo_root` is a non-empty,
-/// **absolute** path to an existing directory (absolute so resolution never
-/// depends on the process CWD, matching the field's doc contract); and
-/// `skill_rel_path` resolves to an existing file that stays **inside**
-/// `repo_root`. The skill check defends two `Path::join` pitfalls: an absolute
-/// `skill_rel_path` would discard `repo_root`, and `..` traversal could escape
-/// the clone — both would let a later engine read arbitrary files. Errors
-/// funnel through [`AppError`] naming the offending field.
+/// Checks: `repo` is `owner/name` (one slash, both sides non-empty, no
+/// whitespace — the backend boundary `gh pr list --repo` consumes, mirroring the
+/// frontend `REPO_RE`); `repo_root` is a non-empty, **absolute** path to an
+/// existing directory (absolute so resolution never depends on the process CWD,
+/// matching the field's doc contract); `skill_rel_path` resolves to an existing
+/// file that stays **inside** `repo_root` (the skill check defends two
+/// `Path::join` pitfalls: an absolute `skill_rel_path` would discard `repo_root`,
+/// and `..` traversal could escape the clone — both would let a later engine read
+/// arbitrary files); positive poll/cooldown intervals; and non-empty
+/// `review_label` / `check_label` (each is fed to `gh pr list --label`, so a blank
+/// one makes every poll match nothing / fail).
+///
+/// Errors funnel through [`AppError`], and each message **starts with** the
+/// offending field's wire name (`repo` / `repoRoot` / `skillRelPath` / `skill` /
+/// `pollIntervalSecs` / `prCooldownSeconds` / `reviewLabel` / `checkLabel`). That
+/// prefix is the cross-end routing contract the onboarding wizard's `errorToStep`
+/// (src/config/fields.ts) keys on — locked at this end by the `validate_error_*`
+/// test below (PR #41 F4, Medium). Checks run in wizard-step order so the first
+/// failure routes to the earliest offending step.
 pub fn validate(config: &AppConfig) -> AppResult<()> {
-    if config.poll_interval_secs == 0 {
-        return Err(AppError::new("pollIntervalSecs 必须大于 0"));
-    }
-    if config.pr_cooldown_seconds == 0 {
-        return Err(AppError::new("prCooldownSeconds 必须大于 0"));
+    // owner/name: exactly one slash, both sides non-empty, no whitespace anywhere
+    // (mirrors the frontend REPO_RE `^[^/\s]+\/[^/\s]+$`).
+    let repo_parts: Vec<&str> = config.repo.split('/').collect();
+    let repo_ok = repo_parts.len() == 2
+        && !repo_parts[0].is_empty()
+        && !repo_parts[1].is_empty()
+        && !config.repo.chars().any(char::is_whitespace);
+    if !repo_ok {
+        return Err(AppError::new(format!(
+            "repo 必须是 owner/name 格式: {}",
+            config.repo
+        )));
     }
 
     let repo_root = config.repo_root.trim();
@@ -110,6 +128,20 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
             "skillRelPath 不能逃逸 repoRoot: {}",
             config.skill_rel_path
         )));
+    }
+
+    if config.poll_interval_secs == 0 {
+        return Err(AppError::new("pollIntervalSecs 必须大于 0"));
+    }
+    if config.pr_cooldown_seconds == 0 {
+        return Err(AppError::new("prCooldownSeconds 必须大于 0"));
+    }
+
+    if config.review_label.trim().is_empty() {
+        return Err(AppError::new("reviewLabel 不能为空"));
+    }
+    if config.check_label.trim().is_empty() {
+        return Err(AppError::new("checkLabel 不能为空"));
     }
 
     Ok(())
@@ -273,6 +305,116 @@ mod tests {
             ..base
         })
         .is_err());
+    }
+
+    fn valid_base() -> AppConfig {
+        AppConfig {
+            repo_root: env!("CARGO_MANIFEST_DIR").to_string(),
+            skill_rel_path: "Cargo.toml".to_string(),
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_repo() {
+        // owner/name boundary the `gh pr list --repo` call consumes (PR #41 F2).
+        for bad in [
+            "",
+            "owner",
+            "owner/",
+            "/name",
+            "a/b/c",
+            "own er/name",
+            "owner/na me",
+            " ghbvf/gocell",
+        ] {
+            assert!(
+                validate(&AppConfig {
+                    repo: bad.to_string(),
+                    ..valid_base()
+                })
+                .is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+        assert!(validate(&AppConfig {
+            repo: "ghbvf/gocell".to_string(),
+            ..valid_base()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_labels() {
+        // Each label feeds `gh pr list --label`; a blank one makes every poll
+        // match nothing / fail (PR #41 F2).
+        for blank in ["", "   "] {
+            assert!(validate(&AppConfig {
+                review_label: blank.to_string(),
+                ..valid_base()
+            })
+            .is_err());
+            assert!(validate(&AppConfig {
+                check_label: blank.to_string(),
+                ..valid_base()
+            })
+            .is_err());
+        }
+    }
+
+    /// Upstream lock for the `errorToStep` routing contract (PR #41 F4, Medium).
+    /// `errorToStep` (src/config/fields.ts) routes a backend validation error to
+    /// the onboarding step that owns the field by matching the message's leading
+    /// field token — checking `skill` first (the path-escape message names both
+    /// skill and repoRoot) and `repoRoot` before `repo` (since "repoRoot" has
+    /// "repo" as a prefix). This pins that each `validate()` failure message starts
+    /// with the token downstream relies on, so a Rust-side wording change that would
+    /// silently break wizard routing fails CI here. The matching downstream cases
+    /// live in fields.test.ts; the shared field tokens are the cross-end contract.
+    #[test]
+    fn validate_error_messages_start_with_routing_field_token() {
+        let base = valid_base();
+        let msg = |c: AppConfig| validate(&c).unwrap_err().message;
+
+        let repo_err = msg(AppConfig {
+            repo: "not-a-repo".to_string(),
+            ..base.clone()
+        });
+        assert!(repo_err.starts_with("repo"), "{repo_err}");
+        // Must NOT also start with "repoRoot", or errorToStep (which checks repoRoot
+        // first) would route the repo error to the wrong step.
+        assert!(!repo_err.starts_with("repoRoot"), "{repo_err}");
+
+        assert!(msg(AppConfig {
+            repo_root: String::new(),
+            ..base.clone()
+        })
+        .starts_with("repoRoot"));
+        assert!(msg(AppConfig {
+            skill_rel_path: "/etc/hosts".to_string(),
+            ..base.clone()
+        })
+        .starts_with("skill"));
+        assert!(msg(AppConfig {
+            poll_interval_secs: 0,
+            ..base.clone()
+        })
+        .starts_with("pollIntervalSecs"));
+        assert!(msg(AppConfig {
+            pr_cooldown_seconds: 0,
+            ..base.clone()
+        })
+        .starts_with("prCooldownSeconds"));
+        assert!(msg(AppConfig {
+            review_label: "  ".to_string(),
+            ..base.clone()
+        })
+        .starts_with("reviewLabel"));
+        assert!(msg(AppConfig {
+            check_label: String::new(),
+            ..base
+        })
+        .starts_with("checkLabel"));
     }
 
     // Locks the serde-ignores-unknown-fields behavior the #11 reservation relies

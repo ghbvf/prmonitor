@@ -138,12 +138,20 @@ export function validateStep(step: StepId, draft: AppConfig): string | null {
       // `NaN <= 0` is false — without this guard NaN would pass the frontend gate
       // and then break the backend deserializer).
       const { pollIntervalSecs: interval, prCooldownSeconds: cooldown } = draft;
-      return !Number.isFinite(interval) ||
+      if (
+        !Number.isFinite(interval) ||
         !Number.isFinite(cooldown) ||
         interval <= 0 ||
         cooldown <= 0
-        ? "轮询间隔与冷却必须大于 0"
-        : null;
+      ) {
+        return "轮询间隔与冷却必须大于 0";
+      }
+      // Labels feed `gh pr list --label`; a blank one matches nothing. Early
+      // feedback here mirrors the backend validate() boundary (the source of truth).
+      if (draft.reviewLabel.trim() === "" || draft.checkLabel.trim() === "") {
+        return "Review 与 Check 触发标签不能为空";
+      }
+      return null;
     }
     case "done":
       return null;
@@ -151,17 +159,34 @@ export function validateStep(step: StepId, draft: AppConfig): string | null {
 }
 
 // Route a backend AppError message back to the wizard step that owns the field.
-// Substring match (the backend prefixes each message with the offending field
-// name). Order matters: the path-escape error ("skillRelPath 不能逃逸 repoRoot")
-// names BOTH fields but is owned by the skill step, so "skill" is checked before
-// "repoRoot" — no genuine repoRoot message contains "skill", making skill-first
-// safe. Returns null for unrecognized messages so the caller falls back to `done`.
-// NOTE: the substrings here mirror src-tauri/src/config/model.rs error text; the
-// matching cases are locked in fields.test.ts (Medium) — keep all three in sync.
+// The backend (src-tauri/src/config/model.rs validate()) starts each message with
+// the offending field's wire name, so we match on that LEADING token, not anywhere
+// in the message — `includes` would mis-route on the interpolated value (e.g. a
+// repoRoot path containing "skill", or a repo value containing "repoRoot").
+//
+// Order matters: `skill` first (the path-escape message "skillRelPath 不能逃逸
+// repoRoot" names both fields but is owned by the skill step); then `repoRoot`
+// before `repo` (since "repoRoot" itself starts with "repo"). Returns null for
+// unrecognized messages so the caller falls back to `done`.
+//
+// This is the downstream of the cross-end routing funnel (PR #41 F4, Medium): the
+// field tokens here mirror the message prefixes the backend emits. The upstream is
+// locked by `validate_error_messages_start_with_routing_field_token` in model.rs
+// (asserts each message starts with its token); the downstream cases are locked in
+// fields.test.ts. Drift on either side fails CI. Future Hard path (issue): codegen
+// the tokens / a structured `{ field }` error so the contract can't be expressed
+// wrong at all — keep both ends in sync until then.
 export function errorToStep(message: string): StepId | null {
-  if (message.includes("skill")) return "skill";
-  if (message.includes("repoRoot")) return "repoRoot";
-  if (message.includes("pollIntervalSecs") || message.includes("prCooldownSeconds")) {
+  const m = message.trimStart();
+  if (m.startsWith("skill")) return "skill";
+  if (m.startsWith("repoRoot")) return "repoRoot";
+  if (m.startsWith("repo")) return "repo";
+  if (
+    m.startsWith("pollIntervalSecs") ||
+    m.startsWith("prCooldownSeconds") ||
+    m.startsWith("reviewLabel") ||
+    m.startsWith("checkLabel")
+  ) {
     return "autoReview";
   }
   return null;

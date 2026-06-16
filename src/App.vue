@@ -40,6 +40,16 @@ const { codex, dispatchError, clearDispatchError } = useReviewStore();
 const ghBlocked = computed(() => prStore.gh?.authenticated === false);
 const codexBlocked = computed(() => codex.value?.available === false);
 const showPrompt = computed(() => ghBlocked.value || codexBlocked.value);
+// A config LOAD failure leaves `config` null; surface it instead of silently
+// degrading to an empty monitor (finding F3). The user can open Settings to retry
+// (SettingsView re-loads on mount) or re-save.
+const configError = computed(() => (configStore.config ? null : configStore.error));
+
+// A rejected Tauri invoke throws the AppError object `{ message }`; fall back to a
+// stringified form for any non-conforming throw (mirrors the slice stores).
+function toMsg(e: unknown): string {
+  return (e as { message?: string })?.message ?? String(e);
+}
 
 onMounted(async () => {
   version.value = await appVersion();
@@ -60,16 +70,27 @@ onMounted(async () => {
 
 // Cross-slice wiring (composition root only): a config save may both (a) fix a
 // previously-invalid config that left the loop gated off at launch and (b) change
-// the poll interval. start_polling is idempotent (no-op if already running), so it
-// recovers the gated-off case; reschedule then applies the new period. Non-blocking:
-// a failure only delays the rebuild (the next poll still runs on the old period).
-function onConfigSaved() {
-  startPolling()
-    .then(() => {
-      prStore.polling = true;
-      return reschedule();
-    })
-    .catch((e) => console.error("post-save poll start/reschedule failed", e));
+// the poll interval. start_polling is idempotent (no-op if already running) and
+// recovers the gated-off case; reschedule then applies the new period.
+async function onConfigSaved() {
+  try {
+    await startPolling();
+    prStore.polling = true;
+  } catch (e) {
+    // start_polling now rejects under an invalid config (finding F1). Keep the flag
+    // honest and surface the error (finding F3) so a saved-but-not-running monitor is
+    // visible — not just a console line implying the loop resumed.
+    prStore.polling = false;
+    prStore.error = toMsg(e);
+    return;
+  }
+  // The loop is running; a reschedule failure only delays the period rebuild (the
+  // next poll still runs on the old period), so surface it without claiming a stop.
+  try {
+    await reschedule();
+  } catch (e) {
+    prStore.error = toMsg(e);
+  }
 }
 
 // Onboarding finished with a validated save. The backend gate did NOT auto-start
@@ -81,10 +102,11 @@ async function onOnboardingDone() {
     await startPolling();
     prStore.polling = true;
   } catch (e) {
-    // Keep the store's polling flag honest so PollControls doesn't claim the loop
-    // is running when start failed; the user can retry from the monitor controls.
-    console.error("startPolling failed", e);
+    // Keep the polling flag honest (PollControls won't claim the loop is running)
+    // AND surface the error (finding F3) so the user sees why the monitor didn't
+    // start — not just a console line — and can retry from the monitor controls.
     prStore.polling = false;
+    prStore.error = toMsg(e);
   }
   goMonitor();
 }
@@ -143,7 +165,17 @@ const selectedPr = ref<PullRequestView | null>(null);
         />
       </aside>
       <main class="content">
-        <div v-if="showPrompt || dispatchError" class="availability" role="alert">
+        <div
+          v-if="showPrompt || dispatchError || configError"
+          class="availability"
+          role="alert"
+        >
+          <p v-if="configError" class="line dispatch-error">
+            <span>⚠ 配置加载失败：{{ configError }}</span>
+            <button type="button" class="dismiss" @click="goSettings">
+              打开设置
+            </button>
+          </p>
           <p v-if="showPrompt" class="line">
             自动 review 已暂停 —
             <template v-if="ghBlocked">

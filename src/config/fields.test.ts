@@ -97,6 +97,14 @@ describe("validateStep — autoReview (intervals)", () => {
   ])("rejects non-positive / NaN %o", (patch) => {
     expect(validateStep("autoReview", { ...validDraft(), ...patch })).toBeTruthy();
   });
+  it.each([
+    { reviewLabel: "" },
+    { reviewLabel: "   " },
+    { checkLabel: "" },
+    { checkLabel: "  " },
+  ])("rejects blank trigger label %o", (patch) => {
+    expect(validateStep("autoReview", { ...validDraft(), ...patch })).toBeTruthy();
+  });
 });
 
 describe("validateStep — source/done are confirm-only", () => {
@@ -122,6 +130,9 @@ describe("errorToStep — routes backend AppError messages", () => {
   it("repoRoot message → repoRoot step", () => {
     expect(errorToStep("repoRoot 必须是存在的绝对目录路径: ")).toBe("repoRoot");
   });
+  it("repo message → repo step (checked after repoRoot)", () => {
+    expect(errorToStep("repo 必须是 owner/name 格式: not-a-repo")).toBe("repo");
+  });
   it("skill message → skill step", () => {
     expect(errorToStep("skill 路径不存在: /x/y")).toBe("skill");
     expect(errorToStep("skillRelPath 必须是相对路径: /x")).toBe("skill");
@@ -133,7 +144,22 @@ describe("errorToStep — routes backend AppError messages", () => {
     expect(errorToStep("pollIntervalSecs 必须大于 0")).toBe("autoReview");
     expect(errorToStep("prCooldownSeconds 必须大于 0")).toBe("autoReview");
   });
+  it("label messages → autoReview step", () => {
+    expect(errorToStep("reviewLabel 不能为空")).toBe("autoReview");
+    expect(errorToStep("checkLabel 不能为空")).toBe("autoReview");
+  });
+  // Prefix-match (not substring) so an interpolated VALUE can't hijack routing.
+  it("does not let an interpolated value hijack the route", () => {
+    // A repoRoot path that contains "skill" must still route to repoRoot.
+    expect(errorToStep("repoRoot 必须是存在的绝对目录路径: /home/me/skills")).toBe(
+      "repoRoot",
+    );
+    // A repo value that contains "repoRoot" must still route to repo, not repoRoot.
+    expect(errorToStep("repo 必须是 owner/name 格式: repoRoot/x")).toBe("repo");
+  });
   it("unknown message → null (caller falls back to the done step)", () => {
     expect(errorToStep("某种未知错误")).toBeNull();
+    // A non-field store error (no field-name prefix) is also unrouted.
+    expect(errorToStep("打开配置存储失败: io")).toBeNull();
   });
 });
