@@ -91,14 +91,38 @@ pub(crate) async fn discover<R: tauri::Runtime>(
     Ok((views, dispatchable))
 }
 
-/// Starts the scheduled-pull loop (idempotent: a no-op if already running).
+/// Starts the scheduled-pull loop only when the persisted config validates,
+/// returning the validation error (without starting) otherwise.
+///
+/// The single enforcement point for the "no poll loop under an invalid config"
+/// funnel (PR #41 F1). BOTH entry paths go through here, so neither can start the
+/// loop on a config that fails [`config_service::load_validated`]:
+/// - launch (`lib.rs` setup) discards the `Err` so a first launch (empty
+///   `repoRoot` default) routes to onboarding instead of polling a default config;
+/// - the public `start_polling` command surfaces the `Err` to the frontend.
+///
+/// Previously the command called `scheduler.start` directly, leaving the funnel's
+/// downstream open: a user could start the loop on an invalid hand-edited config,
+/// spamming a per-cycle `DispatchError` and running `gh pr list` against a bad repo.
+pub(crate) fn start_if_config_valid<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &crate::state::AppState,
+) -> AppResult<()> {
+    config_service::load_validated(app)?;
+    state.scheduler.start(app.clone());
+    Ok(())
+}
+
+/// Starts the scheduled-pull loop. Idempotent (a no-op if already running); errors
+/// without starting when the persisted config is invalid (see
+/// [`start_if_config_valid`]), so the loop never runs under a bad config — the
+/// frontend surfaces the returned error.
 #[tauri::command]
 pub async fn start_polling<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, crate::state::AppState>,
 ) -> AppResult<()> {
-    state.scheduler.start(app);
-    Ok(())
+    start_if_config_valid(&app, state.inner())
 }
 
 /// Stops the scheduled-pull loop (no-op if not running).
