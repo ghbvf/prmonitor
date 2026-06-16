@@ -72,6 +72,7 @@ impl TrackedPrs {
         let store = app
             .store(STORE_FILE)
             .map_err(|e| AppError::new(format!("打开 PR 存储失败: {e}")))?;
+        // tauri-plugin-store 2.x: `Store::set` is infallible and returns `()`.
         store.set(
             TRACKED_KEY,
             serde_json::to_value(&self.prs).map_err(|e| AppError::new(e.to_string()))?,
@@ -114,23 +115,39 @@ impl TrackedPrs {
         self.prune();
     }
 
-    /// Unbounded-growth backstop: when the set exceeds [`MAX_TRACKED`], keep the
-    /// `MAX_TRACKED` most-recently-seen records (by `last_seen_epoch`) and drop the
-    /// rest. This never evicts the recent working set — only the long tail of stale
-    /// records a user never archived. No-op while within the cap.
+    /// Unbounded-growth backstop. Archived records are **never** auto-pruned —
+    /// archiving is how users retire rows, so dropping an archived PR would
+    /// contradict that contract. Only the non-archived tail is capped: keep every
+    /// `archived == true` record unconditionally, then keep the most-recently-seen
+    /// (by `last_seen_epoch`) of the non-archived ones up to the cap's remaining
+    /// budget (`MAX_TRACKED - archived_count`, saturating to 0 if archived alone
+    /// already exceeds the cap). This never evicts the recent working set — only the
+    /// long tail of stale, non-archived records. No-op while within the cap.
     fn prune(&mut self) {
-        if self.prs.len() > MAX_TRACKED {
-            // Most-recently-seen first, then keep the cap's worth.
-            self.prs
-                .sort_by_key(|p| std::cmp::Reverse(p.last_seen_epoch));
-            self.prs.truncate(MAX_TRACKED);
+        if self.prs.len() <= MAX_TRACKED {
+            return;
         }
+        let (mut archived, mut active): (Vec<TrackedPr>, Vec<TrackedPr>) =
+            std::mem::take(&mut self.prs)
+                .into_iter()
+                .partition(|p| p.archived);
+        // Cap only the non-archived records; archived ones are all retained.
+        let active_budget = MAX_TRACKED.saturating_sub(archived.len());
+        active.sort_by_key(|p| std::cmp::Reverse(p.last_seen_epoch));
+        active.truncate(active_budget);
+        archived.append(&mut active);
+        self.prs = archived;
     }
 
-    /// Sets the `archived` flag on the PR with `number` (no-op if absent).
-    pub fn set_archived(&mut self, number: u64, archived: bool) {
+    /// Sets the `archived` flag on the PR with `number`, returning `true` if it was
+    /// found and set. Returns `false` (no change) for an unknown number, so the
+    /// caller can skip a phantom persist + re-emit on a no-op.
+    pub fn set_archived(&mut self, number: u64, archived: bool) -> bool {
         if let Some(pr) = self.prs.iter_mut().find(|p| p.number == number) {
             pr.archived = archived;
+            true
+        } else {
+            false
         }
     }
 }
@@ -173,6 +190,21 @@ pub fn to_view_list(tracked: &TrackedPrs, now: u64, grace_secs: u64) -> Vec<Trac
 pub fn presence_grace_secs<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> u64 {
     super::scheduler::resolve_period(config_service::load(app).map(|c| c.poll_interval_secs))
         .saturating_mul(2)
+}
+
+/// Projects the tracked set at *now* with the live grace window — the common
+/// `to_view_list(tracked, now_epoch(), presence_grace_secs(app))` the command
+/// call sites (`get_prs`, `set_pr_archived`'s re-emit) share. The scheduler keeps
+/// its inline `to_view_list` form because it already holds the cycle's `now`.
+pub fn project<R: tauri::Runtime>(
+    tracked: &TrackedPrs,
+    app: &tauri::AppHandle<R>,
+) -> Vec<TrackedPrView> {
+    to_view_list(
+        tracked,
+        super::ledger::now_epoch(),
+        presence_grace_secs(app),
+    )
 }
 
 #[cfg(test)]
@@ -282,13 +314,14 @@ mod tests {
         let mut t = TrackedPrs::default();
         t.upsert(&[view(1, "PR one")], 1_000);
 
-        t.set_archived(1, true);
+        assert!(t.set_archived(1, true), "found+set returns true");
         assert!(t.prs[0].archived);
-        t.set_archived(1, false);
+        assert!(t.set_archived(1, false));
         assert!(!t.prs[0].archived);
 
-        // Unknown number is a no-op (must not panic or insert).
-        t.set_archived(999, true);
+        // Unknown number is a no-op: returns false (so the caller skips persist/emit)
+        // and must not panic or insert.
+        assert!(!t.set_archived(999, true), "unknown number returns false");
         assert_eq!(t.prs.len(), 1);
     }
 
@@ -332,5 +365,58 @@ mod tests {
         // the 50 oldest (last_seen 0..49) were dropped.
         let min_last_seen = t.prs.iter().map(|p| p.last_seen_epoch).min().unwrap();
         assert_eq!(min_last_seen, 50, "the 50 least-recently-seen were dropped");
+    }
+
+    #[test]
+    fn prune_keeps_archived_even_when_old() {
+        let mut t = TrackedPrs::default();
+        // One very-old ARCHIVED record (last_seen 0) that must survive pruning,
+        // plus MAX_TRACKED + 50 non-archived records all seen more recently.
+        let mut old_archived = tracked(9_999, 0);
+        old_archived.archived = true;
+        t.prs.push(old_archived);
+        // 550 non-archived with last_seen 1..=550 (all newer than the archived one).
+        for i in 0..(MAX_TRACKED as u64 + 50) {
+            t.prs.push(tracked(i, i + 1));
+        }
+        t.prune();
+
+        // The archived record survived despite being the least-recently-seen.
+        assert!(
+            t.prs.iter().any(|p| p.number == 9_999 && p.archived),
+            "an old archived record must never be auto-pruned"
+        );
+        // Non-archived capped to the budget = MAX_TRACKED - 1 archived = 499.
+        let active_count = t.prs.iter().filter(|p| !p.archived).count();
+        assert_eq!(
+            active_count,
+            MAX_TRACKED - 1,
+            "non-archived capped to MAX_TRACKED minus the archived count"
+        );
+        // The dropped non-archived ones are the oldest: 550 - 499 = 51 dropped
+        // (last_seen 1..=51), so the surviving minimum last_seen is 52.
+        let min_active = t
+            .prs
+            .iter()
+            .filter(|p| !p.archived)
+            .map(|p| p.last_seen_epoch)
+            .min()
+            .unwrap();
+        assert_eq!(
+            min_active, 52,
+            "the 51 least-recently-seen non-archived were dropped"
+        );
+    }
+
+    // The grace boundary is inclusive (`<=`): a record last seen exactly
+    // `grace_secs` ago is still `Current`, not `Stale`.
+    #[test]
+    fn to_view_list_grace_boundary_is_inclusive() {
+        let t = TrackedPrs {
+            prs: vec![tracked(5, 1_000)],
+        };
+        // age == grace_secs (1120 - 1000 == 120) → Current.
+        let views = to_view_list(&t, 1_120, 120);
+        assert!(matches!(views[0].presence, PrPresence::Current));
     }
 }

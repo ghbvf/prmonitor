@@ -120,9 +120,17 @@ mod tests {
         assert!(v.get("prs").is_some());
         // The row carries the flattened `PullRequestView` keys plus the retention
         // fields — a drift in `TrackedPrView`'s wire shape surfaces here too.
-        assert_eq!(v["prs"][0]["number"], 1);
-        assert_eq!(v["prs"][0]["presence"], "current");
-        assert_eq!(v["prs"][0]["archived"], false);
+        let row = &v["prs"][0];
+        assert_eq!(row["number"], 1);
+        assert!(row.get("title").is_some());
+        assert!(row.get("url").is_some());
+        assert!(row.get("kind").is_some());
+        // `sample_view` has `skip_reason: None` → JSON null at the flattened depth;
+        // the snake_case form must not leak through the union either.
+        assert_eq!(row["skipReason"], serde_json::Value::Null);
+        assert!(row.get("skip_reason").is_none());
+        assert_eq!(row["presence"], "current");
+        assert_eq!(row["archived"], false);
     }
 
     #[test]

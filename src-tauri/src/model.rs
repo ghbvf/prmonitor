@@ -75,6 +75,11 @@ pub struct PullRequestView {
 /// `Current` = last seen within the presence grace window (the live working set);
 /// `Stale` = not seen recently (a transient `gh` miss or a genuinely closed PR),
 /// retained so a one-round miss flips presence rather than dropping the row.
+///
+/// `Serialize`-only by design: this is a frontend projection derived from a
+/// [`crate::pr::registry::TrackedPr`]'s `last_seen_epoch` vs the grace window, never
+/// persisted or read back, so it intentionally does NOT derive `Deserialize` (the
+/// persisted shape is `TrackedPr`).
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PrPresence {
@@ -86,6 +91,11 @@ pub enum PrPresence {
 ///
 /// Flattens [`PullRequestView`] so the wire shape stays a flat row plus the two
 /// retention fields (`presence` / `archived`) the persisted-list UI renders.
+///
+/// `Serialize`-only by design: this is the frontend projection of a
+/// [`crate::pr::registry::TrackedPr`] (computed per emit), never persisted or read
+/// back, so it intentionally does NOT derive `Deserialize` — `TrackedPr` is the
+/// persisted type.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackedPrView {
@@ -222,7 +232,7 @@ mod tests {
                 labels: vec!["review".to_string()],
                 url: "https://example.com/pr/1".to_string(),
                 kind: "review".to_string(),
-                skip_reason: Some("draft PR".to_string()),
+                skip_reason: None,
             },
             presence: PrPresence::Current,
             archived: false,
@@ -241,6 +251,19 @@ mod tests {
         // Retention keys present (camelCase).
         assert!(v.get("presence").is_some());
         assert!(v.get("archived").is_some());
+
+        // `flatten` must hoist the inner fields, NOT nest them under a `pr` wrapper;
+        // and the one multi-word field must not leak its snake_case form.
+        assert!(v.get("skip_reason").is_none());
+        assert!(
+            v.get("pr").is_none(),
+            "flatten must not nest a 'pr' wrapper"
+        );
+
+        // None `skip_reason` serializes as JSON null (not omitted), mirroring
+        // `PullRequestView`'s closed `skipReason: string | null` contract at the
+        // flattened depth.
+        assert_eq!(v["skipReason"], serde_json::Value::Null);
 
         // `presence` serializes to the pinned lowercase wire strings the TS mirror
         // discriminates on.

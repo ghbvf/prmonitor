@@ -170,17 +170,16 @@ pub fn get_prs<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
 ) -> AppResult<Vec<crate::model::TrackedPrView>> {
     let tracked = super::registry::TrackedPrs::load(&app)?;
-    let now = super::ledger::now_epoch();
-    Ok(super::registry::to_view_list(
-        &tracked,
-        now,
-        super::registry::presence_grace_secs(&app),
-    ))
+    Ok(super::registry::project(&tracked, &app))
 }
 
 /// Sets a tracked PR's `archived` flag and re-emits the retained list immediately
 /// so the UI reflects the archive/unarchive without waiting for the next poll
 /// round. PRs are never auto-evicted; archiving is how users retire inactive rows.
+///
+/// An unknown / raced `number` is a benign no-op: `set_archived` reports it didn't
+/// change anything, so we skip the persist + re-emit (no phantom write/event) and
+/// return `Ok` rather than erroring.
 #[tauri::command]
 pub fn set_pr_archived<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -188,13 +187,13 @@ pub fn set_pr_archived<R: tauri::Runtime>(
     archived: bool,
 ) -> AppResult<()> {
     let mut tracked = super::registry::TrackedPrs::load(&app)?;
-    tracked.set_archived(number, archived);
+    if !tracked.set_archived(number, archived) {
+        return Ok(()); // unknown number — nothing changed, skip persist + emit.
+    }
     tracked.save(&app)?;
 
     // Re-emit the retained projection so the list updates immediately.
-    let now = super::ledger::now_epoch();
-    let list =
-        super::registry::to_view_list(&tracked, now, super::registry::presence_grace_secs(&app));
+    let list = super::registry::project(&tracked, &app);
     let _ = app.emit(
         crate::events::PRS_UPDATED_EVENT,
         &crate::events::PrEvent::Updated { prs: list },
