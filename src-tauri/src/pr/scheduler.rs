@@ -40,7 +40,7 @@ use tokio::time::MissedTickBehavior;
 use crate::config::service as config_service;
 use crate::error::AppResult;
 use crate::events::{PrEvent, PRS_UPDATED_EVENT};
-use crate::model::Candidate;
+use crate::model::{Candidate, TrackedPrView};
 
 use super::registry;
 
@@ -221,8 +221,14 @@ async fn run_loop<P, C, Fut>(
 /// readable via `get_prs` — and yields no dispatchable candidates (nothing is
 /// auto-started on a failed cycle). The emitted list is the persisted set projected
 /// at the current epoch, so a transient miss flips a row's presence instead of
-/// dropping it (the ghost-flicker fix); a store load/save failure degrades to the
-/// freshly-upserted in-memory set rather than failing the cycle.
+/// dropping it (the ghost-flicker fix). The upsert + persist run through the registry's
+/// single serialized write seam ([`registry::mutate_tracked`], F1), so this cycle can't
+/// interleave with a concurrent `set_pr_archived` and lose a write. A store failure
+/// (load or save) surfaces as [`PrEvent::Error`] rather than a misleading `Updated`
+/// (F2) — an un-persisted in-memory set would vanish on restart, so the cycle must not
+/// report a retained-snapshot update it did not durably make. Auto-dispatch is a
+/// start-review decision independent of persistence, so it still runs on a persist
+/// failure.
 ///
 /// The dispatch is *spawned detached* (not awaited) after the emit — see the body
 /// for why the scheduler's stop must not be able to cancel a start in flight; an
@@ -233,15 +239,21 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
 ) {
     let (event, dispatchable) = match super::commands::discover(app).await {
         Ok((views, dispatchable)) => {
-            // Upsert this round into the persisted retention set, persist it, then
-            // emit the retained projection (not the raw round). A failed load
-            // degrades to an empty set so the upsert still reflects this round.
+            // Upsert this round and persist it through the registry's single
+            // serialized write seam (F1): `mutate_tracked` holds the cross-writer lock
+            // across load→upsert→save so a concurrent `set_pr_archived` can't interleave
+            // and lose a write. The closure always persists (an upsert always changes
+            // the set); the projection is built inside the seam from the just-upserted
+            // set. `now`/`grace` are read before the lock to keep the critical section
+            // minimal. A store failure (load or save) maps to Error, not a misleading
+            // Updated (F2). Auto-dispatch is independent of persistence and still runs.
             let now = super::ledger::now_epoch();
-            let mut tracked = registry::TrackedPrs::load(app).unwrap_or_default();
-            tracked.upsert(&views, now);
-            let _ = tracked.save(app);
-            let list = registry::to_view_list(&tracked, now, registry::presence_grace_secs(app));
-            (PrEvent::Updated { prs: list }, dispatchable)
+            let grace = registry::presence_grace_secs(app);
+            let event = persist_event(registry::mutate_tracked(app, |tracked| {
+                tracked.upsert(&views, now);
+                (true, registry::to_view_list(tracked, now, grace))
+            }));
+            (event, dispatchable)
         }
         // On discovery error the dispatchable list is empty — nothing auto-starts.
         Err(e) => (PrEvent::Error { message: e.message }, Vec::new()),
@@ -266,6 +278,22 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
             // the task runs to completion regardless of the poll loop.
             drop(tauri::async_runtime::spawn(d(dispatchable)));
         }
+    }
+}
+
+/// Maps the locked persist seam's result to the cycle event (F2). A successful
+/// load→upsert→save yields the retained projection (`Updated`); any store failure
+/// (load or save, surfaced as `Err` by [`registry::mutate_tracked`]) yields `Error`
+/// instead of a misleading `Updated` — the in-memory set was not durably persisted
+/// (it vanishes on restart), so claiming "retained snapshot updated" would lie to the
+/// UI. Pure over the seam's result, so the decision is unit-testable without an
+/// `AppHandle` or a store (the emit + dispatch around it need a live app).
+fn persist_event(result: AppResult<Vec<TrackedPrView>>) -> PrEvent {
+    match result {
+        Ok(list) => PrEvent::Updated { prs: list },
+        Err(e) => PrEvent::Error {
+            message: format!("PR 列表持久化失败：{}", e.message),
+        },
     }
 }
 
@@ -302,6 +330,32 @@ mod tests {
     #[test]
     fn resolve_period_passes_through_positive() {
         assert_eq!(resolve_period(Ok(30)), 30);
+    }
+
+    // F2: a successful persist emits the retained projection (`Updated`); a store
+    // failure (load or save, surfaced as `Err` by `mutate_tracked`) must surface as
+    // `Error`, never a misleading `Updated`. The pre-fix code (`let _ =
+    // tracked.save(app)`) emitted `Updated` regardless, so the UI treated an
+    // un-persisted in-memory set as the retained snapshot (silently lost on restart).
+    #[test]
+    fn persist_event_on_persist_ok_is_updated() {
+        let ev = persist_event(Ok(Vec::new()));
+        assert!(
+            matches!(ev, PrEvent::Updated { .. }),
+            "a successful persist emits Updated"
+        );
+    }
+
+    #[test]
+    fn persist_event_on_store_failure_is_error_not_updated() {
+        let ev = persist_event(Err(AppError::new("写入 PR 存储失败: disk full")));
+        match ev {
+            PrEvent::Error { message } => assert!(
+                message.contains("持久化失败"),
+                "Error carries a persist-failure message, got {message:?}"
+            ),
+            other => panic!("a store failure must emit Error, not {other:?}"),
+        }
     }
 
     #[test]

@@ -177,27 +177,32 @@ pub fn get_prs<R: tauri::Runtime>(
 /// so the UI reflects the archive/unarchive without waiting for the next poll
 /// round. PRs are never auto-evicted; archiving is how users retire inactive rows.
 ///
-/// An unknown / raced `number` is a benign no-op: `set_archived` reports it didn't
-/// change anything, so we skip the persist + re-emit (no phantom write/event) and
-/// return `Ok` rather than erroring.
+/// Routes through the registry's single serialized write seam ([`registry::mutate_tracked`],
+/// F1) so this can't interleave with a poll-cycle upsert and lose a write. An unknown
+/// / raced `number` is a benign no-op: `set_archived` reports no change, the closure
+/// returns `persist == false` so the seam skips the store write, and we emit nothing —
+/// no phantom write/event — returning `Ok` rather than erroring. On a real change we
+/// re-emit the retained projection (built inside the seam, under the lock) so the list
+/// updates immediately.
 #[tauri::command]
 pub fn set_pr_archived<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     number: u64,
     archived: bool,
 ) -> AppResult<()> {
-    let mut tracked = super::registry::TrackedPrs::load(&app)?;
-    if !tracked.set_archived(number, archived) {
-        return Ok(()); // unknown number — nothing changed, skip persist + emit.
+    let emitted = super::registry::mutate_tracked(&app, |tracked| {
+        if tracked.set_archived(number, archived) {
+            (true, Some(super::registry::project(tracked, &app)))
+        } else {
+            (false, None) // unknown number — nothing changed, skip persist + emit.
+        }
+    })?;
+    if let Some(list) = emitted {
+        let _ = app.emit(
+            crate::events::PRS_UPDATED_EVENT,
+            &crate::events::PrEvent::Updated { prs: list },
+        );
     }
-    tracked.save(&app)?;
-
-    // Re-emit the retained projection so the list updates immediately.
-    let list = super::registry::project(&tracked, &app);
-    let _ = app.emit(
-        crate::events::PRS_UPDATED_EVENT,
-        &crate::events::PrEvent::Updated { prs: list },
-    );
     Ok(())
 }
 

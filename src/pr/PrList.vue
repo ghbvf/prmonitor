@@ -103,13 +103,19 @@ onMounted(() => store.refreshGhStatus());
         >
           {{ showArchived ? "▾" : "▸" }} 已归档 ({{ store.archivedPrs.length }})
         </button>
+        <!-- Archived rows are NOT review-selectable: the review target (App.vue's
+             `selectedPr`) excludes archived PRs, so letting an archived row drive
+             `select`/highlight would split the left highlight from the right target
+             (F3). Pin `:selected` false and drop `@select` here — archiving the
+             currently-selected PR thus clears its highlight as the row moves into
+             this section, staying consistent with the disabled ReviewPanel. The
+             archive/restore + open-link controls (their own `@click.stop`) still work. -->
         <ul v-if="showArchived" class="rows">
           <PrRow
             v-for="pr in store.archivedPrs"
             :key="pr.number"
             :pr="pr"
-            :selected="pr.number === selectedNumber"
-            @select="(p) => emit('select', p)"
+            :selected="false"
             @set-archived="(e) => store.setArchived(e.number, e.archived)"
           />
         </ul>

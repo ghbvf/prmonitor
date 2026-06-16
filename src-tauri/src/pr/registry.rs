@@ -12,6 +12,8 @@
 //! Slice boundary: presence is computed purely from `last_seen_epoch` vs the grace
 //! window — the `pr` slice stays review-agnostic and never reads `state.sessions`.
 
+use std::sync::Mutex;
+
 use serde::{Deserialize, Serialize};
 use tauri_plugin_store::StoreExt;
 
@@ -26,6 +28,19 @@ const TRACKED_KEY: &str = "tracked";
 /// Unbounded-growth cap. Beyond this, [`TrackedPrs::prune`] drops the least
 /// recently seen records (never the recent working set) — see its doc.
 const MAX_TRACKED: usize = 500;
+
+/// Serializes every read-modify-write of the persisted set (F1, PR #43). The two
+/// writers — the poll cycle's upsert and the `set_pr_archived` command — each do a
+/// load→mutate→save of the whole `prs.json`; without a shared critical section they
+/// interleave and silently lose each other's write (an archive overwritten by a poll
+/// that loaded the pre-archive snapshot, or vice versa). A process-global `Mutex<()>`
+/// (the data lives in the store, not behind the lock) is the gate, and
+/// [`mutate_tracked`] is its only acquirer. A module static — not an injected
+/// `AppState` field — so the lock *identity* is fixed: a caller cannot accidentally
+/// serialize on the wrong mutex, which closes the funnel downstream as well as up.
+/// `std` (not `tokio`) `Mutex`: the guarded section is fully synchronous, so no
+/// `.await` is ever held across the guard.
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// One persisted PR. `first_seen_epoch` is set once on insert and preserved across
 /// upserts; `last_seen_epoch` is bumped to `now` every round the PR is discovered
@@ -67,8 +82,14 @@ impl TrackedPrs {
         Ok(Self { prs })
     }
 
-    /// Persists the tracked set.
-    pub fn save<R: tauri::Runtime>(&self, app: &tauri::AppHandle<R>) -> AppResult<()> {
+    /// Persists the tracked set. **Module-private — the F1 funnel's upstream gate.**
+    /// This is the only write path to `prs.json`, and it is reachable solely from
+    /// [`mutate_tracked`] (same module), which holds [`WRITE_LOCK`] across the whole
+    /// load→mutate→save. Keeping `save` private makes a lock-free read-modify-write
+    /// *not expressible* outside this module: a new writer has no way to call `save`,
+    /// so it must go through `mutate_tracked` and inherit the serialization. Making
+    /// this `pub` reopens the lost-update race — do not.
+    fn save<R: tauri::Runtime>(&self, app: &tauri::AppHandle<R>) -> AppResult<()> {
         let store = app
             .store(STORE_FILE)
             .map_err(|e| AppError::new(format!("打开 PR 存储失败: {e}")))?;
@@ -150,6 +171,42 @@ impl TrackedPrs {
             false
         }
     }
+}
+
+/// The single serialized read-modify-write seam for the persisted set (F1). Holds
+/// [`WRITE_LOCK`] across load → `mutate` → (conditional) save, so the poll cycle's
+/// upsert and the `set_pr_archived` command can't interleave a load→mutate→save and
+/// lose each other's write. `mutate` returns `(persist, out)`: `persist == false`
+/// skips the store write entirely (e.g. an archive no-op on an unknown number — no
+/// phantom write), and `out` is whatever the caller needs back (the re-emit
+/// projection, or `()`). Load and save errors propagate as `Err` for the caller to
+/// handle — the poll cycle folds them into a `PrEvent::Error` (it must not crash the
+/// loop), the archive command returns them to the frontend.
+///
+/// **This is the ONLY persist path** ([`TrackedPrs::save`] is module-private), so a
+/// lock-free write is not expressible outside this module — the closed funnel that
+/// fixes F1 (upstream: `save` private; downstream: one fixed static [`WRITE_LOCK`]).
+/// Reads (`get_prs`, the projection below) need no lock: a load is a single whole-value
+/// store read, so a torn read can't happen and a stale-by-one-round snapshot self-heals.
+pub fn mutate_tracked<R, T>(
+    app: &tauri::AppHandle<R>,
+    mutate: impl FnOnce(&mut TrackedPrs) -> (bool, T),
+) -> AppResult<T>
+where
+    R: tauri::Runtime,
+{
+    // `.unwrap()` matches the scheduler's std-Mutex convention. Poisoning can't leave
+    // torn state here: the lock guards `()` (the data lives in the store, rewritten
+    // wholesale by `save`), and the synchronous critical section below holds no
+    // `.await` and no panic-prone step (load/save return `Result`, the closures are
+    // pure), so the guard is never poisoned in practice.
+    let _guard = WRITE_LOCK.lock().unwrap();
+    let mut tracked = TrackedPrs::load(app)?;
+    let (persist, out) = mutate(&mut tracked);
+    if persist {
+        tracked.save(app)?;
+    }
+    Ok(out)
 }
 
 /// Projects the tracked set into the frontend wire rows. Each record's presence is
