@@ -1,17 +1,33 @@
 <script setup lang="ts">
-// PR list slice view: renders the discovered rows. The "立即拉取" control lives
-// in PollControls; this component only renders the store's PR state. Selection is
-// owned by the composition root (App.vue): the row's `select` is forwarded up and
-// the currently-selected PR number is passed back down for highlighting.
-import { onMounted } from "vue";
-import type { PullRequestView } from "../types";
+// PR list slice view: renders the discovered rows in three tracking-aware
+// sections (#38) — "current" always shown, "stale" (inactive) and "archived"
+// folded into collapsible sections. The "立即拉取" control lives in PollControls;
+// this component only renders the store's PR state. Selection is owned by the
+// composition root (App.vue): the row's `select` is forwarded up and the
+// currently-selected PR number is passed back down for highlighting.
+import { computed, onMounted, ref } from "vue";
+import type { TrackedPrView } from "../types";
 import { usePrStore } from "./usePrStore";
 import PrRow from "./PrRow.vue";
 
 defineProps<{ selectedNumber: number | null }>();
-const emit = defineEmits<{ select: [pr: PullRequestView] }>();
+const emit = defineEmits<{ select: [pr: TrackedPrView] }>();
 
 const store = usePrStore();
+
+// Stale section: collapsed by default; when open, window to STALE_LIMIT rows with
+// a nested "显示更多 / 显示更少" toggle so a long inactive backlog stays bounded.
+const STALE_LIMIT = 10;
+const showStale = ref(false);
+const staleExpanded = ref(false);
+const visibleStale = computed(() =>
+  staleExpanded.value
+    ? store.stalePrs
+    : store.stalePrs.slice(0, STALE_LIMIT),
+);
+
+// Archived section: collapsed by default.
+const showArchived = ref(false);
 
 // Hydrate the gh CLI status on mount so the StatusBar has data to show.
 onMounted(() => store.refreshGhStatus());
@@ -31,15 +47,64 @@ onMounted(() => store.refreshGhStatus());
 
     <p v-else-if="store.prs.length === 0" class="muted">暂无 PR / No PRs</p>
 
-    <ul v-else class="rows">
-      <PrRow
-        v-for="pr in store.prs"
-        :key="pr.number"
-        :pr="pr"
-        :selected="pr.number === selectedNumber"
-        @select="(p) => emit('select', p)"
-      />
-    </ul>
+    <template v-else>
+      <ul v-if="store.currentPrs.length" class="rows">
+        <PrRow
+          v-for="pr in store.currentPrs"
+          :key="pr.number"
+          :pr="pr"
+          :selected="pr.number === selectedNumber"
+          @select="(p) => emit('select', p)"
+          @set-archived="(e) => store.setArchived(e.number, e.archived)"
+        />
+      </ul>
+
+      <section v-if="store.stalePrs.length" class="section">
+        <button type="button" class="section-toggle" @click="showStale = !showStale">
+          {{ showStale ? "▾" : "▸" }} 不活跃 ({{ store.stalePrs.length }})
+        </button>
+        <template v-if="showStale">
+          <ul class="rows">
+            <PrRow
+              v-for="pr in visibleStale"
+              :key="pr.number"
+              :pr="pr"
+              :selected="pr.number === selectedNumber"
+              @select="(p) => emit('select', p)"
+              @set-archived="(e) => store.setArchived(e.number, e.archived)"
+            />
+          </ul>
+          <button
+            v-if="store.stalePrs.length > STALE_LIMIT"
+            type="button"
+            class="more-toggle muted"
+            @click="staleExpanded = !staleExpanded"
+          >
+            {{ staleExpanded ? "显示更少" : `显示更多 (${store.stalePrs.length - STALE_LIMIT})` }}
+          </button>
+        </template>
+      </section>
+
+      <section v-if="store.archivedPrs.length" class="section">
+        <button
+          type="button"
+          class="section-toggle"
+          @click="showArchived = !showArchived"
+        >
+          {{ showArchived ? "▾" : "▸" }} 已归档 ({{ store.archivedPrs.length }})
+        </button>
+        <ul v-if="showArchived" class="rows">
+          <PrRow
+            v-for="pr in store.archivedPrs"
+            :key="pr.number"
+            :pr="pr"
+            :selected="pr.number === selectedNumber"
+            @select="(p) => emit('select', p)"
+            @set-archived="(e) => store.setArchived(e.number, e.archived)"
+          />
+        </ul>
+      </section>
+    </template>
   </section>
 </template>
 
@@ -68,5 +133,36 @@ onMounted(() => store.refreshGhStatus());
   list-style: none;
   margin: var(--space-4) 0 0;
   padding: 0;
+}
+.section {
+  margin-top: var(--space-5);
+}
+.section-toggle {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: var(--space-2) 0;
+  font: inherit;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+.section-toggle:hover {
+  color: var(--color-text);
+}
+.more-toggle {
+  display: block;
+  margin-top: var(--space-3);
+  padding: var(--space-2) 0;
+  font: inherit;
+  font-size: var(--font-size-sm);
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+.more-toggle:hover {
+  color: var(--color-text);
 }
 </style>

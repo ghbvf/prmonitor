@@ -4,7 +4,7 @@
 // than through the Tauri event bus.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import type { PrEvent, PullRequestView } from "../types";
+import type { PrEvent, TrackedPrView } from "../types";
 
 // Captured callback handed to `onPrsUpdated`, so a test can push a `PrEvent`
 // through the same path `subscribe()` wires up.
@@ -26,13 +26,15 @@ vi.mock("./api", () => ({
 import * as api from "./api";
 import { usePrStore } from "./usePrStore";
 
-const view = (number: number): PullRequestView => ({
+const view = (number: number): TrackedPrView => ({
   number,
   title: `PR #${number}`,
   labels: [],
   url: `https://example.test/${number}`,
   kind: "review",
   skipReason: null,
+  presence: "current",
+  archived: false,
 });
 
 beforeEach(() => {

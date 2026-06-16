@@ -9,14 +9,15 @@ import {
   ghStatus,
   onPrsUpdated,
   pollNow,
+  setPrArchived,
   startPolling,
   stopPolling,
 } from "./api";
-import type { PullRequestView } from "../types";
+import type { TrackedPrView } from "../types";
 import type { GhStatus } from "./types";
 
 interface PrState {
-  prs: PullRequestView[];
+  prs: TrackedPrView[];
   loading: boolean;
   error: string | null;
   gh: GhStatus | null;
@@ -46,6 +47,21 @@ export const usePrStore = defineStore("pr", {
     // hand-edited repoRoot is the lone exception; the user fixes it in Settings.)
     polling: true,
   }),
+  getters: {
+    // Tracking-aware partitions (#38). The store holds the full retained list;
+    // these split it into the three sections PrList renders. "current" = active
+    // and not archived; "stale" = retained-but-inactive and not archived;
+    // "archived" = hidden until restored.
+    currentPrs(state): TrackedPrView[] {
+      return state.prs.filter((p) => !p.archived && p.presence === "current");
+    },
+    stalePrs(state): TrackedPrView[] {
+      return state.prs.filter((p) => !p.archived && p.presence === "stale");
+    },
+    archivedPrs(state): TrackedPrView[] {
+      return state.prs.filter((p) => p.archived);
+    },
+  },
   actions: {
     // Wire the `prs:updated` push stream into state. Returns the
     // `Promise<UnlistenFn>` so the component can await it for cleanup.
@@ -104,6 +120,16 @@ export const usePrStore = defineStore("pr", {
           await startPolling();
           this.polling = true;
         }
+      } catch (err) {
+        this.error = toMessage(err);
+      }
+    },
+    // Archive / unarchive a retained PR (#38). Fire-and-rely: the backend flips
+    // the flag and re-emits `prs:updated`, so the `subscribe` listener refreshes
+    // the list — no local mutation here. A rejected invoke surfaces the message.
+    async setArchived(number: number, archived: boolean) {
+      try {
+        await setPrArchived(number, archived);
       } catch (err) {
         this.error = toMessage(err);
       }

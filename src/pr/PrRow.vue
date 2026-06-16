@@ -5,10 +5,13 @@
 // the PR (for the Review panel); the title link opens the browser (`@click.stop`
 // so the two actions stay distinct).
 import { openUrl } from "@tauri-apps/plugin-opener";
-import type { PullRequestView } from "../types";
+import type { TrackedPrView } from "../types";
 
-const props = defineProps<{ pr: PullRequestView; selected: boolean }>();
-const emit = defineEmits<{ select: [pr: PullRequestView] }>();
+const props = defineProps<{ pr: TrackedPrView; selected: boolean }>();
+const emit = defineEmits<{
+  select: [pr: TrackedPrView];
+  "set-archived": [payload: { number: number; archived: boolean }];
+}>();
 
 function open() {
   // Only follow web links (gh returns https PR urls); reject any other scheme,
@@ -22,14 +25,29 @@ function open() {
 <template>
   <li
     class="pr-row"
-    :class="{ skipped: pr.skipReason != null, selected }"
+    :class="{ skipped: pr.skipReason != null, selected, stale: pr.presence === 'stale' }"
     @click="emit('select', pr)"
   >
     <div class="title-line">
-      <button type="button" class="title" @click.stop="open">
+      <button
+        type="button"
+        class="title"
+        :title="`#${pr.number} — ${pr.title}`"
+        @click.stop="open"
+      >
         #{{ pr.number }} — {{ pr.title }}
       </button>
       <span class="badge kind">{{ pr.kind }}</span>
+      <button
+        type="button"
+        class="archive-btn"
+        :title="pr.archived ? '恢复 / unarchive' : '归档 / archive'"
+        @click.stop="
+          emit('set-archived', { number: pr.number, archived: !pr.archived })
+        "
+      >
+        {{ pr.archived ? "恢复" : "归档" }}
+      </button>
     </div>
 
     <div v-if="pr.labels.length" class="labels">
@@ -61,6 +79,11 @@ function open() {
 .pr-row.skipped {
   opacity: 0.55;
 }
+/* Stale (retained-but-inactive) rows get the same muted treatment as skipped
+   ones — reuses the existing opacity convention so the two read consistently. */
+.pr-row.stale {
+  opacity: 0.55;
+}
 .title-line {
   display: flex;
   align-items: center;
@@ -68,6 +91,12 @@ function open() {
 }
 .title {
   flex: 1;
+  /* #39: truncate long titles to one line so they never overflow the 320px
+     sidebar; min-width:0 lets the flex item shrink below its content width. */
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   text-align: left;
   background: none;
   border: none;
@@ -78,6 +107,25 @@ function open() {
 }
 .title:hover {
   text-decoration: underline;
+}
+/* Badge + archive control must not shrink; only the title (flex:1) absorbs the
+   width pressure (#39). */
+.badge.kind {
+  flex: none;
+}
+.archive-btn {
+  flex: none;
+  padding: 1px var(--space-3);
+  font: inherit;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.archive-btn:hover {
+  background: var(--color-surface-hover);
 }
 .labels {
   margin-top: var(--space-2);

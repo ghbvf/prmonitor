@@ -10,6 +10,19 @@ export interface PullRequestView {
   skipReason: string | null; // null = would dispatch; string = why it is skipped
 }
 
+// Tracking presence for a retained PR (#38): "current" = seen in the latest
+// discovery; "stale" = previously seen, no longer active. Mirrors the Rust
+// `Presence` enum's camelCase wire values.
+export type PrPresence = "current" | "stale";
+
+// The retained, tracking-aware row pushed by the backend (#38). Flattened on the
+// wire: extends the `PullRequestView` contract with the tracking fields, so the
+// Rust↔TS mirror stays a strict superset of `PullRequestView`.
+export interface TrackedPrView extends PullRequestView {
+  presence: PrPresence;
+  archived: boolean;
+}
+
 // Discriminator unions mirroring the `SourceKind` / `EngineKind` Rust enums.
 // Single-arm today; widening tracked by #11.
 export type SourceKind = "github"; // 未来 #11: | "gitlab" | "bitbucket"
@@ -27,5 +40,5 @@ export type ReviewEvent =
 // Mirrors `events.rs::PrEvent` (tagged `kind`, camelCase) — the funnel's
 // downstream end for the `prs:updated` Tauri event payload.
 export type PrEvent =
-  | { kind: "updated"; prs: PullRequestView[] }
+  | { kind: "updated"; prs: TrackedPrView[] }
   | { kind: "error"; message: string };
