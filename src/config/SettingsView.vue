@@ -9,6 +9,7 @@ import { useConfigStore } from "./useConfigStore";
 import type { AppConfig } from "./types";
 import { GROUPS, type FieldDef, type FieldKey } from "./fields";
 import ConfigField from "./ConfigField.vue";
+import WebhookPanel from "../pr/WebhookPanel.vue";
 
 const store = useConfigStore();
 
@@ -30,6 +31,10 @@ const draft = reactive<AppConfig>({
   sourceKind: "github",
   engineKind: "codex",
   autoReview: true,
+  webhookEnabled: false,
+  webhookPort: 8787,
+  webhookSecret: "",
+  cloudflaredBin: "cloudflared",
 });
 
 const authorsInput = ref("");
@@ -46,6 +51,10 @@ function hydrate(cfg: AppConfig) {
   draft.sourceKind = cfg.sourceKind;
   draft.engineKind = cfg.engineKind;
   draft.autoReview = cfg.autoReview;
+  draft.webhookEnabled = cfg.webhookEnabled;
+  draft.webhookPort = cfg.webhookPort;
+  draft.webhookSecret = cfg.webhookSecret;
+  draft.cloudflaredBin = cfg.cloudflaredBin;
   authorsInput.value = cfg.authors.join(", ");
 }
 
@@ -136,6 +145,8 @@ async function onSave() {
             />
           </div>
         </template>
+
+        <WebhookPanel v-if="activeGroupId === 'webhook'" />
 
         <div class="actions">
           <button type="submit" class="primary" :disabled="store.saving">

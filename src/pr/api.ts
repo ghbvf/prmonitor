@@ -2,7 +2,7 @@
 // `prs:updated` event subscription.
 import { invoke, listen } from "../api";
 import type { PrEvent, TrackedPrView } from "../types";
-import type { GhStatus } from "./types";
+import type { GhStatus, WebhookStatus } from "./types";
 
 // Mirrors src-tauri/src/events.rs::PRS_UPDATED_EVENT (this TS side is the
 // open downstream end of the event-name funnel — keep in lockstep).
@@ -49,4 +49,18 @@ export function setPrArchived(
 
 export function ghStatus(): Promise<GhStatus> {
   return invoke<GhStatus>("gh_status");
+}
+
+// Webhook receiver + Cloudflare tunnel controls (#9). Each returns the current
+// WebhookStatus snapshot the WebhookPanel renders; none take arguments.
+export function startWebhook(): Promise<WebhookStatus> {
+  return invoke<WebhookStatus>("start_webhook");
+}
+
+export function stopWebhook(): Promise<WebhookStatus> {
+  return invoke<WebhookStatus>("stop_webhook");
+}
+
+export function webhookStatus(): Promise<WebhookStatus> {
+  return invoke<WebhookStatus>("webhook_status");
 }

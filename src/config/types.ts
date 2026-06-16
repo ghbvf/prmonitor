@@ -13,4 +13,8 @@ export interface AppConfig {
   sourceKind: SourceKind;
   engineKind: EngineKind;
   autoReview: boolean;
+  webhookEnabled: boolean;
+  webhookPort: number;
+  webhookSecret: string;
+  cloudflaredBin: string;
 }

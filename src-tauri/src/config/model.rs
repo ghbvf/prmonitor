@@ -41,6 +41,16 @@ pub struct AppConfig {
     pub engine_kind: EngineKind,
     /// 是否在发现 dispatchable PR 时自动派发 review（false=仅手动「开始 review」触发）。
     pub auto_review: bool,
+    /// 是否启用 webhook 接收端（#9）。开关本身只 gate「能否启动」本地接收端 + Cloudflare
+    /// 隧道（手动 `start_webhook` 命令）——不自动起、不影响轮询路径。
+    pub webhook_enabled: bool,
+    /// webhook 本地 HTTP 监听端口（仅绑 127.0.0.1；公网经 cloudflared 隧道代理到此）。
+    pub webhook_port: u16,
+    /// GitHub webhook 的 HMAC secret（`X-Hub-Signature-256` 验签）。`webhook_enabled`
+    /// 时必填——公网端点没有验签即可被任意 POST 伪造触发 review。
+    pub webhook_secret: String,
+    /// `cloudflared` 可执行文件（PATH 名或绝对路径）。Quick Tunnel 子进程由此拉起。
+    pub cloudflared_bin: String,
 }
 
 impl Default for AppConfig {
@@ -57,6 +67,10 @@ impl Default for AppConfig {
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
             auto_review: true,
+            webhook_enabled: false,
+            webhook_port: 8787,
+            webhook_secret: String::new(),
+            cloudflared_bin: "cloudflared".to_string(),
         }
     }
 }
@@ -147,6 +161,22 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
         return Err(AppError::new("checkLabel 不能为空"));
     }
 
+    // Webhook fields are only constrained when the receiver is enabled: a public
+    // endpoint (reached via the cloudflared tunnel) MUST have a secret or any POST
+    // could forge a review trigger; a zero port can't bind. Disabled → unconstrained
+    // (defaults stay valid). Messages keep the field-token prefix the wizard's
+    // `errorToStep` contract relies on (locked by `validate_error_messages_*`).
+    if config.webhook_enabled {
+        if config.webhook_secret.trim().is_empty() {
+            return Err(AppError::new(
+                "webhookSecret 不能为空（启用 webhook 时必填）",
+            ));
+        }
+        if config.webhook_port == 0 {
+            return Err(AppError::new("webhookPort 必须大于 0"));
+        }
+    }
+
     Ok(())
 }
 
@@ -178,6 +208,10 @@ mod tests {
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
             auto_review: true,
+            webhook_enabled: false,
+            webhook_port: 8787,
+            webhook_secret: "shh".to_string(),
+            cloudflared_bin: "cloudflared".to_string(),
         };
 
         let v = serde_json::to_value(&config).expect("AppConfig serializes");
@@ -196,6 +230,10 @@ mod tests {
         assert!(v.get("engineKind").is_some());
         assert_eq!(v["engineKind"], "codex");
         assert!(v.get("autoReview").is_some());
+        assert!(v.get("webhookEnabled").is_some());
+        assert!(v.get("webhookPort").is_some());
+        assert!(v.get("webhookSecret").is_some());
+        assert!(v.get("cloudflaredBin").is_some());
 
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("repo_root").is_none());
@@ -207,6 +245,10 @@ mod tests {
         assert!(v.get("source_kind").is_none());
         assert!(v.get("engine_kind").is_none());
         assert!(v.get("auto_review").is_none());
+        assert!(v.get("webhook_enabled").is_none());
+        assert!(v.get("webhook_port").is_none());
+        assert!(v.get("webhook_secret").is_none());
+        assert!(v.get("cloudflared_bin").is_none());
     }
 
     /// First-launch marker lock (Medium). The frontend routes a fresh install into
@@ -366,6 +408,48 @@ mod tests {
             })
             .is_err());
         }
+    }
+
+    #[test]
+    fn validate_webhook_fields_only_when_enabled() {
+        // Disabled (default) → empty secret / any port is fine.
+        assert!(validate(&AppConfig {
+            webhook_enabled: false,
+            webhook_secret: String::new(),
+            ..valid_base()
+        })
+        .is_ok());
+
+        // Enabled requires a non-empty secret (public endpoint forgery guard) — message
+        // keeps the `webhookSecret` routing prefix.
+        let secret_err = validate(&AppConfig {
+            webhook_enabled: true,
+            webhook_secret: "   ".to_string(),
+            ..valid_base()
+        })
+        .unwrap_err()
+        .message;
+        assert!(secret_err.starts_with("webhookSecret"), "{secret_err}");
+
+        // Enabled requires a non-zero port.
+        let port_err = validate(&AppConfig {
+            webhook_enabled: true,
+            webhook_secret: "shh".to_string(),
+            webhook_port: 0,
+            ..valid_base()
+        })
+        .unwrap_err()
+        .message;
+        assert!(port_err.starts_with("webhookPort"), "{port_err}");
+
+        // Enabled + valid secret + non-zero port → ok.
+        assert!(validate(&AppConfig {
+            webhook_enabled: true,
+            webhook_secret: "shh".to_string(),
+            webhook_port: 8787,
+            ..valid_base()
+        })
+        .is_ok());
     }
 
     /// Upstream lock for the `errorToStep` routing contract (PR #41 F4, Medium).

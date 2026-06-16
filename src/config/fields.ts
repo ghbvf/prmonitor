@@ -67,6 +67,36 @@ export const GROUPS: FieldGroup[] = [
     ],
   },
   {
+    id: "webhook",
+    title: "Webhook",
+    fields: [
+      {
+        key: "webhookEnabled",
+        label: "启用 Webhook",
+        kind: "checkbox",
+        hint: "勾选后可启动本地接收端 + Cloudflare 隧道，GitHub 加触发标签即时触发 review",
+      },
+      {
+        key: "webhookPort",
+        label: "本地端口",
+        kind: "number",
+        hint: "本地 127.0.0.1 监听端口（仅 cloudflared 本地可达）",
+      },
+      {
+        key: "webhookSecret",
+        label: "Webhook Secret",
+        kind: "text",
+        hint: "与 GitHub 仓库 webhook 的 Secret 一致；用于 HMAC 验签",
+      },
+      {
+        key: "cloudflaredBin",
+        label: "cloudflared 路径",
+        kind: "text",
+        hint: "cloudflared 可执行文件（默认 PATH 中的 cloudflared；未安装可 brew install cloudflared）",
+      },
+    ],
+  },
+  {
     id: "labels",
     title: "标签",
     fields: [

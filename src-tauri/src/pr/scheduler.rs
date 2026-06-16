@@ -285,7 +285,9 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
 /// 这是 pr→config 的**函数级跨切片读**（走 config 公有 service，AppConfig 仍 config 私有）。
 /// load 失败 → 返回 false（不派发）：config 不可读时不擅自消耗 review 额度/算力，
 /// 宁可漏触发也不误触发；下一轮 load 成功即恢复。
-fn auto_review_enabled<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
+/// `pub(crate)`：webhook trigger（[`crate::pr::webhook`]）的派发闭包复用同一开关，
+/// 与本轮询调用点一致——两条 auto-trigger 路径共用同一 autoReview gate。
+pub(crate) fn auto_review_enabled<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
     config_service::load(app)
         .map(|c| c.auto_review)
         .unwrap_or(false)

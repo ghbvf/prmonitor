@@ -9,6 +9,7 @@ use crate::model::{Candidate, PullRequestView};
 use super::discover::{self, MonitorParams};
 use super::gh::{gh_auth_status, GhRow, GhStatus, GithubCli};
 use super::ledger::{now_epoch, Ledger};
+use super::webhook::WebhookStatus;
 
 /// Annotates one discovered row for the PR list and surfaces its dispatchable
 /// [`Candidate`] when nothing gates it. Conflict (both trigger labels) skips
@@ -204,6 +205,99 @@ pub fn set_pr_archived<R: tauri::Runtime>(
         );
     }
     Ok(())
+}
+
+/// Apply the SAME static + cooldown gates the poll path applies (via `build_view`)
+/// to webhook-sourced candidates, so a push trigger has dispatch parity with the
+/// scheduler: no draft / fork / disallowed-author / within-cooldown PR slips through
+/// just because it arrived by webhook. Reads config (authors / cooldown) and the
+/// dedup ledger, then filters each candidate through [`discover::should_skip`] and
+/// [`discover::cooldown_skip`].
+///
+/// On an unreadable config it returns an empty Vec (fail closed — don't dispatch
+/// under a bad config, same spirit as [`super::scheduler::auto_review_enabled`]). A
+/// ledger read failure degrades to an empty ledger (no dedup that round), never a panic.
+///
+/// Called by the composition root's webhook dispatcher closure (`lib.rs`); the
+/// conflict (both-labels) gate already dropped in `webhook::payload_to_candidate`.
+pub(crate) fn gate_dispatchable<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    candidates: Vec<Candidate>,
+) -> Vec<Candidate> {
+    let Ok(cfg) = config_service::load(app) else {
+        return Vec::new();
+    };
+    let params = MonitorParams {
+        repo: cfg.repo,
+        review_label: cfg.review_label,
+        check_label: cfg.check_label,
+        authors: cfg.authors,
+        pr_cooldown_seconds: cfg.pr_cooldown_seconds,
+    };
+    let ledger = Ledger::load(app).unwrap_or_default();
+    let now = now_epoch();
+    candidates
+        .into_iter()
+        .filter(|c| {
+            discover::should_skip(c, &params, &ledger).is_none()
+                && discover::cooldown_skip(c, &params, &ledger, now).is_none()
+        })
+        .collect()
+}
+
+/// Starts the webhook receiver + Cloudflare Quick Tunnel. Requires `webhook_enabled`
+/// (and a non-empty secret) in the persisted config; returns the resolved status
+/// (incl. the public `*.trycloudflare.com` URL to paste into GitHub). The local
+/// server binds `127.0.0.1` only — the public path is the tunnel.
+#[tauri::command]
+pub async fn start_webhook<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> AppResult<WebhookStatus> {
+    let cfg = config_service::load(&app)?;
+    if !cfg.webhook_enabled {
+        return Err(crate::error::AppError::new(
+            "请先在设置中启用 Webhook 并保存配置",
+        ));
+    }
+    if cfg.webhook_secret.trim().is_empty() {
+        return Err(crate::error::AppError::new(
+            "webhookSecret 不能为空（启用 webhook 时必填）",
+        ));
+    }
+    state
+        .webhook
+        .start(
+            cfg.webhook_port,
+            cfg.webhook_secret,
+            cfg.review_label,
+            cfg.check_label,
+            cfg.cloudflared_bin,
+        )
+        .await
+}
+
+/// Stops the webhook receiver + tunnel (no-op if not running). Returns the post-stop
+/// status (so the UI reflects `running: false` + the current cloudflared install state).
+#[tauri::command]
+pub async fn stop_webhook<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> AppResult<WebhookStatus> {
+    state.webhook.stop();
+    let cfg = config_service::load(&app)?;
+    Ok(state.webhook.status(&cfg.cloudflared_bin).await)
+}
+
+/// Reports webhook receiver + tunnel status (running, public URL, cloudflared install)
+/// for the settings panel.
+#[tauri::command]
+pub async fn webhook_status<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> AppResult<WebhookStatus> {
+    let cfg = config_service::load(&app)?;
+    Ok(state.webhook.status(&cfg.cloudflared_bin).await)
 }
 
 #[cfg(test)]

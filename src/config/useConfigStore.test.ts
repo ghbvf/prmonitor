@@ -26,6 +26,10 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
   sourceKind: "github",
   engineKind: "codex",
   autoReview: true,
+  webhookEnabled: false,
+  webhookPort: 8787,
+  webhookSecret: "",
+  cloudflaredBin: "cloudflared",
   ...over,
 });
 

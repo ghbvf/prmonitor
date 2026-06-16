@@ -13,4 +13,8 @@ pub struct AppState {
     /// Review sessions keyed by `threadId` (PR6). Shared (`Arc` inside) with each
     /// session's streaming pump task; methods take `&self`.
     pub sessions: crate::review::session::SessionRegistry,
+    /// The webhook receiver + Cloudflare Quick Tunnel handle (#9). Started/stopped
+    /// on demand via the `start_webhook`/`stop_webhook` commands; killed on app
+    /// shutdown. Methods take `&self`.
+    pub webhook: crate::pr::webhook::WebhookManager,
 }

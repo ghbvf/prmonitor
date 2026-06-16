@@ -26,11 +26,15 @@ function validDraft(): AppConfig {
     sourceKind: "github",
     engineKind: "codex",
     autoReview: true,
+    webhookEnabled: false,
+    webhookPort: 8787,
+    webhookSecret: "",
+    cloudflaredBin: "cloudflared",
   };
 }
 
 describe("GROUPS", () => {
-  it("covers all 11 AppConfig keys exactly once across groups", () => {
+  it("covers all 15 AppConfig keys exactly once across groups", () => {
     const keys = GROUPS.flatMap((g) => g.fields.map((f) => f.key)).sort();
     const expected = Object.keys(validDraft()).sort();
     expect(keys).toEqual(expected);
