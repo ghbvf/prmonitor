@@ -25,6 +25,12 @@ const visibleStale = computed(() =>
     ? store.stalePrs
     : store.stalePrs.slice(0, STALE_LIMIT),
 );
+// Collapsing the section also resets the window so re-opening starts at the
+// STALE_LIMIT view (with its "显示更多" entry), never jumping straight to expanded.
+function toggleStale() {
+  showStale.value = !showStale.value;
+  if (!showStale.value) staleExpanded.value = false;
+}
 
 // Archived section: collapsed by default.
 const showArchived = ref(false);
@@ -48,6 +54,10 @@ onMounted(() => store.refreshGhStatus());
     <p v-else-if="store.prs.length === 0" class="muted">暂无 PR / No PRs</p>
 
     <template v-else>
+      <p v-if="!store.currentPrs.length" class="muted">
+        无活跃 PR（展开下方「不活跃 / 已归档」查看）
+      </p>
+
       <ul v-if="store.currentPrs.length" class="rows">
         <PrRow
           v-for="pr in store.currentPrs"
@@ -60,7 +70,7 @@ onMounted(() => store.refreshGhStatus());
       </ul>
 
       <section v-if="store.stalePrs.length" class="section">
-        <button type="button" class="section-toggle" @click="showStale = !showStale">
+        <button type="button" class="section-toggle" @click="toggleStale">
           {{ showStale ? "▾" : "▸" }} 不活跃 ({{ store.stalePrs.length }})
         </button>
         <template v-if="showStale">

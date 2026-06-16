@@ -170,6 +170,27 @@ describe("usePrStore init()", () => {
     expect(store.prs).toEqual(snapshot);
     expect(typeof (await unlisten)).toBe("function");
   });
+
+  it("registers the listener BEFORE reading the snapshot (#27 F3 race guard)", async () => {
+    // Capture the actual call order: a snapshot read that landed first would let a
+    // `prs:updated` event fired in the gap go unheard. The guard is the await on the
+    // listener registration inside init() — assert it observably precedes getPrs.
+    const order: string[] = [];
+    vi.mocked(api.onPrsUpdated).mockImplementation((cb) => {
+      order.push("subscribe");
+      prsCb = cb;
+      return Promise.resolve(() => {});
+    });
+    vi.mocked(api.getPrs).mockImplementation(() => {
+      order.push("snapshot");
+      return Promise.resolve([]);
+    });
+    const store = usePrStore();
+
+    await store.init();
+
+    expect(order).toEqual(["subscribe", "snapshot"]);
+  });
 });
 
 describe("usePrStore tracking getters (#38)", () => {

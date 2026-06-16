@@ -116,10 +116,15 @@ async function onOnboardingDone() {
 // Selection is keyed by PR *number*, not list identity (#38): the retained list
 // re-emits stable rows, so resolving the selected PR from the live store keeps the
 // highlight + review target pinned across refreshes — and auto-clears to null when
-// the selected PR drops out of the list entirely.
+// the selected PR drops out of the list entirely. Resolve against the *non-archived*
+// rows: archiving the selected PR retires it, so the review target clears and
+// ReviewPanel's "开始 review" doesn't stay enabled on an archived PR.
 const selectedNumber = ref<number | null>(null);
 const selectedPr = computed(
-  () => prStore.prs.find((p) => p.number === selectedNumber.value) ?? null,
+  () =>
+    prStore.prs.find(
+      (p) => !p.archived && p.number === selectedNumber.value,
+    ) ?? null,
 );
 </script>
 
