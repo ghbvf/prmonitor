@@ -25,14 +25,20 @@ function validDraft(): AppConfig {
     prCooldownSeconds: 1800,
     sourceKind: "github",
     engineKind: "codex",
+    autoReview: true,
   };
 }
 
 describe("GROUPS", () => {
-  it("covers all 10 AppConfig keys exactly once across groups", () => {
+  it("covers all 11 AppConfig keys exactly once across groups", () => {
     const keys = GROUPS.flatMap((g) => g.fields.map((f) => f.key)).sort();
     const expected = Object.keys(validDraft()).sort();
     expect(keys).toEqual(expected);
+  });
+
+  it("autoReview is a checkbox in the polling group", () => {
+    const f = GROUPS.flatMap((g) => g.fields).find((f) => f.key === "autoReview");
+    expect(f?.kind).toBe("checkbox");
   });
 
   it("marks the engine group fields read-only (sourceKind/engineKind reserved #11)", () => {

@@ -29,6 +29,7 @@ const draft = reactive<AppConfig>({
   prCooldownSeconds: 0,
   sourceKind: "github",
   engineKind: "codex",
+  autoReview: true,
 });
 
 const authorsInput = ref("");
@@ -44,6 +45,7 @@ function hydrate(cfg: AppConfig) {
   draft.prCooldownSeconds = cfg.prCooldownSeconds;
   draft.sourceKind = cfg.sourceKind;
   draft.engineKind = cfg.engineKind;
+  draft.autoReview = cfg.autoReview;
   authorsInput.value = cfg.authors.join(", ");
 }
 
@@ -63,12 +65,12 @@ const activeGroupId = ref(GROUPS[0].id);
 // Read/write a field's draft value by key. `authors` is special-cased to the
 // comma-joined `authorsInput` so the csv ConfigField round-trips through one
 // string source (mirrors the old ConfigPanel join/split on ", ").
-function fieldValue(def: FieldDef): string | number | string[] {
+function fieldValue(def: FieldDef): string | number | boolean | string[] {
   if (def.key === "authors") return authorsInput.value;
   return draft[def.key];
 }
 
-function setField(def: FieldDef, value: string | number | string[]) {
+function setField(def: FieldDef, value: string | number | boolean | string[]) {
   if (def.key === "authors") {
     authorsInput.value = Array.isArray(value) ? value.join(", ") : String(value);
     return;

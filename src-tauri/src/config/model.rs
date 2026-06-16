@@ -39,6 +39,8 @@ pub struct AppConfig {
     /// Which review engine runs against a PR. #11 reservation: today only
     /// [`EngineKind::Codex`]; future variant gates Claude.
     pub engine_kind: EngineKind,
+    /// 是否在发现 dispatchable PR 时自动派发 review（false=仅手动「开始 review」触发）。
+    pub auto_review: bool,
 }
 
 impl Default for AppConfig {
@@ -54,6 +56,7 @@ impl Default for AppConfig {
             pr_cooldown_seconds: 1800,
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
+            auto_review: true,
         }
     }
 }
@@ -174,6 +177,7 @@ mod tests {
             pr_cooldown_seconds: 1800,
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
+            auto_review: true,
         };
 
         let v = serde_json::to_value(&config).expect("AppConfig serializes");
@@ -191,6 +195,7 @@ mod tests {
         assert_eq!(v["sourceKind"], "github");
         assert!(v.get("engineKind").is_some());
         assert_eq!(v["engineKind"], "codex");
+        assert!(v.get("autoReview").is_some());
 
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("repo_root").is_none());
@@ -201,6 +206,7 @@ mod tests {
         assert!(v.get("pr_cooldown_seconds").is_none());
         assert!(v.get("source_kind").is_none());
         assert!(v.get("engine_kind").is_none());
+        assert!(v.get("auto_review").is_none());
     }
 
     /// First-launch marker lock (Medium). The frontend routes a fresh install into

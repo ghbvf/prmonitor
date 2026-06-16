@@ -6,7 +6,7 @@
 import type { AppConfig } from "./types";
 
 export type FieldKey = keyof AppConfig;
-type FieldKind = "text" | "number" | "csv" | "select";
+type FieldKind = "text" | "number" | "csv" | "select" | "checkbox";
 
 export interface FieldDef {
   key: FieldKey;
@@ -46,6 +46,12 @@ export const GROUPS: FieldGroup[] = [
     id: "polling",
     title: "轮询",
     fields: [
+      {
+        key: "autoReview",
+        label: "自动 review",
+        kind: "checkbox",
+        hint: "勾选=发现 dispatchable PR 自动起 review；取消=仅手动「开始 review」触发",
+      },
       {
         key: "pollIntervalSecs",
         label: "轮询间隔（秒）",

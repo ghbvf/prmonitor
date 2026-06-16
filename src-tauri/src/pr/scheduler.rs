@@ -261,7 +261,7 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
     let _ = app.emit(PRS_UPDATED_EVENT, &event); // ignore emit error (window may be gone)
 
     if let Some(d) = dispatcher {
-        if !dispatchable.is_empty() {
+        if !dispatchable.is_empty() && auto_review_enabled(app) {
             // Spawn the dispatch DETACHED rather than awaiting it inline. This cycle
             // runs inside the loop's stop-cancellable `select!` (the F1 cancellation
             // domain that lets a stop reap the in-flight `gh` child). Awaiting
@@ -279,6 +279,13 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
             drop(tauri::async_runtime::spawn(d(dispatchable)));
         }
     }
+}
+
+/// 每轮重读 config 的自动 review 开关（运行时切换无需重启）。load 失败保守按 true。
+fn auto_review_enabled<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
+    config_service::load(app)
+        .map(|c| c.auto_review)
+        .unwrap_or(true)
 }
 
 /// Maps the locked persist seam's result to the cycle event (F2). A successful

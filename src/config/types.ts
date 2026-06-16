@@ -12,4 +12,5 @@ export interface AppConfig {
   prCooldownSeconds: number;
   sourceKind: SourceKind;
   engineKind: EngineKind;
+  autoReview: boolean;
 }
