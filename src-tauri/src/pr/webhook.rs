@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::Router;
@@ -87,10 +87,15 @@ pub struct WebhookManager {
     start_lock: tokio::sync::Mutex<()>,
 }
 
-/// The live receiver + tunnel handles. Dropping it tears both down: the server task
-/// is aborted explicitly; the cloudflared child dies via `kill_on_drop(true)`.
+/// The live receiver + tunnel handles. `stop_inner` aborts `server_task` and
+/// `_drain` (explicit — neither is aborted by `Drop`) before dropping this value;
+/// `_tunnel` (the cloudflared child) is then killed via `kill_on_drop(true)` on drop.
 struct WebhookRuntime {
     server_task: JoinHandle<()>,
+    /// stderr-drain task for the cloudflared child (keeps the pipe from filling).
+    /// Aborted in `stop_inner` for lifecycle symmetry rather than relying on the
+    /// child-kill → pipe-EOF chain to end it.
+    drain_task: JoinHandle<()>,
     /// Held only to keep the child alive (and `kill_on_drop` it when the runtime
     /// drops); never read after construction.
     _tunnel: Child,
@@ -149,15 +154,30 @@ impl WebhookManager {
         });
         let router = Router::new()
             .route("/webhook", post(handle_webhook))
+            // Cap the public endpoint's request body. GitHub webhook payloads are well
+            // under this (typically < 25 KiB); the limit bounds the memory a forged POST
+            // can make us buffer before the HMAC check rejects it.
+            .layer(DefaultBodyLimit::max(1024 * 1024))
             .with_state(ctx);
         let server_task = spawn(async move {
             let _ = axum::serve(listener, router.into_make_service()).await;
         });
 
-        let (tunnel, public_url) = spawn_quick_tunnel(&cloudflared_bin, port).await?;
+        // If the tunnel can't start, the server task (already spawned, holding the
+        // bound port) must be aborted here — otherwise it detaches and leaks the port,
+        // and `self.runtime` stays `None` so a later `stop_inner` can't reap it.
+        let (tunnel, drain_task, public_url) =
+            match spawn_quick_tunnel(&cloudflared_bin, port).await {
+                Ok(parts) => parts,
+                Err(e) => {
+                    server_task.abort();
+                    return Err(e);
+                }
+            };
 
         *self.runtime.lock().unwrap() = Some(WebhookRuntime {
             server_task,
+            drain_task,
             _tunnel: tunnel,
             public_url: public_url.clone(),
         });
@@ -179,6 +199,7 @@ impl WebhookManager {
     fn stop_inner(&self) {
         if let Some(rt) = self.runtime.lock().unwrap().take() {
             rt.server_task.abort();
+            rt.drain_task.abort();
             // rt._tunnel dropped here → kill_on_drop kills cloudflared.
         }
     }
@@ -240,6 +261,9 @@ async fn handle_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
+    // A missing header or a non-UTF-8 value both collapse to "" — equivalent to an
+    // absent signature, which `verify_signature`'s `strip_prefix("sha256=")` gate then
+    // rejects (fail-closed). The public endpoint never acts on an unverified request.
     let signature = headers
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
@@ -373,9 +397,18 @@ async fn cloudflared_installed(bin: &str) -> bool {
 /// Spawn a Cloudflare Quick Tunnel for `http://127.0.0.1:<port>` and capture the
 /// assigned `https://*.trycloudflare.com` URL from cloudflared's stderr. The child
 /// is `kill_on_drop(true)`, so the manager's runtime drop kills the tunnel. Returns
-/// `(child, Some(url))`, or `(child, None)` if the URL didn't appear within the
-/// timeout (the tunnel may still come up; the UI can re-query status).
-async fn spawn_quick_tunnel(bin: &str, port: u16) -> AppResult<(Child, Option<String>)> {
+/// `(child, drain_task, Some(url))`, or `…None` if the URL didn't appear within the
+/// timeout (the tunnel may still come up; the UI can re-query status). The caller
+/// owns the returned `drain_task` and aborts it on stop (lifecycle symmetry).
+///
+/// `bin` is exec'd directly by `tokio::process::Command::new` — NOT via a shell — so
+/// a `cloudflared_bin` path with spaces/special chars is treated as one program name,
+/// never word-split or shell-interpreted (no command injection). `port` is a `u16`
+/// formatted into a fixed arg, also unable to inject.
+async fn spawn_quick_tunnel(
+    bin: &str,
+    port: u16,
+) -> AppResult<(Child, JoinHandle<()>, Option<String>)> {
     let mut cmd = Command::new(bin);
     cmd.args([
         "tunnel",
@@ -404,10 +437,12 @@ async fn spawn_quick_tunnel(bin: &str, port: u16) -> AppResult<(Child, Option<St
         .flatten();
 
     // Keep draining stderr for the child's lifetime so a full pipe can't stall
-    // cloudflared after we stop scanning (mirrors codex's stderr drain).
-    spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+    // cloudflared after we stop scanning (mirrors codex's stderr drain). The handle
+    // is returned so `stop_inner` can abort it; absent that, the child-kill → pipe-EOF
+    // chain would still end it, but we prefer explicit teardown.
+    let drain_task = spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
 
-    Ok((child, url))
+    Ok((child, drain_task, url))
 }
 
 /// Read cloudflared's stderr line-by-line until a trycloudflare URL appears (or EOF).

@@ -17,6 +17,10 @@ export interface FieldDef {
   options?: readonly string[];
   // Reserved single-option enums (#11) are shown but not editable.
   readonly?: boolean;
+  // text fields holding a credential (e.g. the webhook HMAC secret): rendered
+  // masked (type=password) with a reveal toggle so it isn't exposed in screenshots
+  // / screen-shares.
+  secret?: boolean;
 }
 
 interface FieldGroup {
@@ -86,6 +90,7 @@ export const GROUPS: FieldGroup[] = [
         key: "webhookSecret",
         label: "Webhook Secret",
         kind: "text",
+        secret: true,
         hint: "与 GitHub 仓库 webhook 的 Secret 一致；用于 HMAC 验签",
       },
       {
@@ -212,6 +217,13 @@ export function validateStep(step: StepId, draft: AppConfig): string | null {
 // fields.test.ts. Drift on either side fails CI. Future Hard path (issue): codegen
 // the tokens / a structured `{ field }` error so the contract can't be expressed
 // wrong at all — keep both ends in sync until then.
+//
+// Webhook fields (`webhookSecret` / `webhookPort`) are deliberately NOT routed here:
+// they are Settings-only (no onboarding step owns them — see STEPS), and `webhook_enabled`
+// defaults false so the wizard's save never triggers their `validate()` errors. They
+// therefore fall through to `null` (→ done) by design; SettingsView surfaces those
+// backend errors directly without `errorToStep`. Locked by an explicit
+// "webhook messages → null" case in fields.test.ts so this stays intentional, not a gap.
 export function errorToStep(message: string): StepId | null {
   const m = message.trimStart();
   if (m.startsWith("skill")) return "skill";

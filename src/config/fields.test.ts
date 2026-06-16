@@ -172,4 +172,12 @@ describe("errorToStep — routes backend AppError messages", () => {
     // A non-field store error (no field-name prefix) is also unrouted.
     expect(errorToStep("打开配置存储失败: io")).toBeNull();
   });
+  // Webhook fields are Settings-only (no onboarding step owns them), so their
+  // validate() messages are intentionally NOT wizard-routed — they fall through to
+  // null (→ done). SettingsView shows these backend errors directly. This case locks
+  // that intent so a future reader doesn't mistake the missing branch for a gap.
+  it("webhook messages → null (settings-only, not wizard-routed)", () => {
+    expect(errorToStep("webhookSecret 不能为空（启用 webhook 时必填）")).toBeNull();
+    expect(errorToStep("webhookPort 必须大于 0")).toBeNull();
+  });
 });

@@ -220,6 +220,11 @@ pub fn set_pr_archived<R: tauri::Runtime>(
 ///
 /// Called by the composition root's webhook dispatcher closure (`lib.rs`); the
 /// conflict (both-labels) gate already dropped in `webhook::payload_to_candidate`.
+///
+/// Coverage: the gate predicates are unit-tested at their source
+/// ([`discover::should_skip`] / [`discover::cooldown_skip`] in `discover.rs`); this
+/// wrapper's `AppHandle`-bound load/fail-closed branches are exercised by the running
+/// app, not a unit test (a Tauri `AppHandle` isn't constructible in a plain test).
 pub(crate) fn gate_dispatchable<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     candidates: Vec<Candidate>,

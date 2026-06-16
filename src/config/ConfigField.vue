@@ -3,8 +3,12 @@
 // value, driven by `def.kind`. Stateless — owns no draft; parents (SettingsView /
 // OnboardingWizard) bind via v-model and normalize the csv<->string[] form on save.
 // `edit` fires on real user input so parents can clear the saved/error banner.
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import type { FieldDef } from "./fields";
+
+// Local reveal toggle for `secret` text fields — masked by default so a credential
+// (the webhook HMAC secret) isn't exposed in screenshots / screen-shares.
+const reveal = ref(false);
 
 // modelValue is the heterogeneous draft value for this field: string (text/csv —
 // csv is carried as a comma-joined string), number, or string[] (an authors array
@@ -62,8 +66,19 @@ function onCheckbox(e: Event) {
   <label class="field">
     <span class="label">{{ def.label }}</span>
 
+    <div v-if="def.kind === 'text' && def.secret" class="secret-row">
+      <input
+        :type="reveal ? 'text' : 'password'"
+        :value="modelValue"
+        @input="onText"
+      />
+      <button type="button" class="reveal" @click.stop.prevent="reveal = !reveal">
+        {{ reveal ? "隐藏" : "显示" }}
+      </button>
+    </div>
+
     <input
-      v-if="def.kind === 'text'"
+      v-else-if="def.kind === 'text'"
       type="text"
       :value="modelValue"
       @input="onText"
@@ -137,5 +152,24 @@ function onCheckbox(e: Event) {
 .hint {
   font-size: var(--font-size-xs);
   color: var(--color-text-muted);
+}
+.secret-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: stretch;
+}
+.secret-row input {
+  flex: 1;
+}
+.reveal {
+  flex-shrink: 0;
+  padding: var(--space-2) var(--space-3);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  color: var(--color-accent);
+  background: none;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
 }
 </style>
