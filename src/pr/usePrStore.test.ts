@@ -16,6 +16,7 @@ vi.mock("./api", () => ({
   stopPolling: vi.fn(() => Promise.resolve()),
   ghStatus: vi.fn(() => Promise.resolve({ authenticated: true, message: "" })),
   getPrs: vi.fn(() => Promise.resolve([])),
+  setPrArchived: vi.fn(() => Promise.resolve()),
   onPrsUpdated: vi.fn((cb: (e: PrEvent) => void) => {
     prsCb = cb;
     // onPrsUpdated returns a Promise<UnlistenFn>.
@@ -26,7 +27,12 @@ vi.mock("./api", () => ({
 import * as api from "./api";
 import { usePrStore } from "./usePrStore";
 
-const view = (number: number): TrackedPrView => ({
+// `track` overrides the tracking fields so a test can mint stale / archived rows;
+// the defaults (current + not archived) keep every existing single-arg call valid.
+const view = (
+  number: number,
+  track: Partial<Pick<TrackedPrView, "presence" | "archived">> = {},
+): TrackedPrView => ({
   number,
   title: `PR #${number}`,
   labels: [],
@@ -35,6 +41,7 @@ const view = (number: number): TrackedPrView => ({
   skipReason: null,
   presence: "current",
   archived: false,
+  ...track,
 });
 
 beforeEach(() => {
@@ -46,6 +53,7 @@ beforeEach(() => {
   vi.mocked(api.startPolling).mockResolvedValue(undefined);
   vi.mocked(api.stopPolling).mockResolvedValue(undefined);
   vi.mocked(api.getPrs).mockResolvedValue([]);
+  vi.mocked(api.setPrArchived).mockResolvedValue(undefined);
   vi.mocked(api.onPrsUpdated).mockImplementation((cb) => {
     prsCb = cb;
     return Promise.resolve(() => {});
@@ -161,5 +169,61 @@ describe("usePrStore init()", () => {
     expect(api.getPrs).toHaveBeenCalledOnce();
     expect(store.prs).toEqual(snapshot);
     expect(typeof (await unlisten)).toBe("function");
+  });
+});
+
+describe("usePrStore tracking getters (#38)", () => {
+  // One PR of each tracking class, fed through the same `subscribe` path the
+  // backend's `prs:updated` push uses, so the getters partition real store state.
+  it("partition the retained list into current / stale / archived", () => {
+    const store = usePrStore();
+    store.subscribe();
+
+    const current = view(1, { presence: "current", archived: false });
+    const stale = view(2, { presence: "stale", archived: false });
+    const archivedCurrent = view(3, { presence: "current", archived: true });
+    const archivedStale = view(4, { presence: "stale", archived: true });
+    prsCb?.({
+      kind: "updated",
+      prs: [current, stale, archivedCurrent, archivedStale],
+    });
+
+    // current = not archived AND presence "current".
+    expect(store.currentPrs).toEqual([current]);
+    // stale = not archived AND presence "stale".
+    expect(store.stalePrs).toEqual([stale]);
+    // archived = archived regardless of presence (both #3 and #4).
+    expect(store.archivedPrs).toEqual([archivedCurrent, archivedStale]);
+  });
+
+  it("keep an archived+current PR out of currentPrs (archived wins)", () => {
+    const store = usePrStore();
+    store.subscribe();
+
+    const archivedCurrent = view(5, { presence: "current", archived: true });
+    prsCb?.({ kind: "updated", prs: [archivedCurrent] });
+
+    expect(store.currentPrs).toEqual([]);
+    expect(store.archivedPrs).toEqual([archivedCurrent]);
+  });
+});
+
+describe("usePrStore setArchived()", () => {
+  it("invokes setPrArchived with {number, archived}", async () => {
+    const store = usePrStore();
+
+    await store.setArchived(42, true);
+
+    expect(api.setPrArchived).toHaveBeenCalledWith(42, true);
+    expect(store.error).toBeNull();
+  });
+
+  it("surfaces a rejected invoke as error", async () => {
+    vi.mocked(api.setPrArchived).mockRejectedValueOnce({ message: "archive failed" });
+    const store = usePrStore();
+
+    await store.setArchived(7, false);
+
+    expect(store.error).toBe("archive failed");
   });
 });
