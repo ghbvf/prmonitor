@@ -77,6 +77,8 @@ pub fn run() {
             pr::commands::get_prs,
             pr::commands::set_pr_archived,
             review::commands::get_codex_status,
+            review::commands::start_codex,
+            review::commands::stop_codex,
             review::commands::start_review,
             review::commands::stop_review,
             review::commands::list_review_sessions,

@@ -30,6 +30,8 @@ const NOTIF_CAPACITY: usize = 1024;
 #[serde(rename_all = "camelCase")]
 pub struct CodexStatus {
     pub available: bool,
+    /// 用户意图的运行状态：true=意图运行（available 反映实际连通），false=用户已显式停止。前端据此显示「启动」/「停止」按钮与 idle 态。
+    pub desired_running: bool,
     /// `userAgent` on success, or a human-readable (Chinese) failure message.
     pub message: String,
 }
@@ -279,11 +281,14 @@ mod tests {
     fn codex_status_wire_shape_is_camel_case() {
         let v = serde_json::to_value(CodexStatus {
             available: true,
+            desired_running: true,
             message: "codex/0.139.0".to_string(),
         })
         .expect("CodexStatus serializes");
         // Keys present — locks the contract with `src/review/types.ts`.
         assert!(v.get("available").is_some());
+        assert!(v.get("desiredRunning").is_some());
+        assert!(v.get("desired_running").is_none());
         assert!(v.get("message").is_some());
         assert_eq!(v["available"], true);
     }

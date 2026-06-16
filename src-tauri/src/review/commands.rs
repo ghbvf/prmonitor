@@ -29,6 +29,22 @@ pub async fn get_codex_status<R: tauri::Runtime>(
     Ok(state.codex.status(CODEX_BIN, &cfg.repo_root).await)
 }
 
+/// 显式启动常驻 codex app-server（清除「已停止」标记并拉起握手）。返回最新状态。
+#[tauri::command]
+pub async fn start_codex<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<CodexStatus> {
+    let cfg = config_service::load(&app)?;
+    Ok(state.codex.start(CODEX_BIN, &cfg.repo_root).await)
+}
+
+/// 显式停止常驻 codex app-server（设「已停止」标记 + 杀进程；被动状态探测此后不再自动拉起，显式 review 仍会强制启动）。
+#[tauri::command]
+pub fn stop_codex(state: tauri::State<'_, AppState>) -> CodexStatus {
+    state.codex.stop()
+}
+
 /// Start a review for `pr_number` (`kind` = `"review"` or `"check"`), returning
 /// the session id (codex `threadId`). Output streams out-of-band via the
 /// `review:event` Tauri event ([`crate::events::ReviewEvent`]).

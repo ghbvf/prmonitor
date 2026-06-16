@@ -7,7 +7,17 @@ import type { ReviewSession } from "./types";
 
 vi.mock("./api", () => ({
   getCodexStatus: vi.fn(() =>
-    Promise.resolve({ available: true, message: "ok" }),
+    Promise.resolve({ available: true, desiredRunning: true, message: "ok" }),
+  ),
+  startCodex: vi.fn(() =>
+    Promise.resolve({ available: true, desiredRunning: true, message: "ok" }),
+  ),
+  stopCodex: vi.fn(() =>
+    Promise.resolve({
+      available: false,
+      desiredRunning: false,
+      message: "codex app-server 已停止",
+    }),
   ),
   startReview: vi.fn(() => Promise.resolve("th_1")),
   stopReview: vi.fn(() => Promise.resolve()),
@@ -23,6 +33,7 @@ beforeEach(() => {
   // Restore default resolved behavior wiped by clearAllMocks.
   vi.mocked(api.getCodexStatus).mockResolvedValue({
     available: true,
+    desiredRunning: true,
     message: "ok",
   });
   vi.mocked(api.startReview).mockResolvedValue("th_1");
@@ -63,7 +74,11 @@ describe("useReviewStore refreshCodexStatus()", () => {
     await store.refreshCodexStatus();
 
     expect(api.getCodexStatus).toHaveBeenCalledOnce();
-    expect(store.codex.value).toEqual({ available: true, message: "ok" });
+    expect(store.codex.value).toEqual({
+      available: true,
+      desiredRunning: true,
+      message: "ok",
+    });
   });
 
   it("on a rejected invoke sets an unavailable codex status", async () => {
@@ -74,6 +89,53 @@ describe("useReviewStore refreshCodexStatus()", () => {
 
     expect(store.codex.value?.available).toBe(false);
     expect(store.codex.value?.message).toBe("boom");
+  });
+});
+
+describe("useReviewStore startCodexServer()/stopCodexServer()", () => {
+  it("startCodexServer writes a running codex status from startCodex", async () => {
+    const store = useReviewStore();
+
+    await store.startCodexServer();
+
+    expect(api.startCodex).toHaveBeenCalledOnce();
+    expect(store.codex.value).toEqual({
+      available: true,
+      desiredRunning: true,
+      message: "ok",
+    });
+  });
+
+  it("startCodexServer on a rejected invoke marks intent-to-run unavailable", async () => {
+    vi.mocked(api.startCodex).mockRejectedValueOnce({ message: "boom" });
+    const store = useReviewStore();
+
+    await store.startCodexServer();
+
+    expect(store.codex.value?.available).toBe(false);
+    expect(store.codex.value?.desiredRunning).toBe(true);
+    expect(store.codex.value?.message).toBe("boom");
+  });
+
+  it("stopCodexServer writes a stopped codex status from stopCodex", async () => {
+    const store = useReviewStore();
+
+    await store.stopCodexServer();
+
+    expect(api.stopCodex).toHaveBeenCalledOnce();
+    expect(store.codex.value?.available).toBe(false);
+    expect(store.codex.value?.desiredRunning).toBe(false);
+  });
+
+  it("stopCodexServer on a rejected invoke still marks it stopped", async () => {
+    vi.mocked(api.stopCodex).mockRejectedValueOnce({ message: "gone" });
+    const store = useReviewStore();
+
+    await store.stopCodexServer();
+
+    expect(store.codex.value?.available).toBe(false);
+    expect(store.codex.value?.desiredRunning).toBe(false);
+    expect(store.codex.value?.message).toBe("gone");
   });
 });
 

@@ -4,6 +4,7 @@
 //! many `thread/start`s reuse the one connection. The child is killed when the
 //! app closes ([`Self::shutdown`], wired to `RunEvent` in `lib.rs`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,6 +29,8 @@ pub struct CodexManager {
     /// the spawn/handshake await; this async lock fills that gap while leaving the
     /// fast path and `shutdown` synchronous on the std `Mutex`.
     start_lock: tokio::sync::Mutex<()>,
+    /// 用户显式停止标记。true=被动探测不再自动拉起；任何显式 review（connection）会清此位强制启动。默认 false=保持现状 lazy 行为。
+    stopped: AtomicBool,
 }
 
 impl CodexManager {
@@ -86,6 +89,10 @@ impl CodexManager {
         codex_bin: &str,
         repo_root: &str,
     ) -> AppResult<Arc<RpcClient<ChildStdin>>> {
+        // Any review (manual `start_review` or auto dispatch) needs a live process,
+        // so clear the user-stop flag to force a start: an explicit review overrides
+        // a prior `stop`. `ensure_started` itself is unchanged (still lazy / self-heal).
+        self.stopped.store(false, Ordering::SeqCst);
         self.ensure_started(codex_bin, repo_root).await?;
         let guard = self.inner.lock().unwrap();
         let proc = guard
@@ -103,10 +110,27 @@ impl CodexManager {
     }
 
     /// Probe codex availability for the StatusBar: ensure the resident connection
-    /// and report `available` + version (`userAgent`). Never errors — every
-    /// failure maps to `available: false` with a Chinese message (mirrors the pr
-    /// slice's `gh_auth_status`).
+    /// and report `available` + version (`userAgent`). Honors the user-stop flag —
+    /// when `stop` was called this short-circuits to a stopped status WITHOUT
+    /// calling `ensure_started`, so a passive probe never revives a stopped server.
+    /// Never errors — every failure maps to `available: false` with a Chinese
+    /// message (mirrors the pr slice's `gh_auth_status`).
     pub async fn status(&self, codex_bin: &str, repo_root: &str) -> CodexStatus {
+        if self.stopped.load(Ordering::SeqCst) {
+            return CodexStatus {
+                available: false,
+                desired_running: false,
+                message: "codex app-server 已停止".to_string(),
+            };
+        }
+        self.status_inner(codex_bin, repo_root).await
+    }
+
+    /// The probe body shared by `status` (passive) and `start` (explicit): ensure
+    /// the resident connection and map the outcome to a `desired_running: true`
+    /// status (success or spawn failure are both an intent-to-run state — only an
+    /// explicit `stop` clears the intent). Calls `ensure_started`, so it CAN spawn.
+    async fn status_inner(&self, codex_bin: &str, repo_root: &str) -> CodexStatus {
         match self.ensure_started(codex_bin, repo_root).await {
             Ok(info) => {
                 let message = if info.user_agent.is_empty() {
@@ -116,13 +140,35 @@ impl CodexManager {
                 };
                 CodexStatus {
                     available: true,
+                    desired_running: true,
                     message,
                 }
             }
             Err(e) => CodexStatus {
                 available: false,
+                desired_running: true,
                 message: e.message,
             },
+        }
+    }
+
+    /// Explicitly (re)start the resident server: clear the user-stop flag and
+    /// ensure the connection. Returns the latest status (`desired_running: true`).
+    pub async fn start(&self, codex_bin: &str, repo_root: &str) -> CodexStatus {
+        self.stopped.store(false, Ordering::SeqCst);
+        self.status_inner(codex_bin, repo_root).await
+    }
+
+    /// Explicitly stop the resident server: set the user-stop flag (so passive
+    /// `status` probes no longer revive it) and kill the child. An explicit review
+    /// (`connection`) still forces a restart by clearing the flag.
+    pub fn stop(&self) -> CodexStatus {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.shutdown();
+        CodexStatus {
+            available: false,
+            desired_running: false,
+            message: "codex app-server 已停止".to_string(),
         }
     }
 
@@ -135,5 +181,41 @@ impl CodexManager {
         if let Some(proc) = proc {
             proc.kill_and_reap();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // CI-safe: the user-stop short-circuit returns before any spawn, and the
+    // not-stopped paths use a bin name that doesn't exist so `spawn` errors
+    // immediately (no real binary, no handshake-timeout wait).
+
+    #[tokio::test]
+    async fn status_reports_stopped_without_spawning() {
+        let m = CodexManager::default();
+        m.stop();
+        let s = m.status("prmonitor-no-such-codex-bin", "").await;
+        assert!(!s.available);
+        assert!(!s.desired_running);
+        assert_eq!(s.message, "codex app-server 已停止");
+    }
+
+    #[tokio::test]
+    async fn status_attempts_start_when_not_stopped() {
+        let m = CodexManager::default();
+        let s = m.status("prmonitor-no-such-codex-bin", "").await;
+        assert!(!s.available);
+        assert!(s.desired_running);
+    }
+
+    #[tokio::test]
+    async fn start_clears_stopped_then_attempts() {
+        let m = CodexManager::default();
+        m.stop();
+        let s = m.start("prmonitor-no-such-codex-bin", "").await;
+        assert!(s.desired_running);
+        assert!(!s.available);
     }
 }
