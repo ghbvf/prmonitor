@@ -291,6 +291,17 @@ mod tests {
         assert!(v.get("desired_running").is_none());
         assert!(v.get("message").is_some());
         assert_eq!(v["available"], true);
+
+        // 停止态：desiredRunning=false 必须如实出现（StatusBar 据此切「启动/停止」按钮）。
+        let stopped = serde_json::to_value(CodexStatus {
+            available: false,
+            desired_running: false,
+            message: "codex app-server 已停止".to_string(),
+        })
+        .expect("CodexStatus serializes");
+        assert_eq!(stopped["available"], false);
+        assert_eq!(stopped["desiredRunning"], false);
+        assert!(stopped.get("desired_running").is_none());
     }
 
     /// An unterminated stderr line (no newline) must not hang or buffer without
