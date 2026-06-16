@@ -1,5 +1,7 @@
 //! PR slice Tauri commands: manual fetch + `gh` auth status.
 
+use tauri::Emitter; // for app.emit
+
 use crate::config::service as config_service;
 use crate::error::AppResult;
 use crate::model::{Candidate, PullRequestView};
@@ -158,12 +160,46 @@ pub async fn gh_status() -> AppResult<GhStatus> {
     Ok(gh_auth_status("gh").await)
 }
 
-/// Returns the latest discovered PR list (the scheduler's snapshot) so the
-/// frontend can render current state on mount without waiting for the next
-/// `prs:updated` event (closes the startup lost-event race).
+/// Returns the retained tracked-PR list (the persisted `prs.json` set projected at
+/// the current epoch) so the frontend can render current state on mount without
+/// waiting for the next `prs:updated` event (closes the startup lost-event race).
+/// Reads only `app` — the persisted set survives restarts, so this no longer
+/// depends on the scheduler having run this session.
 #[tauri::command]
-pub fn get_prs(state: tauri::State<'_, crate::state::AppState>) -> AppResult<Vec<PullRequestView>> {
-    Ok(state.scheduler.snapshot())
+pub fn get_prs<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> AppResult<Vec<crate::model::TrackedPrView>> {
+    let tracked = super::registry::TrackedPrs::load(&app)?;
+    let now = super::ledger::now_epoch();
+    Ok(super::registry::to_view_list(
+        &tracked,
+        now,
+        super::registry::presence_grace_secs(&app),
+    ))
+}
+
+/// Sets a tracked PR's `archived` flag and re-emits the retained list immediately
+/// so the UI reflects the archive/unarchive without waiting for the next poll
+/// round. PRs are never auto-evicted; archiving is how users retire inactive rows.
+#[tauri::command]
+pub fn set_pr_archived<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    number: u64,
+    archived: bool,
+) -> AppResult<()> {
+    let mut tracked = super::registry::TrackedPrs::load(&app)?;
+    tracked.set_archived(number, archived);
+    tracked.save(&app)?;
+
+    // Re-emit the retained projection so the list updates immediately.
+    let now = super::ledger::now_epoch();
+    let list =
+        super::registry::to_view_list(&tracked, now, super::registry::presence_grace_secs(&app));
+    let _ = app.emit(
+        crate::events::PRS_UPDATED_EVENT,
+        &crate::events::PrEvent::Updated { prs: list },
+    );
+    Ok(())
 }
 
 #[cfg(test)]

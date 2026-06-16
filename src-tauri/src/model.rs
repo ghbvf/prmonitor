@@ -70,6 +70,31 @@ pub struct PullRequestView {
     pub skip_reason: Option<String>,
 }
 
+/// Whether a tracked PR was seen in the latest discovery window or has aged out.
+///
+/// `Current` = last seen within the presence grace window (the live working set);
+/// `Stale` = not seen recently (a transient `gh` miss or a genuinely closed PR),
+/// retained so a one-round miss flips presence rather than dropping the row.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PrPresence {
+    Current,
+    Stale,
+}
+
+/// Tracking-aware PR row emitted to the frontend (persisted-retention view).
+///
+/// Flattens [`PullRequestView`] so the wire shape stays a flat row plus the two
+/// retention fields (`presence` / `archived`) the persisted-list UI renders.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackedPrView {
+    #[serde(flatten)]
+    pub pr: PullRequestView,
+    pub presence: PrPresence,
+    pub archived: bool,
+}
+
 /// Serde wire-shape locks for `model.rs`'s cross-slice types.
 ///
 /// The **Medium carrier** for these serde shapes per
@@ -179,5 +204,48 @@ mod tests {
 
         let v = serde_json::to_value(&view).expect("PullRequestView serializes");
         assert_eq!(v["skipReason"], serde_json::Value::Null);
+    }
+
+    // Front/back contract lock for the persisted-retention row (Medium carrier per
+    // ai-robust.md): `TrackedPrView` is mirrored in `src/types.ts`. It flattens
+    // `PullRequestView`, so the inner keys (`number,title,labels,url,kind,skipReason`)
+    // must surface at the top level alongside `presence` / `archived`; a flatten
+    // regression or field rename surfaces here and must be synced to the TS mirror
+    // in lockstep (the open end of this funnel; future Hard path = codegen from
+    // `model.rs` + `git diff --exit-code`).
+    #[test]
+    fn tracked_pr_view_wire_shape_is_camel_case() {
+        let view = TrackedPrView {
+            pr: PullRequestView {
+                number: 1,
+                title: "Add feature".to_string(),
+                labels: vec!["review".to_string()],
+                url: "https://example.com/pr/1".to_string(),
+                kind: "review".to_string(),
+                skip_reason: Some("draft PR".to_string()),
+            },
+            presence: PrPresence::Current,
+            archived: false,
+        };
+
+        let v = serde_json::to_value(&view).expect("TrackedPrView serializes");
+
+        // Flattened `PullRequestView` keys present at the top level.
+        assert!(v.get("number").is_some());
+        assert!(v.get("title").is_some());
+        assert!(v.get("labels").is_some());
+        assert!(v.get("url").is_some());
+        assert!(v.get("kind").is_some());
+        assert!(v.get("skipReason").is_some());
+
+        // Retention keys present (camelCase).
+        assert!(v.get("presence").is_some());
+        assert!(v.get("archived").is_some());
+
+        // `presence` serializes to the pinned lowercase wire strings the TS mirror
+        // discriminates on.
+        assert_eq!(v["presence"], "current");
+        let stale = serde_json::to_value(PrPresence::Stale).expect("PrPresence serializes");
+        assert_eq!(stale, "stale");
     }
 }

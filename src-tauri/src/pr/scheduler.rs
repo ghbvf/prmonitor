@@ -2,7 +2,7 @@
 //!
 //! A `tokio::time::interval` drives discovery, plus a manual `wake` (the "立即
 //! 拉取" button) and live period changes (`reconfigure`). The loop never exits on
-//! a discovery error — `discover_emit_snapshot` swallows it into a
+//! a discovery error — `discover_emit_dispatch` swallows it into a
 //! [`PrEvent::Error`] and the loop continues. The first `interval` tick fires
 //! immediately (t=0), so `start`/`reconfigure` each trigger an immediate
 //! discovery ("启动即跑").
@@ -13,10 +13,12 @@
 //! a stop mid-discovery returns immediately and drops the discovery future; the
 //! `gh` child it owns dies via `kill_on_drop`. No orphaned subprocess.
 //!
-//! **Snapshot (F3).** Each successful discovery writes the resulting PR list to a
-//! shared `snapshot` *before* emitting `prs:updated`. The frontend reads it on
-//! mount via the `get_prs` command, so a `prs:updated` lost to a not-yet-mounted
-//! listener no longer strands the UI on an empty list for a full period.
+//! **Snapshot (F3 → #38).** The poll-cycle snapshot is now the persisted
+//! `prs.json` tracked set: each successful discovery upserts the round's PRs into
+//! it and emits the *retained* list (read on mount via the `get_prs` command).
+//! Because the set is persisted it survives restarts, and a failed cycle leaves it
+//! intact (the last good list stays readable). A transient one-round `gh` miss no
+//! longer drops a row — it flips presence `Current`→`Stale` after the grace window.
 //!
 //! **Auto-trigger (#8).** Each cycle also passes its dispatchable candidates (the
 //! clean rows) to an injected [`Dispatcher`] hook. The hook is the seam that keeps
@@ -40,6 +42,8 @@ use crate::error::AppResult;
 use crate::events::{PrEvent, PRS_UPDATED_EVENT};
 use crate::model::Candidate;
 
+use super::registry;
+
 /// Abstract per-cycle dispatch hook: consumes the cycle's dispatchable
 /// [`Candidate`]s and drives them to completion (in practice: auto-start their
 /// reviews concurrently). Boxed-future + `Arc` so it is `Clone`able into the cycle
@@ -52,7 +56,9 @@ pub type Dispatcher =
 /// Default poll period when config is unreadable or non-positive. Mirrors
 /// `AppConfig::default().poll_interval_secs`. A 0 period would make
 /// `interval(Duration::from_secs(0))` hot-spin, so [`resolve_period`] clamps it.
-const DEFAULT_POLL_INTERVAL_SECS: u64 = 120;
+/// `pub(crate)` so the registry single-sources this clamp for its presence grace
+/// window rather than re-hardcoding the default.
+pub(crate) const DEFAULT_POLL_INTERVAL_SECS: u64 = 120;
 
 /// The composition-root handle for the scheduled-pull loop. Lives in
 /// [`crate::state::AppState`]; all methods take `&self` and use interior
@@ -60,10 +66,6 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 120;
 #[derive(Default)]
 pub struct Scheduler {
     task: StdMutex<Option<RunningTask>>,
-    /// Latest successfully discovered PR list (F3). Shared with the loop, which
-    /// writes it before each emit; read by `get_prs` so the frontend renders
-    /// current state on mount without waiting for the next `prs:updated`.
-    snapshot: Arc<StdMutex<Vec<crate::model::PullRequestView>>>,
     /// The auto-trigger dispatch hook (#8), installed by the composition root via
     /// [`Self::set_dispatcher`] before `start`. `Mutex<Option<_>>` defaults to
     /// `None` (so `#[derive(Default)]` still holds) — a `None` dispatcher means a
@@ -108,20 +110,18 @@ impl Scheduler {
         let dispatcher = self.dispatcher.lock().unwrap().clone();
 
         // Production wiring: the period comes from the live config each rebuild,
-        // and each cycle discovers → writes the snapshot → emits → dispatches. Both
-        // are injected into the generic `run_loop` so the lifecycle is testable (F4).
+        // and each cycle discovers → upserts the persisted set → emits → dispatches.
+        // Both are injected into the generic `run_loop` so the lifecycle is testable (F4).
         let period_provider = {
             let app = app.clone();
             move || resolve_period(config_service::load(&app).map(|c| c.poll_interval_secs))
         };
         let on_cycle = {
             let app = app.clone();
-            let snapshot = Arc::clone(&self.snapshot);
             move || {
                 let app = app.clone();
-                let snapshot = Arc::clone(&snapshot);
                 let dispatcher = dispatcher.clone();
-                async move { discover_emit_dispatch(&app, &snapshot, dispatcher.as_ref()).await }
+                async move { discover_emit_dispatch(&app, dispatcher.as_ref()).await }
             }
         };
 
@@ -139,12 +139,6 @@ impl Scheduler {
             reconfigure,
             stop,
         });
-    }
-
-    /// Returns the latest discovered PR list (F3). Cheap clone of the shared
-    /// snapshot for the `get_prs` command.
-    pub fn snapshot(&self) -> Vec<crate::model::PullRequestView> {
-        self.snapshot.lock().unwrap().clone()
     }
 
     /// Stops the poll loop gracefully (F1). No-op if not running.
@@ -220,25 +214,34 @@ async fn run_loop<P, C, Fut>(
     }
 }
 
-/// Runs one discovery cycle: writes the snapshot (F3), emits the result, then
-/// auto-triggers the dispatchable candidates (#8). A discovery failure folds into
-/// a [`PrEvent::Error`] (the loop survives it) and leaves the snapshot intact —
-/// the last good list stays readable via `get_prs` — and yields no dispatchable
-/// candidates (nothing is auto-started on a failed cycle). Writing the snapshot
-/// *before* the emit means a lost `prs:updated` is still covered by `get_prs`.
+/// Runs one discovery cycle: upserts the round's PRs into the persisted tracked
+/// set (#38), emits the *retained* list, then auto-triggers the dispatchable
+/// candidates (#8). A discovery failure folds into a [`PrEvent::Error`] (the loop
+/// survives it) and leaves the persisted set intact — the last good list stays
+/// readable via `get_prs` — and yields no dispatchable candidates (nothing is
+/// auto-started on a failed cycle). The emitted list is the persisted set projected
+/// at the current epoch, so a transient miss flips a row's presence instead of
+/// dropping it (the ghost-flicker fix); a store load/save failure degrades to the
+/// freshly-upserted in-memory set rather than failing the cycle.
 ///
 /// The dispatch is *spawned detached* (not awaited) after the emit — see the body
 /// for why the scheduler's stop must not be able to cancel a start in flight; an
 /// empty dispatchable list skips the hook entirely.
 async fn discover_emit_dispatch<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    snapshot: &Arc<StdMutex<Vec<crate::model::PullRequestView>>>,
     dispatcher: Option<&Dispatcher>,
 ) {
     let (event, dispatchable) = match super::commands::discover(app).await {
-        Ok((prs, dispatchable)) => {
-            *snapshot.lock().unwrap() = prs.clone();
-            (PrEvent::Updated { prs }, dispatchable)
+        Ok((views, dispatchable)) => {
+            // Upsert this round into the persisted retention set, persist it, then
+            // emit the retained projection (not the raw round). A failed load
+            // degrades to an empty set so the upsert still reflects this round.
+            let now = super::ledger::now_epoch();
+            let mut tracked = registry::TrackedPrs::load(app).unwrap_or_default();
+            tracked.upsert(&views, now);
+            let _ = tracked.save(app);
+            let list = registry::to_view_list(&tracked, now, registry::presence_grace_secs(app));
+            (PrEvent::Updated { prs: list }, dispatchable)
         }
         // On discovery error the dispatchable list is empty — nothing auto-starts.
         Err(e) => (PrEvent::Error { message: e.message }, Vec::new()),
@@ -268,8 +271,9 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
 
 /// Clamps a loaded poll period to a usable value: a positive load passes
 /// through; 0 or an error falls back to [`DEFAULT_POLL_INTERVAL_SECS`] (a 0
-/// period would hot-spin the interval).
-fn resolve_period(loaded: AppResult<u64>) -> u64 {
+/// period would hot-spin the interval). `pub(crate)` so the registry reuses this
+/// single clamp for its presence grace window.
+pub(crate) fn resolve_period(loaded: AppResult<u64>) -> u64 {
     match loaded {
         Ok(s) if s > 0 => s,
         _ => DEFAULT_POLL_INTERVAL_SECS,
