@@ -2,13 +2,14 @@
 // Composition-root layout: wires the slice views together and switches between the
 // monitor / settings / onboarding views. Slices own their own UI + state; App only
 // arranges them.
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import { appVersion } from "./config/api";
 import { useConfigStore } from "./config/useConfigStore";
 import SettingsView from "./config/SettingsView.vue";
 import OnboardingWizard from "./config/OnboardingWizard.vue";
 import PollControls from "./pr/PollControls.vue";
 import PrList from "./pr/PrList.vue";
+import ProjectSwitcher from "./pr/ProjectSwitcher.vue";
 import WebhookPanel from "./pr/WebhookPanel.vue";
 import { usePrStore } from "./pr/usePrStore";
 import StatusBar from "./StatusBar.vue";
@@ -17,6 +18,7 @@ import ReviewSessions from "./review/ReviewSessions.vue";
 import { useReviewStore } from "./review/useReviewStore";
 import { reschedule, startPolling } from "./pr/api";
 import { useAppView } from "./useAppView";
+import { useProjects } from "./projects";
 
 const version = ref("");
 // Gate view selection until the config load resolves, so a first-launch user never
@@ -26,6 +28,9 @@ const booting = ref(true);
 const prStore = usePrStore();
 const configStore = useConfigStore();
 const { currentView, goMonitor, goSettings, goOnboarding } = useAppView();
+// Active project (#35): the switcher rail flips it; the PR + review views below
+// resolve their data against it. Persisted via useProjects().setActive.
+const { activeProjectId } = useProjects();
 
 // Login / availability banner (composition layer only): #8 auto-triggers reviews,
 // which silently stall if `gh` isn't authenticated or codex is unavailable.
@@ -36,10 +41,14 @@ const { currentView, goMonitor, goSettings, goOnboarding } = useAppView();
 // `dispatchError` is the session-less auto-trigger notice (#8): the backend
 // dispatcher emits it on a bad config / start failure / ledger-write failure, so
 // the same banner that warns "auto review paused" also reports "auto review failed".
-const { codex, dispatchError, clearDispatchError } = useReviewStore();
+const { codex, dispatchError, clearDispatchError, clearFocus } = useReviewStore();
 const ghBlocked = computed(() => prStore.gh?.authenticated === false);
 const codexBlocked = computed(() => codex.value?.available === false);
 const showPrompt = computed(() => ghBlocked.value || codexBlocked.value);
+// dispatchError is keyed per project (#35): show the active project's notice.
+const activeDispatchError = computed(
+  () => dispatchError.value[activeProjectId.value] ?? null,
+);
 // A config LOAD failure leaves `config` null; surface it instead of silently
 // degrading to an empty monitor (finding F3). The user can open Settings to retry
 // (SettingsView re-loads on mount) or re-save.
@@ -60,7 +69,14 @@ onMounted(async () => {
   // and forcing a returning user back through onboarding on a transient error would
   // be worse than degrading to the monitor view.
   await configStore.load();
-  if (configStore.config && configStore.config.repoRoot === "") {
+  // Seed the project switcher + active selection from the loaded config (#35).
+  if (configStore.config) useProjects().hydrate(configStore.config);
+  // First-launch detection is now "no projects yet": migration wraps a legacy
+  // single-repo config into projects:[default], and onboarding creates the first
+  // project — so an empty `projects` is the only fresh-install state that routes to
+  // onboarding. A null config means the load failed (IPC error); degrade to the
+  // monitor rather than forcing a returning user back through onboarding.
+  if (configStore.config && configStore.config.projects.length === 0) {
     goOnboarding();
   } else {
     goMonitor();
@@ -73,23 +89,31 @@ onMounted(async () => {
 // the poll interval. start_polling is idempotent (no-op if already running) and
 // recovers the gated-off case; reschedule then applies the new period.
 async function onConfigSaved() {
+  // A save may have added / removed / edited projects, so re-load and re-hydrate the
+  // switcher + active selection before reconciling the loops (#35).
+  await configStore.load();
+  if (configStore.config) useProjects().hydrate(configStore.config);
+  const ids = useProjects().projects.value.map((p) => p.id);
+  const activeId = activeProjectId.value;
   try {
+    // start_polling reconciles ALL enabled projects' loops (idempotent); recovers a
+    // project whose loop was gated off at launch by a previously-invalid config.
     await startPolling();
-    prStore.polling = true;
+    for (const id of ids) prStore.polling[id] = true;
   } catch (e) {
-    // start_polling now rejects under an invalid config (finding F1). Keep the flag
+    // start_polling rejects under an invalid config (finding F1). Keep the flags
     // honest and surface the error (finding F3) so a saved-but-not-running monitor is
     // visible — not just a console line implying the loop resumed.
-    prStore.polling = false;
-    prStore.error = toMsg(e);
+    for (const id of ids) prStore.polling[id] = false;
+    prStore.error[activeId] = toMsg(e);
     return;
   }
-  // The loop is running; a reschedule failure only delays the period rebuild (the
+  // The loops are running; a reschedule failure only delays the period rebuild (the
   // next poll still runs on the old period), so surface it without claiming a stop.
   try {
     await reschedule();
   } catch (e) {
-    prStore.error = toMsg(e);
+    prStore.error[activeId] = toMsg(e);
   }
 }
 
@@ -98,15 +122,21 @@ async function onConfigSaved() {
 // store before entering the monitor view — this is the downstream that closes the
 // poll-gate funnel (upstream = the lib.rs validity gate).
 async function onOnboardingDone() {
+  // Onboarding created the first project; re-load + hydrate so the switcher and the
+  // active selection reflect it before the monitor view mounts (#35).
+  await configStore.load();
+  if (configStore.config) useProjects().hydrate(configStore.config);
+  const ids = useProjects().projects.value.map((p) => p.id);
+  const activeId = activeProjectId.value;
   try {
     await startPolling();
-    prStore.polling = true;
+    for (const id of ids) prStore.polling[id] = true;
   } catch (e) {
-    // Keep the polling flag honest (PollControls won't claim the loop is running)
+    // Keep the polling flags honest (PollControls won't claim the loop is running)
     // AND surface the error (finding F3) so the user sees why the monitor didn't
     // start — not just a console line — and can retry from the monitor controls.
-    prStore.polling = false;
-    prStore.error = toMsg(e);
+    for (const id of ids) prStore.polling[id] = false;
+    prStore.error[activeId] = toMsg(e);
   }
   goMonitor();
 }
@@ -123,10 +153,18 @@ async function onOnboardingDone() {
 const selectedNumber = ref<number | null>(null);
 const selectedPr = computed(
   () =>
-    prStore.prs.find(
+    (prStore.prs[activeProjectId.value] ?? []).find(
       (p) => !p.archived && p.number === selectedNumber.value,
     ) ?? null,
 );
+// Switching projects clears the selection AND the focused review (#35). PR numbers
+// collide across repos, so a carried-over selection could point ReviewPanel at the
+// wrong PR; and the review focus is a global singleton, so without clearFocus the
+// panel would keep showing/stopping the previous project's session (pr-review F5).
+watch(activeProjectId, () => {
+  selectedNumber.value = null;
+  clearFocus();
+});
 </script>
 
 <template>
@@ -180,6 +218,7 @@ const selectedPr = computed(
     </SettingsView>
 
     <div v-else class="layout">
+      <ProjectSwitcher />
       <aside class="sidebar">
         <PollControls />
         <PrList
@@ -189,7 +228,7 @@ const selectedPr = computed(
       </aside>
       <main class="content">
         <div
-          v-if="showPrompt || dispatchError || configError"
+          v-if="showPrompt || activeDispatchError || configError"
           class="availability"
           role="alert"
         >
@@ -209,13 +248,13 @@ const selectedPr = computed(
               codex 不可用（{{ codex?.message }}）
             </template>
           </p>
-          <p v-if="dispatchError" class="line dispatch-error">
-            <span>⚠ 自动 review 异常：{{ dispatchError }}</span>
+          <p v-if="activeDispatchError" class="line dispatch-error">
+            <span>⚠ 自动 review 异常：{{ activeDispatchError }}</span>
             <button
               type="button"
               class="dismiss"
               aria-label="关闭 / dismiss"
-              @click="clearDispatchError"
+              @click="clearDispatchError(activeProjectId)"
             >
               ✕
             </button>

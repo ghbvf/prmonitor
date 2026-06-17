@@ -1,10 +1,12 @@
-// usePrStore state-machine tests (#27 F4). Drives the store against a mocked
-// `./api` module so the assertions stay deterministic — the `prs:updated` event
-// is simulated by invoking the captured `onPrsUpdated` callback directly rather
-// than through the Tauri event bus.
+// usePrStore state-machine tests (#27 F4, multi-project #35). Drives the store
+// against a mocked `./api` module so the assertions stay deterministic — the
+// `prs:updated` event is simulated by invoking the captured `onPrsUpdated`
+// callback directly rather than through the Tauri event bus. State is partitioned
+// by projectId; tests seed `prs["p1"]` and set "p1" active via useProjects().
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import type { PrEvent, TrackedPrView } from "../types";
+import type { Project } from "../config/types";
 
 // Captured callback handed to `onPrsUpdated`, so a test can push a `PrEvent`
 // through the same path `subscribe()` wires up.
@@ -24,8 +26,16 @@ vi.mock("./api", () => ({
   }),
 }));
 
+// `useProjects().setActive` persists via the root `../api` invoke — stub it so
+// `switchTo` does not hit the Tauri bridge.
+vi.mock("../api", () => ({
+  invoke: vi.fn(() => Promise.resolve()),
+  listen: vi.fn(() => Promise.resolve(() => {})),
+}));
+
 import * as api from "./api";
 import { usePrStore } from "./usePrStore";
+import { useProjects } from "../projects";
 
 // `track` overrides the tracking fields so a test can mint stale / archived rows;
 // the defaults (current + not archived) keep every existing single-arg call valid.
@@ -44,6 +54,24 @@ const view = (
   ...track,
 });
 
+// Minimal Project rows for hydrate(); only id/name are exercised by these tests.
+const project = (id: string): Project => ({
+  id,
+  name: id.toUpperCase(),
+  enabled: true,
+  repo: "owner/repo",
+  repoRoot: "/tmp/repo",
+  pollIntervalSecs: 60,
+  authors: [],
+  reviewLabel: "review",
+  checkLabel: "check",
+  skillRelPath: ".claude/skills/pr-review",
+  prCooldownSeconds: 0,
+  sourceKind: "github",
+  engineKind: "codex",
+  autoReview: false,
+});
+
 beforeEach(() => {
   setActivePinia(createPinia());
   prsCb = null;
@@ -58,116 +86,182 @@ beforeEach(() => {
     prsCb = cb;
     return Promise.resolve(() => {});
   });
+  // Seed two projects with "p1" active; module-level refs persist across tests,
+  // so hydrate() re-establishes a clean baseline each run.
+  useProjects().hydrate({
+    projects: [project("p1"), project("p2")],
+    activeProjectId: "p1",
+    webhookEnabled: false,
+    webhookPort: 0,
+    webhookSecret: "",
+    cloudflaredBin: "",
+    webhookTunnelMode: "quick",
+    webhookTunnelCommand: "",
+    webhookPublicUrl: "",
+  });
 });
 
 describe("usePrStore subscribe()", () => {
-  it("applies an `updated` event: sets prs, lastPulledAt, clears error + loading", () => {
+  it("applies an `updated` event: sets prs, lastPulledAt, clears error + loading for that project", () => {
     const store = usePrStore();
     store.subscribe();
-    store.error = "stale";
-    store.loading = true;
+    store.error.p1 = "stale";
+    store.loading.p1 = true;
 
     const prs = [view(1), view(2)];
-    prsCb?.({ kind: "updated", prs });
+    prsCb?.({ kind: "updated", projectId: "p1", prs });
 
-    expect(store.prs).toEqual(prs);
-    expect(store.lastPulledAt).not.toBeNull();
-    expect(store.error).toBeNull();
-    expect(store.loading).toBe(false);
+    expect(store.prs.p1).toEqual(prs);
+    expect(store.lastPulledAt.p1).not.toBeNull();
+    expect(store.error.p1).toBeNull();
+    expect(store.loading.p1).toBe(false);
+    // Active project's updated PRs do NOT raise the new-PR flag.
+    expect(store.hasNewPr.p1).toBeFalsy();
   });
 
-  it("applies an `error` event: sets error, clears loading", () => {
+  it("applies an `error` event: sets error, clears loading for that project", () => {
     const store = usePrStore();
     store.subscribe();
-    store.loading = true;
+    store.loading.p1 = true;
 
-    prsCb?.({ kind: "error", message: "gh exploded" });
+    prsCb?.({ kind: "error", projectId: "p1", message: "gh exploded" });
 
-    expect(store.error).toBe("gh exploded");
-    expect(store.loading).toBe(false);
+    expect(store.error.p1).toBe("gh exploded");
+    expect(store.loading.p1).toBe(false);
+  });
+
+  it("routes a non-active project's event into its own partition without disturbing the active one", () => {
+    const store = usePrStore();
+    store.subscribe();
+    const p1prs = [view(1)];
+    prsCb?.({ kind: "updated", projectId: "p1", prs: p1prs });
+
+    const p2prs = [view(10), view(11)];
+    prsCb?.({ kind: "updated", projectId: "p2", prs: p2prs });
+
+    expect(store.prs.p2).toEqual(p2prs);
+    // p1 (active) partition untouched by the p2 event.
+    expect(store.prs.p1).toEqual(p1prs);
+  });
+
+  it("flips hasNewPr for a NON-active project that gains a new PR number", () => {
+    const store = usePrStore();
+    store.subscribe();
+
+    // First p2 update establishes a baseline (#10) — already counts as new since
+    // p2 held nothing before; the flag flips on the first unseen number.
+    prsCb?.({ kind: "updated", projectId: "p2", prs: [view(10)] });
+    expect(store.hasNewPr.p2).toBe(true);
+  });
+
+  it("does NOT flip hasNewPr when a non-active project's update brings no new numbers", () => {
+    const store = usePrStore();
+    store.subscribe();
+
+    // Seed p2 then clear the flag, mimicking the user having visited p2.
+    prsCb?.({ kind: "updated", projectId: "p2", prs: [view(10)] });
+    store.hasNewPr.p2 = false;
+
+    // A re-poll of the SAME numbers must not re-flag.
+    prsCb?.({ kind: "updated", projectId: "p2", prs: [view(10)] });
+    expect(store.hasNewPr.p2).toBe(false);
   });
 });
 
 describe("usePrStore pollNow()", () => {
-  it("on success leaves loading=true (event clears it later)", async () => {
+  it("on success leaves loading=true for the project (event clears it later)", async () => {
     const store = usePrStore();
-    await store.pollNow();
+    await store.pollNow("p1");
 
-    expect(api.pollNow).toHaveBeenCalledOnce();
-    expect(store.loading).toBe(true);
-    expect(store.error).toBeNull();
+    expect(api.pollNow).toHaveBeenCalledWith("p1");
+    expect(store.loading.p1).toBe(true);
+    expect(store.error.p1).toBeNull();
   });
 
   it("on a rejected invoke sets error and clears loading", async () => {
     vi.mocked(api.pollNow).mockRejectedValueOnce({ message: "boom" });
     const store = usePrStore();
-    await store.pollNow();
+    await store.pollNow("p1");
 
-    expect(store.error).toBe("boom");
-    expect(store.loading).toBe(false);
+    expect(store.error.p1).toBe("boom");
+    expect(store.loading.p1).toBe(false);
   });
 });
 
 describe("usePrStore toggle()", () => {
-  it("polling -> paused calls stopPolling and flips polling=false", async () => {
+  it("polling -> paused calls stopPolling and flips polling=false for all projects", async () => {
     const store = usePrStore();
-    expect(store.polling).toBe(true);
+    expect(store.pollingActive).toBe(true);
 
     await store.toggle();
 
     expect(api.stopPolling).toHaveBeenCalledOnce();
-    expect(store.polling).toBe(false);
-    expect(store.error).toBeNull();
+    expect(store.pollingFor("p1")).toBe(false);
+    expect(store.pollingFor("p2")).toBe(false);
+    expect(store.errorActive).toBeNull();
   });
 
   it("on a rejected command sets error and does NOT flip polling", async () => {
     vi.mocked(api.stopPolling).mockRejectedValueOnce({ message: "stop failed" });
     const store = usePrStore();
-    expect(store.polling).toBe(true);
+    expect(store.pollingActive).toBe(true);
 
     await store.toggle();
 
-    // catch runs before the flip, so polling stays at its prior value.
-    expect(store.error).toBe("stop failed");
-    expect(store.polling).toBe(true);
+    // catch runs before the flip, so polling stays at its prior (default) value.
+    expect(store.errorActive).toBe("stop failed");
+    expect(store.pollingActive).toBe(true);
   });
 });
 
 describe("usePrStore loadSnapshot()", () => {
-  it("sets prs from getPrs", async () => {
+  it("sets prs from getPrs for the project", async () => {
     const snapshot = [view(7)];
     vi.mocked(api.getPrs).mockResolvedValueOnce(snapshot);
     const store = usePrStore();
 
-    await store.loadSnapshot();
+    await store.loadSnapshot("p1");
 
-    expect(api.getPrs).toHaveBeenCalledOnce();
-    expect(store.prs).toEqual(snapshot);
+    expect(api.getPrs).toHaveBeenCalledWith("p1");
+    expect(store.prs.p1).toEqual(snapshot);
   });
 
-  it("surfaces a rejected getPrs as error without mutating prs", async () => {
+  it("guards a second load of the same project (visited-once)", async () => {
+    vi.mocked(api.getPrs).mockResolvedValue([view(7)]);
+    const store = usePrStore();
+
+    await store.loadSnapshot("p1");
+    await store.loadSnapshot("p1");
+
+    expect(api.getPrs).toHaveBeenCalledOnce();
+  });
+
+  it("surfaces a rejected getPrs as error without mutating prs (and resets the guard)", async () => {
     vi.mocked(api.getPrs).mockRejectedValueOnce({ message: "no snapshot" });
     const store = usePrStore();
 
-    await store.loadSnapshot();
+    await store.loadSnapshot("p1");
 
-    expect(store.error).toBe("no snapshot");
-    expect(store.prs).toEqual([]);
+    expect(store.error.p1).toBe("no snapshot");
+    expect(store.prs.p1).toBeUndefined();
+    // Guard reset so a retry can re-fetch.
+    vi.mocked(api.getPrs).mockResolvedValueOnce([view(7)]);
+    await store.loadSnapshot("p1");
+    expect(store.prs.p1).toEqual([view(7)]);
   });
 });
 
 describe("usePrStore init()", () => {
-  it("subscribes before reading the snapshot baseline", async () => {
+  it("subscribes before reading the active project's snapshot baseline", async () => {
     const snapshot = [view(3)];
     vi.mocked(api.getPrs).mockResolvedValueOnce(snapshot);
     const store = usePrStore();
 
     const unlisten = await store.init();
 
-    // subscribe() wired the listener and loadSnapshot() baselined the list.
     expect(api.onPrsUpdated).toHaveBeenCalledOnce();
-    expect(api.getPrs).toHaveBeenCalledOnce();
-    expect(store.prs).toEqual(snapshot);
+    expect(api.getPrs).toHaveBeenCalledWith("p1");
+    expect(store.prs.p1).toEqual(snapshot);
     expect(typeof (await unlisten)).toBe("function");
   });
 
@@ -193,10 +287,26 @@ describe("usePrStore init()", () => {
   });
 });
 
-describe("usePrStore tracking getters (#38)", () => {
+describe("usePrStore switchTo()", () => {
+  it("activates the project, clears its new-PR flag, and baselines its list", async () => {
+    const snapshot = [view(10)];
+    vi.mocked(api.getPrs).mockResolvedValueOnce(snapshot);
+    const store = usePrStore();
+    store.hasNewPr.p2 = true;
+
+    await store.switchTo("p2");
+
+    expect(useProjects().activeProjectId.value).toBe("p2");
+    expect(store.hasNewPr.p2).toBe(false);
+    expect(api.getPrs).toHaveBeenCalledWith("p2");
+    expect(store.prs.p2).toEqual(snapshot);
+  });
+});
+
+describe("usePrStore tracking getters (#38, scoped #35)", () => {
   // One PR of each tracking class, fed through the same `subscribe` path the
   // backend's `prs:updated` push uses, so the getters partition real store state.
-  it("partition the retained list into current / stale / archived", () => {
+  it("partition the ACTIVE project's retained list into current / stale / archived", () => {
     const store = usePrStore();
     store.subscribe();
 
@@ -206,15 +316,23 @@ describe("usePrStore tracking getters (#38)", () => {
     const archivedStale = view(4, { presence: "stale", archived: true });
     prsCb?.({
       kind: "updated",
+      projectId: "p1",
       prs: [current, stale, archivedCurrent, archivedStale],
     });
 
-    // current = not archived AND presence "current".
+    // The prop-free active wrappers resolve the "p1" partition.
     expect(store.currentPrs).toEqual([current]);
-    // stale = not archived AND presence "stale".
     expect(store.stalePrs).toEqual([stale]);
-    // archived = archived regardless of presence (both #3 and #4).
     expect(store.archivedPrs).toEqual([archivedCurrent, archivedStale]);
+    // Parameterized getters agree.
+    expect(store.currentPrsFor("p1")).toEqual([current]);
+  });
+
+  it("an empty/unknown project partition resolves to empty getters", () => {
+    const store = usePrStore();
+    expect(store.currentPrsFor("nope")).toEqual([]);
+    expect(store.stalePrsFor("nope")).toEqual([]);
+    expect(store.archivedPrsFor("nope")).toEqual([]);
   });
 
   it("keep an archived+current PR out of currentPrs (archived wins)", () => {
@@ -222,7 +340,7 @@ describe("usePrStore tracking getters (#38)", () => {
     store.subscribe();
 
     const archivedCurrent = view(5, { presence: "current", archived: true });
-    prsCb?.({ kind: "updated", prs: [archivedCurrent] });
+    prsCb?.({ kind: "updated", projectId: "p1", prs: [archivedCurrent] });
 
     expect(store.currentPrs).toEqual([]);
     expect(store.archivedPrs).toEqual([archivedCurrent]);
@@ -230,21 +348,21 @@ describe("usePrStore tracking getters (#38)", () => {
 });
 
 describe("usePrStore setArchived()", () => {
-  it("invokes setPrArchived with {number, archived}", async () => {
+  it("invokes setPrArchived with {projectId, number, archived}", async () => {
     const store = usePrStore();
 
-    await store.setArchived(42, true);
+    await store.setArchived("p1", 42, true);
 
-    expect(api.setPrArchived).toHaveBeenCalledWith(42, true);
-    expect(store.error).toBeNull();
+    expect(api.setPrArchived).toHaveBeenCalledWith("p1", 42, true);
+    expect(store.error.p1).toBeUndefined();
   });
 
-  it("surfaces a rejected invoke as error", async () => {
+  it("surfaces a rejected invoke as error on that project", async () => {
     vi.mocked(api.setPrArchived).mockRejectedValueOnce({ message: "archive failed" });
     const store = usePrStore();
 
-    await store.setArchived(7, false);
+    await store.setArchived("p1", 7, false);
 
-    expect(store.error).toBe("archive failed");
+    expect(store.error.p1).toBe("archive failed");
   });
 });

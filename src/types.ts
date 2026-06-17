@@ -37,17 +37,20 @@ export interface TrackedPrView extends PullRequestView {
 export type SourceKind = "github"; // 未来 #11: | "gitlab" | "bitbucket"
 export type EngineKind = "codex"; // 未来 #11: | "claude"
 
+// Every arm carries `projectId` (#35): events fan out per monitored project, so the
+// frontend routes each payload to the project it belongs to. Discriminant stays `kind`.
 export type ReviewEvent =
-  | { kind: "messageDelta"; threadId: string; itemId: string; text: string }
-  | { kind: "reasoningDelta"; threadId: string; itemId: string; text: string }
-  | { kind: "turnCompleted"; threadId: string; status: string }
-  | { kind: "error"; threadId: string; message: string }
+  | { kind: "messageDelta"; projectId: string; threadId: string; itemId: string; text: string }
+  | { kind: "reasoningDelta"; projectId: string; threadId: string; itemId: string; text: string }
+  | { kind: "turnCompleted"; projectId: string; threadId: string; status: string }
+  | { kind: "error"; projectId: string; threadId: string; message: string }
   // Session-less auto-trigger (#8) notice — no threadId (mirrors
   // `events.rs::ReviewEvent::DispatchError`; locked by a serde golden test).
-  | { kind: "dispatchError"; message: string };
+  | { kind: "dispatchError"; projectId: string; message: string };
 
 // Mirrors `events.rs::PrEvent` (tagged `kind`, camelCase) — the funnel's
-// downstream end for the `prs:updated` Tauri event payload.
+// downstream end for the `prs:updated` Tauri event payload. `projectId` (#35)
+// routes each update to its monitored project.
 export type PrEvent =
-  | { kind: "updated"; prs: TrackedPrView[] }
-  | { kind: "error"; message: string };
+  | { kind: "updated"; projectId: string; prs: TrackedPrView[] }
+  | { kind: "error"; projectId: string; message: string };

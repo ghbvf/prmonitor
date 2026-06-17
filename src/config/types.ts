@@ -14,7 +14,14 @@ import type { SourceKind, EngineKind } from "../types";
 export const WEBHOOK_TUNNEL_MODES = ["quick", "command", "listener"] as const;
 export type WebhookTunnelMode = (typeof WEBHOOK_TUNNEL_MODES)[number];
 
-export interface AppConfig {
+// One monitored project (#35): the per-project slice of what used to be the flat
+// AppConfig. Mirrors the Rust `Project` struct's camelCase wire shape (golden-locked
+// on the Rust side). `id` is the stable handle used by `activeProjectId` and the
+// per-project event arms (`projectId` in src/types.ts).
+export interface Project {
+  id: string;
+  name: string;
+  enabled: boolean;
   repo: string;
   repoRoot: string;
   pollIntervalSecs: number;
@@ -26,6 +33,15 @@ export interface AppConfig {
   sourceKind: SourceKind;
   engineKind: EngineKind;
   autoReview: boolean;
+}
+
+// Multi-project config (#35): a list of `Project`s plus the active selection, with
+// the webhook/shell fields staying global (one receiver/tunnel serves all projects).
+// Mirrors `src-tauri/src/config/model.rs`'s `AppConfig`.
+export interface AppConfig {
+  projects: Project[];
+  activeProjectId: string;
+  // Global webhook/shell fields stay top-level — one receiver + tunnel for all projects.
   webhookEnabled: boolean;
   webhookPort: number;
   webhookSecret: string;

@@ -3,13 +3,22 @@
 // Plus two pure helpers — `validateStep` (per-step frontend gate) and `errorToStep`
 // (route a backend AppError back to the wizard step that owns the offending field).
 // Kept side-effect-free: no Pinia, no Vue — unit-tested in `fields.test.ts`.
-import { WEBHOOK_TUNNEL_MODES, type AppConfig } from "./types";
+//
+// Multi-project (#35): the groups split into PROJECT_GROUPS (per-project fields,
+// keys are `keyof Project`) and GLOBAL_GROUPS (the global webhook fields, keys are
+// `keyof AppConfig`). `FieldGroup`/`FieldDef` are generic over the key type so each
+// set is precisely typed and its coverage test can assert exactly that key set.
+import { WEBHOOK_TUNNEL_MODES, type AppConfig, type Project } from "./types";
 
-export type FieldKey = keyof AppConfig;
+// A project field's key (per-project form/wizard) or a global AppConfig field's key
+// (the webhook group). Generic `FieldDef<K>` keeps each group set precisely typed.
+export type ProjectFieldKey = keyof Project;
+export type GlobalFieldKey = keyof AppConfig;
+export type FieldKey = ProjectFieldKey | GlobalFieldKey;
 type FieldKind = "text" | "number" | "csv" | "select" | "checkbox";
 
-export interface FieldDef {
-  key: FieldKey;
+export interface FieldDef<K extends FieldKey = FieldKey> {
+  key: K;
   label: string;
   kind: FieldKind;
   hint?: string;
@@ -23,15 +32,17 @@ export interface FieldDef {
   secret?: boolean;
 }
 
-interface FieldGroup {
+interface FieldGroup<K extends FieldKey = FieldKey> {
   id: string;
   title: string;
-  fields: FieldDef[];
+  fields: FieldDef<K>[];
 }
 
-// Every AppConfig key appears exactly once across the groups (asserted in
-// fields.test.ts), so adding a config field forces a home here.
-export const GROUPS: FieldGroup[] = [
+// Per-project field groups (#35). Every `Project` key appears exactly once across
+// these groups (asserted in fields.test.ts), so adding a project field forces a home
+// here. `id`/`name`/`enabled` are project-identity fields managed by the project
+// list/selector UI, not by these form groups.
+export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
   {
     id: "project",
     title: "项目",
@@ -70,6 +81,56 @@ export const GROUPS: FieldGroup[] = [
       },
     ],
   },
+  {
+    id: "labels",
+    title: "标签",
+    fields: [
+      { key: "reviewLabel", label: "Review 触发标签", kind: "text", hint: "命中即触发 review" },
+      { key: "checkLabel", label: "Check 触发标签", kind: "text", hint: "命中即触发 check 修复" },
+    ],
+  },
+  {
+    id: "filters",
+    title: "过滤",
+    fields: [
+      {
+        key: "authors",
+        label: "作者过滤",
+        kind: "csv",
+        hint: "逗号分隔；留空表示不按作者过滤",
+      },
+    ],
+  },
+  {
+    id: "engine",
+    title: "引擎",
+    fields: [
+      // Single-arm enums today; widening tracked by #11 — kept read-only so the UI
+      // never offers an option the backend can't honor.
+      {
+        key: "sourceKind",
+        label: "PR 来源",
+        kind: "select",
+        options: ["github"],
+        readonly: true,
+        hint: "暂仅支持 github（#11）",
+      },
+      {
+        key: "engineKind",
+        label: "Review 引擎",
+        kind: "select",
+        options: ["codex"],
+        readonly: true,
+        hint: "暂仅支持 codex（#11）",
+      },
+    ],
+  },
+];
+
+// Global (non-per-project) field groups (#35): the webhook receiver + tunnel serve
+// all projects, so these stay top-level on AppConfig. Keys are `keyof AppConfig`;
+// the webhook keys are asserted exhaustively in fields.test.ts.
+export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
   {
     id: "webhook",
     title: "Webhook",
@@ -122,50 +183,6 @@ export const GROUPS: FieldGroup[] = [
       },
     ],
   },
-  {
-    id: "labels",
-    title: "标签",
-    fields: [
-      { key: "reviewLabel", label: "Review 触发标签", kind: "text", hint: "命中即触发 review" },
-      { key: "checkLabel", label: "Check 触发标签", kind: "text", hint: "命中即触发 check 修复" },
-    ],
-  },
-  {
-    id: "filters",
-    title: "过滤",
-    fields: [
-      {
-        key: "authors",
-        label: "作者过滤",
-        kind: "csv",
-        hint: "逗号分隔；留空表示不按作者过滤",
-      },
-    ],
-  },
-  {
-    id: "engine",
-    title: "引擎",
-    fields: [
-      // Single-arm enums today; widening tracked by #11 — kept read-only so the UI
-      // never offers an option the backend can't honor.
-      {
-        key: "sourceKind",
-        label: "PR 来源",
-        kind: "select",
-        options: ["github"],
-        readonly: true,
-        hint: "暂仅支持 github（#11）",
-      },
-      {
-        key: "engineKind",
-        label: "Review 引擎",
-        kind: "select",
-        options: ["codex"],
-        readonly: true,
-        hint: "暂仅支持 codex（#11）",
-      },
-    ],
-  },
 ];
 
 // Onboarding wizard step sequence. `source`/`done` are confirm-only steps.
@@ -179,8 +196,9 @@ const WIN_ABS_RE = /^[A-Za-z]:[\\/]/;
 
 // Per-step frontend gate: null = ok, else a user-facing Chinese error string.
 // Mirrors the backend AppError checks so most failures are caught before the
-// round-trip; the backend remains the source of truth (see errorToStep).
-export function validateStep(step: StepId, draft: AppConfig): string | null {
+// round-trip; the backend remains the source of truth (see errorToStep). The draft
+// is a single `Project` (#35) — every field it reads now lives on `Project`.
+export function validateStep(step: StepId, draft: Project): string | null {
   switch (step) {
     case "repo":
       return REPO_RE.test(draft.repo) ? null : "仓库需为 owner/name 格式";

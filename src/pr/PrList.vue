@@ -5,15 +5,21 @@
 // this component only renders the store's PR state. Selection is owned by the
 // composition root (App.vue): the row's `select` is forwarded up and the
 // currently-selected PR number is passed back down for highlighting.
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import type { TrackedPrView } from "../types";
 import { usePrStore } from "./usePrStore";
+import { useProjects } from "../projects";
 import PrRow from "./PrRow.vue";
 
 defineProps<{ selectedNumber: number | null }>();
 const emit = defineEmits<{ select: [pr: TrackedPrView] }>();
 
 const store = usePrStore();
+const { activeProjectId } = useProjects();
+
+// The active project's retained list (#35) — drives the empty/loading states the
+// three section getters partition.
+const activePrs = computed(() => store.prs[activeProjectId.value] ?? []);
 
 // Stale section: collapsed by default; when open, window to STALE_LIMIT rows with
 // a nested "显示更多 / 显示更少" toggle so a long inactive backlog stays bounded.
@@ -35,6 +41,16 @@ function toggleStale() {
 // Archived section: collapsed by default.
 const showArchived = ref(false);
 
+// These collapse refs are component-level, but the list they fold over is the ACTIVE
+// project's (#35). Reset them when the active project changes so one project's
+// expanded "不活跃 / 已归档" state doesn't bleed into the next — each project opens at
+// its own default (all collapsed).
+watch(activeProjectId, () => {
+  showStale.value = false;
+  staleExpanded.value = false;
+  showArchived.value = false;
+});
+
 // Hydrate the gh CLI status on mount so the StatusBar has data to show.
 onMounted(() => store.refreshGhStatus());
 </script>
@@ -45,13 +61,13 @@ onMounted(() => store.refreshGhStatus());
       <h2>Pull requests</h2>
     </header>
 
-    <p v-if="store.error" class="error">{{ store.error }}</p>
+    <p v-if="store.errorActive" class="error">{{ store.errorActive }}</p>
 
-    <p v-else-if="store.loading && store.prs.length === 0" class="muted">
+    <p v-else-if="store.loadingActive && activePrs.length === 0" class="muted">
       拉取中…
     </p>
 
-    <p v-else-if="store.prs.length === 0" class="muted">暂无 PR / No PRs</p>
+    <p v-else-if="activePrs.length === 0" class="muted">暂无 PR / No PRs</p>
 
     <template v-else>
       <p v-if="!store.currentPrs.length" class="muted">
@@ -65,7 +81,7 @@ onMounted(() => store.refreshGhStatus());
           :pr="pr"
           :selected="pr.number === selectedNumber"
           @select="(p) => emit('select', p)"
-          @set-archived="(e) => store.setArchived(e.number, e.archived)"
+          @set-archived="(e) => store.setArchived(activeProjectId, e.number, e.archived)"
         />
       </ul>
 
@@ -81,7 +97,7 @@ onMounted(() => store.refreshGhStatus());
               :pr="pr"
               :selected="pr.number === selectedNumber"
               @select="(p) => emit('select', p)"
-              @set-archived="(e) => store.setArchived(e.number, e.archived)"
+              @set-archived="(e) => store.setArchived(activeProjectId, e.number, e.archived)"
             />
           </ul>
           <button
@@ -116,7 +132,7 @@ onMounted(() => store.refreshGhStatus());
             :key="pr.number"
             :pr="pr"
             :selected="false"
-            @set-archived="(e) => store.setArchived(e.number, e.archived)"
+            @set-archived="(e) => store.setArchived(activeProjectId, e.number, e.archived)"
           />
         </ul>
       </section>

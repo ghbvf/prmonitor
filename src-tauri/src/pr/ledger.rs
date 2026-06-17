@@ -12,6 +12,7 @@
 //! cycle's started candidates) so unbounded concurrent starts can't race the store.
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tauri_plugin_store::StoreExt;
@@ -21,10 +22,39 @@ use crate::model::Candidate;
 
 /// Store file holding the persisted ledger.
 const STORE_FILE: &str = "ledger.json";
-/// Key holding the set of dispatched dedup keys.
-const DISPATCHED_KEY: &str = "dispatched";
-/// Key holding the dispatch-event log (for cooldown).
-const EVENTS_KEY: &str = "events";
+/// Key PREFIX holding the per-project set of dispatched dedup keys (#35). The
+/// effective key is `dispatched:{project_id}` (see [`dispatched_key`]); a single
+/// `ledger.json` holds every project's partition under its own key.
+const DISPATCHED_KEY_PREFIX: &str = "dispatched";
+/// Key PREFIX holding the per-project dispatch-event log for cooldown (#35). The
+/// effective key is `events:{project_id}` (see [`events_key`]).
+const EVENTS_KEY_PREFIX: &str = "events";
+
+/// Serializes EVERY load→stage→save of `ledger.json` across projects (#35). The
+/// store is one file holding all projects' partitions (`dispatched:{pid}` /
+/// `events:{pid}`); `Store::save` rewrites the WHOLE file, so two parallel project
+/// cycles each doing a load→stage→save would interleave and one would clobber the
+/// other's just-written partition (a lost dispatch record → re-review storm). A
+/// process-global `Mutex<()>` (the data lives in the store, not behind the lock)
+/// guards the critical section in [`Ledger::record_many`]; a module static so the
+/// lock IDENTITY is fixed (a caller cannot serialize on the wrong mutex). Mirrors
+/// the registry's `WRITE_LOCK` rationale. `std` (not `tokio`) `Mutex`: the guarded
+/// section is fully synchronous (`tauri-plugin-store` reads/writes are sync), so no
+/// `.await` is ever held across the guard.
+static LEDGER_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Store key for a project's dispatched dedup-key set: `dispatched:{project_id}`
+/// (#35). Partitions the shared `ledger.json` so two projects' identical
+/// `(number, head_sha, kind)` dedup keys never collide.
+fn dispatched_key(project_id: &str) -> String {
+    format!("{DISPATCHED_KEY_PREFIX}:{project_id}")
+}
+
+/// Store key for a project's dispatch-event (cooldown) log: `events:{project_id}`
+/// (#35). Same partitioning rationale as [`dispatched_key`].
+fn events_key(project_id: &str) -> String {
+    format!("{EVENTS_KEY_PREFIX}:{project_id}")
+}
 
 /// One recorded dispatch — the cooldown source (mirrors `router.py`
 /// dispatch-events: `(pr, kind, dispatchedAtEpoch)`).
@@ -65,15 +95,28 @@ pub(crate) fn now_epoch() -> u64 {
 }
 
 /// Load the ledger, batch-record the started candidates at one epoch, and persist
-/// — the dispatch-time landing in ONE call. Stamps the clock internally so callers
-/// (the dispatcher, [`crate::dispatch`]) pass only the candidates that started;
-/// the load + stage + persist + clock all stay in the pr slice.
+/// — the dispatch-time landing in ONE call, scoped to `project_id` (#35). Stamps the
+/// clock internally so callers (the dispatcher, [`crate::dispatch`]) pass only the
+/// candidates that started; the load + stage + persist + clock all stay in the pr
+/// slice. The load→stage→save runs under [`LEDGER_WRITE_LOCK`] (in
+/// [`Ledger::record_many`]) so parallel project cycles can't clobber each other's
+/// whole-file rewrite.
 pub fn record_dispatched<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
+    project_id: &str,
     cands: &[Candidate],
 ) -> AppResult<()> {
-    let mut ledger = Ledger::load(app)?;
-    ledger.record_many(app, cands, now_epoch())
+    // Hold the cross-project write lock across the WHOLE load→stage→save (#35): N
+    // parallel project cycles each rewrite the same `ledger.json` (whole-file save),
+    // so a load here racing another project's save would drop that project's
+    // just-recorded partition. The guard makes load + persist one atomic section.
+    // `.unwrap()` matches the registry's std-Mutex convention; the section is
+    // synchronous (store reads/writes are sync) so no `.await` is held across it, and
+    // a panic mid-section can't leave torn state (the data lives in the store, each
+    // key rewritten wholesale by `record_many`). Poisoning is therefore benign.
+    let _guard = LEDGER_WRITE_LOCK.lock().unwrap();
+    let mut ledger = Ledger::load(app, project_id)?;
+    ledger.record_many(app, project_id, cands, now_epoch())
 }
 
 /// Remaining cooldown seconds when `last` is within `secs` of `now`, else `None`
@@ -89,21 +132,33 @@ pub fn cooldown_remaining(now: u64, last: u64, secs: u64) -> Option<u64> {
 }
 
 impl Ledger {
-    /// Loads the persisted ledger, defaulting to empty when nothing is stored or
-    /// a value is corrupt (a corrupt ledger must never block discovery — the worst
-    /// case is a duplicate dispatch, which the in-process registry guard then drops
-    /// for any still-active session).
-    pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResult<Self> {
+    /// Loads `project_id`'s partition of the persisted ledger (#35), defaulting to
+    /// empty when nothing is stored or a value is corrupt (a corrupt ledger must
+    /// never block discovery — the worst case is a duplicate dispatch, which the
+    /// in-process registry guard then drops for any still-active session). Reads only
+    /// this project's keys (`dispatched:{project_id}` / `events:{project_id}`), so a
+    /// `has_dispatched` / cooldown check for one project never sees another's records.
+    ///
+    /// **Lock-free read (intentional).** The discovery path (`commands::discover`) and
+    /// the webhook gate (`commands::gate_dispatchable`) call this OUTSIDE
+    /// [`LEDGER_WRITE_LOCK`]; a load is a single whole-value store read (no torn read)
+    /// and a stale-by-one-round snapshot is acceptable because it only gates an
+    /// OPTIMIZATION — the real double-dispatch backstop is the session registry's
+    /// `try_reserve_pair` atomic test-and-set at start time. A read racing a concurrent
+    /// write at worst lets one extra candidate through the cooldown/dedup gate, which
+    /// the reservation then rejects. The write path ([`record_dispatched`]) DOES hold
+    /// the lock across its own load→stage→save (a lost write there is unrecoverable).
+    pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>, project_id: &str) -> AppResult<Self> {
         let store = app
             .store(STORE_FILE)
             .map_err(|e| AppError::new(format!("打开 ledger 存储失败: {e}")))?;
 
         let dispatched = store
-            .get(DISPATCHED_KEY)
+            .get(dispatched_key(project_id))
             .and_then(|v| serde_json::from_value::<HashSet<String>>(v).ok())
             .unwrap_or_default();
         let events = store
-            .get(EVENTS_KEY)
+            .get(events_key(project_id))
             .and_then(|v| serde_json::from_value::<Vec<DispatchEvent>>(v).ok())
             .unwrap_or_default();
 
@@ -126,18 +181,27 @@ impl Ledger {
             .max()
     }
 
-    /// Records a batch of dispatches (key + event per candidate) and persists
-    /// **once**. Invoked by the auto-trigger dispatcher ([`crate::dispatch`]) after
-    /// a poll cycle's reviews have started; PR discovery itself never dispatches.
+    /// Records a batch of dispatches (key + event per candidate) into `project_id`'s
+    /// partition and persists **once**. Invoked by the auto-trigger dispatcher
+    /// ([`crate::dispatch`]) via [`record_dispatched`] after a poll cycle's reviews
+    /// have started; PR discovery itself never dispatches.
     ///
     /// The single-persist shape matters under unbounded concurrent starts: staging
     /// every candidate's key/event in memory and saving the store one time avoids
     /// the interleaved store writes (and redundant saves) that per-candidate
     /// `record` calls would produce. An empty `cands` slice still touches the store
     /// (a harmless no-op save) — callers gate on non-empty before calling.
+    ///
+    /// **Concurrency (#35):** writes ONLY this project's keys
+    /// (`dispatched:{project_id}` / `events:{project_id}`), but `Store::save` rewrites
+    /// the whole `ledger.json`. The cross-project lost-update race that creates is
+    /// closed by [`record_dispatched`], which holds [`LEDGER_WRITE_LOCK`] across its
+    /// `load` → this `record_many`, so the load this method's `self` came from and the
+    /// save below are one atomic critical section relative to other projects' cycles.
     pub fn record_many<R: tauri::Runtime>(
         &mut self,
         app: &tauri::AppHandle<R>,
+        project_id: &str,
         cands: &[Candidate],
         epoch: u64,
     ) -> AppResult<()> {
@@ -147,11 +211,11 @@ impl Ledger {
             .store(STORE_FILE)
             .map_err(|e| AppError::new(format!("打开 ledger 存储失败: {e}")))?;
         store.set(
-            DISPATCHED_KEY,
+            dispatched_key(project_id),
             serde_json::to_value(&self.dispatched).map_err(|e| AppError::new(e.to_string()))?,
         );
         store.set(
-            EVENTS_KEY,
+            events_key(project_id),
             serde_json::to_value(&self.events).map_err(|e| AppError::new(e.to_string()))?,
         );
         store
@@ -256,6 +320,50 @@ mod tests {
     fn dispatch_key_format() {
         assert_eq!(dispatch_key(42, "abc123", "review"), "42@abc123:review");
         assert_eq!(dispatch_key(7, "deadbeef", "check"), "7@deadbeef:check");
+    }
+
+    // Project store-key partitioning (#35). The persisted `ledger.json` holds every
+    // project's dedup set / cooldown log under a project-scoped store key; the dedup
+    // KEY format (`{number}@{head_sha}:{kind}`) is unchanged. This pins that two
+    // projects' keys differ so a same-(number, head, kind) dispatch in one project
+    // can't be read as already-dispatched in another (the `Store::set` slot is
+    // distinct), and that the suffix is the raw project id.
+    #[test]
+    fn project_store_keys_are_partitioned() {
+        assert_eq!(dispatched_key("alpha"), "dispatched:alpha");
+        assert_eq!(events_key("alpha"), "events:alpha");
+        assert_ne!(dispatched_key("alpha"), dispatched_key("beta"));
+        assert_ne!(events_key("alpha"), events_key("beta"));
+        // The dedup KEY format itself is project-agnostic and unchanged — isolation
+        // comes from the STORE key, not from baking the project into the dedup key.
+        assert_eq!(dispatch_key(1, "sha", "review"), "1@sha:review");
+    }
+
+    // Ledger isolation (#35): two projects whose dedup sets are loaded from distinct
+    // store-key partitions do NOT collide even when an identical (number, head, kind)
+    // candidate was dispatched in one. `Ledger::load` is the partitioning seam (it
+    // reads `dispatched:{pid}`); here we simulate the two loaded partitions directly
+    // (the live `load` needs a Tauri store) and assert `has_dispatched` is true for
+    // the project that recorded it and false for the other — the dedup gate is
+    // per-project, so PR #1@sha:review reviewed under project A is still dispatchable
+    // under project B.
+    #[test]
+    fn dedup_does_not_collide_across_projects() {
+        let key = dispatch_key(1, "sha", "review");
+
+        // Project A staged the candidate; project B's partition is empty.
+        let mut ledger_a = Ledger::default();
+        ledger_a.stage_all(&[cand(1, "review")], 1_000);
+        let ledger_b = Ledger::default();
+
+        assert!(
+            ledger_a.has_dispatched(&key),
+            "project A recorded the dispatch"
+        );
+        assert!(
+            !ledger_b.has_dispatched(&key),
+            "the SAME (number, head, kind) must NOT read as dispatched under project B"
+        );
     }
 
     #[test]

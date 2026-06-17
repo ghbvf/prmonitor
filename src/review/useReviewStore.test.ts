@@ -27,6 +27,7 @@ vi.mock("./api", () => ({
 
 import * as api from "./api";
 import { useReviewStore } from "./useReviewStore";
+import { useProjects } from "../projects";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -51,12 +52,16 @@ beforeEach(() => {
   s.activePr.value = null;
   s.listenerReady.value = false;
   s.listenerError.value = null;
-  s.dispatchError.value = null;
+  s.dispatchError.value = {};
+  // hydrateActiveSession (#35) reattaches only within the active project; reset the
+  // shared singleton so each test starts from a known active selection.
+  useProjects().activeProjectId.value = "";
 });
 
 // One backend session row; spread an override to vary a field.
 function session(over: Partial<ReviewSession> = {}): ReviewSession {
   return {
+    projectId: "p1",
     threadId: "th_1",
     turnId: "tn_1",
     prNumber: 7,
@@ -142,6 +147,7 @@ describe("useReviewStore startCodexServer()/stopCodexServer()", () => {
 describe("useReviewStore applyEvent()", () => {
   const md = (itemId: string, text: string): ReviewEvent => ({
     kind: "messageDelta",
+    projectId: "p1",
     threadId: "th_1",
     itemId,
     text,
@@ -169,6 +175,7 @@ describe("useReviewStore applyEvent()", () => {
     store.applyEvent(md("i1", "a"));
     store.applyEvent({
       kind: "reasoningDelta",
+      projectId: "p1",
       threadId: "th_1",
       itemId: "r1",
       text: "why",
@@ -185,6 +192,7 @@ describe("useReviewStore applyEvent()", () => {
     store.running.value = true;
     store.applyEvent({
       kind: "turnCompleted",
+      projectId: "p1",
       threadId: "th_1",
       status: "interrupted",
     });
@@ -196,7 +204,12 @@ describe("useReviewStore applyEvent()", () => {
   it("error event surfaces the message and clears running", () => {
     const store = useReviewStore();
     store.running.value = true;
-    store.applyEvent({ kind: "error", threadId: "th_1", message: "boom" });
+    store.applyEvent({
+      kind: "error",
+      projectId: "p1",
+      threadId: "th_1",
+      message: "boom",
+    });
 
     expect(store.error.value).toBe("boom");
     expect(store.running.value).toBe(false);
@@ -207,6 +220,7 @@ describe("useReviewStore applyEvent()", () => {
     store.activeThreadId.value = "th_1";
     store.applyEvent({
       kind: "messageDelta",
+      projectId: "p1",
       threadId: "other",
       itemId: "x",
       text: "nope",
@@ -224,6 +238,7 @@ describe("useReviewStore applyEvent()", () => {
     store.activeThreadId.value = null;
     store.applyEvent({
       kind: "messageDelta",
+      projectId: "p1",
       threadId: "auto_1",
       itemId: "i1",
       text: "x",
@@ -231,32 +246,44 @@ describe("useReviewStore applyEvent()", () => {
     expect(store.items.value).toEqual([]);
   });
 
-  it("dispatchError sets the session-less notice without touching the stream", () => {
+  it("dispatchError sets the per-project notice without touching the stream", () => {
     const store = useReviewStore();
     store.applyEvent(md("i1", "hi")); // an existing session item
-    store.applyEvent({ kind: "dispatchError", message: "配置无效" });
+    store.applyEvent({ kind: "dispatchError", projectId: "p1", message: "配置无效" });
 
-    expect(store.dispatchError.value).toBe("配置无效");
+    expect(store.dispatchError.value.p1).toBe("配置无效");
     // Session-less: must not be folded into the stream or the per-session error.
     expect(store.items.value).toHaveLength(1);
     expect(store.error.value).toBeNull();
   });
 
+  it("dispatchError is keyed per project (#35): p2's notice doesn't touch p1", () => {
+    const store = useReviewStore();
+    store.applyEvent({ kind: "dispatchError", projectId: "p2", message: "配置无效" });
+
+    expect(store.dispatchError.value.p2).toBe("配置无效");
+    expect(store.dispatchError.value.p1).toBeUndefined();
+  });
+
   it("dispatchError is surfaced even while a session is focused (not threadId-filtered)", () => {
     const store = useReviewStore();
     store.activeThreadId.value = "th_1"; // a focused session would drop foreign events
-    store.applyEvent({ kind: "dispatchError", message: "ledger 落账失败" });
+    store.applyEvent({
+      kind: "dispatchError",
+      projectId: "p1",
+      message: "ledger 落账失败",
+    });
 
-    expect(store.dispatchError.value).toBe("ledger 落账失败");
+    expect(store.dispatchError.value.p1).toBe("ledger 落账失败");
   });
 
-  it("clearDispatchError dismisses the notice", () => {
+  it("clearDispatchError dismisses one project's notice", () => {
     const store = useReviewStore();
-    store.applyEvent({ kind: "dispatchError", message: "boom" });
-    expect(store.dispatchError.value).toBe("boom");
+    store.applyEvent({ kind: "dispatchError", projectId: "p1", message: "boom" });
+    expect(store.dispatchError.value.p1).toBe("boom");
 
-    store.clearDispatchError();
-    expect(store.dispatchError.value).toBeNull();
+    store.clearDispatchError("p1");
+    expect(store.dispatchError.value.p1).toBeNull();
   });
 });
 
@@ -265,9 +292,9 @@ describe("useReviewStore start()/stop()", () => {
     const store = useReviewStore();
     store.items.value = [{ itemId: "stale", kind: "message", text: "old" }];
 
-    await store.start(7, "review");
+    await store.start("p1", 7, "review");
 
-    expect(api.startReview).toHaveBeenCalledWith(7, "review");
+    expect(api.startReview).toHaveBeenCalledWith("p1", 7, "review");
     expect(store.activeThreadId.value).toBe("th_1");
     expect(store.activePr.value).toBe(7);
     expect(store.running.value).toBe(true);
@@ -278,7 +305,7 @@ describe("useReviewStore start()/stop()", () => {
     vi.mocked(api.startReview).mockRejectedValueOnce({ message: "nope" });
     const store = useReviewStore();
 
-    await store.start(7, "review");
+    await store.start("p1", 7, "review");
 
     expect(store.running.value).toBe(false);
     expect(store.error.value).toBe("nope");
@@ -342,8 +369,11 @@ describe("useReviewStore init()", () => {
   });
 
   it("reattaches to a still-active backend session", async () => {
-    vi.mocked(api.listReviewSessions).mockResolvedValueOnce([
+    // init() calls listReviewSessions twice (hydrateActiveSession + refreshSessions);
+    // a persistent mock so BOTH the reattach pick and the session-list seed see it.
+    vi.mocked(api.listReviewSessions).mockResolvedValue([
       {
+        projectId: "p1",
         threadId: "th_live",
         turnId: "tn",
         prNumber: 42,
@@ -352,17 +382,23 @@ describe("useReviewStore init()", () => {
       },
     ]);
     const store = useReviewStore();
+    // hydrateActiveSession filters by the active project (#35) — point it at p1.
+    useProjects().activeProjectId.value = "p1";
 
     await store.init();
 
     expect(store.activeThreadId.value).toBe("th_live");
     expect(store.activePr.value).toBe(42);
     expect(store.running.value).toBe(true);
+    // init()'s refreshSessions ran: the concurrent-session list is seeded too.
+    expect(store.sessions.value.length).toBeGreaterThan(0);
+    expect(store.sessions.value[0]?.threadId).toBe("th_live");
   });
 
   it("leaves state clean when no backend session is active", async () => {
     vi.mocked(api.listReviewSessions).mockResolvedValueOnce([
       {
+        projectId: "p1",
         threadId: "th_done",
         turnId: "tn",
         prNumber: 1,
@@ -371,6 +407,9 @@ describe("useReviewStore init()", () => {
       },
     ]);
     const store = useReviewStore();
+    // Active project matches the session's, so the terminal STATUS is what blocks the
+    // reattach here (not the #35 project filter).
+    useProjects().activeProjectId.value = "p1";
 
     await store.init();
 
@@ -389,17 +428,19 @@ describe("useReviewStore start() in-flight buffering", () => {
       }),
     );
     const store = useReviewStore();
-    const startPromise = store.start(7, "review");
+    const startPromise = store.start("p1", 7, "review");
 
     // Events arriving before the id resolves: one foreign, one for our session.
     store.applyEvent({
       kind: "messageDelta",
+      projectId: "p1",
       threadId: "foreign",
       itemId: "x",
       text: "NOPE",
     });
     store.applyEvent({
       kind: "messageDelta",
+      projectId: "p1",
       threadId: "th_1",
       itemId: "i1",
       text: "yes",
@@ -459,6 +500,7 @@ describe("useReviewStore applyEvent() sessions refresh", () => {
 
     store.applyEvent({
       kind: "messageDelta",
+      projectId: "p1",
       threadId: "th_new",
       itemId: "i1",
       text: "hi",
@@ -475,6 +517,7 @@ describe("useReviewStore applyEvent() sessions refresh", () => {
 
     store.applyEvent({
       kind: "messageDelta",
+      projectId: "p1",
       threadId: "th_1",
       itemId: "i1",
       text: "hi",
@@ -493,6 +536,7 @@ describe("useReviewStore applyEvent() sessions refresh", () => {
 
     store.applyEvent({
       kind: "turnCompleted",
+      projectId: "p1",
       threadId: "th_1",
       status: "completed",
     });
@@ -509,7 +553,12 @@ describe("useReviewStore applyEvent() sessions refresh", () => {
     const store = useReviewStore();
     store.sessions.value = [session({ threadId: "th_1", status: "running" })];
 
-    store.applyEvent({ kind: "error", threadId: "th_1", message: "boom" });
+    store.applyEvent({
+      kind: "error",
+      projectId: "p1",
+      threadId: "th_1",
+      message: "boom",
+    });
     await flush();
 
     expect(api.listReviewSessions).toHaveBeenCalledOnce();
@@ -575,5 +624,24 @@ describe("useReviewStore focus()", () => {
 
     expect(store.running.value).toBe(false);
     expect(store.finalStatus.value).toBe("failed");
+  });
+
+  it("clearFocus() drops the focused session (#35 F5: project switch)", () => {
+    const store = useReviewStore();
+    // A focused, running session from the project the user is about to leave.
+    store.focus("th_other_project", 7, "running");
+    store.items.value = [{ itemId: "i1", kind: "message", text: "hi" }];
+
+    store.clearFocus();
+
+    // Nothing focused → ReviewPanel renders the empty "Select a PR" state for the new
+    // project instead of the previous project's session (which its 停止 button would
+    // otherwise still target).
+    expect(store.activeThreadId.value).toBeNull();
+    expect(store.activePr.value).toBeNull();
+    expect(store.running.value).toBe(false);
+    expect(store.finalStatus.value).toBeNull();
+    expect(store.error.value).toBeNull();
+    expect(store.items.value).toEqual([]);
   });
 });

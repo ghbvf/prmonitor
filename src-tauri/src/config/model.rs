@@ -7,16 +7,28 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AppError, AppResult};
 use crate::model::{EngineKind, SourceKind, WebhookTunnelMode};
 
-/// Persisted application configuration. Defaults target the gocell repo the
-/// app is built to serve.
+/// One monitored project (#35). What was previously the flat per-repo subset of
+/// [`AppConfig`] is now a list element: each project carries its own repo, paths,
+/// labels, source/engine kind, and auto-review toggle, so the app can poll and
+/// review several repos in parallel. Global webhook/shell settings stay on
+/// [`AppConfig`] (one receiver serves all projects).
 ///
-/// `#[serde(default)]` makes deserialization forward-compatible: a persisted
-/// config missing fields (older versions, or before a #11 field is added) fills
-/// absent fields from [`Default`] instead of failing. Do not add
-/// `#[serde(deny_unknown_fields)]` — it would break that forward-compat.
+/// `#[serde(default)]` mirrors [`AppConfig`]'s forward-compat contract: a project
+/// object missing fields fills them from [`Default`]. Field defaults match the
+/// historical single-project [`AppConfig`] defaults (the gocell repo the app was
+/// built to serve) so a migrated config keeps identical behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct AppConfig {
+pub struct Project {
+    /// Stable identifier (the migration assigns `"default"` to the lifted
+    /// single-project config; new projects get a fresh id). Used as the routing
+    /// key on every PR/review event and by [`super::service::project`] lookup.
+    pub id: String,
+    /// Human-readable label shown in the project switcher.
+    pub name: String,
+    /// Whether this project is polled/reviewed. Disabled projects are skipped by
+    /// `validate` (their fields are not checked) and by the scheduler.
+    pub enabled: bool,
     /// Monitored repo, `owner/name`.
     pub repo: String,
     /// Absolute path to the local clone codex runs the pr-review skill against.
@@ -41,6 +53,49 @@ pub struct AppConfig {
     pub engine_kind: EngineKind,
     /// 是否在发现 dispatchable PR 时自动派发 review（false=仅手动「开始 review」触发）。
     pub auto_review: bool,
+}
+
+impl Default for Project {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            enabled: true,
+            repo: "ghbvf/gocell".to_string(),
+            repo_root: String::new(),
+            poll_interval_secs: 120,
+            authors: Vec::new(),
+            review_label: "pr-status/needs-review-again".to_string(),
+            check_label: "pr-status/needs-check-fix".to_string(),
+            skill_rel_path: ".codex/skills/pr-review/SKILL.md".to_string(),
+            pr_cooldown_seconds: 1800,
+            source_kind: SourceKind::default(),
+            engine_kind: EngineKind::default(),
+            // Boot defaults to manual review: scheduler polls/emits but does NOT
+            // auto-dispatch codex at startup (avoids clashing with other review
+            // processes). Flip-back guarded by `default_auto_review_is_off`.
+            auto_review: false,
+        }
+    }
+}
+
+/// Persisted application configuration (#35: multi-project). Holds the list of
+/// monitored [`Project`]s plus the GLOBAL webhook/shell settings (one webhook
+/// receiver serves every project).
+///
+/// `#[serde(default)]` makes deserialization forward-compatible: a persisted
+/// config missing fields (older versions, or before a #11 field is added) fills
+/// absent fields from [`Default`] instead of failing. Do not add
+/// `#[serde(deny_unknown_fields)]` — it would break that forward-compat. The
+/// legacy flat single-project shape is upgraded by `super::service::migrate_value`
+/// before deserialization, so old stored configs still load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AppConfig {
+    /// Monitored projects. Empty on first launch (onboarding then adds the first).
+    pub projects: Vec<Project>,
+    /// `id` of the project the UI currently focuses. Empty when `projects` is empty.
+    pub active_project_id: String,
     /// 是否启用 webhook 接收端（#9）。开关本身只 gate「能否启动」本地接收端 + Cloudflare
     /// 隧道（手动 `start_webhook` 命令）——不自动起、不影响轮询路径。
     pub webhook_enabled: bool,
@@ -68,20 +123,8 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            repo: "ghbvf/gocell".to_string(),
-            repo_root: String::new(),
-            poll_interval_secs: 120,
-            authors: Vec::new(),
-            review_label: "pr-status/needs-review-again".to_string(),
-            check_label: "pr-status/needs-check-fix".to_string(),
-            skill_rel_path: ".codex/skills/pr-review/SKILL.md".to_string(),
-            pr_cooldown_seconds: 1800,
-            source_kind: SourceKind::default(),
-            engine_kind: EngineKind::default(),
-            // Boot defaults to manual review: scheduler polls/emits but does NOT
-            // auto-dispatch codex at startup (avoids clashing with other review
-            // processes). Flip-back guarded by `default_auto_review_is_off`.
-            auto_review: false,
+            projects: Vec::new(),
+            active_project_id: String::new(),
             webhook_enabled: false,
             webhook_port: 8787,
             webhook_secret: String::new(),
@@ -93,7 +136,12 @@ impl Default for AppConfig {
     }
 }
 
-/// Validates config fields before persisting (hard-reject on failure).
+/// Minimum `webhook_secret` length (trimmed chars) when the receiver is enabled. The
+/// secret is the SOLE gate on a public HMAC-SHA256 endpoint, so a 1–2 char value is
+/// brute-forceable; require a floor (GitHub recommends a long random secret).
+const WEBHOOK_SECRET_MIN_LEN: usize = 16;
+
+/// Validates one [`Project`]'s fields (hard-reject on failure).
 ///
 /// Checks: `repo` is `owner/name` (one slash, both sides non-empty, no
 /// whitespace — the backend boundary `gh pr list --repo` consumes, mirroring the
@@ -114,40 +162,35 @@ impl Default for AppConfig {
 /// (src/config/fields.ts) keys on — locked at this end by the `validate_error_*`
 /// test below (PR #41 F4, Medium). Checks run in wizard-step order so the first
 /// failure routes to the earliest offending step.
-/// Minimum `webhook_secret` length (trimmed chars) when the receiver is enabled. The
-/// secret is the SOLE gate on a public HMAC-SHA256 endpoint, so a 1–2 char value is
-/// brute-forceable; require a floor (GitHub recommends a long random secret).
-const WEBHOOK_SECRET_MIN_LEN: usize = 16;
-
-pub fn validate(config: &AppConfig) -> AppResult<()> {
+pub fn validate_project(project: &Project) -> AppResult<()> {
     // owner/name: exactly one slash, both sides non-empty, no whitespace anywhere
     // (mirrors the frontend REPO_RE `^[^/\s]+\/[^/\s]+$`).
-    let repo_parts: Vec<&str> = config.repo.split('/').collect();
+    let repo_parts: Vec<&str> = project.repo.split('/').collect();
     let repo_ok = repo_parts.len() == 2
         && !repo_parts[0].is_empty()
         && !repo_parts[1].is_empty()
-        && !config.repo.chars().any(char::is_whitespace);
+        && !project.repo.chars().any(char::is_whitespace);
     if !repo_ok {
         return Err(AppError::new(format!(
             "repo 必须是 owner/name 格式: {}",
-            config.repo
+            project.repo
         )));
     }
 
-    let repo_root = config.repo_root.trim();
+    let repo_root = project.repo_root.trim();
     let root = Path::new(repo_root);
     if repo_root.is_empty() || !root.is_absolute() || !root.is_dir() {
         return Err(AppError::new(format!(
             "repoRoot 必须是存在的绝对目录路径: {}",
-            config.repo_root
+            project.repo_root
         )));
     }
 
-    let skill_rel = Path::new(&config.skill_rel_path);
+    let skill_rel = Path::new(&project.skill_rel_path);
     if skill_rel.is_absolute() {
         return Err(AppError::new(format!(
             "skillRelPath 必须是相对路径: {}",
-            config.skill_rel_path
+            project.skill_rel_path
         )));
     }
     let skill = root.join(skill_rel);
@@ -166,24 +209,35 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
     if !skill_canon.starts_with(&root_canon) {
         return Err(AppError::new(format!(
             "skillRelPath 不能逃逸 repoRoot: {}",
-            config.skill_rel_path
+            project.skill_rel_path
         )));
     }
 
-    if config.poll_interval_secs == 0 {
+    if project.poll_interval_secs == 0 {
         return Err(AppError::new("pollIntervalSecs 必须大于 0"));
     }
-    if config.pr_cooldown_seconds == 0 {
+    if project.pr_cooldown_seconds == 0 {
         return Err(AppError::new("prCooldownSeconds 必须大于 0"));
     }
 
-    if config.review_label.trim().is_empty() {
+    if project.review_label.trim().is_empty() {
         return Err(AppError::new("reviewLabel 不能为空"));
     }
-    if config.check_label.trim().is_empty() {
+    if project.check_label.trim().is_empty() {
         return Err(AppError::new("checkLabel 不能为空"));
     }
 
+    Ok(())
+}
+
+/// Validates the whole [`AppConfig`] before persisting (hard-reject on failure).
+///
+/// Validates the GLOBAL webhook fields (only when the receiver is enabled), then
+/// every `enabled` [`Project`] via [`validate_project`], and rejects duplicate
+/// project `id`s or `repo`s (each would make event routing / dedup ambiguous). An
+/// empty `projects` list (first launch, before onboarding adds one) is VALID —
+/// onboarding is the gate that fills it.
+pub fn validate(config: &AppConfig) -> AppResult<()> {
     // Webhook fields are only constrained when the receiver is enabled: a public
     // endpoint (reached via the cloudflared tunnel) MUST have a secret or any POST
     // could forge a review trigger; a zero port can't bind. Disabled → unconstrained
@@ -218,6 +272,69 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
         }
     }
 
+    // Per-project fields: validate each ENABLED project; disabled ones are skipped
+    // (their fields may be intentionally incomplete). The id/repo of every project
+    // (enabled or not) is a routing/dedup key, so duplicates are rejected regardless.
+    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut seen_repos: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for project in &config.projects {
+        // id-format lock (Medium carrier): the id becomes a store-key PREFIX
+        // (`dispatched:{id}` / `events:{id}` in ledger.rs, `tracked:{id}` in
+        // registry.rs). An id containing `:` would split the partition wrong and an
+        // empty / whitespace id would alias or corrupt a key — either silently merges
+        // two projects' dedup/retention partitions → dedup failure → re-review storm.
+        // Checked for EVERY project (not just enabled): a disabled project's stores
+        // persist and its id re-enters the key space the moment it is re-enabled. The
+        // Hard path (future) is a `ProjectId` newtype whose typed constructor rejects
+        // these at the type level, making the bad shape unexpressible.
+        if project.id.is_empty()
+            || project.id.contains(':')
+            || project.id.chars().any(char::is_whitespace)
+        {
+            return Err(AppError::new(format!(
+                "projectId 非法（不能为空、含 `:` 或空白字符）: {:?}",
+                project.id
+            )));
+        }
+        if !seen_ids.insert(project.id.as_str()) {
+            return Err(AppError::new(format!(
+                "项目 id 重复: {}（每个项目的 id 必须唯一）",
+                project.id
+            )));
+        }
+        // GitHub repo names are case-INSENSITIVE (`Owner/Repo` and `owner/repo` are the
+        // same repository), and the webhook router matches them with
+        // `eq_ignore_ascii_case` — so dedup must normalize too, or two case variants
+        // would each register a project for the SAME repo (duplicate PR rows, double
+        // dispatch). Normalize to lowercase before the uniqueness check.
+        if !seen_repos.insert(project.repo.to_ascii_lowercase()) {
+            return Err(AppError::new(format!(
+                "项目 repo 重复: {}（同一仓库不能监控两次，大小写不敏感）",
+                project.repo
+            )));
+        }
+        if project.enabled {
+            validate_project(project)?;
+        }
+    }
+
+    // When there ARE projects, `active_project_id` must point at one of them. A dangling
+    // active id (e.g. the active project was deleted but the pointer wasn't updated) would
+    // leave the UI `hydrate`d on a non-existent project and make `active_repo_root` silently
+    // fall back to "" (codex handshake cwd lost). An empty `projects` keeps the first-launch
+    // semantics (active id "" + no projects → onboarding), so only guard the non-empty case.
+    if !config.projects.is_empty()
+        && !config
+            .projects
+            .iter()
+            .any(|p| p.id == config.active_project_id)
+    {
+        return Err(AppError::new(format!(
+            "activeProjectId 不指向任何现有项目: {:?}",
+            config.active_project_id
+        )));
+    }
+
     Ok(())
 }
 
@@ -235,20 +352,44 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
 mod tests {
     use super::*;
 
+    /// A [`Project`] whose filesystem-dependent fields point at this crate (so
+    /// `validate_project` passes) — the per-project analogue of the old `valid_base`.
+    fn valid_project() -> Project {
+        Project {
+            id: "default".to_string(),
+            name: "default".to_string(),
+            repo_root: env!("CARGO_MANIFEST_DIR").to_string(),
+            skill_rel_path: "Cargo.toml".to_string(),
+            ..Project::default()
+        }
+    }
+
+    /// A valid [`AppConfig`] containing exactly one valid project — the new analogue
+    /// of the old `valid_base`. Tests that exercise a bad per-project field mutate
+    /// `..valid_project()` into the single slot.
+    fn valid_base() -> AppConfig {
+        AppConfig {
+            projects: vec![valid_project()],
+            active_project_id: "default".to_string(),
+            ..AppConfig::default()
+        }
+    }
+
+    /// Wraps one project as the sole element of an otherwise-default `AppConfig`,
+    /// so `validate(&with_project(p))` routes through the per-project loop.
+    fn with_project(project: Project) -> AppConfig {
+        AppConfig {
+            projects: vec![project],
+            active_project_id: "default".to_string(),
+            ..AppConfig::default()
+        }
+    }
+
     #[test]
     fn app_config_wire_shape_is_camel_case() {
         let config = AppConfig {
-            repo: "owner/name".to_string(),
-            repo_root: "/path/to/repo".to_string(),
-            poll_interval_secs: 120,
-            authors: vec!["octocat".to_string()],
-            review_label: "needs-review".to_string(),
-            check_label: "needs-check".to_string(),
-            skill_rel_path: ".codex/skills/pr-review/SKILL.md".to_string(),
-            pr_cooldown_seconds: 1800,
-            source_kind: SourceKind::default(),
-            engine_kind: EngineKind::default(),
-            auto_review: false,
+            projects: vec![Project::default()],
+            active_project_id: "default".to_string(),
             webhook_enabled: false,
             webhook_port: 8787,
             webhook_secret: "shh".to_string(),
@@ -260,7 +401,61 @@ mod tests {
 
         let v = serde_json::to_value(&config).expect("AppConfig serializes");
 
+        // Multi-project keys present (camelCase).
+        assert!(v.get("projects").is_some());
+        assert!(v.get("activeProjectId").is_some());
+        // Global webhook keys stay at the top level.
+        assert!(v.get("webhookEnabled").is_some());
+        assert!(v.get("webhookPort").is_some());
+        assert!(v.get("webhookSecret").is_some());
+        assert!(v.get("cloudflaredBin").is_some());
+        assert!(v.get("webhookTunnelMode").is_some());
+        assert_eq!(v["webhookTunnelMode"], "quick");
+        assert!(v.get("webhookTunnelCommand").is_some());
+        assert!(v.get("webhookPublicUrl").is_some());
+
+        // snake_case forms absent — a rename would surface here.
+        assert!(v.get("active_project_id").is_none());
+        assert!(v.get("webhook_enabled").is_none());
+        assert!(v.get("webhook_port").is_none());
+        assert!(v.get("webhook_secret").is_none());
+        assert!(v.get("cloudflared_bin").is_none());
+        assert!(v.get("webhook_tunnel_mode").is_none());
+        assert!(v.get("webhook_tunnel_command").is_none());
+        assert!(v.get("webhook_public_url").is_none());
+
+        // The per-project fields must NOT have leaked back to the top level (they
+        // moved into `Project` — a regression that re-flattened them surfaces here).
+        assert!(v.get("repo").is_none());
+        assert!(v.get("repoRoot").is_none());
+        assert!(v.get("autoReview").is_none());
+    }
+
+    #[test]
+    fn project_wire_shape_is_camel_case() {
+        let project = Project {
+            id: "p1".to_string(),
+            name: "Project One".to_string(),
+            enabled: true,
+            repo: "owner/name".to_string(),
+            repo_root: "/path/to/repo".to_string(),
+            poll_interval_secs: 120,
+            authors: vec!["octocat".to_string()],
+            review_label: "needs-review".to_string(),
+            check_label: "needs-check".to_string(),
+            skill_rel_path: ".codex/skills/pr-review/SKILL.md".to_string(),
+            pr_cooldown_seconds: 1800,
+            source_kind: SourceKind::default(),
+            engine_kind: EngineKind::default(),
+            auto_review: false,
+        };
+
+        let v = serde_json::to_value(&project).expect("Project serializes");
+
         // camelCase keys present.
+        assert!(v.get("id").is_some());
+        assert!(v.get("name").is_some());
+        assert!(v.get("enabled").is_some());
         assert!(v.get("repo").is_some());
         assert!(v.get("repoRoot").is_some());
         assert!(v.get("pollIntervalSecs").is_some());
@@ -274,14 +469,6 @@ mod tests {
         assert!(v.get("engineKind").is_some());
         assert_eq!(v["engineKind"], "codex");
         assert!(v.get("autoReview").is_some());
-        assert!(v.get("webhookEnabled").is_some());
-        assert!(v.get("webhookPort").is_some());
-        assert!(v.get("webhookSecret").is_some());
-        assert!(v.get("cloudflaredBin").is_some());
-        assert!(v.get("webhookTunnelMode").is_some());
-        assert_eq!(v["webhookTunnelMode"], "quick");
-        assert!(v.get("webhookTunnelCommand").is_some());
-        assert!(v.get("webhookPublicUrl").is_some());
 
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("repo_root").is_none());
@@ -293,136 +480,239 @@ mod tests {
         assert!(v.get("source_kind").is_none());
         assert!(v.get("engine_kind").is_none());
         assert!(v.get("auto_review").is_none());
-        assert!(v.get("webhook_enabled").is_none());
-        assert!(v.get("webhook_port").is_none());
-        assert!(v.get("webhook_secret").is_none());
-        assert!(v.get("cloudflared_bin").is_none());
-        assert!(v.get("webhook_tunnel_mode").is_none());
-        assert!(v.get("webhook_tunnel_command").is_none());
-        assert!(v.get("webhook_public_url").is_none());
     }
 
     /// First-launch marker lock (Medium). The frontend routes a fresh install into
-    /// onboarding by detecting `config.repoRoot === ""` (src/App.vue) — that empty
-    /// default is the contract. If a future change gave `repo_root` a non-empty
-    /// default, the frontend would silently skip onboarding and the poll-loop gate
-    /// in lib.rs (`load_validated`) would change behavior; this assertion fails first
-    /// so the coupling is machine-checked rather than comment-only.
+    /// onboarding by detecting that no project exists yet (`config.projects` empty)
+    /// — that empty default is the contract. If a future change gave `AppConfig` a
+    /// pre-populated project, the frontend would silently skip onboarding and the
+    /// poll-loop gate would change behavior; this assertion fails first so the
+    /// coupling is machine-checked rather than comment-only.
     #[test]
-    fn default_repo_root_is_empty_first_launch_marker() {
-        assert_eq!(AppConfig::default().repo_root, "");
+    fn default_has_no_projects() {
+        assert!(AppConfig::default().projects.is_empty());
+        assert_eq!(AppConfig::default().active_project_id, "");
     }
 
-    /// Default-manual-review lock (Medium). A fresh/reset config must NOT
-    /// auto-dispatch codex review at boot: `auto_review` defaults off, so the
-    /// scheduler only polls/emits PRs and codex is left to the explicit triggers
+    /// Default-manual-review lock (Medium). A fresh project must NOT auto-dispatch
+    /// codex review at boot: `Project::auto_review` defaults off, so the scheduler
+    /// only polls/emits PRs and codex is left to the explicit triggers
     /// (`start_review` / `start_codex`). Locking the default here makes that intent
     /// machine-checked — a silent flip back to `true` would reintroduce the
     /// boot-time review-process clash this guards against, and fails CI first.
     #[test]
     fn default_auto_review_is_off() {
-        assert!(!AppConfig::default().auto_review);
+        assert!(!Project::default().auto_review);
+    }
+
+    #[test]
+    fn validate_accepts_empty_projects_first_launch() {
+        // No project yet (onboarding not run) — valid; onboarding is the gate.
+        assert!(validate(&AppConfig::default()).is_ok());
     }
 
     #[test]
     fn validate_accepts_existing_repo_root_and_skill() {
+        assert!(validate(&valid_base()).is_ok());
+        // The per-project validator agrees directly.
+        assert!(validate_project(&valid_project()).is_ok());
+    }
+
+    #[test]
+    fn validate_skips_disabled_projects() {
+        // A disabled project with a bogus repo_root must NOT fail validation — its
+        // fields are not checked (only enabled projects are).
+        let disabled = Project {
+            enabled: false,
+            repo_root: "/no/such/dir/xyz".to_string(),
+            skill_rel_path: "definitely_missing.md".to_string(),
+            ..valid_project()
+        };
+        assert!(validate(&with_project(disabled)).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_project_ids() {
         let config = AppConfig {
-            repo_root: env!("CARGO_MANIFEST_DIR").to_string(),
-            skill_rel_path: "Cargo.toml".to_string(),
+            projects: vec![
+                Project {
+                    repo: "owner/a".to_string(),
+                    ..valid_project()
+                },
+                Project {
+                    repo: "owner/b".to_string(),
+                    ..valid_project()
+                },
+            ],
+            active_project_id: "default".to_string(),
             ..AppConfig::default()
         };
-        assert!(validate(&config).is_ok());
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_project_repos() {
+        let config = AppConfig {
+            projects: vec![
+                Project {
+                    id: "a".to_string(),
+                    ..valid_project()
+                },
+                Project {
+                    id: "b".to_string(),
+                    ..valid_project()
+                },
+            ],
+            active_project_id: "a".to_string(),
+            ..AppConfig::default()
+        };
+        // Both share the default `repo` (ghbvf/gocell) → reject.
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_project_repos_case_insensitive() {
+        // GitHub repo names are case-insensitive and the webhook router matches with
+        // `eq_ignore_ascii_case`, so `Owner/Repo` and `owner/repo` are the SAME repo →
+        // monitoring both must be rejected (else duplicate rows + double dispatch).
+        let config = AppConfig {
+            projects: vec![
+                Project {
+                    id: "a".to_string(),
+                    repo: "Owner/Repo".to_string(),
+                    ..valid_project()
+                },
+                Project {
+                    id: "b".to_string(),
+                    repo: "owner/repo".to_string(),
+                    ..valid_project()
+                },
+            ],
+            active_project_id: "a".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_dangling_active_project_id() {
+        // Non-empty projects but `active_project_id` matches none → reject (a dangling
+        // pointer would strand the UI / lose the codex handshake cwd).
+        let config = AppConfig {
+            active_project_id: "ghost".to_string(),
+            ..valid_base()
+        };
+        assert!(validate(&config).is_err());
+
+        // The pointer matching an existing project is accepted.
+        assert!(validate(&valid_base()).is_ok());
+
+        // Empty projects keeps first-launch semantics: active id "" + no projects is OK.
+        assert!(validate(&AppConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_project_id_with_colon_or_whitespace() {
+        // The id becomes a store-key prefix (`dispatched:{id}` / `events:{id}` /
+        // `tracked:{id}`); a `:`, whitespace, or empty id corrupts that partition →
+        // dedup failure → re-review storm. Rejected for EVERY project (even disabled),
+        // since a disabled project's id re-enters the key space when re-enabled.
+        for bad in ["", "a:b", "has space", "tab\tid", "\n"] {
+            assert!(
+                validate(&with_project(Project {
+                    id: bad.to_string(),
+                    ..valid_project()
+                }))
+                .is_err(),
+                "expected id {bad:?} to be rejected"
+            );
+        }
+        // A disabled project with a bad id is STILL rejected (its store key persists).
+        assert!(validate(&with_project(Project {
+            id: "a:b".to_string(),
+            enabled: false,
+            ..valid_project()
+        }))
+        .is_err());
+        // A clean id (no `:`, no whitespace, non-empty) is accepted.
+        assert!(validate(&with_project(Project {
+            id: "default".to_string(),
+            ..valid_project()
+        }))
+        .is_ok());
     }
 
     #[test]
     fn validate_rejects_empty_repo_root() {
-        let config = AppConfig {
+        assert!(validate(&with_project(Project {
             repo_root: String::new(),
-            skill_rel_path: "Cargo.toml".to_string(),
-            ..AppConfig::default()
-        };
-        assert!(validate(&config).is_err());
+            ..valid_project()
+        }))
+        .is_err());
     }
 
     #[test]
     fn validate_rejects_missing_repo_root() {
-        let config = AppConfig {
+        assert!(validate(&with_project(Project {
             repo_root: "/no/such/dir/xyz".to_string(),
-            skill_rel_path: "Cargo.toml".to_string(),
-            ..AppConfig::default()
-        };
-        assert!(validate(&config).is_err());
+            ..valid_project()
+        }))
+        .is_err());
     }
 
     #[test]
     fn validate_rejects_missing_skill() {
-        let config = AppConfig {
-            repo_root: env!("CARGO_MANIFEST_DIR").to_string(),
+        assert!(validate(&with_project(Project {
             skill_rel_path: "definitely_missing.md".to_string(),
-            ..AppConfig::default()
-        };
-        assert!(validate(&config).is_err());
+            ..valid_project()
+        }))
+        .is_err());
     }
 
     #[test]
     fn validate_rejects_relative_repo_root() {
         // `repo_root` must be absolute (doc contract) regardless of CWD.
-        let config = AppConfig {
+        assert!(validate(&with_project(Project {
             repo_root: "src".to_string(),
-            skill_rel_path: "Cargo.toml".to_string(),
-            ..AppConfig::default()
-        };
-        assert!(validate(&config).is_err());
+            ..valid_project()
+        }))
+        .is_err());
     }
 
     #[test]
     fn validate_rejects_absolute_skill_rel_path() {
         // An absolute skill path would let `Path::join` discard `repo_root`.
-        let config = AppConfig {
-            repo_root: env!("CARGO_MANIFEST_DIR").to_string(),
+        assert!(validate(&with_project(Project {
             skill_rel_path: "/etc/hosts".to_string(),
-            ..AppConfig::default()
-        };
-        assert!(validate(&config).is_err());
+            ..valid_project()
+        }))
+        .is_err());
     }
 
     #[test]
     fn validate_rejects_skill_escaping_repo_root() {
         // `repo_root`/src + `../Cargo.toml` resolves to repo_root/Cargo.toml,
         // which is outside repo_root/src — must be rejected.
-        let config = AppConfig {
+        assert!(validate(&with_project(Project {
             repo_root: format!("{}/src", env!("CARGO_MANIFEST_DIR")),
             skill_rel_path: "../Cargo.toml".to_string(),
-            ..AppConfig::default()
-        };
-        assert!(validate(&config).is_err());
+            ..valid_project()
+        }))
+        .is_err());
     }
 
     #[test]
     fn validate_rejects_zero_intervals() {
-        let base = AppConfig {
-            repo_root: env!("CARGO_MANIFEST_DIR").to_string(),
-            skill_rel_path: "Cargo.toml".to_string(),
-            ..AppConfig::default()
-        };
-        assert!(validate(&AppConfig {
+        assert!(validate(&with_project(Project {
             poll_interval_secs: 0,
-            ..base.clone()
-        })
+            ..valid_project()
+        }))
         .is_err());
-        assert!(validate(&AppConfig {
+        assert!(validate(&with_project(Project {
             pr_cooldown_seconds: 0,
-            ..base
-        })
+            ..valid_project()
+        }))
         .is_err());
-    }
-
-    fn valid_base() -> AppConfig {
-        AppConfig {
-            repo_root: env!("CARGO_MANIFEST_DIR").to_string(),
-            skill_rel_path: "Cargo.toml".to_string(),
-            ..AppConfig::default()
-        }
     }
 
     #[test]
@@ -439,18 +729,18 @@ mod tests {
             " ghbvf/gocell",
         ] {
             assert!(
-                validate(&AppConfig {
+                validate(&with_project(Project {
                     repo: bad.to_string(),
-                    ..valid_base()
-                })
+                    ..valid_project()
+                }))
                 .is_err(),
                 "expected {bad:?} to be rejected"
             );
         }
-        assert!(validate(&AppConfig {
+        assert!(validate(&with_project(Project {
             repo: "ghbvf/gocell".to_string(),
-            ..valid_base()
-        })
+            ..valid_project()
+        }))
         .is_ok());
     }
 
@@ -459,15 +749,15 @@ mod tests {
         // Each label feeds `gh pr list --label`; a blank one makes every poll
         // match nothing / fail (PR #41 F2).
         for blank in ["", "   "] {
-            assert!(validate(&AppConfig {
+            assert!(validate(&with_project(Project {
                 review_label: blank.to_string(),
-                ..valid_base()
-            })
+                ..valid_project()
+            }))
             .is_err());
-            assert!(validate(&AppConfig {
+            assert!(validate(&with_project(Project {
                 check_label: blank.to_string(),
-                ..valid_base()
-            })
+                ..valid_project()
+            }))
             .is_err());
         }
     }
@@ -577,16 +867,17 @@ mod tests {
     /// the onboarding step that owns the field by matching the message's leading
     /// field token — checking `skill` first (the path-escape message names both
     /// skill and repoRoot) and `repoRoot` before `repo` (since "repoRoot" has
-    /// "repo" as a prefix). This pins that each `validate()` failure message starts
-    /// with the token downstream relies on, so a Rust-side wording change that would
-    /// silently break wizard routing fails CI here. The matching downstream cases
-    /// live in fields.test.ts; the shared field tokens are the cross-end contract.
+    /// "repo" as a prefix). This pins that each per-project `validate_project`
+    /// failure message starts with the token downstream relies on, so a Rust-side
+    /// wording change that would silently break wizard routing fails CI here. The
+    /// matching downstream cases live in fields.test.ts; the shared field tokens are
+    /// the cross-end contract.
     #[test]
     fn validate_error_messages_start_with_routing_field_token() {
-        let base = valid_base();
-        let msg = |c: AppConfig| validate(&c).unwrap_err().message;
+        let base = valid_project();
+        let msg = |p: Project| validate_project(&p).unwrap_err().message;
 
-        let repo_err = msg(AppConfig {
+        let repo_err = msg(Project {
             repo: "not-a-repo".to_string(),
             ..base.clone()
         });
@@ -595,32 +886,32 @@ mod tests {
         // first) would route the repo error to the wrong step.
         assert!(!repo_err.starts_with("repoRoot"), "{repo_err}");
 
-        assert!(msg(AppConfig {
+        assert!(msg(Project {
             repo_root: String::new(),
             ..base.clone()
         })
         .starts_with("repoRoot"));
-        assert!(msg(AppConfig {
+        assert!(msg(Project {
             skill_rel_path: "/etc/hosts".to_string(),
             ..base.clone()
         })
         .starts_with("skill"));
-        assert!(msg(AppConfig {
+        assert!(msg(Project {
             poll_interval_secs: 0,
             ..base.clone()
         })
         .starts_with("pollIntervalSecs"));
-        assert!(msg(AppConfig {
+        assert!(msg(Project {
             pr_cooldown_seconds: 0,
             ..base.clone()
         })
         .starts_with("prCooldownSeconds"));
-        assert!(msg(AppConfig {
+        assert!(msg(Project {
             review_label: "  ".to_string(),
             ..base.clone()
         })
         .starts_with("reviewLabel"));
-        assert!(msg(AppConfig {
+        assert!(msg(Project {
             check_label: String::new(),
             ..base
         })
@@ -633,9 +924,9 @@ mod tests {
     #[test]
     fn unknown_fields_are_ignored() {
         let parsed: AppConfig =
-            serde_json::from_value(serde_json::json!({"repo": "x/y", "futureField": 42}))
+            serde_json::from_value(serde_json::json!({"activeProjectId": "x", "futureField": 42}))
                 .expect("unknown fields are ignored");
-        assert_eq!(parsed.repo, "x/y");
+        assert_eq!(parsed.active_project_id, "x");
     }
 
     // Forward-compat lock: `#[serde(default)]` lets older/partial persisted
@@ -653,11 +944,28 @@ mod tests {
 
     #[test]
     fn partial_object_fills_rest_from_default() {
-        let parsed: AppConfig = serde_json::from_value(serde_json::json!({"repo": "x/y"}))
+        let parsed: AppConfig = serde_json::from_value(serde_json::json!({"activeProjectId": "x"}))
             .expect("partial object deserializes via serde(default)");
         let expected = AppConfig {
-            repo: "x/y".to_string(),
+            active_project_id: "x".to_string(),
             ..AppConfig::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&parsed).expect("parsed serializes"),
+            serde_json::to_value(&expected).expect("expected serializes")
+        );
+    }
+
+    // Forward-compat lock for the new `Project` element: a project object missing
+    // fields fills them from `Project::default()` (same `#[serde(default)]`
+    // contract as `AppConfig`).
+    #[test]
+    fn project_partial_object_fills_rest_from_default() {
+        let parsed: Project = serde_json::from_value(serde_json::json!({"id": "p1"}))
+            .expect("partial project deserializes via serde(default)");
+        let expected = Project {
+            id: "p1".to_string(),
+            ..Project::default()
         };
         assert_eq!(
             serde_json::to_value(&parsed).expect("parsed serializes"),

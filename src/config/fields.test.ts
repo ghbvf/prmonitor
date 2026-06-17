@@ -2,19 +2,26 @@
 // grouped form and the onboarding wizard, plus two pure helpers — `validateStep`
 // (per-step frontend gate) and `errorToStep` (route a backend AppError back to the
 // step that owns the offending field). Pure functions → no Pinia/mocks needed.
+//
+// Multi-project (#35): coverage is split into PROJECT_GROUPS (per-project `Project`
+// keys) and GLOBAL_GROUPS (global webhook `AppConfig` keys).
 import { describe, expect, it } from "vitest";
-import type { AppConfig } from "./types";
+import type { AppConfig, Project } from "./types";
 import {
-  GROUPS,
+  PROJECT_GROUPS,
+  GLOBAL_GROUPS,
   STEPS,
   validateStep,
   errorToStep,
   type StepId,
 } from "./fields";
 
-// A fully-valid draft; each test perturbs one field to assert its step's gate.
-function validDraft(): AppConfig {
+// A fully-valid single project; each test perturbs one field to assert its step's gate.
+function validProject(): Project {
   return {
+    id: "proj-1",
+    name: "gocell",
+    enabled: true,
     repo: "ghbvf/gocell",
     repoRoot: "/abs/path",
     pollIntervalSecs: 120,
@@ -26,30 +33,42 @@ function validDraft(): AppConfig {
     sourceKind: "github",
     engineKind: "codex",
     autoReview: false,
-    webhookEnabled: false,
-    webhookPort: 8787,
-    webhookSecret: "",
-    cloudflaredBin: "cloudflared",
-    webhookTunnelMode: "quick",
-    webhookTunnelCommand: "",
-    webhookPublicUrl: "",
   };
 }
 
-describe("GROUPS", () => {
-  it("covers all 18 AppConfig keys exactly once across groups", () => {
-    const keys = GROUPS.flatMap((g) => g.fields.map((f) => f.key)).sort();
-    const expected = Object.keys(validDraft()).sort();
+// The global (non-per-project) AppConfig keys. Only the webhook/shell fields are
+// driven by GLOBAL_GROUPS; `projects`/`activeProjectId` are structural and managed
+// by the project list/selector UI, not a field group.
+const GLOBAL_FORM_KEYS: (keyof AppConfig)[] = [
+  "webhookEnabled",
+  "webhookPort",
+  "webhookSecret",
+  "cloudflaredBin",
+  "webhookTunnelMode",
+  "webhookTunnelCommand",
+  "webhookPublicUrl",
+];
+
+// `Project` identity fields managed by the project list/selector UI (not a field
+// group), so PROJECT_GROUPS deliberately omits them.
+const PROJECT_IDENTITY_KEYS: (keyof Project)[] = ["id", "name", "enabled"];
+
+describe("PROJECT_GROUPS", () => {
+  it("covers every Project key (except identity fields) exactly once across groups", () => {
+    const keys = PROJECT_GROUPS.flatMap((g) => g.fields.map((f) => f.key)).sort();
+    const expected = (Object.keys(validProject()) as (keyof Project)[])
+      .filter((k) => !PROJECT_IDENTITY_KEYS.includes(k))
+      .sort();
     expect(keys).toEqual(expected);
   });
 
   it("autoReview is a checkbox in the polling group", () => {
-    const f = GROUPS.flatMap((g) => g.fields).find((f) => f.key === "autoReview");
+    const f = PROJECT_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "autoReview");
     expect(f?.kind).toBe("checkbox");
   });
 
   it("marks the engine group fields read-only (sourceKind/engineKind reserved #11)", () => {
-    const engine = GROUPS.find((g) => g.id === "engine");
+    const engine = PROJECT_GROUPS.find((g) => g.id === "engine");
     expect(engine).toBeDefined();
     expect(engine!.fields.every((f) => f.readonly)).toBe(true);
     expect(engine!.fields.map((f) => f.key).sort()).toEqual([
@@ -59,46 +78,58 @@ describe("GROUPS", () => {
   });
 });
 
+describe("GLOBAL_GROUPS", () => {
+  it("covers all global (webhook) AppConfig keys exactly once across groups", () => {
+    const keys = GLOBAL_GROUPS.flatMap((g) => g.fields.map((f) => f.key)).sort();
+    expect(keys).toEqual([...GLOBAL_FORM_KEYS].sort());
+  });
+
+  it("masks the webhook secret field", () => {
+    const f = GLOBAL_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "webhookSecret");
+    expect(f?.secret).toBe(true);
+  });
+});
+
 describe("validateStep — repo", () => {
   it("accepts owner/name", () => {
-    expect(validateStep("repo", validDraft())).toBeNull();
+    expect(validateStep("repo", validProject())).toBeNull();
   });
   it.each(["ghbvf", "a/b/c", "", "owner /name", "owner/"])(
     "rejects %j",
     (repo) => {
-      expect(validateStep("repo", { ...validDraft(), repo })).toBeTruthy();
+      expect(validateStep("repo", { ...validProject(), repo })).toBeTruthy();
     },
   );
 });
 
 describe("validateStep — repoRoot", () => {
   it("accepts a non-empty path", () => {
-    expect(validateStep("repoRoot", validDraft())).toBeNull();
+    expect(validateStep("repoRoot", validProject())).toBeNull();
   });
   it.each(["", "   "])("rejects empty/whitespace-only %j", (repoRoot) => {
-    expect(validateStep("repoRoot", { ...validDraft(), repoRoot })).toBeTruthy();
+    expect(validateStep("repoRoot", { ...validProject(), repoRoot })).toBeTruthy();
   });
 });
 
 describe("validateStep — skill", () => {
   it("accepts a relative path", () => {
-    expect(validateStep("skill", validDraft())).toBeNull();
+    expect(validateStep("skill", validProject())).toBeNull();
   });
   it("rejects empty", () => {
     expect(
-      validateStep("skill", { ...validDraft(), skillRelPath: "" }),
+      validateStep("skill", { ...validProject(), skillRelPath: "" }),
     ).toBeTruthy();
   });
   it("rejects an absolute path", () => {
     expect(
-      validateStep("skill", { ...validDraft(), skillRelPath: "/etc/x" }),
+      validateStep("skill", { ...validProject(), skillRelPath: "/etc/x" }),
     ).toBeTruthy();
   });
 });
 
 describe("validateStep — autoReview (intervals)", () => {
   it("accepts positive intervals", () => {
-    expect(validateStep("autoReview", validDraft())).toBeNull();
+    expect(validateStep("autoReview", validProject())).toBeNull();
   });
   it.each([
     { pollIntervalSecs: 0 },
@@ -108,7 +139,7 @@ describe("validateStep — autoReview (intervals)", () => {
     { pollIntervalSecs: NaN },
     { prCooldownSeconds: NaN },
   ])("rejects non-positive / NaN %o", (patch) => {
-    expect(validateStep("autoReview", { ...validDraft(), ...patch })).toBeTruthy();
+    expect(validateStep("autoReview", { ...validProject(), ...patch })).toBeTruthy();
   });
   it.each([
     { reviewLabel: "" },
@@ -116,13 +147,13 @@ describe("validateStep — autoReview (intervals)", () => {
     { checkLabel: "" },
     { checkLabel: "  " },
   ])("rejects blank trigger label %o", (patch) => {
-    expect(validateStep("autoReview", { ...validDraft(), ...patch })).toBeTruthy();
+    expect(validateStep("autoReview", { ...validProject(), ...patch })).toBeTruthy();
   });
 });
 
 describe("validateStep — source/done are confirm-only", () => {
   it.each(["source", "done"] as StepId[])("accepts %s", (step) => {
-    expect(validateStep(step, validDraft())).toBeNull();
+    expect(validateStep(step, validProject())).toBeNull();
   });
 });
 

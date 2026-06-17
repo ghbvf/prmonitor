@@ -8,10 +8,14 @@ import type { GhStatus, WebhookStatus } from "./types";
 // open downstream end of the event-name funnel — keep in lockstep).
 const PRS_UPDATED_EVENT = "prs:updated" as const;
 
-export function pollNow(): Promise<void> {
-  return invoke<void>("poll_now");
+// Wake ONE project's poll loop (#35). The JS `projectId` key maps to the Rust
+// `project_id` snake_case arg.
+export function pollNow(projectId: string): Promise<void> {
+  return invoke<void>("poll_now", { projectId });
 }
 
+// Global scheduler controls (#35): reconcile-all / stop-all — they take NO
+// projectId; the backend fans the loop out across every enabled project.
 export function startPolling(): Promise<void> {
   return invoke<void>("start_polling");
 }
@@ -30,21 +34,23 @@ export function onPrsUpdated(cb: (e: PrEvent) => void) {
   return listen<PrEvent>(PRS_UPDATED_EVENT, (event) => cb(event.payload));
 }
 
-// Read the scheduler's latest PR snapshot. Used to baseline the list at startup
-// so the view is populated regardless of whether the first `prs:updated` event
-// raced ahead of the listener registration (#27 F3). The backend now returns the
-// retained, tracking-aware list (#38).
-export function getPrs(): Promise<TrackedPrView[]> {
-  return invoke<TrackedPrView[]>("get_prs");
+// Read one project's latest PR snapshot (#35). Used to baseline the list at
+// startup / on project switch so the view is populated regardless of whether the
+// first `prs:updated` event raced ahead of the listener registration (#27 F3).
+// The backend returns the retained, tracking-aware list (#38).
+export function getPrs(projectId: string): Promise<TrackedPrView[]> {
+  return invoke<TrackedPrView[]>("get_prs", { projectId });
 }
 
-// Archive / unarchive a retained PR (#38). The backend re-emits `prs:updated`
-// after the flag flips, so the store refreshes via the existing listener.
+// Archive / unarchive a retained PR within a project (#38, #35). The backend
+// re-emits `prs:updated` for that project after the flag flips, so the store
+// refreshes via the existing listener.
 export function setPrArchived(
+  projectId: string,
   number: number,
   archived: boolean,
 ): Promise<void> {
-  return invoke<void>("set_pr_archived", { number, archived });
+  return invoke<void>("set_pr_archived", { projectId, number, archived });
 }
 
 export function ghStatus(): Promise<GhStatus> {

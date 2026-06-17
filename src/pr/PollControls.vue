@@ -5,13 +5,15 @@
 // subscription down on unmount.
 import { computed, onMounted, onUnmounted } from "vue";
 import { usePrStore } from "./usePrStore";
+import { useProjects } from "../projects";
 
 const store = usePrStore();
+const { activeProjectId } = useProjects();
 
 const lastPulledText = computed(() =>
-  store.lastPulledAt === null
+  store.lastPulledAtActive === null
     ? "从未"
-    : new Date(store.lastPulledAt).toLocaleTimeString(),
+    : new Date(store.lastPulledAtActive).toLocaleTimeString(),
 );
 
 // Hold the resolved UnlistenFn so onUnmounted can invoke it.
@@ -33,13 +35,17 @@ onUnmounted(() => {
     <div class="actions">
       <button
         type="button"
-        :disabled="store.loading || !store.polling"
-        @click="store.pollNow()"
+        :disabled="store.loadingActive || !store.pollingActive"
+        @click="store.pollNow(activeProjectId)"
       >
-        {{ store.loading ? "拉取中…" : "立即拉取" }}
+        {{ store.loadingActive ? "拉取中…" : "立即拉取" }}
       </button>
-      <button type="button" :disabled="store.loading" @click="store.toggle()">
-        {{ store.polling ? "暂停轮询" : "恢复轮询" }}
+      <button
+        type="button"
+        :disabled="store.loadingActive"
+        @click="store.toggle()"
+      >
+        {{ store.pollingActive ? "暂停轮询" : "恢复轮询" }}
       </button>
     </div>
     <p class="muted">上次拉取：{{ lastPulledText }}</p>

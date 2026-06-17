@@ -1,19 +1,23 @@
 <script setup lang="ts">
-// First-launch onboarding wizard (#34): walks STEPS (repo → repoRoot → skill →
-// source → autoReview → done), reusing the fields.ts FieldDefs so labels/hints
-// match Settings. The draft seeds from store.config (defaults prefill; on a first
-// launch repoRoot is ""). "下一步" runs validateStep and blocks on a message; the
-// final save routes a backend error back to its owning step via errorToStep.
+// First-launch onboarding wizard (#34, multi-project #35): walks STEPS (repo →
+// repoRoot → skill → source → autoReview → done), reusing the fields.ts PROJECT_GROUPS
+// FieldDefs so labels/hints match Settings. It builds the FIRST project: the `draft`
+// is a single reactive `Project`, seeded from the persisted config's first project
+// (defaults prefill; on a first launch repoRoot is ""). "下一步" runs validateStep and
+// blocks on a message; `finish()` composes the full AppConfig — one project plus the
+// global webhook defaults — and the final save routes a backend error back to its
+// owning step via errorToStep.
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useConfigStore } from "./useConfigStore";
-import type { AppConfig } from "./types";
+import type { AppConfig, Project } from "./types";
+import { DEFAULT_PROJECT_ID, NEW_PROJECT_DEFAULTS } from "./defaults";
 import {
-  GROUPS,
+  PROJECT_GROUPS,
   STEPS,
   validateStep,
   errorToStep,
   type FieldDef,
-  type FieldKey,
+  type ProjectFieldKey,
   type StepId,
 } from "./fields";
 import ConfigField from "./ConfigField.vue";
@@ -23,49 +27,39 @@ const store = useConfigStore();
 // Emitted only after a validated, successful save.
 const emit = defineEmits<{ done: [] }>();
 
-const draft = reactive<AppConfig>({
-  repo: "",
-  repoRoot: "",
-  pollIntervalSecs: 0,
-  authors: [],
-  reviewLabel: "",
-  checkLabel: "",
-  skillRelPath: "",
-  prCooldownSeconds: 0,
-  sourceKind: "github",
-  engineKind: "codex",
-  autoReview: false,
-  webhookEnabled: false,
-  webhookPort: 8787,
-  webhookSecret: "",
-  cloudflaredBin: "cloudflared",
-  webhookTunnelMode: "quick",
-  webhookTunnelCommand: "",
-  webhookPublicUrl: "",
+// The first project being created. Per-project fields seed from the shared
+// NEW_PROJECT_DEFAULTS (single-sourced with ProjectsManager in defaults.ts) so the two
+// seed paths can't drift; identity uses the fixed DEFAULT_PROJECT_ID. The global
+// webhook fields are filled in by `finish()` when composing the AppConfig.
+const draft = reactive<Project>({
+  ...NEW_PROJECT_DEFAULTS,
+  id: DEFAULT_PROJECT_ID,
+  name: "默认项目",
 });
 
 const authorsInput = ref("");
 
+// Seed the project draft from the persisted config's FIRST project (#35) if present,
+// so the wizard prefills sensible defaults. A first launch has a single default
+// project whose repoRoot is "".
 function hydrate(cfg: AppConfig) {
-  draft.repo = cfg.repo;
-  draft.repoRoot = cfg.repoRoot;
-  draft.pollIntervalSecs = cfg.pollIntervalSecs;
-  draft.authors = [...cfg.authors];
-  draft.reviewLabel = cfg.reviewLabel;
-  draft.checkLabel = cfg.checkLabel;
-  draft.skillRelPath = cfg.skillRelPath;
-  draft.prCooldownSeconds = cfg.prCooldownSeconds;
-  draft.sourceKind = cfg.sourceKind;
-  draft.engineKind = cfg.engineKind;
-  draft.autoReview = cfg.autoReview;
-  draft.webhookEnabled = cfg.webhookEnabled;
-  draft.webhookPort = cfg.webhookPort;
-  draft.webhookSecret = cfg.webhookSecret;
-  draft.cloudflaredBin = cfg.cloudflaredBin;
-  draft.webhookTunnelMode = cfg.webhookTunnelMode;
-  draft.webhookTunnelCommand = cfg.webhookTunnelCommand;
-  draft.webhookPublicUrl = cfg.webhookPublicUrl;
-  authorsInput.value = cfg.authors.join(", ");
+  const p = cfg.projects[0];
+  if (!p) return;
+  draft.id = p.id;
+  draft.name = p.name;
+  draft.enabled = p.enabled;
+  draft.repo = p.repo;
+  draft.repoRoot = p.repoRoot;
+  draft.pollIntervalSecs = p.pollIntervalSecs;
+  draft.authors = [...p.authors];
+  draft.reviewLabel = p.reviewLabel;
+  draft.checkLabel = p.checkLabel;
+  draft.skillRelPath = p.skillRelPath;
+  draft.prCooldownSeconds = p.prCooldownSeconds;
+  draft.sourceKind = p.sourceKind;
+  draft.engineKind = p.engineKind;
+  draft.autoReview = p.autoReview;
+  authorsInput.value = p.authors.join(", ");
 }
 
 // Seed defaults from the persisted config so the wizard prefills sensible values.
@@ -84,22 +78,23 @@ const currentStep = computed<StepId>(() => STEPS[stepIndex.value]);
 // Inline validation / backend error for the current step.
 const stepError = ref<string | null>(null);
 
-// All field defs flattened, addressable by key — the wizard cherry-picks which
-// FieldDefs each step shows (reusing the same definitions Settings groups use).
-const FIELD_BY_KEY = new Map<FieldKey, FieldDef>(
-  GROUPS.flatMap((g) => g.fields).map((f) => [f.key, f]),
+// All per-project field defs flattened, addressable by key — the wizard cherry-picks
+// which FieldDefs each step shows (reusing the same definitions Settings groups use).
+// Every STEP_FIELDS key is a `keyof Project`, so PROJECT_GROUPS is the right source.
+const FIELD_BY_KEY = new Map<ProjectFieldKey, FieldDef>(
+  PROJECT_GROUPS.flatMap((g) => g.fields).map((f) => [f.key, f]),
 );
 
-function defOf(key: FieldKey): FieldDef {
+function defOf(key: ProjectFieldKey): FieldDef {
   const def = FIELD_BY_KEY.get(key);
-  // Every AppConfig key is grouped (asserted in fields.test.ts), so this never
+  // Every per-project key is grouped (asserted in fields.test.ts), so this never
   // misses; throw rather than render a half-broken step if that invariant breaks.
   if (!def) throw new Error(`missing field def: ${key}`);
   return def;
 }
 
-// Which fields each step renders.
-const STEP_FIELDS: Record<StepId, FieldKey[]> = {
+// Which fields each step renders. Keys are `keyof Project` (#35).
+const STEP_FIELDS: Record<StepId, ProjectFieldKey[]> = {
   repo: ["repo"],
   repoRoot: ["repoRoot"],
   skill: ["skillRelPath"],
@@ -114,7 +109,7 @@ const currentFields = computed<FieldDef[]>(() =>
 
 function fieldValue(def: FieldDef): string | number | boolean | string[] {
   if (def.key === "authors") return authorsInput.value;
-  return draft[def.key];
+  return draft[def.key as ProjectFieldKey];
 }
 
 function setField(def: FieldDef, value: string | number | boolean | string[]) {
@@ -122,9 +117,9 @@ function setField(def: FieldDef, value: string | number | boolean | string[]) {
     authorsInput.value = Array.isArray(value) ? value.join(", ") : String(value);
     return;
   }
-  // FieldDef.kind matches its AppConfig value type, so the assignment is
-  // type-correct at runtime; the cast bridges the heterogeneous emit signature.
-  (draft as Record<FieldKey, unknown>)[def.key] = value;
+  // FieldDef.kind matches its Project value type, so the assignment is type-correct
+  // at runtime; the cast bridges the heterogeneous emit signature.
+  (draft as Record<ProjectFieldKey, unknown>)[def.key as ProjectFieldKey] = value;
 }
 
 // Clear the inline error on real input so a fixed field stops showing stale text.
@@ -159,6 +154,23 @@ function authorsArray(): string[] {
     .filter((a) => a.length > 0);
 }
 
+// Compose the full AppConfig from the single project draft plus the global webhook
+// defaults. The first project gets the fixed id "default" (mirrors the backend
+// migration's fixed id for symmetry) and `activeProjectId` points at it.
+function composeConfig(): AppConfig {
+  return {
+    projects: [{ ...draft, id: DEFAULT_PROJECT_ID, authors: authorsArray() }],
+    activeProjectId: DEFAULT_PROJECT_ID,
+    webhookEnabled: false,
+    webhookPort: 8787,
+    webhookSecret: "",
+    cloudflaredBin: "cloudflared",
+    webhookTunnelMode: "quick",
+    webhookTunnelCommand: "",
+    webhookPublicUrl: "",
+  };
+}
+
 async function finish() {
   // Re-validate every gated step before committing (defensive: the user could
   // reach `done` then edit a prior step's value via back-nav).
@@ -172,7 +184,7 @@ async function finish() {
     }
   }
 
-  await store.save({ ...draft, authors: authorsArray() });
+  await store.save(composeConfig());
   if (store.savedOk) {
     emit("done");
     return;

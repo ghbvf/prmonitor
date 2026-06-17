@@ -14,18 +14,28 @@ vi.mock("./api", () => ({
 import * as api from "./api";
 import { useConfigStore } from "./useConfigStore";
 
+// Multi-project AppConfig (#35): one project plus the global webhook fields. Tests
+// perturb `projects` / global fields via `over` to exercise the store's load/save.
 const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
-  repo: "ghbvf/gocell",
-  repoRoot: "/abs/path",
-  pollIntervalSecs: 120,
-  authors: [],
-  reviewLabel: "pr-status/needs-review-again",
-  checkLabel: "pr-status/needs-check-fix",
-  skillRelPath: ".codex/skills/pr-review/SKILL.md",
-  prCooldownSeconds: 1800,
-  sourceKind: "github",
-  engineKind: "codex",
-  autoReview: false,
+  projects: [
+    {
+      id: "default",
+      name: "默认项目",
+      enabled: true,
+      repo: "ghbvf/gocell",
+      repoRoot: "/abs/path",
+      pollIntervalSecs: 120,
+      authors: [],
+      reviewLabel: "pr-status/needs-review-again",
+      checkLabel: "pr-status/needs-check-fix",
+      skillRelPath: ".codex/skills/pr-review/SKILL.md",
+      prCooldownSeconds: 1800,
+      sourceKind: "github",
+      engineKind: "codex",
+      autoReview: false,
+    },
+  ],
+  activeProjectId: "default",
   webhookEnabled: false,
   webhookPort: 8787,
   webhookSecret: "",
@@ -70,7 +80,7 @@ describe("useConfigStore load()", () => {
 
 describe("useConfigStore save()", () => {
   it("on success stores the new config and sets savedOk", async () => {
-    const next = cfg({ repo: "owner/changed" });
+    const next = cfg({ activeProjectId: "default", webhookPort: 9999 });
     const store = useConfigStore();
 
     await store.save(next);
@@ -88,7 +98,7 @@ describe("useConfigStore save()", () => {
     });
     const store = useConfigStore();
 
-    await store.save(cfg({ repoRoot: "" }));
+    await store.save(cfg());
 
     expect(store.error).toBe("repoRoot 必须是存在的绝对目录路径: ");
     expect(store.savedOk).toBe(false);

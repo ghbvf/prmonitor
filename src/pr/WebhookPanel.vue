@@ -204,6 +204,14 @@ async function copyUrl() {
       App 仅监听 127.0.0.1:{{ port ?? "?" }}，请自行将隧道指向该端口。
     </p>
 
+    <!-- Static reminder (#35): the webhook routes by repo, so adding/removing a project
+         changes the route table the running tunnel was started with. Don't try to detect
+         project changes here — just inform. -->
+    <p v-if="status?.running" class="hint">
+      提示：增删项目后需重启隧道以更新路由 / Restart the tunnel after adding/removing
+      projects to refresh routing.
+    </p>
+
     <p v-if="status?.message" class="msg">{{ status.message }}</p>
     <p v-if="error" class="error">{{ error }}</p>
   </section>

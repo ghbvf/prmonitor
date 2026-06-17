@@ -5,8 +5,11 @@
 
 #[derive(Default)]
 pub struct AppState {
-    /// The scheduled-pull loop handle (PR4). Long-lived; methods take `&self`.
-    pub scheduler: crate::pr::scheduler::Scheduler,
+    /// The per-project scheduled-pull loops (#35): a `project_id → Scheduler` set the
+    /// composition root reconciles to the enabled projects. Long-lived; methods take
+    /// `&self`. Pre-#35 this was a single `Scheduler`; now one app drives N parallel
+    /// poll loops, one per enabled project.
+    pub scheduler: crate::pr::scheduler::SchedulerSet,
     /// The resident codex app-server connection (PR5). Lazily started, kept alive
     /// so reviews start fast; killed on app shutdown. Methods take `&self`.
     pub codex: crate::review::engines::codex::CodexManager,

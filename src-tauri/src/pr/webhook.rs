@@ -18,16 +18,26 @@
 //! list); a webhook is push-shaped (GitHub hands us one event). Per the
 //! [`crate::dispatch`] doc, "a future webhook trigger calls the same `auto_dispatch`
 //! with the candidates a push event yields" — that is exactly this module: the
-//! handler maps a payload to a [`Candidate`] and hands it to the injected
-//! [`Dispatcher`] (the composition root's gate + `auto_dispatch` closure), reusing
-//! the entire vetted dispatch path with zero duplication.
+//! handler maps a payload to a `(project_id, Candidate)` and hands it to the injected
+//! [`ProjectDispatcher`] (the composition root's gate + `auto_dispatch` closure),
+//! reusing the entire vetted dispatch path with zero duplication.
+//!
+//! **Multi-project routing (#35).** One global receiver / port / secret / tunnel
+//! serves EVERY monitored project. The handler routes each verified event to the
+//! enabled project whose `repo` matches the payload's repository (case-insensitive),
+//! classifies review-vs-check with THAT project's labels, and dispatches under that
+//! project's id. A payload whose repo matches no enabled project is dropped
+//! (fail-closed — same spirit as the old single-repo ownership gate). The route list
+//! ([`WebhookCtx::routes`]) is a SNAPSHOT taken at [`WebhookManager::start`] time from
+//! the enabled projects; adding/removing/enabling a project requires a webhook restart
+//! to refresh it (the composition root wires that restart on `set_config`).
 //!
 //! **Layering.** The axum handler is runtime-agnostic — it never names
 //! `AppHandle<R>`. The autoReview gate and the static/cooldown gates (parity with
-//! the poll path) live in the [`Dispatcher`] closure the root installs via
+//! the poll path) live in the [`ProjectDispatcher`] closure the root installs via
 //! [`WebhookManager::set_dispatcher`] (which holds the concrete app handle), exactly
 //! as [`super::scheduler::Scheduler`] does. The handler's only job is verify →
-//! parse → map → hand off.
+//! parse → route → hand off.
 //!
 //! **Security.** The endpoint is public (via the tunnel), so every request is
 //! HMAC-verified (`X-Hub-Signature-256`) against the configured secret before the
@@ -55,7 +65,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
-use super::scheduler::Dispatcher;
+use super::scheduler::ProjectDispatcher;
 use crate::error::{AppError, AppResult};
 use crate::model::{Candidate, WebhookTunnelMode};
 
@@ -153,15 +163,35 @@ pub struct TunnelSpec {
     pub public_url: String,
 }
 
+/// One enabled project's webhook routing info (#35) — the minimal slice of
+/// [`crate::config::model::Project`] the handler needs to route a push event:
+/// match the event repo, classify review-vs-check by THIS project's labels, and
+/// dispatch under THIS project's id. The composition root builds the list from
+/// every `enabled` project at [`WebhookManager::start`] time (see [`WebhookCtx::routes`]);
+/// it does NOT carry the full `Project` so the `pr` slice stays decoupled from the
+/// config slice's domain model (parity with how `start` takes flat receiver params).
+pub struct ProjectRoute {
+    /// The routing key emitted on the dispatched candidate (`Project::id`).
+    pub id: String,
+    /// The monitored repo `owner/name` matched (case-insensitively) against the
+    /// event's repository.
+    pub repo: String,
+    /// Label that classifies an event as a `review` turn (this project's).
+    pub review_label: String,
+    /// Label that classifies an event as a `check` turn (this project's).
+    pub check_label: String,
+}
+
 /// Owns the running receiver + tunnel. `&self` methods + interior mutability so it
 /// lives in `AppState` (which stays `Default`), mirroring `Scheduler`/`CodexManager`.
 #[derive(Default)]
 pub struct WebhookManager {
     /// Installed once by the composition root (lib.rs) BEFORE any start, like
-    /// [`super::scheduler::Scheduler::set_dispatcher`]. The closure applies the
-    /// autoReview + static/cooldown gates and runs `auto_dispatch`, keeping the axum
-    /// handler runtime-agnostic.
-    dispatcher: StdMutex<Option<Dispatcher>>,
+    /// [`super::scheduler::Scheduler::set_dispatcher`]. The closure is called with the
+    /// routed `project_id` (#35) + the event's candidates; it applies the autoReview +
+    /// static/cooldown gates and runs `auto_dispatch`, keeping the axum handler
+    /// runtime-agnostic.
+    dispatcher: StdMutex<Option<ProjectDispatcher>>,
     runtime: StdMutex<Option<WebhookRuntime>>,
     /// Serializes `start` (bind + spawn + tunnel-URL await) so concurrent starts
     /// can't double-bind the port.
@@ -262,7 +292,7 @@ impl WebhookRuntime {
 
 impl WebhookManager {
     /// Install the dispatch hook (composition root, before any start).
-    pub fn set_dispatcher(&self, d: Dispatcher) {
+    pub fn set_dispatcher(&self, d: ProjectDispatcher) {
         *self.dispatcher.lock().unwrap() = Some(d);
     }
 
@@ -279,14 +309,19 @@ impl WebhookManager {
     ///   `public_url` is empty). Does NOT require cloudflared.
     /// - `Listener`: bind only, spawn no child; `public_url` from config. Does NOT
     ///   require cloudflared.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// `routes` (#35) is the SNAPSHOT of enabled projects' routing info the handler
+    /// matches each event against (the composition root builds it from every `enabled`
+    /// [`crate::config::model::Project`] at this call). It is captured into
+    /// [`WebhookCtx::routes`] and never refreshed for the life of the runtime — a
+    /// project add/remove/enable change requires a restart (the root wires that on
+    /// `set_config`). The receiver params (port / secret / cloudflared_bin) stay GLOBAL
+    /// (one receiver serves all projects).
     pub async fn start(
         &self,
         port: u16,
         secret: String,
-        repo: String,
-        review_label: String,
-        check_label: String,
+        routes: Vec<ProjectRoute>,
         cloudflared_bin: String,
         tunnel: TunnelSpec,
     ) -> AppResult<WebhookStatus> {
@@ -365,9 +400,7 @@ impl WebhookManager {
 
         let ctx = Arc::new(WebhookCtx {
             secret,
-            repo,
-            review_label,
-            check_label,
+            routes,
             dispatcher,
         });
         let router = Router::new()
@@ -587,13 +620,16 @@ impl WebhookManager {
 /// Shared, runtime-agnostic state for the axum handler.
 struct WebhookCtx {
     secret: String,
-    /// The monitored repo `owner/name` (from `AppConfig.repo`). The handler requires a
-    /// verified payload's repository to match this (F2) — HMAC proves the secret is
-    /// known, not that the event is for the repo this app reviews.
-    repo: String,
-    review_label: String,
-    check_label: String,
-    dispatcher: Dispatcher,
+    /// The enabled projects' routing info (#35), a SNAPSHOT taken at
+    /// [`WebhookManager::start`] time from every `enabled`
+    /// [`crate::config::model::Project`]. The handler routes a verified payload to the
+    /// project whose `repo` matches the event repository (case-insensitive); a payload
+    /// matching no route is dropped (fail-closed — HMAC proves the secret is known, not
+    /// that the event is for a repo this app reviews). This list does NOT refresh for
+    /// the runtime's life — a project add/remove/enable requires a webhook restart (the
+    /// composition root wires that on `set_config`).
+    routes: Vec<ProjectRoute>,
+    dispatcher: ProjectDispatcher,
 }
 
 /// `POST /webhook`. Verify the GitHub HMAC, map a `pull_request` payload to a
@@ -629,13 +665,12 @@ async fn handle_webhook(
         Err(_) => return StatusCode::BAD_REQUEST,
     };
 
-    if let Some(candidate) =
-        payload_to_candidate(&payload, &ctx.repo, &ctx.review_label, &ctx.check_label)
-    {
+    if let Some((project_id, candidate)) = payload_to_candidate(&payload, &ctx.routes) {
         // Detached: the dispatcher future is `Send + 'static`; the gates + review
-        // start run independently of this response.
+        // start run independently of this response. The routed `project_id` (#35) tells
+        // the composition root which project's gates/engine to run under.
         let dispatcher = ctx.dispatcher.clone();
-        drop(spawn(dispatcher(vec![candidate])));
+        drop(spawn(dispatcher(project_id, vec![candidate])));
     }
     StatusCode::OK
 }
@@ -661,31 +696,27 @@ fn verify_signature(secret: &str, body: &[u8], header: &str) -> bool {
     mac.verify_slice(&expected).is_ok()
 }
 
-/// Map a GitHub `pull_request` webhook payload to a dispatchable [`Candidate`], or
-/// `None` when it carries no single trigger label. Conflict (BOTH trigger labels)
-/// drops here, mirroring the poll path's discovery-stage conflict skip; the
-/// remaining gates (cross-repo / draft / author / cooldown) are applied downstream
-/// by the dispatcher closure via [`super::discover::should_skip`] /
-/// [`super::discover::cooldown_skip`], so this stays a pure parse+map (the
-/// `is_draft` / `is_cross_repository` flags it extracts are what those gates read).
-/// Pure — unit-tested without a server.
-fn payload_to_candidate(
-    payload: &Value,
-    repo: &str,
-    review_label: &str,
-    check_label: &str,
-) -> Option<Candidate> {
+/// Map a GitHub `pull_request` webhook payload to a `(project_id, Candidate)` to
+/// dispatch (#35), or `None` when it routes to no enabled project or carries no single
+/// trigger label. Conflict (BOTH of the routed project's trigger labels) drops here,
+/// mirroring the poll path's discovery-stage conflict skip; the remaining gates
+/// (cross-repo / draft / author / cooldown) are applied downstream by the dispatcher
+/// closure via [`super::discover::should_skip`] / [`super::discover::cooldown_skip`],
+/// so this stays a pure parse+route+map (the `is_draft` / `is_cross_repository` flags
+/// it extracts are what those gates read). Pure — unit-tested without a server.
+fn payload_to_candidate(payload: &Value, routes: &[ProjectRoute]) -> Option<(String, Candidate)> {
     let pr = payload.get("pull_request")?;
 
-    // Repo-ownership gate (F2): the HMAC proves the POST came from a sender who knows the
-    // secret — NOT that the event is for the repo THIS app monitors/reviews. A webhook
-    // misconfigured onto a different repo, or a reused secret, would otherwise let a
-    // label event elsewhere cross-trigger a review of the configured repo (the engine
-    // always reviews `cfg.repo`, so the payload's PR number would be applied to the wrong
-    // repo). Require the event's repo (top-level `repository.full_name`, falling back to
-    // the PR's `base.repo.full_name`) to equal the configured `repo`; missing or
-    // mismatched → no candidate (fail closed). Case-insensitive, matching GitHub's
-    // repo-name semantics (and the poll path's `gh --repo`).
+    // Repo-routing gate (#35, was F2's single-repo ownership gate): the HMAC proves the
+    // POST came from a sender who knows the secret — NOT that the event is for a repo THIS
+    // app monitors/reviews. With one global receiver serving many projects, route the
+    // event to the ENABLED project whose `repo` matches; a payload matching none is
+    // dropped (fail-closed — same spirit as the old single-repo gate, so a misconfigured
+    // webhook / reused secret on an unmonitored repo can't cross-trigger a review).
+    // Match the event's repo (top-level `repository.full_name`, falling back to the PR's
+    // `base.repo.full_name`) case-insensitively against each route's `repo` (GitHub's
+    // repo-name semantics, matching the poll path's `gh --repo`). The matched route
+    // supplies the project id to dispatch under AND the labels to classify by.
     let event_repo = payload
         .get("repository")
         .and_then(|r| r.get("full_name"))
@@ -695,11 +726,10 @@ fn payload_to_candidate(
                 .and_then(|b| b.get("repo"))
                 .and_then(|r| r.get("full_name"))
                 .and_then(Value::as_str)
-        });
-    match event_repo {
-        Some(r) if r.eq_ignore_ascii_case(repo) => {}
-        _ => return None,
-    }
+        })?;
+    let route = routes
+        .iter()
+        .find(|r| r.repo.eq_ignore_ascii_case(event_repo))?;
 
     // Parity with the poll path's `--state open` (`gh.rs`): only an OPEN PR is a
     // dispatch candidate. A closed/merged PR still carrying a trigger label (a
@@ -716,8 +746,10 @@ fn payload_to_candidate(
         .iter()
         .filter_map(|l| l.get("name").and_then(Value::as_str))
         .collect();
-    let has_review = label_names.contains(&review_label);
-    let has_check = label_names.contains(&check_label);
+    // Classify with the MATCHED project's labels (#35) — review/check labels are
+    // per-project, so a payload routed to project B is classified by B's labels.
+    let has_review = label_names.contains(&route.review_label.as_str());
+    let has_check = label_names.contains(&route.check_label.as_str());
     let kind = match (has_review, has_check) {
         (true, true) => return None, // conflict — both trigger labels (poll path skips too)
         (true, false) => "review",
@@ -752,15 +784,18 @@ fn payload_to_candidate(
         _ => true,
     };
 
-    Some(Candidate {
-        number,
-        head_sha,
-        head_ref,
-        author,
-        is_cross_repository,
-        is_draft,
-        kind: kind.to_string(),
-    })
+    Some((
+        route.id.clone(),
+        Candidate {
+            number,
+            head_sha,
+            head_ref,
+            author,
+            is_cross_repository,
+            is_draft,
+            kind: kind.to_string(),
+        },
+    ))
 }
 
 /// Probe whether `cloudflared` is runnable (`cloudflared --version`). Never errors;
@@ -999,11 +1034,35 @@ mod tests {
         serde_json::json!({ "action": "labeled", "pull_request": pr })
     }
 
+    fn route(id: &str, repo: &str, review_label: &str, check_label: &str) -> ProjectRoute {
+        ProjectRoute {
+            id: id.to_string(),
+            repo: repo.to_string(),
+            review_label: review_label.to_string(),
+            check_label: check_label.to_string(),
+        }
+    }
+
+    /// A one-project route list for `owner/repo` (id `"default"`) — the single-project
+    /// analogue of the old flat `(repo, review_label, check_label)` args, so the
+    /// existing parse/map tests read unchanged apart from the routing wrapper.
+    fn single_route(review_label: &str, check_label: &str) -> Vec<ProjectRoute> {
+        vec![route("default", "owner/repo", review_label, check_label)]
+    }
+
+    /// The minimal route list every webhook `start` test needs (one project for
+    /// `owner/repo`). The receiver params are global; routing/labels live here now.
+    fn start_routes() -> Vec<ProjectRoute> {
+        single_route("review", "check")
+    }
+
     #[test]
     fn payload_to_candidate_maps_review_label() {
         let p = pr_payload(&["needs-review"], serde_json::json!({}));
-        let c = payload_to_candidate(&p, "owner/repo", "needs-review", "needs-check")
-            .expect("review candidate");
+        let (project_id, c) =
+            payload_to_candidate(&p, &single_route("needs-review", "needs-check"))
+                .expect("review candidate");
+        assert_eq!(project_id, "default");
         assert_eq!(c.number, 42);
         assert_eq!(c.kind, "review");
         assert_eq!(c.head_sha, "abc123");
@@ -1016,8 +1075,10 @@ mod tests {
     #[test]
     fn payload_to_candidate_maps_check_label() {
         let p = pr_payload(&["needs-check"], serde_json::json!({}));
-        let c = payload_to_candidate(&p, "owner/repo", "needs-review", "needs-check")
-            .expect("check candidate");
+        let (project_id, c) =
+            payload_to_candidate(&p, &single_route("needs-review", "needs-check"))
+                .expect("check candidate");
+        assert_eq!(project_id, "default");
         assert_eq!(c.kind, "check");
     }
 
@@ -1025,10 +1086,14 @@ mod tests {
     fn payload_to_candidate_skips_conflict_and_no_trigger_label() {
         // Both trigger labels → conflict → None (mirrors the poll path).
         let both = pr_payload(&["needs-review", "needs-check"], serde_json::json!({}));
-        assert!(payload_to_candidate(&both, "owner/repo", "needs-review", "needs-check").is_none());
+        assert!(
+            payload_to_candidate(&both, &single_route("needs-review", "needs-check")).is_none()
+        );
         // No trigger label → None.
         let none = pr_payload(&["unrelated"], serde_json::json!({}));
-        assert!(payload_to_candidate(&none, "owner/repo", "needs-review", "needs-check").is_none());
+        assert!(
+            payload_to_candidate(&none, &single_route("needs-review", "needs-check")).is_none()
+        );
     }
 
     #[test]
@@ -1037,20 +1102,22 @@ mod tests {
         // the poll path's `--state open`). closed / merged / missing state → None.
         let closed = pr_payload(&["needs-review"], serde_json::json!({ "state": "closed" }));
         assert!(
-            payload_to_candidate(&closed, "owner/repo", "needs-review", "needs-check").is_none()
+            payload_to_candidate(&closed, &single_route("needs-review", "needs-check")).is_none()
         );
         let merged = pr_payload(&["needs-review"], serde_json::json!({ "state": "merged" }));
         assert!(
-            payload_to_candidate(&merged, "owner/repo", "needs-review", "needs-check").is_none()
+            payload_to_candidate(&merged, &single_route("needs-review", "needs-check")).is_none()
         );
         // Defensive: a payload with no `state` field fails safe to no candidate.
         let no_state = pr_payload(&["needs-review"], serde_json::json!({ "state": null }));
         assert!(
-            payload_to_candidate(&no_state, "owner/repo", "needs-review", "needs-check").is_none()
+            payload_to_candidate(&no_state, &single_route("needs-review", "needs-check")).is_none()
         );
         // Sanity: the default helper payload IS open and still maps.
         let open = pr_payload(&["needs-review"], serde_json::json!({}));
-        assert!(payload_to_candidate(&open, "owner/repo", "needs-review", "needs-check").is_some());
+        assert!(
+            payload_to_candidate(&open, &single_route("needs-review", "needs-check")).is_some()
+        );
     }
 
     #[test]
@@ -1060,8 +1127,9 @@ mod tests {
         // gate, not the parse, decides to skip it.
         let draft = pr_payload(&["needs-review"], serde_json::json!({ "draft": true }));
         assert!(
-            payload_to_candidate(&draft, "owner/repo", "needs-review", "needs-check")
+            payload_to_candidate(&draft, &single_route("needs-review", "needs-check"))
                 .unwrap()
+                .1
                 .is_draft
         );
 
@@ -1070,8 +1138,9 @@ mod tests {
             serde_json::json!({ "head": { "sha": "s", "ref": "r", "repo": { "full_name": "forker/repo" } } }),
         );
         assert!(
-            payload_to_candidate(&fork, "owner/repo", "needs-review", "needs-check")
+            payload_to_candidate(&fork, &single_route("needs-review", "needs-check"))
                 .unwrap()
+                .1
                 .is_cross_repository
         );
     }
@@ -1085,8 +1154,9 @@ mod tests {
             serde_json::json!({ "head": { "sha": "s", "ref": "r", "repo": null } }),
         );
         assert!(
-            payload_to_candidate(&p, "owner/repo", "needs-review", "needs-check")
+            payload_to_candidate(&p, &single_route("needs-review", "needs-check"))
                 .unwrap()
+                .1
                 .is_cross_repository
         );
     }
@@ -1094,7 +1164,32 @@ mod tests {
     #[test]
     fn payload_to_candidate_none_without_pull_request() {
         let p = serde_json::json!({ "action": "labeled" });
-        assert!(payload_to_candidate(&p, "owner/repo", "needs-review", "needs-check").is_none());
+        assert!(payload_to_candidate(&p, &single_route("needs-review", "needs-check")).is_none());
+    }
+
+    #[test]
+    fn payload_to_candidate_fails_closed_when_repo_matches_no_route() {
+        // Repo-routing gate (#35): a verified payload whose repo matches NO enabled
+        // route is DROPPED (HMAC proves the secret is known, not that the event is for
+        // a repo this app monitors). A reused secret on an unmonitored repo must not
+        // cross-trigger a review. Payload repo `owner/repo` (the helper default)
+        // against routes for `owner/a` + `owner/b` → no match → None.
+        let p = pr_payload(&["needs-review"], serde_json::json!({}));
+        let routes = vec![
+            route("a", "owner/a", "needs-review", "needs-check"),
+            route("b", "owner/b", "needs-review", "needs-check"),
+        ];
+        assert!(
+            payload_to_candidate(&p, &routes).is_none(),
+            "a payload matching no enabled route must fail closed (None)"
+        );
+        // Sanity: adding the matching route makes the SAME payload route + dispatch,
+        // so the None above is the routing gate, not a parse failure.
+        let mut routes_with_match = routes;
+        routes_with_match.push(route("c", "owner/repo", "needs-review", "needs-check"));
+        let (project_id, _c) = payload_to_candidate(&p, &routes_with_match)
+            .expect("payload routes to the matching project");
+        assert_eq!(project_id, "c");
     }
 
     #[test]
@@ -1256,7 +1351,7 @@ mod tests {
     #[tokio::test]
     async fn command_mode_start_reports_configured_public_url() {
         let mgr = WebhookManager::default();
-        mgr.set_dispatcher(Arc::new(|_| Box::pin(async {})));
+        mgr.set_dispatcher(Arc::new(|_, _| Box::pin(async {})));
 
         // port 0 → OS picks a free port; `{port}` substitutes into the (harmless) sleep
         // args. cloudflared_bin is bogus on purpose — command mode must NOT require it.
@@ -1264,9 +1359,7 @@ mod tests {
             .start(
                 0,
                 "shh".to_string(),
-                "owner/repo".to_string(),
-                "review".to_string(),
-                "check".to_string(),
+                start_routes(),
                 "prmonitor-no-such-cloudflared".to_string(),
                 TunnelSpec {
                     mode: WebhookTunnelMode::Command,
@@ -1302,15 +1395,13 @@ mod tests {
     #[tokio::test]
     async fn command_mode_self_heals_when_child_exits() {
         let mgr = WebhookManager::default();
-        mgr.set_dispatcher(Arc::new(|_| Box::pin(async {})));
+        mgr.set_dispatcher(Arc::new(|_, _| Box::pin(async {})));
 
         let s = mgr
             .start(
                 0,
                 "shh".to_string(),
-                "owner/repo".to_string(),
-                "review".to_string(),
-                "check".to_string(),
+                start_routes(),
                 "bogus".to_string(),
                 TunnelSpec {
                     mode: WebhookTunnelMode::Command,
@@ -1358,15 +1449,13 @@ mod tests {
     #[tokio::test]
     async fn listener_mode_has_no_child_and_does_not_self_heal() {
         let mgr = WebhookManager::default();
-        mgr.set_dispatcher(Arc::new(|_| Box::pin(async {})));
+        mgr.set_dispatcher(Arc::new(|_, _| Box::pin(async {})));
 
         let s = mgr
             .start(
                 0,
                 "shh".to_string(),
-                "owner/repo".to_string(),
-                "review".to_string(),
-                "check".to_string(),
+                start_routes(),
                 "prmonitor-no-such-cloudflared".to_string(),
                 TunnelSpec {
                     mode: WebhookTunnelMode::Listener,
@@ -1417,15 +1506,13 @@ mod tests {
     #[tokio::test]
     async fn stop_kills_and_reaps_tunnel_child() {
         let mgr = WebhookManager::default();
-        mgr.set_dispatcher(Arc::new(|_| Box::pin(async {})));
+        mgr.set_dispatcher(Arc::new(|_, _| Box::pin(async {})));
 
         let s = mgr
             .start(
                 0,
                 "shh".to_string(),
-                "owner/repo".to_string(),
-                "review".to_string(),
-                "check".to_string(),
+                start_routes(),
                 "bogus".to_string(),
                 TunnelSpec {
                     mode: WebhookTunnelMode::Command,
@@ -1484,15 +1571,13 @@ mod tests {
     #[tokio::test]
     async fn listener_mode_empty_public_url_reports_none() {
         let mgr = WebhookManager::default();
-        mgr.set_dispatcher(Arc::new(|_| Box::pin(async {})));
+        mgr.set_dispatcher(Arc::new(|_, _| Box::pin(async {})));
 
         let s = mgr
             .start(
                 0,
                 "shh".to_string(),
-                "owner/repo".to_string(),
-                "review".to_string(),
-                "check".to_string(),
+                start_routes(),
                 "prmonitor-no-such-cloudflared".to_string(),
                 TunnelSpec {
                     mode: WebhookTunnelMode::Listener,
@@ -1563,15 +1648,13 @@ mod tests {
     #[tokio::test]
     async fn command_mode_blank_command_errs() {
         let mgr = WebhookManager::default();
-        mgr.set_dispatcher(Arc::new(|_| Box::pin(async {})));
+        mgr.set_dispatcher(Arc::new(|_, _| Box::pin(async {})));
 
         let r = mgr
             .start(
                 0,
                 "shh".to_string(),
-                "owner/repo".to_string(),
-                "review".to_string(),
-                "check".to_string(),
+                start_routes(),
                 "bogus".to_string(),
                 TunnelSpec {
                     mode: WebhookTunnelMode::Command,
@@ -1583,36 +1666,49 @@ mod tests {
         assert!(r.is_err(), "blank command-mode command must Err");
     }
 
-    /// F2: a verified payload whose repository is NOT the configured repo must NOT map to
-    /// a candidate — the HMAC proves the secret is known, not that the event is for the
-    /// repo this app reviews. A misconfigured webhook / reused secret on another repo is
-    /// dropped (fail closed).
+    /// F2 (now #35 routing): a verified payload whose repository matches NO enabled
+    /// project's route must NOT map to a candidate — the HMAC proves the secret is known,
+    /// not that the event is for a repo this app reviews. A misconfigured webhook / reused
+    /// secret on an unmonitored repo is dropped (fail closed).
     #[test]
     fn payload_to_candidate_requires_matching_repo() {
         // A different `base.repo.full_name` (no top-level `repository`) → None despite a
-        // valid trigger label.
+        // valid trigger label: no route matches `evil/repo`.
         let other = pr_payload(
             &["needs-review"],
             serde_json::json!({ "base": { "repo": { "full_name": "evil/repo" } } }),
         );
         assert!(
-            payload_to_candidate(&other, "owner/repo", "needs-review", "needs-check").is_none(),
-            "a payload for a different repo must not dispatch"
+            payload_to_candidate(&other, &single_route("needs-review", "needs-check")).is_none(),
+            "a payload for an unrouted repo must not dispatch"
         );
 
         // Top-level `repository.full_name` (what GitHub actually sends) is honored and
-        // takes precedence: matching it admits the candidate.
+        // takes precedence: matching it admits the candidate (routed to the matched id).
         let mut top = pr_payload(&["needs-review"], serde_json::json!({}));
         top.as_object_mut().unwrap().insert(
             "repository".to_string(),
             serde_json::json!({ "full_name": "owner/repo" }),
         );
-        assert!(payload_to_candidate(&top, "owner/repo", "needs-review", "needs-check").is_some());
+        assert_eq!(
+            payload_to_candidate(&top, &single_route("needs-review", "needs-check"))
+                .map(|(id, _)| id),
+            Some("default".to_string())
+        );
 
-        // Case-insensitive (GitHub repo-name semantics): configured `Owner/Repo` matches
+        // Case-insensitive (GitHub repo-name semantics): a route for `Owner/Repo` matches
         // the event's `owner/repo`.
         let p = pr_payload(&["needs-review"], serde_json::json!({}));
-        assert!(payload_to_candidate(&p, "Owner/Repo", "needs-review", "needs-check").is_some());
+        assert!(payload_to_candidate(
+            &p,
+            &[route(
+                "default",
+                "Owner/Repo",
+                "needs-review",
+                "needs-check"
+            )]
+        )
+        .is_some());
 
         // Missing repo entirely (no top-level `repository`, no `base.repo`) → None.
         let no_repo = pr_payload(
@@ -1620,7 +1716,61 @@ mod tests {
             serde_json::json!({ "base": { "repo": null } }),
         );
         assert!(
-            payload_to_candidate(&no_repo, "owner/repo", "needs-review", "needs-check").is_none()
+            payload_to_candidate(&no_repo, &single_route("needs-review", "needs-check")).is_none()
+        );
+
+        // Empty route list (no enabled projects) → nothing can match → None.
+        let any = pr_payload(&["needs-review"], serde_json::json!({}));
+        assert!(payload_to_candidate(&any, &[]).is_none());
+    }
+
+    /// #35: with several enabled projects sharing ONE receiver, a payload routes to the
+    /// project whose repo matches (NOT the first in the list) AND is classified by THAT
+    /// project's labels — project B's `b-review` admits a review under B's id even though
+    /// project A (a different repo, different labels) comes first.
+    #[test]
+    fn payload_to_candidate_routes_to_matching_project_and_uses_its_labels() {
+        let routes = vec![
+            route("proj-a", "owner/a", "a-review", "a-check"),
+            route("proj-b", "owner/b", "b-review", "b-check"),
+        ];
+
+        // A payload for owner/b carrying B's review label → routed to proj-b, kind review.
+        let mut for_b = pr_payload(&["b-review"], serde_json::json!({}));
+        for_b.as_object_mut().unwrap().insert(
+            "repository".to_string(),
+            serde_json::json!({ "full_name": "owner/b" }),
+        );
+        let (project_id, c) =
+            payload_to_candidate(&for_b, &routes).expect("routes to proj-b on a B-label match");
+        assert_eq!(
+            project_id, "proj-b",
+            "routed to the matching project, not the first"
+        );
+        assert_eq!(c.kind, "review");
+
+        // The SAME repo with project A's label is NOT a B trigger → dropped (labels are
+        // per-project; B doesn't classify on A's labels).
+        let mut wrong_label = pr_payload(&["a-review"], serde_json::json!({}));
+        wrong_label.as_object_mut().unwrap().insert(
+            "repository".to_string(),
+            serde_json::json!({ "full_name": "owner/b" }),
+        );
+        assert!(
+            payload_to_candidate(&wrong_label, &routes).is_none(),
+            "project B does not classify on project A's labels"
+        );
+
+        // A payload for owner/a with B's check label is classified by A's labels (none
+        // match) → dropped — confirms classification uses the ROUTED project's labels.
+        let mut for_a = pr_payload(&["b-check"], serde_json::json!({}));
+        for_a.as_object_mut().unwrap().insert(
+            "repository".to_string(),
+            serde_json::json!({ "full_name": "owner/a" }),
+        );
+        assert!(
+            payload_to_candidate(&for_a, &routes).is_none(),
+            "owner/a is classified by A's labels, not B's"
         );
     }
 
@@ -1712,16 +1862,14 @@ mod tests {
 
         tauri::async_runtime::block_on(async move {
             let mgr = WebhookManager::default();
-            mgr.set_dispatcher(Arc::new(|_| Box::pin(async {})));
+            mgr.set_dispatcher(Arc::new(|_, _| Box::pin(async {})));
 
             for i in 0..3 {
                 let s = mgr
                     .start(
                         port,
                         "shh".to_string(),
-                        "owner/repo".to_string(),
-                        "review".to_string(),
-                        "check".to_string(),
+                        start_routes(),
                         "bogus".to_string(),
                         TunnelSpec {
                             mode: WebhookTunnelMode::Listener,

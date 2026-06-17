@@ -49,9 +49,9 @@ pub fn run() {
             // [`dispatch::auto_dispatch`] (so adding an engine never edits `dispatch`).
             state.scheduler.set_dispatcher(Arc::new({
                 let app = app.handle().clone();
-                move |cands| {
+                move |project_id, cands| {
                     let app = app.clone();
-                    Box::pin(run_auto_dispatch(app, cands))
+                    Box::pin(run_auto_dispatch(app, project_id, cands))
                 }
             }));
             // Install the WEBHOOK trigger's dispatch hook (#9). The webhook is a
@@ -65,14 +65,17 @@ pub fn run() {
             // is what lets `pr::webhook` stay runtime-agnostic (never names AppHandle).
             state.webhook.set_dispatcher(Arc::new({
                 let app = app.handle().clone();
-                move |cands| {
+                move |project_id: String, cands| {
                     let app = app.clone();
                     Box::pin(async move {
-                        if !pr::scheduler::auto_review_enabled(&app) {
+                        // The webhook handler already routed by repo to the owning
+                        // project (#35); apply that project's autoReview + static/cooldown
+                        // gates before reusing the same per-project run_auto_dispatch.
+                        if !pr::scheduler::auto_review_enabled(&app, &project_id) {
                             return;
                         }
-                        let gated = pr::commands::gate_dispatchable(&app, cands);
-                        run_auto_dispatch(app, gated).await;
+                        let gated = pr::commands::gate_dispatchable(&app, &project_id, cands);
+                        run_auto_dispatch(app, project_id, gated).await;
                     })
                 }
             }));
@@ -107,6 +110,7 @@ pub fn run() {
             review::commands::start_review,
             review::commands::stop_review,
             review::commands::list_review_sessions,
+            config::commands::set_active_project,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -134,24 +138,27 @@ pub fn run() {
 /// comment-only (PR #31 finding F1).
 async fn run_auto_dispatch<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
+    project_id: String,
     candidates: Vec<Candidate>,
 ) {
     if candidates.is_empty() {
         return;
     }
 
-    // A bad / hand-edited config must not take the poll loop down: skip the batch,
-    // logged + surfaced to the UI (a desktop user never sees stderr).
-    let cfg = match config::service::load_validated(&app) {
-        Ok(cfg) => cfg,
+    // Resolve + validate THIS project (#35): a bad / hand-edited project config (e.g. an
+    // escaped skill path) must not take the poll loop down — skip the batch, logged +
+    // surfaced to the UI scoped to the project (a desktop user never sees stderr).
+    // `project_validated` re-runs the skill-path validation before codex attaches it.
+    let project = match config::service::project_validated(&app, &project_id) {
+        Ok(p) => p,
         Err(e) => {
             let msg = format!("配置无效，自动 review 跳过本轮（{}）", e.message);
-            eprintln!("auto-dispatch 跳过本轮：{msg}");
-            emit_dispatch_error(&app, msg);
+            eprintln!("auto-dispatch 跳过本轮（{project_id}）：{msg}");
+            emit_dispatch_error(&app, &project_id, msg);
             return;
         }
     };
-    let skill_abs = skill_abs_path(&cfg.repo_root, &cfg.skill_rel_path);
+    let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
     let state = app.state::<AppState>();
     // Respect an explicit user `stop_codex`: a stopped codex is NOT auto-revived by a
     // dispatchable PR. Skip this batch silently (same as the autoReview-off skip — no
@@ -165,24 +172,35 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
         codex: &state.codex,
         registry: &state.sessions,
         codex_bin: review::commands::CODEX_BIN,
-        repo: &cfg.repo,
-        repo_root: &cfg.repo_root,
+        project_id: &project_id,
+        repo: &project.repo,
+        repo_root: &project.repo_root,
         skill_abs_path: &skill_abs,
     };
     // The review slice owns "what counts as active"; the pr slice owns the ledger.
-    let active = state.sessions.active_pairs();
-    let record = |cands: &[Candidate]| pr::ledger::record_dispatched(&app, cands);
-    let report = |msg: String| emit_dispatch_error(&app, msg);
+    // Both are scoped to this project (#35) so a PR number active in one project does
+    // not gate the same number in another, and dedup writes land in the right partition.
+    let active = state.sessions.active_pairs(&project_id);
+    let record = |cands: &[Candidate]| pr::ledger::record_dispatched(&app, &project_id, cands);
+    let report = |msg: String| emit_dispatch_error(&app, &project_id, msg);
     dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
 }
 
 /// Emit a session-less [`events::ReviewEvent::DispatchError`] to the review area
-/// (the availability banner). Best-effort — a gone window is not an error worth
+/// (the availability banner), routed to `project_id` (#35) so the frontend shows it
+/// on the right project. Best-effort — a gone window is not an error worth
 /// propagating from the poll loop.
-fn emit_dispatch_error<R: tauri::Runtime>(app: &tauri::AppHandle<R>, message: String) {
+fn emit_dispatch_error<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_id: &str,
+    message: String,
+) {
     let _ = app.emit(
         events::REVIEW_EVENT,
-        &events::ReviewEvent::DispatchError { message },
+        &events::ReviewEvent::DispatchError {
+            project_id: project_id.to_string(),
+            message,
+        },
     );
 }
 
