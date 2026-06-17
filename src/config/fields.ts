@@ -3,7 +3,7 @@
 // Plus two pure helpers — `validateStep` (per-step frontend gate) and `errorToStep`
 // (route a backend AppError back to the wizard step that owns the offending field).
 // Kept side-effect-free: no Pinia, no Vue — unit-tested in `fields.test.ts`.
-import type { AppConfig } from "./types";
+import { WEBHOOK_TUNNEL_MODES, type AppConfig } from "./types";
 
 export type FieldKey = keyof AppConfig;
 type FieldKind = "text" | "number" | "csv" | "select" | "checkbox";
@@ -84,7 +84,7 @@ export const GROUPS: FieldGroup[] = [
         key: "webhookPort",
         label: "本地端口",
         kind: "number",
-        hint: "本地 127.0.0.1 监听端口（仅 cloudflared 本地可达）",
+        hint: "本地 127.0.0.1 监听端口（仅经隧道公网可达）",
       },
       {
         key: "webhookSecret",
@@ -103,8 +103,10 @@ export const GROUPS: FieldGroup[] = [
         key: "webhookTunnelMode",
         label: "隧道模式",
         kind: "select",
-        options: ["quick", "command", "listener"],
-        hint: "quick=零配置随机 URL（App 起 Cloudflare Quick Tunnel）；command=自定义隧道命令、固定 URL；listener=仅监听、隧道全外置",
+        // Single-sourced from the union's backing array (#50 G9) — type & options
+        // can't drift. command/listener also need 下方「公网 URL」(webhookPublicUrl).
+        options: WEBHOOK_TUNNEL_MODES,
+        hint: "quick=零配置随机 URL（App 起 Cloudflare Quick Tunnel）；command=自定义隧道命令、固定 URL；listener=仅监听、隧道全外置。command/listener 需同时填写下方「公网 URL」",
       },
       {
         key: "webhookTunnelCommand",

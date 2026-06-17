@@ -2,12 +2,17 @@
 import type { SourceKind, EngineKind } from "../types";
 
 // Webhook receiver tunnel mode (#9), config slice-private — mirrors the Rust
-// `WebhookTunnelMode` enum's camelCase wire values. Named (like SourceKind/EngineKind)
-// so the literal union has a single home. quick = App starts a Cloudflare Quick
-// Tunnel (random URL); command = App runs the configured tunnel command ({port}
+// `WebhookTunnelMode` enum's camelCase wire values. quick = App starts a Cloudflare
+// Quick Tunnel (random URL); command = App runs the configured tunnel command ({port}
 // placeholder); listener = App only listens on 127.0.0.1:port, tunnel managed
 // externally.
-export type WebhookTunnelMode = "quick" | "command" | "listener";
+//
+// Single-sourced as an `as const` array (#50 review G9): the type is DERIVED from
+// the array, and fields.ts feeds the same array into the select `options`, so the
+// type and the UI's option list can never drift. Adding/renaming a mode = edit this
+// one array. (The Rust↔TS mirror remains a separate, golden-locked contract.)
+export const WEBHOOK_TUNNEL_MODES = ["quick", "command", "listener"] as const;
+export type WebhookTunnelMode = (typeof WEBHOOK_TUNNEL_MODES)[number];
 
 export interface AppConfig {
   repo: string;

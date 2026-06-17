@@ -7,6 +7,7 @@
 import { computed, onMounted, ref } from "vue";
 import { startWebhook, stopWebhook, webhookStatus } from "./api";
 import type { WebhookStatus } from "./types";
+import { assertNever } from "../types";
 import { useConfigStore } from "../config/useConfigStore";
 
 const status = ref<WebhookStatus | null>(null);
@@ -42,12 +43,15 @@ const startLabel = computed(() => {
     return mode.value === "listener" ? "重启监听" : "重启隧道";
   }
   switch (mode.value) {
+    case "quick":
+      return "启动 Webhook 隧道";
     case "command":
       return "启动隧道（自定义命令）";
     case "listener":
       return "启动监听";
     default:
-      return "启动 Webhook 隧道";
+      // Exhaustive: a new WebhookTunnelMode arm fails to compile here (#50 G8).
+      return assertNever(mode.value);
   }
 });
 
@@ -150,7 +154,10 @@ async function copyUrl() {
     </div>
 
     <div v-else-if="status?.running && !status.payloadUrl" class="url-box">
-      <p class="hint">公网 URL 尚未解析（cloudflared 可能仍在建立隧道）。</p>
+      <p v-if="mode === 'quick'" class="hint">公网 URL 尚未解析（cloudflared 可能仍在建立隧道）。</p>
+      <p v-else class="hint">
+        请在设置中填写「公网 URL」(webhookPublicUrl) 并重启，以显示要粘进 GitHub 的 Payload URL。
+      </p>
       <button type="button" class="copy" :disabled="busy" @click="onRefresh">
         重新查询状态
       </button>
