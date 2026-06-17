@@ -248,7 +248,7 @@ mod tests {
             pr_cooldown_seconds: 1800,
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
-            auto_review: true,
+            auto_review: false,
             webhook_enabled: false,
             webhook_port: 8787,
             webhook_secret: "shh".to_string(),
