@@ -22,6 +22,35 @@ const copied = ref(false);
 const store = useConfigStore();
 const enabled = computed(() => store.config?.webhookEnabled === true);
 
+// Tunnel mode (#9) drives mode-aware copy. Read the SAVED config (start_webhook
+// honors the persisted mode), defaulting to "quick" (the AppConfig default) when
+// config isn't loaded yet. quick = App starts a Cloudflare Quick Tunnel; command =
+// App runs the configured tunnel command; listener = App only listens, tunnel is
+// managed externally.
+const mode = computed(() => store.config?.webhookTunnelMode ?? "quick");
+const port = computed(() => store.config?.webhookPort ?? null);
+
+// cloudflared is only App's concern in quick mode; command/listener manage tunnels
+// externally, so don't nag about a missing cloudflared there.
+const showCloudflaredWarn = computed(
+  () => mode.value === "quick" && status.value !== null && !status.value.cloudflaredInstalled,
+);
+
+// Action label per mode (start), and the running-state header noun.
+const startLabel = computed(() => {
+  if (status.value?.running) {
+    return mode.value === "listener" ? "重启监听" : "重启隧道";
+  }
+  switch (mode.value) {
+    case "command":
+      return "启动隧道（自定义命令）";
+    case "listener":
+      return "启动监听";
+    default:
+      return "启动 Webhook 隧道";
+  }
+});
+
 // Normalize a rejected invoke into a user-facing string (Tauri rejects with an
 // object carrying `message`; fall back to String() for anything else).
 function toMessage(e: unknown): string {
@@ -82,7 +111,7 @@ async function copyUrl() {
     </p>
     <p v-else class="hint">启动前请确认上方 Webhook 配置（端口/Secret）已保存。</p>
 
-    <p v-if="status && !status.cloudflaredInstalled" class="warn">
+    <p v-if="showCloudflaredWarn" class="warn">
       未检测到 cloudflared，请先 <code>brew install cloudflared</code>。
     </p>
 
@@ -93,7 +122,7 @@ async function copyUrl() {
         :disabled="busy || !enabled"
         @click="onStart"
       >
-        {{ busy ? "处理中…" : status?.running ? "重启 Webhook 隧道" : "启动 Webhook 隧道" }}
+        {{ busy ? "处理中…" : startLabel }}
       </button>
       <button
         v-if="status?.running"
@@ -126,6 +155,10 @@ async function copyUrl() {
         重新查询状态
       </button>
     </div>
+
+    <p v-if="status?.running && mode === 'listener'" class="hint">
+      App 仅监听 127.0.0.1:{{ port ?? "?" }}，请自行将隧道指向该端口。
+    </p>
 
     <p v-if="status?.message" class="msg">{{ status.message }}</p>
     <p v-if="error" class="error">{{ error }}</p>

@@ -30,11 +30,14 @@ function validDraft(): AppConfig {
     webhookPort: 8787,
     webhookSecret: "",
     cloudflaredBin: "cloudflared",
+    webhookTunnelMode: "quick",
+    webhookTunnelCommand: "",
+    webhookPublicUrl: "",
   };
 }
 
 describe("GROUPS", () => {
-  it("covers all 15 AppConfig keys exactly once across groups", () => {
+  it("covers all 18 AppConfig keys exactly once across groups", () => {
     const keys = GROUPS.flatMap((g) => g.fields.map((f) => f.key)).sort();
     const expected = Object.keys(validDraft()).sort();
     expect(keys).toEqual(expected);
@@ -179,5 +182,13 @@ describe("errorToStep — routes backend AppError messages", () => {
   it("webhook messages → null (settings-only, not wizard-routed)", () => {
     expect(errorToStep("webhookSecret 不能为空（启用 webhook 时必填）")).toBeNull();
     expect(errorToStep("webhookPort 必须大于 0")).toBeNull();
+    // The tunnel-mode fields (#9) are likewise Settings-only: command mode's
+    // missing-command validate() error must also fall through to null, not route
+    // to a wizard step. Message mirrors the backend's exact wording
+    // (config/model.rs validate(), which starts with the `webhookTunnelCommand`
+    // routing-field token).
+    expect(
+      errorToStep("webhookTunnelCommand 不能为空（command 模式需填隧道命令，可用 {port} 占位）"),
+    ).toBeNull();
   });
 });

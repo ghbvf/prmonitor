@@ -30,6 +30,9 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
   webhookPort: 8787,
   webhookSecret: "",
   cloudflaredBin: "cloudflared",
+  webhookTunnelMode: "quick",
+  webhookTunnelCommand: "",
+  webhookPublicUrl: "",
   ...over,
 });
 

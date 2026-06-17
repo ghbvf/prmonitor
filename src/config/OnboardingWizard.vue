@@ -39,6 +39,9 @@ const draft = reactive<AppConfig>({
   webhookPort: 8787,
   webhookSecret: "",
   cloudflaredBin: "cloudflared",
+  webhookTunnelMode: "quick",
+  webhookTunnelCommand: "",
+  webhookPublicUrl: "",
 });
 
 const authorsInput = ref("");
@@ -59,6 +62,9 @@ function hydrate(cfg: AppConfig) {
   draft.webhookPort = cfg.webhookPort;
   draft.webhookSecret = cfg.webhookSecret;
   draft.cloudflaredBin = cfg.cloudflaredBin;
+  draft.webhookTunnelMode = cfg.webhookTunnelMode;
+  draft.webhookTunnelCommand = cfg.webhookTunnelCommand;
+  draft.webhookPublicUrl = cfg.webhookPublicUrl;
   authorsInput.value = cfg.authors.join(", ");
 }
 

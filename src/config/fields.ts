@@ -99,6 +99,25 @@ export const GROUPS: FieldGroup[] = [
         kind: "text",
         hint: "cloudflared 可执行文件（默认 PATH 中的 cloudflared；未安装可 brew install cloudflared）",
       },
+      {
+        key: "webhookTunnelMode",
+        label: "隧道模式",
+        kind: "select",
+        options: ["quick", "command", "listener"],
+        hint: "quick=零配置随机 URL（App 起 Cloudflare Quick Tunnel）；command=自定义隧道命令、固定 URL；listener=仅监听、隧道全外置",
+      },
+      {
+        key: "webhookTunnelCommand",
+        label: "隧道命令",
+        kind: "text",
+        hint: "command 模式：App 拉起的隧道命令，{port} 占位（如 cloudflared tunnel run my-tunnel）",
+      },
+      {
+        key: "webhookPublicUrl",
+        label: "公网 URL",
+        kind: "text",
+        hint: "command/listener 模式：你的固定公网根 URL，面板据此显示要粘进 GitHub 的 Payload URL",
+      },
     ],
   },
   {
