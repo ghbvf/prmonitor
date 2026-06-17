@@ -1,6 +1,15 @@
 // Shared cross-slice contracts mirroring `src-tauri/src/model.rs` (the contract
 // boundary). Slices import from here; they do not import each other's internals.
 
+// Exhaustiveness guard for discriminated unions / string-literal enums: in a
+// `default`/`else` branch, `assertNever(x)` only type-checks if `x` has been
+// narrowed to `never`, so adding an arm without handling it is a COMPILE error
+// (#50 review G8, Medium — `assertNever`穷尽). Throws at runtime as a fail-safe
+// for values that bypass the type system (e.g. malformed wire data).
+export function assertNever(x: never): never {
+  throw new Error(`Unexpected value: ${String(x)}`);
+}
+
 export interface PullRequestView {
   number: number;
   title: string;

@@ -25,7 +25,7 @@
 
 use crate::error::AppResult;
 use crate::model::Candidate;
-use crate::review::engine::ReviewEngine;
+use crate::review::engine::{ReviewEngine, StartReviewOutcome};
 
 /// Auto-start reviews for a cycle's dispatchable candidates against `engine`,
 /// concurrently and unbounded, then land the dedup ledger for the ones that started.
@@ -51,11 +51,11 @@ pub async fn auto_dispatch<E: ReviewEngine>(
     record: &(dyn Fn(&[Candidate]) -> AppResult<()> + Send + Sync),
     report_error: &(dyn Fn(String) + Send + Sync),
 ) {
-    // Registry guard: drop candidates already covered by an in-flight session. With
-    // no live gate (the fresh discovery list is the source of truth), this is the
-    // safety net against starting a *second* review for a PR whose prior one is still
-    // running — the within/overlapping-cycle race the ledger (written only after a
-    // start) can't cover.
+    // Registry guard: a cheap PRE-FILTER dropping candidates a snapshot already shows
+    // in flight (or reserved), so we don't even attempt an obviously-redundant start.
+    // It is NO LONGER the correctness boundary — `engine.start` reserves `(pr, kind)`
+    // atomically (`Ok(None)` if it loses), which closes the within/overlapping-cycle
+    // race a stale snapshot can't (two concurrent dispatches both passing this filter).
     let candidates = dispatchable_after_guard(candidates, active);
     if candidates.is_empty() {
         return;
@@ -75,7 +75,13 @@ pub async fn auto_dispatch<E: ReviewEngine>(
     let mut failures: Vec<String> = Vec::new();
     for (cand, result) in candidates.into_iter().zip(results) {
         match result {
-            Ok(_session_id) => succeeded.push(cand),
+            // Started → record it in the dedup ledger.
+            Ok(StartReviewOutcome::Started(_session_id)) => succeeded.push(cand),
+            // Deduped by the registry reservation (a concurrent start already owns this
+            // `(pr, kind)`): NOT started, so nothing to record, and NOT a failure — no
+            // error banner. This is the race the snapshot guard could miss, now caught
+            // atomically downstream; here it is simply a silent skip.
+            Ok(StartReviewOutcome::Deduped) => {}
             Err(e) => {
                 eprintln!(
                     "auto-dispatch 启动 review 失败（PR {} {}）：{}",
@@ -185,6 +191,55 @@ mod tests {
         let kept = dispatchable_after_guard(candidates, &active);
         let kv: Vec<(u64, &str)> = kept.iter().map(|c| (c.number, c.kind.as_str())).collect();
         assert_eq!(kv, vec![(1, "check")]);
+    }
+
+    /// Fake engine encoding the three `start` outcomes by PR number: PR1 starts
+    /// (`Started`), PR2 is deduped (`Deduped`), PR3+ fails (`Err`).
+    struct FakeEngine;
+
+    impl ReviewEngine for FakeEngine {
+        async fn start(&self, pr_number: u64, _kind: &str) -> AppResult<StartReviewOutcome> {
+            match pr_number {
+                1 => Ok(StartReviewOutcome::Started("session-1".to_string())),
+                2 => Ok(StartReviewOutcome::Deduped),
+                _ => Err(crate::error::AppError::new("boom".to_string())),
+            }
+        }
+        async fn stop(&self, _session: &String) -> AppResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_dispatch_records_started_skips_deduped_reports_failed() {
+        use std::sync::Mutex;
+        // Locks the `Deduped` arm: a deduped candidate is neither recorded in the
+        // ledger nor reported as a start failure — distinct from both `Started` and
+        // `Err`. Without the dedicated arm, a dedup would fall into the failure banner.
+        let candidates = vec![cand(1, "review"), cand(2, "review"), cand(3, "review")];
+        let recorded: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let record = |cands: &[Candidate]| {
+            recorded
+                .lock()
+                .unwrap()
+                .extend(cands.iter().map(|c| c.number));
+            Ok(())
+        };
+        let report = |msg: String| errors.lock().unwrap().push(msg);
+
+        auto_dispatch(candidates, &FakeEngine, &[], &record, &report).await;
+
+        // Only PR1 (Started) recorded; PR2 (Deduped) and PR3 (Err) not.
+        assert_eq!(*recorded.lock().unwrap(), vec![1]);
+        // PR3 failure reported; the PR2 dedup is NOT a failure (no banner for it).
+        let errs = errors.lock().unwrap();
+        assert_eq!(errs.len(), 1, "exactly one failure banner");
+        assert!(errs[0].contains("#3"), "names the failed PR: {}", errs[0]);
+        assert!(
+            !errs[0].contains("#2"),
+            "dedup must not be reported as a failure"
+        );
     }
 
     // ── Governance: "the app writes NO labels/comments" (Medium carrier) ────────

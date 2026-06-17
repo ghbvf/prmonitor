@@ -54,6 +54,28 @@ pub fn run() {
                     Box::pin(run_auto_dispatch(app, cands))
                 }
             }));
+            // Install the WEBHOOK trigger's dispatch hook (#9). The webhook is a
+            // second auto-trigger source: its axum handler maps a push payload to a
+            // `Candidate` and hands it here. Unlike the scheduler (whose candidates
+            // are pre-gated by `build_view`), webhook candidates arrive raw, so this
+            // closure applies the parity gates the composition root owns — the same
+            // `autoReview` gate the scheduler applies at its call site, then the
+            // static/cooldown gates (`gate_dispatchable`) — before reusing the very
+            // same `run_auto_dispatch`. Keeping the gates here (not in the handler)
+            // is what lets `pr::webhook` stay runtime-agnostic (never names AppHandle).
+            state.webhook.set_dispatcher(Arc::new({
+                let app = app.handle().clone();
+                move |cands| {
+                    let app = app.clone();
+                    Box::pin(async move {
+                        if !pr::scheduler::auto_review_enabled(&app) {
+                            return;
+                        }
+                        let gated = pr::commands::gate_dispatchable(&app, cands);
+                        run_auto_dispatch(app, gated).await;
+                    })
+                }
+            }));
             // Auto-start the poll loop only when the persisted config is valid, via the
             // shared start_if_config_valid gate — the SINGLE funnel point (PR #41 F1) the
             // public start_polling command also goes through. On first launch (empty
@@ -76,6 +98,9 @@ pub fn run() {
             pr::commands::gh_status,
             pr::commands::get_prs,
             pr::commands::set_pr_archived,
+            pr::commands::start_webhook,
+            pr::commands::stop_webhook,
+            pr::commands::webhook_status,
             review::commands::get_codex_status,
             review::commands::start_codex,
             review::commands::stop_codex,
@@ -90,7 +115,11 @@ pub fn run() {
             // process never outlives the app ("软件关闭时一起关闭"). The manager's
             // shutdown is idempotent and `kill_on_drop(true)` is the backstop.
             if matches!(event, tauri::RunEvent::Exit) {
-                app_handle.state::<AppState>().codex.shutdown();
+                let state = app_handle.state::<AppState>();
+                state.codex.shutdown();
+                // Kill the cloudflared tunnel + abort the receiver so neither outlives
+                // the app (same "软件关闭时一起关闭" contract as codex).
+                state.webhook.shutdown();
             }
         });
 }

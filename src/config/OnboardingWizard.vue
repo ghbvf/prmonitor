@@ -35,6 +35,13 @@ const draft = reactive<AppConfig>({
   sourceKind: "github",
   engineKind: "codex",
   autoReview: true,
+  webhookEnabled: false,
+  webhookPort: 8787,
+  webhookSecret: "",
+  cloudflaredBin: "cloudflared",
+  webhookTunnelMode: "quick",
+  webhookTunnelCommand: "",
+  webhookPublicUrl: "",
 });
 
 const authorsInput = ref("");
@@ -51,6 +58,13 @@ function hydrate(cfg: AppConfig) {
   draft.sourceKind = cfg.sourceKind;
   draft.engineKind = cfg.engineKind;
   draft.autoReview = cfg.autoReview;
+  draft.webhookEnabled = cfg.webhookEnabled;
+  draft.webhookPort = cfg.webhookPort;
+  draft.webhookSecret = cfg.webhookSecret;
+  draft.cloudflaredBin = cfg.cloudflaredBin;
+  draft.webhookTunnelMode = cfg.webhookTunnelMode;
+  draft.webhookTunnelCommand = cfg.webhookTunnelCommand;
+  draft.webhookPublicUrl = cfg.webhookPublicUrl;
   authorsInput.value = cfg.authors.join(", ");
 }
 

@@ -55,6 +55,34 @@ pub enum EngineKind {
     // future #11: Claude
 }
 
+/// How the webhook receiver's local port is exposed to the public internet (#9).
+///
+/// Lives here (not in `pr/webhook.rs`) because, like [`SourceKind`] / [`EngineKind`],
+/// it is a config→pr cross-slice kind enum: the `config` slice persists it on
+/// `AppConfig` and the `pr` slice's `webhook::start` consumes it to branch the tunnel
+/// strategy. Keeping it in `crate::model` is the SINGLE source both slices import,
+/// rather than each defining its own — mirroring the `SourceKind` precedent.
+///
+/// Wire strings are pinned lowercase (`"quick" | "command" | "listener"`) — a
+/// cross-agent contract the frontend's TS union must mirror exactly; a serde golden
+/// test below locks it.
+///
+/// Modes:
+/// - [`Quick`](Self::Quick) (default, unchanged status quo): spawn a Cloudflare Quick
+///   Tunnel via `cloudflared` and scrape the `*.trycloudflare.com` URL.
+/// - [`Command`](Self::Command): spawn a user-supplied tunnel command (e.g. a named
+///   cloudflared tunnel, `ngrok`, …); `publicUrl` comes from config, not scraped.
+/// - [`Listener`](Self::Listener): only bind the local port; the tunnel is fully
+///   external (no child process); `publicUrl` comes from config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WebhookTunnelMode {
+    #[default]
+    Quick,
+    Command,
+    Listener,
+}
+
 /// A PR row shown in the UI (display superset of [`Candidate`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,6 +196,29 @@ mod tests {
         assert_eq!(
             serde_json::to_value(EngineKind::Codex).expect("EngineKind serializes"),
             "codex"
+        );
+    }
+
+    // Cross-agent wire contract lock for `WebhookTunnelMode` (#9): the frontend's TS
+    // union mirrors these exact lowercase strings. A variant rename or a
+    // `rename_all` change surfaces here. Default is `Quick` (status-quo behavior).
+    #[test]
+    fn webhook_tunnel_mode_serializes_to_pinned_wire_strings() {
+        assert_eq!(
+            serde_json::to_value(WebhookTunnelMode::Quick).expect("serializes"),
+            "quick"
+        );
+        assert_eq!(
+            serde_json::to_value(WebhookTunnelMode::Command).expect("serializes"),
+            "command"
+        );
+        assert_eq!(
+            serde_json::to_value(WebhookTunnelMode::Listener).expect("serializes"),
+            "listener"
+        );
+        assert_eq!(
+            serde_json::to_value(WebhookTunnelMode::default()).expect("serializes"),
+            "quick"
         );
     }
 

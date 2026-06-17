@@ -3,7 +3,7 @@
 // Plus two pure helpers — `validateStep` (per-step frontend gate) and `errorToStep`
 // (route a backend AppError back to the wizard step that owns the offending field).
 // Kept side-effect-free: no Pinia, no Vue — unit-tested in `fields.test.ts`.
-import type { AppConfig } from "./types";
+import { WEBHOOK_TUNNEL_MODES, type AppConfig } from "./types";
 
 export type FieldKey = keyof AppConfig;
 type FieldKind = "text" | "number" | "csv" | "select" | "checkbox";
@@ -17,6 +17,10 @@ export interface FieldDef {
   options?: readonly string[];
   // Reserved single-option enums (#11) are shown but not editable.
   readonly?: boolean;
+  // text fields holding a credential (e.g. the webhook HMAC secret): rendered
+  // masked (type=password) with a reveal toggle so it isn't exposed in screenshots
+  // / screen-shares.
+  secret?: boolean;
 }
 
 interface FieldGroup {
@@ -63,6 +67,58 @@ export const GROUPS: FieldGroup[] = [
         label: "PR 冷却（秒）",
         kind: "number",
         hint: "同一 PR 两次自动 review 的最小间隔",
+      },
+    ],
+  },
+  {
+    id: "webhook",
+    title: "Webhook",
+    fields: [
+      {
+        key: "webhookEnabled",
+        label: "启用 Webhook",
+        kind: "checkbox",
+        hint: "勾选后可启动本地接收端 + Cloudflare 隧道，GitHub 加触发标签即时触发 review",
+      },
+      {
+        key: "webhookPort",
+        label: "本地端口",
+        kind: "number",
+        hint: "本地 127.0.0.1 监听端口（仅经隧道公网可达）",
+      },
+      {
+        key: "webhookSecret",
+        label: "Webhook Secret",
+        kind: "text",
+        secret: true,
+        hint: "与 GitHub 仓库 webhook 的 Secret 一致；用于 HMAC 验签",
+      },
+      {
+        key: "cloudflaredBin",
+        label: "cloudflared 路径",
+        kind: "text",
+        hint: "cloudflared 可执行文件（默认 PATH 中的 cloudflared；未安装可 brew install cloudflared）",
+      },
+      {
+        key: "webhookTunnelMode",
+        label: "隧道模式",
+        kind: "select",
+        // Single-sourced from the union's backing array (#50 G9) — type & options
+        // can't drift. command/listener also need 下方「公网 URL」(webhookPublicUrl).
+        options: WEBHOOK_TUNNEL_MODES,
+        hint: "quick=零配置随机 URL（App 起 Cloudflare Quick Tunnel）；command=自定义隧道命令、固定 URL；listener=仅监听、隧道全外置。command/listener 需同时填写下方「公网 URL」",
+      },
+      {
+        key: "webhookTunnelCommand",
+        label: "隧道命令",
+        kind: "text",
+        hint: "command 模式：App 拉起的隧道命令，{port} 占位（如 cloudflared tunnel run my-tunnel）",
+      },
+      {
+        key: "webhookPublicUrl",
+        label: "公网 URL",
+        kind: "text",
+        hint: "command/listener 模式：你的固定公网根 URL，面板据此显示要粘进 GitHub 的 Payload URL",
       },
     ],
   },
@@ -182,6 +238,13 @@ export function validateStep(step: StepId, draft: AppConfig): string | null {
 // fields.test.ts. Drift on either side fails CI. Future Hard path (issue): codegen
 // the tokens / a structured `{ field }` error so the contract can't be expressed
 // wrong at all — keep both ends in sync until then.
+//
+// Webhook fields (`webhookSecret` / `webhookPort`) are deliberately NOT routed here:
+// they are Settings-only (no onboarding step owns them — see STEPS), and `webhook_enabled`
+// defaults false so the wizard's save never triggers their `validate()` errors. They
+// therefore fall through to `null` (→ done) by design; SettingsView surfaces those
+// backend errors directly without `errorToStep`. Locked by an explicit
+// "webhook messages → null" case in fields.test.ts so this stays intentional, not a gap.
 export function errorToStep(message: string): StepId | null {
   const m = message.trimStart();
   if (m.startsWith("skill")) return "skill";

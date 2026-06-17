@@ -9,6 +9,10 @@ import { useConfigStore } from "./useConfigStore";
 import type { AppConfig } from "./types";
 import { GROUPS, type FieldDef, type FieldKey } from "./fields";
 import ConfigField from "./ConfigField.vue";
+// The webhook control panel lives in the `pr` slice; mounting it here would be a
+// config→pr edge. Instead we expose a `webhook` scoped slot (saved config + live
+// draft + saving flag) and let the composition root (App.vue) fill it — keeping
+// this slice free of any pr import (F5).
 
 const store = useConfigStore();
 
@@ -30,6 +34,13 @@ const draft = reactive<AppConfig>({
   sourceKind: "github",
   engineKind: "codex",
   autoReview: true,
+  webhookEnabled: false,
+  webhookPort: 8787,
+  webhookSecret: "",
+  cloudflaredBin: "cloudflared",
+  webhookTunnelMode: "quick",
+  webhookTunnelCommand: "",
+  webhookPublicUrl: "",
 });
 
 const authorsInput = ref("");
@@ -46,6 +57,13 @@ function hydrate(cfg: AppConfig) {
   draft.sourceKind = cfg.sourceKind;
   draft.engineKind = cfg.engineKind;
   draft.autoReview = cfg.autoReview;
+  draft.webhookEnabled = cfg.webhookEnabled;
+  draft.webhookPort = cfg.webhookPort;
+  draft.webhookSecret = cfg.webhookSecret;
+  draft.cloudflaredBin = cfg.cloudflaredBin;
+  draft.webhookTunnelMode = cfg.webhookTunnelMode;
+  draft.webhookTunnelCommand = cfg.webhookTunnelCommand;
+  draft.webhookPublicUrl = cfg.webhookPublicUrl;
   authorsInput.value = cfg.authors.join(", ");
 }
 
@@ -136,6 +154,14 @@ async function onSave() {
             />
           </div>
         </template>
+
+        <slot
+          v-if="activeGroupId === 'webhook'"
+          name="webhook"
+          :saved-config="store.config"
+          :draft="draft"
+          :saving="store.saving"
+        />
 
         <div class="actions">
           <button type="submit" class="primary" :disabled="store.saving">

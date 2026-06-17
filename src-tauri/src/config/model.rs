@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
-use crate::model::{EngineKind, SourceKind};
+use crate::model::{EngineKind, SourceKind, WebhookTunnelMode};
 
 /// Persisted application configuration. Defaults target the gocell repo the
 /// app is built to serve.
@@ -41,6 +41,28 @@ pub struct AppConfig {
     pub engine_kind: EngineKind,
     /// 是否在发现 dispatchable PR 时自动派发 review（false=仅手动「开始 review」触发）。
     pub auto_review: bool,
+    /// 是否启用 webhook 接收端（#9）。开关本身只 gate「能否启动」本地接收端 + Cloudflare
+    /// 隧道（手动 `start_webhook` 命令）——不自动起、不影响轮询路径。
+    pub webhook_enabled: bool,
+    /// webhook 本地 HTTP 监听端口（仅绑 127.0.0.1；公网经 cloudflared 隧道代理到此）。
+    pub webhook_port: u16,
+    /// GitHub webhook 的 HMAC secret（`X-Hub-Signature-256` 验签）。`webhook_enabled`
+    /// 时必填——公网端点没有验签即可被任意 POST 伪造触发 review。
+    pub webhook_secret: String,
+    /// `cloudflared` 可执行文件（PATH 名或绝对路径）。Quick Tunnel 子进程由此拉起。
+    pub cloudflared_bin: String,
+    /// 隧道暴露模式（#9）。`quick`=Cloudflare Quick Tunnel（默认，现状）；
+    /// `command`=自定义隧道命令（见 `webhook_tunnel_command`）；`listener`=只监听本地端口、
+    /// 隧道完全外置。接收端只管 bind/验签/派发，隧道如何暴露公网由本字段分支。
+    pub webhook_tunnel_mode: WebhookTunnelMode,
+    /// `command` 模式下拉起的自定义隧道命令（按空白分词；首 token 为程序、其余为参数；
+    /// 字面量 `{port}` 替换成实际监听端口）。**直接 exec、不过 shell**（防注入）。仅
+    /// `command` 模式必填（由 `validate` 强制）；其他模式留空。
+    pub webhook_tunnel_command: String,
+    /// `command` / `listener` 模式下手填的公网 URL 根（隧道由外部暴露，接收端无从抓取）。
+    /// 非空则作为 `WebhookStatus.public_url`，UI 据此拼出 GitHub Payload URL；为空则 `None`。
+    /// `quick` 模式忽略本字段（URL 从 cloudflared 日志抓取）。
+    pub webhook_public_url: String,
 }
 
 impl Default for AppConfig {
@@ -57,6 +79,13 @@ impl Default for AppConfig {
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
             auto_review: true,
+            webhook_enabled: false,
+            webhook_port: 8787,
+            webhook_secret: String::new(),
+            cloudflared_bin: "cloudflared".to_string(),
+            webhook_tunnel_mode: WebhookTunnelMode::default(),
+            webhook_tunnel_command: String::new(),
+            webhook_public_url: String::new(),
         }
     }
 }
@@ -82,6 +111,11 @@ impl Default for AppConfig {
 /// (src/config/fields.ts) keys on — locked at this end by the `validate_error_*`
 /// test below (PR #41 F4, Medium). Checks run in wizard-step order so the first
 /// failure routes to the earliest offending step.
+/// Minimum `webhook_secret` length (trimmed chars) when the receiver is enabled. The
+/// secret is the SOLE gate on a public HMAC-SHA256 endpoint, so a 1–2 char value is
+/// brute-forceable; require a floor (GitHub recommends a long random secret).
+const WEBHOOK_SECRET_MIN_LEN: usize = 16;
+
 pub fn validate(config: &AppConfig) -> AppResult<()> {
     // owner/name: exactly one slash, both sides non-empty, no whitespace anywhere
     // (mirrors the frontend REPO_RE `^[^/\s]+\/[^/\s]+$`).
@@ -147,6 +181,40 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
         return Err(AppError::new("checkLabel 不能为空"));
     }
 
+    // Webhook fields are only constrained when the receiver is enabled: a public
+    // endpoint (reached via the cloudflared tunnel) MUST have a secret or any POST
+    // could forge a review trigger; a zero port can't bind. Disabled → unconstrained
+    // (defaults stay valid). Messages keep the field-token prefix the wizard's
+    // `errorToStep` contract relies on (locked by `validate_error_messages_*`).
+    if config.webhook_enabled {
+        let secret = config.webhook_secret.trim();
+        if secret.is_empty() {
+            return Err(AppError::new(
+                "webhookSecret 不能为空（启用 webhook 时必填）",
+            ));
+        }
+        // Minimum strength (F8): empty-only was insufficient — a low-entropy secret on a
+        // public endpoint is brute-forceable. Count chars on the trimmed value so leading/
+        // trailing whitespace can't pad a weak secret to length.
+        if secret.chars().count() < WEBHOOK_SECRET_MIN_LEN {
+            return Err(AppError::new(format!(
+                "webhookSecret 太短（至少 {WEBHOOK_SECRET_MIN_LEN} 个字符；请使用更长的随机串）"
+            )));
+        }
+        if config.webhook_port == 0 {
+            return Err(AppError::new("webhookPort 必须大于 0"));
+        }
+        // `command` 模式必须有命令可 spawn；空命令到 `start()` 会被防御性短路成 AppError，
+        // 在此上游拦住给出可路由的字段前缀错误（与 `quick`/`listener` 无关，故仅此分支约束）。
+        if config.webhook_tunnel_mode == WebhookTunnelMode::Command
+            && config.webhook_tunnel_command.trim().is_empty()
+        {
+            return Err(AppError::new(
+                "webhookTunnelCommand 不能为空（command 模式需填隧道命令，可用 {port} 占位）",
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -178,6 +246,13 @@ mod tests {
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
             auto_review: true,
+            webhook_enabled: false,
+            webhook_port: 8787,
+            webhook_secret: "shh".to_string(),
+            cloudflared_bin: "cloudflared".to_string(),
+            webhook_tunnel_mode: WebhookTunnelMode::default(),
+            webhook_tunnel_command: String::new(),
+            webhook_public_url: String::new(),
         };
 
         let v = serde_json::to_value(&config).expect("AppConfig serializes");
@@ -196,6 +271,14 @@ mod tests {
         assert!(v.get("engineKind").is_some());
         assert_eq!(v["engineKind"], "codex");
         assert!(v.get("autoReview").is_some());
+        assert!(v.get("webhookEnabled").is_some());
+        assert!(v.get("webhookPort").is_some());
+        assert!(v.get("webhookSecret").is_some());
+        assert!(v.get("cloudflaredBin").is_some());
+        assert!(v.get("webhookTunnelMode").is_some());
+        assert_eq!(v["webhookTunnelMode"], "quick");
+        assert!(v.get("webhookTunnelCommand").is_some());
+        assert!(v.get("webhookPublicUrl").is_some());
 
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("repo_root").is_none());
@@ -207,6 +290,13 @@ mod tests {
         assert!(v.get("source_kind").is_none());
         assert!(v.get("engine_kind").is_none());
         assert!(v.get("auto_review").is_none());
+        assert!(v.get("webhook_enabled").is_none());
+        assert!(v.get("webhook_port").is_none());
+        assert!(v.get("webhook_secret").is_none());
+        assert!(v.get("cloudflared_bin").is_none());
+        assert!(v.get("webhook_tunnel_mode").is_none());
+        assert!(v.get("webhook_tunnel_command").is_none());
+        assert!(v.get("webhook_public_url").is_none());
     }
 
     /// First-launch marker lock (Medium). The frontend routes a fresh install into
@@ -366,6 +456,106 @@ mod tests {
             })
             .is_err());
         }
+    }
+
+    #[test]
+    fn validate_webhook_fields_only_when_enabled() {
+        // Disabled (default) → empty secret / any port is fine.
+        assert!(validate(&AppConfig {
+            webhook_enabled: false,
+            webhook_secret: String::new(),
+            ..valid_base()
+        })
+        .is_ok());
+
+        // Enabled requires a non-empty secret (public endpoint forgery guard) — message
+        // keeps the `webhookSecret` routing prefix.
+        let secret_err = validate(&AppConfig {
+            webhook_enabled: true,
+            webhook_secret: "   ".to_string(),
+            ..valid_base()
+        })
+        .unwrap_err()
+        .message;
+        assert!(secret_err.starts_with("webhookSecret"), "{secret_err}");
+
+        // F8: a too-short (low-entropy) secret is also rejected, with the same routing
+        // prefix — empty-only was insufficient for a public HMAC endpoint.
+        let short_err = validate(&AppConfig {
+            webhook_enabled: true,
+            webhook_secret: "shh".to_string(), // 3 chars < WEBHOOK_SECRET_MIN_LEN
+            webhook_port: 8787,
+            ..valid_base()
+        })
+        .unwrap_err()
+        .message;
+        assert!(short_err.starts_with("webhookSecret"), "{short_err}");
+
+        // Enabled requires a non-zero port (with a long-enough secret so the secret check
+        // passes and we actually reach the port check).
+        let port_err = validate(&AppConfig {
+            webhook_enabled: true,
+            webhook_secret: "webhook-secret-0123456789".to_string(),
+            webhook_port: 0,
+            ..valid_base()
+        })
+        .unwrap_err()
+        .message;
+        assert!(port_err.starts_with("webhookPort"), "{port_err}");
+
+        // Enabled + sufficiently long secret + non-zero port → ok.
+        assert!(validate(&AppConfig {
+            webhook_enabled: true,
+            webhook_secret: "webhook-secret-0123456789".to_string(),
+            webhook_port: 8787,
+            ..valid_base()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_command_mode_requires_tunnel_command() {
+        let base = AppConfig {
+            webhook_enabled: true,
+            webhook_secret: "webhook-secret-0123456789".to_string(),
+            webhook_port: 8787,
+            ..valid_base()
+        };
+
+        // command 模式 + 空命令（含纯空白）→ err，且消息带 `webhookTunnelCommand` 路由前缀。
+        for blank in ["", "   "] {
+            let err = validate(&AppConfig {
+                webhook_tunnel_mode: WebhookTunnelMode::Command,
+                webhook_tunnel_command: blank.to_string(),
+                ..base.clone()
+            })
+            .unwrap_err()
+            .message;
+            assert!(err.starts_with("webhookTunnelCommand"), "{err}");
+        }
+
+        // command 模式 + 有命令 → ok。
+        assert!(validate(&AppConfig {
+            webhook_tunnel_mode: WebhookTunnelMode::Command,
+            webhook_tunnel_command:
+                "cloudflared tunnel run --url http://127.0.0.1:{port} my-tunnel".to_string(),
+            ..base.clone()
+        })
+        .is_ok());
+
+        // listener / quick 模式不要求命令（空命令仍 ok）。
+        assert!(validate(&AppConfig {
+            webhook_tunnel_mode: WebhookTunnelMode::Listener,
+            webhook_tunnel_command: String::new(),
+            ..base.clone()
+        })
+        .is_ok());
+        assert!(validate(&AppConfig {
+            webhook_tunnel_mode: WebhookTunnelMode::Quick,
+            webhook_tunnel_command: String::new(),
+            ..base
+        })
+        .is_ok());
     }
 
     /// Upstream lock for the `errorToStep` routing contract (PR #41 F4, Medium).

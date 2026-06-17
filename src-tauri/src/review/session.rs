@@ -9,7 +9,7 @@
 //! stream). The [`SessionRegistry`] tracks each session's lifecycle for
 //! `list_review_sessions`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -24,6 +24,7 @@ use super::engines::codex::protocol::{
 use super::engines::codex::CodexManager;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, REVIEW_EVENT};
+use crate::review::engine::StartReviewOutcome;
 
 /// A review session is identified by its codex `threadId`.
 pub type ThreadId = String;
@@ -68,7 +69,20 @@ pub struct SessionInfo {
 /// lock).
 #[derive(Default, Clone)]
 pub struct SessionRegistry {
-    inner: Arc<Mutex<HashMap<ThreadId, SessionInfo>>>,
+    inner: Arc<Mutex<RegistryState>>,
+}
+
+/// The registry's single critical section: the session map AND the set of `(pr, kind)`
+/// pairs RESERVED by an in-flight [`start_review`] that has not yet inserted its
+/// `Starting` session. Both live under ONE mutex, so reserve / promote-to-session /
+/// [`SessionRegistry::active_pairs`] are mutually atomic — the reservation closes the
+/// window where a session exists conceptually (its `thread/start` is mid-flight) but
+/// isn't yet in `sessions`, the gap the old snapshot-then-act guard could not see (two
+/// concurrent webhook deliveries both passing an empty snapshot → double review).
+#[derive(Default)]
+struct RegistryState {
+    sessions: HashMap<ThreadId, SessionInfo>,
+    reserved: HashSet<(u64, String)>,
 }
 
 /// Outcome of [`SessionRegistry::begin_interrupt`] — the atomic guard that makes
@@ -83,15 +97,20 @@ enum BeginInterrupt {
 }
 
 impl SessionRegistry {
+    /// Test-only direct session insert. Production starts a session via
+    /// [`Self::promote_reservation`] (which also consumes the reservation); tests use
+    /// this to seed arbitrary statuses (`Running`/`Done`/…) without a reservation.
+    #[cfg(test)]
     fn insert(&self, info: SessionInfo) {
         self.inner
             .lock()
             .unwrap()
+            .sessions
             .insert(info.thread_id.clone(), info);
     }
 
     fn set_status(&self, thread_id: &str, status: SessionStatus) {
-        if let Some(info) = self.inner.lock().unwrap().get_mut(thread_id) {
+        if let Some(info) = self.inner.lock().unwrap().sessions.get_mut(thread_id) {
             info.status = status;
         }
     }
@@ -99,10 +118,60 @@ impl SessionRegistry {
     /// Record the turn id and flip to [`SessionStatus::Running`] once `turn/start`
     /// has returned (the session was inserted as `Starting` before the turn began).
     fn set_running(&self, thread_id: &str, turn_id: String) {
-        if let Some(info) = self.inner.lock().unwrap().get_mut(thread_id) {
+        if let Some(info) = self.inner.lock().unwrap().sessions.get_mut(thread_id) {
             info.turn_id = turn_id;
             info.status = SessionStatus::Running;
         }
+    }
+
+    /// Atomically reserve `(pr_number, kind)` for a dispatch about to start a review,
+    /// BEFORE the async `thread/start` — so the pair is visible to a concurrent
+    /// dispatch's guard the instant this returns, not only after the `Starting` insert.
+    /// `true` = the caller now OWNS the reservation; `false` = the pair is already
+    /// covered (a prior reservation OR an in-flight session), so the caller must NOT
+    /// start and must NOT release (it owns nothing). One synchronous critical section
+    /// against the same mutex as `sessions`, so two concurrent reservations for the
+    /// same pair cannot both win (test-and-set) — this is what makes the idempotency
+    /// boundary atomic rather than a snapshot.
+    pub fn try_reserve_pair(&self, pr_number: u64, kind: &str) -> bool {
+        let mut st = self.inner.lock().unwrap();
+        let covered_by_session = st.sessions.values().any(|s| {
+            s.pr_number == pr_number
+                && s.kind == kind
+                && matches!(
+                    s.status,
+                    SessionStatus::Starting | SessionStatus::Running | SessionStatus::Interrupting
+                )
+        });
+        if covered_by_session || st.reserved.contains(&(pr_number, kind.to_string())) {
+            return false;
+        }
+        st.reserved.insert((pr_number, kind.to_string()));
+        true
+    }
+
+    /// Release a reservation taken by [`Self::try_reserve_pair`] whose review did NOT
+    /// reach a `Starting` session (a `thread/start` failure / early return / panic
+    /// before the insert). A successful start hands the reservation to the inserted
+    /// session via [`Self::promote_reservation`], so the happy path never calls this.
+    /// Idempotent (a missing pair is a no-op).
+    fn release_pair(&self, pr_number: u64, kind: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .reserved
+            .remove(&(pr_number, kind.to_string()));
+    }
+
+    /// Insert the just-started session as `Starting` AND drop its reservation in ONE
+    /// critical section, so a concurrent reserve / guard never sees the pair as
+    /// unreserved-and-not-yet-a-session (the gap between `thread/start` success and the
+    /// insert). The pair stays continuously covered: reserved → (this swap) →
+    /// in-flight session.
+    fn promote_reservation(&self, info: SessionInfo) {
+        let mut st = self.inner.lock().unwrap();
+        st.reserved.remove(&(info.pr_number, info.kind.clone()));
+        st.sessions.insert(info.thread_id.clone(), info);
     }
 
     /// Atomically begin an interrupt. Only a [`SessionStatus::Running`] session
@@ -112,8 +181,8 @@ impl SessionRegistry {
     /// The check-and-set is one synchronous critical section, so two concurrent
     /// stops can't both proceed.
     fn begin_interrupt(&self, thread_id: &str) -> BeginInterrupt {
-        let mut map = self.inner.lock().unwrap();
-        match map.get_mut(thread_id) {
+        let mut st = self.inner.lock().unwrap();
+        match st.sessions.get_mut(thread_id) {
             None => BeginInterrupt::NotFound,
             Some(info) => match info.status {
                 SessionStatus::Running => {
@@ -129,7 +198,7 @@ impl SessionRegistry {
     /// [`SessionStatus::Running`], so a retry can stop the still-running turn. A
     /// terminal status that raced in via the pump meanwhile is left untouched.
     fn rollback_interrupt(&self, thread_id: &str) {
-        if let Some(info) = self.inner.lock().unwrap().get_mut(thread_id) {
+        if let Some(info) = self.inner.lock().unwrap().sessions.get_mut(thread_id) {
             if info.status == SessionStatus::Interrupting {
                 info.status = SessionStatus::Running;
             }
@@ -138,20 +207,27 @@ impl SessionRegistry {
 
     /// Snapshot of all known sessions (for `list_review_sessions`).
     pub fn list(&self) -> Vec<SessionInfo> {
-        self.inner.lock().unwrap().values().cloned().collect()
-    }
-
-    /// The `(pr_number, kind)` of every session still in flight
-    /// (`Starting`/`Running`/`Interrupting`) — the auto-trigger registry guard's
-    /// view. A PR with an in-flight session of a given kind must not be
-    /// re-dispatched; a terminal (`Done`/`Failed`) session is finished and excluded.
-    /// Owning the "what counts as active" rule here keeps [`SessionStatus`] inside
-    /// the review slice — the composition-layer dispatcher consumes only the pairs,
-    /// so it never imports the session state machine.
-    pub fn active_pairs(&self) -> Vec<(u64, String)> {
         self.inner
             .lock()
             .unwrap()
+            .sessions
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// The `(pr_number, kind)` of every in-flight session
+    /// (`Starting`/`Running`/`Interrupting`) PLUS every RESERVED pair — the
+    /// auto-trigger registry guard's view. A PR with an in-flight (or reserved) session
+    /// of a given kind must not be re-dispatched; a terminal (`Done`/`Failed`) session
+    /// is finished and excluded. Including reservations is what lets a not-yet-`Starting`
+    /// dispatch still block a concurrent one. Owning the "what counts as active" rule
+    /// here keeps [`SessionStatus`] inside the review slice — the composition-layer
+    /// dispatcher consumes only the pairs, so it never imports the session state machine.
+    pub fn active_pairs(&self) -> Vec<(u64, String)> {
+        let st = self.inner.lock().unwrap();
+        let mut pairs: Vec<(u64, String)> = st
+            .sessions
             .values()
             .filter(|s| {
                 matches!(
@@ -160,12 +236,50 @@ impl SessionRegistry {
                 )
             })
             .map(|s| (s.pr_number, s.kind.clone()))
-            .collect()
+            .collect();
+        // A reserved pair has no session yet (its `thread/start` is mid-flight) but is
+        // every bit as "in flight" — include it so the dispatch guard and a concurrent
+        // reserve both see it. A duplicate vs a just-promoted session is harmless (the
+        // guard does set membership, not counting).
+        pairs.extend(st.reserved.iter().cloned());
+        pairs
     }
 }
 
-/// Start a review for `pr_number` and stream its output. Returns the codex
-/// `threadId` (the [`crate::review::engine::SessionId`]).
+/// RAII release of a `(pr, kind)` reservation taken by
+/// [`SessionRegistry::try_reserve_pair`]. [`Self::disarm`] is called once the
+/// reservation has been handed to a `Starting` session ([`SessionRegistry::promote_reservation`]);
+/// an UNdisarmed guard releases on drop, so NO early `?` / error / panic between the
+/// reserve and the insert can leak a reservation — leak-on-failure is made
+/// unrepresentable, not merely hand-avoided on each return path.
+struct ReservationGuard<'a> {
+    registry: &'a SessionRegistry,
+    pr_number: u64,
+    kind: String,
+    armed: bool,
+}
+
+impl ReservationGuard<'_> {
+    /// The reservation has been handed to a `Starting` session — stop owning it.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReservationGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry.release_pair(self.pr_number, &self.kind);
+        }
+    }
+}
+
+/// Start a review for `pr_number` and stream its output. Returns
+/// [`StartReviewOutcome::Started`] with the codex `threadId`, or
+/// [`StartReviewOutcome::Deduped`] when the `(pr_number, kind)` is already covered by
+/// an in-flight (or reserved) review — not started. The dispatch path skips a
+/// `Deduped` (neither recorded nor a failure); the manual command surfaces it as a
+/// benign "already in flight".
 ///
 /// Subscribes to the notification stream BEFORE `turn/start` so no early delta is
 /// missed, then spawns a pump task that forwards events until the turn completes.
@@ -180,7 +294,24 @@ pub async fn start_review<R: tauri::Runtime>(
     skill_abs_path: &str,
     pr_number: u64,
     kind: &str,
-) -> AppResult<ThreadId> {
+) -> AppResult<StartReviewOutcome> {
+    // Atomic test-and-set BEFORE any `.await`: if this `(pr, kind)` is already reserved
+    // or covered by an in-flight session, do NOT start a second review. This is the
+    // idempotency boundary — atomic, not the old snapshot-then-act guard that two
+    // concurrent webhook deliveries could both pass before either's `Starting` landed.
+    if !registry.try_reserve_pair(pr_number, kind) {
+        return Ok(StartReviewOutcome::Deduped);
+    }
+    // From here, ANY early return / `?` / panic before `promote_reservation` releases
+    // the reservation via the guard's `Drop` (leak-proof); `disarm()` on success hands
+    // it to the inserted session instead.
+    let reservation = ReservationGuard {
+        registry,
+        pr_number,
+        kind: kind.to_string(),
+        armed: true,
+    };
+
     let client = codex.connection(codex_bin, repo_root).await?;
 
     // Subscribe before starting the turn: the broadcast buffers from here, so the
@@ -195,16 +326,19 @@ pub async fn start_review<R: tauri::Runtime>(
     )
     .await?;
 
-    // Register as `Starting` now we have a thread id, so a `turn/start` failure is
-    // visible to `list_review_sessions` as `Failed` (rather than the session
-    // vanishing). `turn_id` is filled once the turn starts.
-    registry.insert(SessionInfo {
+    // Hand the reservation to a `Starting` session in ONE critical section (no gap):
+    // the pair stays continuously covered (reserved → Starting), so a concurrent
+    // dispatch never slips between `thread/start` success and this insert. A later
+    // `turn/start` failure flips it to `Failed` (visible to `list_review_sessions`,
+    // not vanished); `turn_id` is filled once the turn starts.
+    registry.promote_reservation(SessionInfo {
         thread_id: thread_id.clone(),
         turn_id: String::new(),
         pr_number,
         kind: kind.to_string(),
         status: SessionStatus::Starting,
     });
+    reservation.disarm();
 
     let prompt = review_prompt(repo, &skill_command(pr_number, kind));
     let turn_id = match process::start_turn(
@@ -243,7 +377,7 @@ pub async fn start_review<R: tauri::Runtime>(
 
     tauri::async_runtime::spawn(pump(rx, thread_id.clone(), app.clone(), registry.clone()));
 
-    Ok(thread_id)
+    Ok(StartReviewOutcome::Started(thread_id))
 }
 
 /// Interrupt a running review session. The terminal `turn/completed` (status
@@ -609,6 +743,97 @@ mod tests {
                 (2, "check".to_string()),
                 (3, "review".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn try_reserve_pair_is_atomic_test_and_set() {
+        let reg = SessionRegistry::default();
+        assert!(reg.try_reserve_pair(7, "review"), "first reservation wins");
+        assert!(
+            !reg.try_reserve_pair(7, "review"),
+            "second is rejected while reserved"
+        );
+        // A reservation shows up in active_pairs BEFORE any Starting session exists —
+        // exactly the gap the old snapshot-then-act guard could not see.
+        assert!(reg.active_pairs().contains(&(7, "review".to_string())));
+        // A different kind for the same PR is independent (key is (pr, kind)).
+        assert!(reg.try_reserve_pair(7, "check"));
+        // Release frees it for a later cycle.
+        reg.release_pair(7, "review");
+        assert!(
+            reg.try_reserve_pair(7, "review"),
+            "reservable again after release"
+        );
+    }
+
+    #[test]
+    fn try_reserve_pair_rejects_when_session_in_flight() {
+        let reg = SessionRegistry::default();
+        // An in-flight (Running) session covers the pair even with no reservation.
+        reg.insert(SessionInfo {
+            thread_id: "t1".to_string(),
+            turn_id: "tn".to_string(),
+            pr_number: 7,
+            kind: "review".to_string(),
+            status: SessionStatus::Running,
+        });
+        assert!(!reg.try_reserve_pair(7, "review"));
+        // A different kind is still reservable; a terminal session would not block
+        // (covered by the active_pairs in-flight filter, exercised elsewhere).
+        assert!(reg.try_reserve_pair(7, "check"));
+    }
+
+    #[test]
+    fn promote_reservation_hands_off_without_a_gap() {
+        let reg = SessionRegistry::default();
+        assert!(reg.try_reserve_pair(7, "review"));
+        reg.promote_reservation(SessionInfo {
+            thread_id: "t1".to_string(),
+            turn_id: String::new(),
+            pr_number: 7,
+            kind: "review".to_string(),
+            status: SessionStatus::Starting,
+        });
+        // After promotion the pair is covered by the Starting session, not the reserved
+        // set — and a concurrent reserve still loses (continuous coverage, no gap).
+        assert!(!reg.try_reserve_pair(7, "review"));
+        // The reservation was CONSUMED, not double-counted: exactly one active pair.
+        let pairs = reg.active_pairs();
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|p| **p == (7, "review".to_string()))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_reservations_admit_exactly_one() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // The end-to-end invariant the finding asks for: N concurrent dispatches for
+        // the SAME (pr, kind) → exactly ONE reserves (and so exactly one would start).
+        // `SessionRegistry: Clone` shares the `Arc<Mutex>`, faithful to production.
+        let reg = SessionRegistry::default();
+        let winners = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..32 {
+            let reg = reg.clone();
+            let winners = Arc::clone(&winners);
+            handles.push(tokio::spawn(async move {
+                if reg.try_reserve_pair(7, "review") {
+                    winners.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(
+            winners.load(Ordering::SeqCst),
+            1,
+            "exactly one of N concurrent dispatches reserves the pair"
         );
     }
 

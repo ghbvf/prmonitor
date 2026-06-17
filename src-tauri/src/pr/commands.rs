@@ -9,6 +9,7 @@ use crate::model::{Candidate, PullRequestView};
 use super::discover::{self, MonitorParams};
 use super::gh::{gh_auth_status, GhRow, GhStatus, GithubCli};
 use super::ledger::{now_epoch, Ledger};
+use super::webhook::WebhookStatus;
 
 /// Annotates one discovered row for the PR list and surfaces its dispatchable
 /// [`Candidate`] when nothing gates it. Conflict (both trigger labels) skips
@@ -206,6 +207,136 @@ pub fn set_pr_archived<R: tauri::Runtime>(
     Ok(())
 }
 
+/// Apply the SAME static + cooldown gates the poll path applies (via `build_view`)
+/// to webhook-sourced candidates, so a push trigger has dispatch parity with the
+/// scheduler: no draft / fork / disallowed-author / within-cooldown PR slips through
+/// just because it arrived by webhook. Reads config (authors / cooldown) and the
+/// dedup ledger, then filters each candidate through [`discover::should_skip`] and
+/// [`discover::cooldown_skip`].
+///
+/// BOTH reads fail CLOSED: an unreadable config OR an unreadable ledger returns an
+/// empty Vec (dispatch nothing), same spirit as [`super::scheduler::auto_review_enabled`].
+/// The ledger is the dedup/cooldown source of truth — degrading it to an empty ledger
+/// (the prior `unwrap_or_default()`) would pass EVERY cooldown/dedup gate and re-review
+/// storm, so an unprovable "not a recent duplicate" must fail closed, matching the poll
+/// path (`discover` uses `Ledger::load(app)?`).
+///
+/// Called by the composition root's webhook dispatcher closure (`lib.rs`); the
+/// conflict (both-labels) gate already dropped in `webhook::payload_to_candidate`.
+///
+/// Coverage: the pure predicate composition is unit-tested via [`gate_candidates`];
+/// the predicates themselves at their source (`discover::should_skip` /
+/// `cooldown_skip`). The `AppHandle`-bound load branches run in the live app (a Tauri
+/// `AppHandle` isn't constructible in a plain test).
+pub(crate) fn gate_dispatchable<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    candidates: Vec<Candidate>,
+) -> Vec<Candidate> {
+    let Ok(cfg) = config_service::load(app) else {
+        return Vec::new();
+    };
+    let params = MonitorParams {
+        repo: cfg.repo,
+        review_label: cfg.review_label,
+        check_label: cfg.check_label,
+        authors: cfg.authors,
+        pr_cooldown_seconds: cfg.pr_cooldown_seconds,
+    };
+    let Ok(ledger) = Ledger::load(app) else {
+        return Vec::new();
+    };
+    gate_candidates(candidates, &params, &ledger, now_epoch())
+}
+
+/// Drop candidates a fresh `should_skip` / `cooldown_skip` rejects against `ledger`.
+/// Split from [`gate_dispatchable`] so the predicate composition is unit-testable
+/// without an `AppHandle` — locking that the webhook gate applies BOTH the static and
+/// the cooldown gate (the predicates themselves are tested at their source in
+/// `discover.rs`).
+fn gate_candidates(
+    candidates: Vec<Candidate>,
+    params: &MonitorParams,
+    ledger: &Ledger,
+    now: u64,
+) -> Vec<Candidate> {
+    candidates
+        .into_iter()
+        .filter(|c| {
+            discover::should_skip(c, params, ledger).is_none()
+                && discover::cooldown_skip(c, params, ledger, now).is_none()
+        })
+        .collect()
+}
+
+/// Starts the webhook receiver + Cloudflare Quick Tunnel. Requires `webhook_enabled`
+/// in the persisted config; returns the resolved status (incl. the public
+/// `*.trycloudflare.com` URL to paste into GitHub). The local server binds
+/// `127.0.0.1` only — the public path is the tunnel.
+///
+/// Uses `load_validated` (not bare `load`) so the SAME `validate` the wizard / poll
+/// path enforce gates the start: when `webhook_enabled`, an empty `webhookSecret` or a
+/// zero `webhookPort` (a hand-edited config that would bind a random port) is rejected
+/// HERE, before cloudflared spawns — parity with `start_polling` / `start_review`.
+/// `validate` only constrains the webhook fields WHEN enabled, so the explicit
+/// `webhook_enabled` check below still owns the "enable it first" message.
+#[tauri::command]
+pub async fn start_webhook<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> AppResult<WebhookStatus> {
+    let cfg = config_service::load_validated(&app)?;
+    if !cfg.webhook_enabled {
+        return Err(crate::error::AppError::new(
+            "请先在设置中启用 Webhook 并保存配置",
+        ));
+    }
+    state
+        .webhook
+        .start(
+            cfg.webhook_port,
+            cfg.webhook_secret,
+            cfg.repo,
+            cfg.review_label,
+            cfg.check_label,
+            cfg.cloudflared_bin,
+            super::webhook::TunnelSpec {
+                mode: cfg.webhook_tunnel_mode,
+                command: cfg.webhook_tunnel_command,
+                public_url: cfg.webhook_public_url,
+            },
+        )
+        .await
+}
+
+/// Stops the webhook receiver + tunnel (no-op if not running). Returns the post-stop
+/// status (so the UI reflects `running: false` + the current cloudflared install state).
+#[tauri::command]
+pub async fn stop_webhook<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> AppResult<WebhookStatus> {
+    state.webhook.stop().await;
+    let cfg = config_service::load(&app)?;
+    Ok(state
+        .webhook
+        .status(&cfg.cloudflared_bin, cfg.webhook_tunnel_mode)
+        .await)
+}
+
+/// Reports webhook receiver + tunnel status (running, public URL, cloudflared install)
+/// for the settings panel.
+#[tauri::command]
+pub async fn webhook_status<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, crate::state::AppState>,
+) -> AppResult<WebhookStatus> {
+    let cfg = config_service::load(&app)?;
+    Ok(state
+        .webhook
+        .status(&cfg.cloudflared_bin, cfg.webhook_tunnel_mode)
+        .await)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +431,34 @@ mod tests {
             view.skip_reason
         );
         assert!(cand.is_none());
+    }
+
+    #[test]
+    fn gate_candidates_drops_dispatched_and_cooldown_but_keeps_clean() {
+        use crate::pr::ledger::{dispatch_key, DispatchEvent};
+        use std::collections::HashSet;
+
+        let clean = row(1, "review", false).candidate;
+        let dispatched = row(2, "review", false).candidate;
+        let cooled = row(3, "review", false).candidate;
+
+        let ledger = Ledger {
+            // #2 already dispatched at this head_sha → should_skip drops it.
+            dispatched: HashSet::from([dispatch_key(2, &dispatched.head_sha, "review")]),
+            // #3 dispatched 500s before `now` (1800s cooldown) → cooldown_skip drops it.
+            events: vec![DispatchEvent {
+                pr: 3,
+                kind: "review".to_string(),
+                head_sha: cooled.head_sha.clone(),
+                key: dispatch_key(3, &cooled.head_sha, "review"),
+                dispatched_at_epoch: 1_000,
+            }],
+        };
+
+        // Locks that the webhook gate applies BOTH the static (dispatched) and the
+        // cooldown gate — only the clean candidate survives.
+        let kept = gate_candidates(vec![clean, dispatched, cooled], &params(), &ledger, 1_500);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].number, 1);
     }
 }
