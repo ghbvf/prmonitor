@@ -111,6 +111,11 @@ impl Default for AppConfig {
 /// (src/config/fields.ts) keys on — locked at this end by the `validate_error_*`
 /// test below (PR #41 F4, Medium). Checks run in wizard-step order so the first
 /// failure routes to the earliest offending step.
+/// Minimum `webhook_secret` length (trimmed chars) when the receiver is enabled. The
+/// secret is the SOLE gate on a public HMAC-SHA256 endpoint, so a 1–2 char value is
+/// brute-forceable; require a floor (GitHub recommends a long random secret).
+const WEBHOOK_SECRET_MIN_LEN: usize = 16;
+
 pub fn validate(config: &AppConfig) -> AppResult<()> {
     // owner/name: exactly one slash, both sides non-empty, no whitespace anywhere
     // (mirrors the frontend REPO_RE `^[^/\s]+\/[^/\s]+$`).
@@ -182,10 +187,19 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
     // (defaults stay valid). Messages keep the field-token prefix the wizard's
     // `errorToStep` contract relies on (locked by `validate_error_messages_*`).
     if config.webhook_enabled {
-        if config.webhook_secret.trim().is_empty() {
+        let secret = config.webhook_secret.trim();
+        if secret.is_empty() {
             return Err(AppError::new(
                 "webhookSecret 不能为空（启用 webhook 时必填）",
             ));
+        }
+        // Minimum strength (F8): empty-only was insufficient — a low-entropy secret on a
+        // public endpoint is brute-forceable. Count chars on the trimmed value so leading/
+        // trailing whitespace can't pad a weak secret to length.
+        if secret.chars().count() < WEBHOOK_SECRET_MIN_LEN {
+            return Err(AppError::new(format!(
+                "webhookSecret 太短（至少 {WEBHOOK_SECRET_MIN_LEN} 个字符；请使用更长的随机串）"
+            )));
         }
         if config.webhook_port == 0 {
             return Err(AppError::new("webhookPort 必须大于 0"));
@@ -465,10 +479,23 @@ mod tests {
         .message;
         assert!(secret_err.starts_with("webhookSecret"), "{secret_err}");
 
-        // Enabled requires a non-zero port.
+        // F8: a too-short (low-entropy) secret is also rejected, with the same routing
+        // prefix — empty-only was insufficient for a public HMAC endpoint.
+        let short_err = validate(&AppConfig {
+            webhook_enabled: true,
+            webhook_secret: "shh".to_string(), // 3 chars < WEBHOOK_SECRET_MIN_LEN
+            webhook_port: 8787,
+            ..valid_base()
+        })
+        .unwrap_err()
+        .message;
+        assert!(short_err.starts_with("webhookSecret"), "{short_err}");
+
+        // Enabled requires a non-zero port (with a long-enough secret so the secret check
+        // passes and we actually reach the port check).
         let port_err = validate(&AppConfig {
             webhook_enabled: true,
-            webhook_secret: "shh".to_string(),
+            webhook_secret: "webhook-secret-0123456789".to_string(),
             webhook_port: 0,
             ..valid_base()
         })
@@ -476,10 +503,10 @@ mod tests {
         .message;
         assert!(port_err.starts_with("webhookPort"), "{port_err}");
 
-        // Enabled + valid secret + non-zero port → ok.
+        // Enabled + sufficiently long secret + non-zero port → ok.
         assert!(validate(&AppConfig {
             webhook_enabled: true,
-            webhook_secret: "shh".to_string(),
+            webhook_secret: "webhook-secret-0123456789".to_string(),
             webhook_port: 8787,
             ..valid_base()
         })
@@ -490,7 +517,7 @@ mod tests {
     fn validate_command_mode_requires_tunnel_command() {
         let base = AppConfig {
             webhook_enabled: true,
-            webhook_secret: "shh".to_string(),
+            webhook_secret: "webhook-secret-0123456789".to_string(),
             webhook_port: 8787,
             ..valid_base()
         };
