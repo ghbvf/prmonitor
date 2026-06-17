@@ -25,12 +25,17 @@ pub const REVIEW_EVENT: &str = "review:event";
 pub enum PrEvent {
     /// The retained tracked-PR list (the persisted-retention view, not a raw
     /// per-round discovery — a transient miss flips presence rather than dropping
-    /// a row).
+    /// a row). `project_id` is the routing key (#35): the frontend keys the PR list
+    /// it updates by which project this refresh belongs to.
     #[serde(rename_all = "camelCase")]
-    Updated { prs: Vec<TrackedPrView> },
-    /// A discovery cycle failed; the loop keeps running.
+    Updated {
+        project_id: String,
+        prs: Vec<TrackedPrView>,
+    },
+    /// A discovery cycle failed; the loop keeps running. `project_id` scopes the
+    /// error to the offending project (#35).
     #[serde(rename_all = "camelCase")]
-    Error { message: String },
+    Error { project_id: String, message: String },
 }
 
 /// A single streamed unit of a review session, forwarded to the frontend.
@@ -42,9 +47,11 @@ pub enum PrEvent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum ReviewEvent {
-    /// Incremental assistant message text.
+    /// Incremental assistant message text. `project_id` is the routing key (#35):
+    /// the frontend attributes the streamed delta to the owning project's session.
     #[serde(rename_all = "camelCase")]
     MessageDelta {
+        project_id: String,
         thread_id: String,
         item_id: String,
         text: String,
@@ -52,24 +59,35 @@ pub enum ReviewEvent {
     /// Incremental reasoning text.
     #[serde(rename_all = "camelCase")]
     ReasoningDelta {
+        project_id: String,
         thread_id: String,
         item_id: String,
         text: String,
     },
     /// The review turn ended (`completed` / `interrupted` / `failed`).
     #[serde(rename_all = "camelCase")]
-    TurnCompleted { thread_id: String, status: String },
+    TurnCompleted {
+        project_id: String,
+        thread_id: String,
+        status: String,
+    },
     /// A session-level error.
     #[serde(rename_all = "camelCase")]
-    Error { thread_id: String, message: String },
+    Error {
+        project_id: String,
+        thread_id: String,
+        message: String,
+    },
     /// An auto-trigger dispatch-level notice NOT tied to any one session — config
     /// invalid, one/more `start_review` failures, or a ledger-write failure during
-    /// `crate::dispatch::auto_dispatch`. Carries no `threadId`; the frontend
-    /// surfaces it as an app-level "auto review" notice (the availability banner),
-    /// not a session stream event. `message` is single-word so no per-variant
-    /// `rename_all` is needed (the container tag rename still maps the variant name
-    /// to the camelCase `"dispatchError"`).
-    DispatchError { message: String },
+    /// `crate::dispatch::auto_dispatch`. Carries no `threadId` (session-less), but
+    /// DOES carry `project_id` (#35) so the frontend can scope the app-level "auto
+    /// review" notice to the offending project. Now that it has >1 field, it needs
+    /// its own `#[serde(rename_all = "camelCase")]` so `projectId` serializes
+    /// camelCase (the container tag rename only maps the variant name to the
+    /// camelCase `"dispatchError"` — it does not propagate to field keys).
+    #[serde(rename_all = "camelCase")]
+    DispatchError { project_id: String, message: String },
 }
 
 /// Serde wire-shape lock for the `ReviewEvent` discriminated union.
@@ -111,12 +129,16 @@ mod tests {
     #[test]
     fn pr_updated_wire_shape_is_camel_case() {
         let event = PrEvent::Updated {
+            project_id: "p1".to_string(),
             prs: vec![sample_view()],
         };
 
         let v = serde_json::to_value(&event).expect("PrEvent serializes");
 
         assert_eq!(v["kind"], "updated");
+        // `projectId` routing key present (camelCase); snake_case absent (#35).
+        assert!(v.get("projectId").is_some());
+        assert!(v.get("project_id").is_none());
         assert!(v.get("prs").is_some());
         // The row carries the flattened `PullRequestView` keys plus the retention
         // fields — a drift in `TrackedPrView`'s wire shape surfaces here too.
@@ -136,12 +158,15 @@ mod tests {
     #[test]
     fn pr_error_wire_shape_is_camel_case() {
         let event = PrEvent::Error {
+            project_id: "p1".to_string(),
             message: "boom".to_string(),
         };
 
         let v = serde_json::to_value(&event).expect("PrEvent serializes");
 
         assert_eq!(v["kind"], "error");
+        assert!(v.get("projectId").is_some());
+        assert!(v.get("project_id").is_none());
         assert!(v.get("message").is_some());
     }
 
@@ -160,6 +185,7 @@ mod tests {
     #[test]
     fn message_delta_wire_shape_is_camel_case() {
         let event = ReviewEvent::MessageDelta {
+            project_id: "p1".to_string(),
             thread_id: "t1".to_string(),
             item_id: "i1".to_string(),
             text: "hello".to_string(),
@@ -171,11 +197,13 @@ mod tests {
         assert_eq!(v["kind"], "messageDelta");
 
         // camelCase field keys present.
+        assert!(v.get("projectId").is_some());
         assert!(v.get("threadId").is_some());
         assert!(v.get("itemId").is_some());
         assert!(v.get("text").is_some());
 
         // snake_case forms absent — a rename would surface here.
+        assert!(v.get("project_id").is_none());
         assert!(v.get("thread_id").is_none());
         assert!(v.get("item_id").is_none());
     }
@@ -183,15 +211,18 @@ mod tests {
     #[test]
     fn reasoning_delta_wire_shape_is_camel_case() {
         let event = ReviewEvent::ReasoningDelta {
+            project_id: "p1".to_string(),
             thread_id: "t1".to_string(),
             item_id: "i1".to_string(),
             text: "why".to_string(),
         };
         let v = serde_json::to_value(&event).expect("ReviewEvent serializes");
         assert_eq!(v["kind"], "reasoningDelta");
+        assert!(v.get("projectId").is_some());
         assert!(v.get("threadId").is_some());
         assert!(v.get("itemId").is_some());
         assert!(v.get("text").is_some());
+        assert!(v.get("project_id").is_none());
         assert!(v.get("thread_id").is_none());
         assert!(v.get("item_id").is_none());
     }
@@ -199,24 +230,30 @@ mod tests {
     #[test]
     fn error_event_wire_shape_is_camel_case() {
         let event = ReviewEvent::Error {
+            project_id: "p1".to_string(),
             thread_id: "t1".to_string(),
             message: "boom".to_string(),
         };
         let v = serde_json::to_value(&event).expect("ReviewEvent serializes");
         assert_eq!(v["kind"], "error");
+        assert!(v.get("projectId").is_some());
         assert!(v.get("threadId").is_some());
         assert!(v.get("message").is_some());
+        assert!(v.get("project_id").is_none());
         assert!(v.get("thread_id").is_none());
     }
 
     #[test]
     fn dispatch_error_wire_shape_is_camel_case_and_session_less() {
         let event = ReviewEvent::DispatchError {
+            project_id: "p1".to_string(),
             message: "boom".to_string(),
         };
         let v = serde_json::to_value(&event).expect("ReviewEvent serializes");
-        // Variant tag camelCased by the container rule; carries only `message`.
+        // Variant tag camelCased by the container rule; carries `projectId` + `message`.
         assert_eq!(v["kind"], "dispatchError");
+        assert!(v.get("projectId").is_some());
+        assert!(v.get("project_id").is_none());
         assert!(v.get("message").is_some());
         // Session-less: no thread id (a rename / accidental field would surface here,
         // and the `src/types.ts` mirror must stay session-less in lockstep).
@@ -227,6 +264,7 @@ mod tests {
     #[test]
     fn turn_completed_wire_shape_is_camel_case() {
         let event = ReviewEvent::TurnCompleted {
+            project_id: "p1".to_string(),
             thread_id: "t1".to_string(),
             status: "completed".to_string(),
         };
@@ -237,10 +275,12 @@ mod tests {
         assert_eq!(v["kind"], "turnCompleted");
 
         // camelCase field keys present.
+        assert!(v.get("projectId").is_some());
         assert!(v.get("threadId").is_some());
         assert!(v.get("status").is_some());
 
         // snake_case form absent — a rename would surface here.
+        assert!(v.get("project_id").is_none());
         assert!(v.get("thread_id").is_none());
     }
 }
