@@ -17,12 +17,13 @@ import {
   ghStatus,
   onPrsUpdated,
   pollNow,
+  pollStatus as fetchPollStatus,
   setPrArchived,
   startPolling,
   stopPolling,
 } from "./api";
 import type { TrackedPrView } from "../types";
-import type { GhStatus } from "./types";
+import type { GhStatus, PollStatus } from "./types";
 import { useProjects } from "../projects";
 
 interface PrState {
@@ -44,6 +45,10 @@ interface PrState {
   // gh CLI auth is process-global, not per-project — stays scalar.
   gh: GhStatus | null;
   ghLoading: boolean;
+  // Per-project backend poll-loop status (#62), keyed by projectId. Null until the
+  // first refreshPollStatus lands (or if its command rejects). Diagnostics-only —
+  // distinct from the optimistic `polling` flag above, which mirrors the UI toggle.
+  pollStatus: Record<string, PollStatus | null>;
 }
 
 // A rejected Tauri invoke throws the AppError object `{ message }`; fall back to
@@ -63,6 +68,7 @@ export const usePrStore = defineStore("pr", {
     snapshotLoaded: {},
     gh: null,
     ghLoading: false,
+    pollStatus: {},
   }),
   getters: {
     // Parameterized tracking-aware partitions (#38), scoped to one project (#35).
@@ -120,6 +126,11 @@ export const usePrStore = defineStore("pr", {
     pollingActive(state): boolean {
       return state.polling[useProjects().activeProjectId.value] ?? true;
     },
+    // The ACTIVE project's backend poll-loop status (#62), or null before the first
+    // refresh / on a rejected fetch. PollControls reads this for the diagnostics line.
+    pollStatusActive(state): PollStatus | null {
+      return state.pollStatus[useProjects().activeProjectId.value] ?? null;
+    },
   },
   actions: {
     // Wire the `prs:updated` push stream into state, routing each payload to the
@@ -147,6 +158,10 @@ export const usePrStore = defineStore("pr", {
           this.error[pid] = e.message;
         }
         this.loading[pid] = false;
+        // Refresh the backend poll-loop status on EVERY event (both branches), so a
+        // running-but-failing loop still surfaces its latest error/heartbeat in the
+        // diagnostics line (#62). Fire-and-forget — refreshPollStatus swallows errors.
+        void this.refreshPollStatus(pid);
       });
     },
     // Read one project's backend PR snapshot into its partition (#35). Guarded
@@ -177,7 +192,10 @@ export const usePrStore = defineStore("pr", {
       const unlisten = this.subscribe(); // onPrsUpdated -> Promise<UnlistenFn>
       await unlisten; // ensure the listener is registered
       const activeId = useProjects().activeProjectId.value;
-      if (activeId) await this.loadSnapshot(activeId); // baseline active project
+      if (activeId) {
+        await this.loadSnapshot(activeId); // baseline active project
+        void this.refreshPollStatus(activeId); // baseline poll-loop diagnostics (#62)
+      }
       return unlisten;
     },
     // Switch the active project (#35): persist the selection, baseline its list if
@@ -215,6 +233,8 @@ export const usePrStore = defineStore("pr", {
           await startPolling();
           for (const id of ids) this.polling[id] = true;
         }
+        // Reflect the start/stop in the active project's backend diagnostics (#62).
+        void this.refreshPollStatus(activeId);
       } catch (err) {
         this.error[activeId] = toMessage(err);
       }
@@ -239,6 +259,16 @@ export const usePrStore = defineStore("pr", {
         this.gh = { authenticated: false, message: toMessage(err) };
       } finally {
         this.ghLoading = false;
+      }
+    },
+    // Read one project's backend poll-loop status into its partition (#62). Pure
+    // diagnostics: a rejected command leaves the prior snapshot as-is (no error
+    // banner, no list mutation) so a transient fetch failure can't blank the readout.
+    async refreshPollStatus(id: string) {
+      try {
+        this.pollStatus[id] = await fetchPollStatus(id);
+      } catch {
+        /* leave as-is */
       }
     },
   },
