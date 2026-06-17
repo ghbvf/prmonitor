@@ -25,7 +25,7 @@
 
 use crate::error::AppResult;
 use crate::model::Candidate;
-use crate::review::engine::ReviewEngine;
+use crate::review::engine::{ReviewEngine, StartReviewOutcome};
 
 /// Auto-start reviews for a cycle's dispatchable candidates against `engine`,
 /// concurrently and unbounded, then land the dedup ledger for the ones that started.
@@ -76,12 +76,12 @@ pub async fn auto_dispatch<E: ReviewEngine>(
     for (cand, result) in candidates.into_iter().zip(results) {
         match result {
             // Started → record it in the dedup ledger.
-            Ok(Some(_session_id)) => succeeded.push(cand),
+            Ok(StartReviewOutcome::Started(_session_id)) => succeeded.push(cand),
             // Deduped by the registry reservation (a concurrent start already owns this
             // `(pr, kind)`): NOT started, so nothing to record, and NOT a failure — no
             // error banner. This is the race the snapshot guard could miss, now caught
             // atomically downstream; here it is simply a silent skip.
-            Ok(None) => {}
+            Ok(StartReviewOutcome::Deduped) => {}
             Err(e) => {
                 eprintln!(
                     "auto-dispatch 启动 review 失败（PR {} {}）：{}",
@@ -194,14 +194,14 @@ mod tests {
     }
 
     /// Fake engine encoding the three `start` outcomes by PR number: PR1 starts
-    /// (`Ok(Some)`), PR2 is deduped (`Ok(None)`), PR3+ fails (`Err`).
+    /// (`Started`), PR2 is deduped (`Deduped`), PR3+ fails (`Err`).
     struct FakeEngine;
 
     impl ReviewEngine for FakeEngine {
-        async fn start(&self, pr_number: u64, _kind: &str) -> AppResult<Option<String>> {
+        async fn start(&self, pr_number: u64, _kind: &str) -> AppResult<StartReviewOutcome> {
             match pr_number {
-                1 => Ok(Some("session-1".to_string())),
-                2 => Ok(None),
+                1 => Ok(StartReviewOutcome::Started("session-1".to_string())),
+                2 => Ok(StartReviewOutcome::Deduped),
                 _ => Err(crate::error::AppError::new("boom".to_string())),
             }
         }
@@ -213,8 +213,8 @@ mod tests {
     #[tokio::test]
     async fn auto_dispatch_records_started_skips_deduped_reports_failed() {
         use std::sync::Mutex;
-        // Locks the `Ok(None)` arm: a deduped candidate is neither recorded in the
-        // ledger nor reported as a start failure — distinct from both `Ok(Some)` and
+        // Locks the `Deduped` arm: a deduped candidate is neither recorded in the
+        // ledger nor reported as a start failure — distinct from both `Started` and
         // `Err`. Without the dedicated arm, a dedup would fall into the failure banner.
         let candidates = vec![cand(1, "review"), cand(2, "review"), cand(3, "review")];
         let recorded: Mutex<Vec<u64>> = Mutex::new(Vec::new());
@@ -230,7 +230,7 @@ mod tests {
 
         auto_dispatch(candidates, &FakeEngine, &[], &record, &report).await;
 
-        // Only PR1 (Ok(Some)) recorded; PR2 (Ok(None) dedup) and PR3 (Err) not.
+        // Only PR1 (Started) recorded; PR2 (Deduped) and PR3 (Err) not.
         assert_eq!(*recorded.lock().unwrap(), vec![1]);
         // PR3 failure reported; the PR2 dedup is NOT a failure (no banner for it).
         let errs = errors.lock().unwrap();

@@ -6,7 +6,7 @@
 
 use super::CodexManager;
 use crate::error::AppResult;
-use crate::review::engine::{ReviewEngine, SessionId};
+use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
 use crate::review::session::{self, SessionRegistry};
 
 /// Per-request engine handle. Borrows the long-lived state from `AppState` plus
@@ -28,7 +28,7 @@ pub struct CodexEngine<'a, R: tauri::Runtime> {
 }
 
 impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
-    async fn start(&self, pr_number: u64, kind: &str) -> AppResult<Option<SessionId>> {
+    async fn start(&self, pr_number: u64, kind: &str) -> AppResult<StartReviewOutcome> {
         session::start_review(
             self.app,
             self.codex,

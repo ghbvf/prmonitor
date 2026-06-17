@@ -24,6 +24,7 @@ use super::engines::codex::protocol::{
 use super::engines::codex::CodexManager;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, REVIEW_EVENT};
+use crate::review::engine::StartReviewOutcome;
 
 /// A review session is identified by its codex `threadId`.
 pub type ThreadId = String;
@@ -273,12 +274,12 @@ impl Drop for ReservationGuard<'_> {
     }
 }
 
-/// Start a review for `pr_number` and stream its output. Returns the codex
-/// `threadId` (the [`crate::review::engine::SessionId`]) wrapped in `Some` once
-/// started, or `Ok(None)` when the `(pr_number, kind)` is already covered by an
-/// in-flight (or reserved) review — DEDUPED, not started. The dispatch path skips a
-/// `None` (neither recorded nor a failure); the manual command surfaces it as a benign
-/// "already in flight".
+/// Start a review for `pr_number` and stream its output. Returns
+/// [`StartReviewOutcome::Started`] with the codex `threadId`, or
+/// [`StartReviewOutcome::Deduped`] when the `(pr_number, kind)` is already covered by
+/// an in-flight (or reserved) review — not started. The dispatch path skips a
+/// `Deduped` (neither recorded nor a failure); the manual command surfaces it as a
+/// benign "already in flight".
 ///
 /// Subscribes to the notification stream BEFORE `turn/start` so no early delta is
 /// missed, then spawns a pump task that forwards events until the turn completes.
@@ -293,13 +294,13 @@ pub async fn start_review<R: tauri::Runtime>(
     skill_abs_path: &str,
     pr_number: u64,
     kind: &str,
-) -> AppResult<Option<ThreadId>> {
+) -> AppResult<StartReviewOutcome> {
     // Atomic test-and-set BEFORE any `.await`: if this `(pr, kind)` is already reserved
     // or covered by an in-flight session, do NOT start a second review. This is the
     // idempotency boundary — atomic, not the old snapshot-then-act guard that two
     // concurrent webhook deliveries could both pass before either's `Starting` landed.
     if !registry.try_reserve_pair(pr_number, kind) {
-        return Ok(None);
+        return Ok(StartReviewOutcome::Deduped);
     }
     // From here, ANY early return / `?` / panic before `promote_reservation` releases
     // the reservation via the guard's `Drop` (leak-proof); `disarm()` on success hands
@@ -376,7 +377,7 @@ pub async fn start_review<R: tauri::Runtime>(
 
     tauri::async_runtime::spawn(pump(rx, thread_id.clone(), app.clone(), registry.clone()));
 
-    Ok(Some(thread_id))
+    Ok(StartReviewOutcome::Started(thread_id))
 }
 
 /// Interrupt a running review session. The terminal `turn/completed` (status
