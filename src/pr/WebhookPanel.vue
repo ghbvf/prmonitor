@@ -4,11 +4,27 @@
 // persisted webhook config (port/secret) is edited+saved by the surrounding
 // SettingsView form; this panel only starts/stops the tunnel and surfaces the
 // public URL to paste into the GitHub repo webhook settings.
+//
+// Slice boundary (F5): this panel lives in the `pr` slice but the webhook config is
+// `config` slice state. Rather than reach into config's Pinia store (a runtime
+// pr→config edge), the composition root (App.vue) passes the SAVED config, the live
+// SettingsView draft, and the save-in-flight flag down as props. The only remaining
+// cross-slice reference is a TYPE-only `import type { AppConfig }` — erased at
+// compile time, so it creates no runtime dependency edge (the slice-boundary test
+// in src/slice-boundary.test.ts allows type-only imports for exactly this reason).
 import { computed, onMounted, ref } from "vue";
 import { startWebhook, stopWebhook, webhookStatus } from "./api";
 import type { WebhookStatus } from "./types";
 import { assertNever } from "../types";
-import { useConfigStore } from "../config/useConfigStore";
+import type { AppConfig } from "../config/types";
+
+// `savedConfig` = the persisted config the backend will actually read on start;
+// `draft` = the live SettingsView edit buffer; `saving` = a save in flight.
+const props = defineProps<{
+  savedConfig: AppConfig | null;
+  draft: AppConfig;
+  saving: boolean;
+}>();
 
 const status = ref<WebhookStatus | null>(null);
 // True while a command is in flight, to disable the action buttons.
@@ -16,20 +32,41 @@ const busy = ref(false);
 const error = ref<string | null>(null);
 const copied = ref(false);
 
-// `start_webhook` reads the PERSISTED config, so gate the button on the SAVED
-// `webhookEnabled` (store.config), not the unsaved SettingsView draft — this also
-// enforces the "save before start" coupling. When false, the backend would reject
-// the start; disabling the button surfaces that up-front instead of as an error.
-const store = useConfigStore();
-const enabled = computed(() => store.config?.webhookEnabled === true);
+// Are there unsaved webhook-field edits? `start_webhook` reads the PERSISTED config,
+// so any draft change that hasn't been saved would NOT take effect — gating start on
+// this enforces the "save before start" coupling.
+const webhookDirty = computed(() => {
+  const s = props.savedConfig;
+  const d = props.draft;
+  if (!s) return false;
+  return (
+    s.webhookEnabled !== d.webhookEnabled ||
+    s.webhookPort !== d.webhookPort ||
+    s.webhookSecret !== d.webhookSecret ||
+    s.cloudflaredBin !== d.cloudflaredBin ||
+    s.webhookTunnelMode !== d.webhookTunnelMode ||
+    s.webhookTunnelCommand !== d.webhookTunnelCommand ||
+    s.webhookPublicUrl !== d.webhookPublicUrl
+  );
+});
+
+// Gate the start button on the SAVED `webhookEnabled` (not the draft): the backend
+// reads the persisted config, so when disabled it would reject the start, and
+// disabling the button surfaces that up-front. Also block while there are unsaved
+// webhook edits (`webhookDirty`) or a save is in flight (`saving`) — starting then
+// would silently use stale persisted values (finding F6). The hint below tells the
+// user to save first.
+const enabled = computed(
+  () => props.savedConfig?.webhookEnabled === true && !webhookDirty.value && !props.saving,
+);
 
 // Tunnel mode (#9) drives mode-aware copy. Read the SAVED config (start_webhook
 // honors the persisted mode), defaulting to "quick" (the AppConfig default) when
 // config isn't loaded yet. quick = App starts a Cloudflare Quick Tunnel; command =
 // App runs the configured tunnel command; listener = App only listens, tunnel is
 // managed externally.
-const mode = computed(() => store.config?.webhookTunnelMode ?? "quick");
-const port = computed(() => store.config?.webhookPort ?? null);
+const mode = computed(() => props.savedConfig?.webhookTunnelMode ?? "quick");
+const port = computed(() => props.savedConfig?.webhookPort ?? null);
 
 // cloudflared is only App's concern in quick mode; command/listener manage tunnels
 // externally, so don't nag about a missing cloudflared there.
@@ -111,9 +148,9 @@ async function copyUrl() {
     <h3 class="title">Webhook 隧道</h3>
 
     <p v-if="!enabled" class="warn">
-      请先在上方勾选「启用 Webhook」、填好端口/Secret 并<strong>保存</strong>，然后再启动隧道。
+      请先在上方勾选「启用 Webhook」、填好端口/Secret 并<strong>保存</strong>，然后再启动隧道（有未保存的改动时也需先保存）。
     </p>
-    <p v-else class="hint">启动前请确认上方 Webhook 配置（端口/Secret）已保存。</p>
+    <p v-else class="hint">Webhook 配置已保存，可启动隧道。</p>
 
     <p v-if="showCloudflaredWarn" class="warn">
       未检测到 cloudflared，请先 <code>brew install cloudflared</code>。

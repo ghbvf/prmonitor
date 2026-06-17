@@ -9,7 +9,10 @@ import { useConfigStore } from "./useConfigStore";
 import type { AppConfig } from "./types";
 import { GROUPS, type FieldDef, type FieldKey } from "./fields";
 import ConfigField from "./ConfigField.vue";
-import WebhookPanel from "../pr/WebhookPanel.vue";
+// The webhook control panel lives in the `pr` slice; mounting it here would be a
+// config→pr edge. Instead we expose a `webhook` scoped slot (saved config + live
+// draft + saving flag) and let the composition root (App.vue) fill it — keeping
+// this slice free of any pr import (F5).
 
 const store = useConfigStore();
 
@@ -152,7 +155,13 @@ async function onSave() {
           </div>
         </template>
 
-        <WebhookPanel v-if="activeGroupId === 'webhook'" />
+        <slot
+          v-if="activeGroupId === 'webhook'"
+          name="webhook"
+          :saved-config="store.config"
+          :draft="draft"
+          :saving="store.saving"
+        />
 
         <div class="actions">
           <button type="submit" class="primary" :disabled="store.saving">

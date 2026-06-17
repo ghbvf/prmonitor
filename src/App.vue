@@ -9,6 +9,7 @@ import SettingsView from "./config/SettingsView.vue";
 import OnboardingWizard from "./config/OnboardingWizard.vue";
 import PollControls from "./pr/PollControls.vue";
 import PrList from "./pr/PrList.vue";
+import WebhookPanel from "./pr/WebhookPanel.vue";
 import { usePrStore } from "./pr/usePrStore";
 import StatusBar from "./StatusBar.vue";
 import ReviewPanel from "./review/ReviewPanel.vue";
@@ -165,7 +166,18 @@ const selectedPr = computed(
       class="view"
       @saved="onConfigSaved"
       @close="goMonitor"
-    />
+    >
+      <!-- Composition root fills SettingsView's `webhook` slot with the pr-slice
+           WebhookPanel: SettingsView (config) and WebhookPanel (pr) never import each
+           other; App wires them, passing saved config + live draft + saving flag. -->
+      <template #webhook="s">
+        <WebhookPanel
+          :saved-config="s.savedConfig"
+          :draft="s.draft"
+          :saving="s.saving"
+        />
+      </template>
+    </SettingsView>
 
     <div v-else class="layout">
       <aside class="sidebar">
