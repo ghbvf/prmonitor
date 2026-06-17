@@ -51,8 +51,9 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::Sha256;
 use tauri::async_runtime::{spawn, JoinHandle};
-use tokio::io::{AsyncBufReadExt, BufReader, Lines};
-use tokio::process::{Child, ChildStderr, Command};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
+use tokio::process::{Child, Command};
+use tokio::sync::oneshot;
 
 use super::scheduler::Dispatcher;
 use crate::error::{AppError, AppResult};
@@ -65,6 +66,20 @@ type HmacSha256 = Hmac<Sha256>;
 const TUNNEL_URL_TIMEOUT: Duration = Duration::from_secs(20);
 /// `cloudflared --version` probe budget (the install check).
 const CLOUDFLARED_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bind attempts (and inter-attempt delay) for the receiver socket, so a rapid restart
+/// can ride out the brief window where the OS hasn't yet released the prior listener's
+/// port (F3) instead of failing on a transient "address in use".
+const BIND_RETRIES: u32 = 10;
+const BIND_RETRY_DELAY: Duration = Duration::from_millis(20);
+/// `(tunnel child, drain task, shared public-URL handle)` — the per-mode result of
+/// resolving the tunnel half of a [`WebhookManager::start`]. Aliased to keep that `let`
+/// readable and satisfy `clippy::type_complexity`.
+type TunnelParts = (
+    Option<Child>,
+    Option<JoinHandle<()>>,
+    Arc<StdMutex<Option<String>>>,
+);
+
 /// The single path the axum receiver serves — also the suffix appended to the tunnel
 /// root to form the GitHub "Payload URL". ONE source for both the route registration
 /// and the URL the UI tells the user to paste; they must match or every delivery 404s.
@@ -104,7 +119,13 @@ impl WebhookStatus {
         cloudflared_installed: bool,
         message: String,
     ) -> Self {
-        let payload_url = public_url.as_ref().map(|u| format!("{u}{WEBHOOK_PATH}"));
+        // Trim a trailing '/' on the URL root before appending the route so a user-entered
+        // `https://host/` (command/listener mode) yields `https://host/webhook`, not
+        // `https://host//webhook` (F7). Quick-mode scraped URLs carry no trailing slash, so
+        // this is a no-op there.
+        let payload_url = public_url
+            .as_ref()
+            .map(|u| format!("{}{WEBHOOK_PATH}", u.trim_end_matches('/')));
         Self {
             running,
             public_url,
@@ -160,16 +181,27 @@ pub struct WebhookManager {
 /// applies when there's no child to crash).
 struct WebhookRuntime {
     server_task: JoinHandle<()>,
-    /// stderr-drain task for the tunnel child (keeps the pipe from filling). Aborted in
-    /// `teardown` for lifecycle symmetry rather than relying on the child-kill →
-    /// pipe-EOF chain to end it. `None` in `listener` mode (no child to drain).
+    /// Fires axum's graceful shutdown so teardown can AWAIT the server task's end and be
+    /// sure the listener is dropped (port freed) before returning — what makes an
+    /// immediate same-port re-bind safe (F3). Sending consumes it, hence it lives on the
+    /// owned-`self` teardown methods.
+    shutdown: oneshot::Sender<()>,
+    /// stderr-drain task for the tunnel child (keeps the pipe from filling). In `quick`
+    /// mode it ALSO keeps scanning for a late `*.trycloudflare.com` URL and writes it
+    /// into [`Self::public_url`] (so a URL printed after the initial scan window is still
+    /// captured — F4). Aborted in teardown for lifecycle symmetry rather than relying on
+    /// the child-kill → pipe-EOF chain. `None` in `listener` mode (no child to drain).
     drain_task: Option<JoinHandle<()>>,
     /// The tunnel child (cloudflared in `quick` mode, the user command in `command`
     /// mode). Kept to keep the tunnel alive (and `kill_on_drop` it on drop), and probed
     /// by `status` via `try_wait` to detect a crashed tunnel. `None` in `listener` mode
     /// (tunnel external — no child).
     tunnel: Option<Child>,
-    public_url: Option<String>,
+    /// The resolved public URL root, SHARED with `drain_task` (`quick` mode fills it in
+    /// when cloudflared prints the URL — possibly after `start` returned, F4). `status`
+    /// reads the live value through this handle, so a late URL surfaces on the next
+    /// status poll. For `command`/`listener` the URL is from config and never changes.
+    public_url: Arc<StdMutex<Option<String>>>,
     /// The tunnel mode this runtime was started with (Copy off `TunnelSpec`). Held so
     /// `status` is mode-aware: only `Quick` owns/depends on cloudflared, so only `Quick`
     /// runs the install probe + renders cloudflared-specific crash/install text.
@@ -177,15 +209,19 @@ struct WebhookRuntime {
 }
 
 impl WebhookRuntime {
-    /// Abort the server task + (if any) drain task, then explicitly kill + reap the
-    /// tunnel child. `start_kill` is synchronous (safe from the sync app-exit
-    /// `RunEvent` path) and `wait` is detached so the child (and its pipes) are reaped
-    /// rather than left a zombie for the duration of a long-running app — mirroring
-    /// `engines/codex/process.rs::kill_and_reap`. `kill_on_drop(true)` and the OS
-    /// reaping on app exit are the backstops if the reaper can't run. A `None` `tunnel`
-    /// (listener mode) skips the kill — there is no child. The single teardown shared by
-    /// `stop_inner` and `status`'s crash self-heal.
+    /// Sync best-effort teardown: abort the server + (if any) drain task, then
+    /// `start_kill` the tunnel child and reap it on a DETACHED task (mirroring
+    /// `engines/codex/process.rs::kill_and_reap`). Synchronous so it is safe from the
+    /// app-exit `RunEvent` handler ([`WebhookManager::shutdown`]) and `status`'s crash
+    /// self-heal, where no `.await` is available; it does NOT wait for the server task
+    /// to drop the listener. Use [`Self::teardown_awaiting`] on any path that re-binds
+    /// the port (restart / explicit stop). `kill_on_drop(true)` + OS exit reaping are
+    /// the backstops if the detached reaper can't run.
     fn teardown(self) {
+        // Signal graceful shutdown, then `abort` as the immediate backstop (this sync
+        // path can't await the server to fully stop). It never re-binds the port (app
+        // exit / crash self-heal), so it needn't wait for the listener to drop.
+        let _ = self.shutdown.send(());
         self.server_task.abort();
         if let Some(drain) = self.drain_task {
             drain.abort();
@@ -196,6 +232,30 @@ impl WebhookRuntime {
                 // Move `child` in so it (and its pipes) live until reaped.
                 let _ = child.wait().await;
             });
+        }
+    }
+
+    /// Async teardown that AWAITS the server task's end before returning, so the bound
+    /// `127.0.0.1:port` is actually released (the listener is owned by `server_task`;
+    /// `abort()` only schedules cancellation). Used by the restart path in
+    /// [`WebhookManager::start`] and by [`WebhookManager::stop`] so an immediate re-bind
+    /// on the same port can't hit `address in use` (F3). Also reaps the tunnel child
+    /// inline (await `wait` after `start_kill`) rather than detaching, since this path
+    /// can wait.
+    async fn teardown_awaiting(self) {
+        // Graceful shutdown + AWAIT: axum stops accepting and drops the listener, and the
+        // await returns only after the server task has fully ended — so the port is
+        // released before we return (a bare `abort` does not reliably drop the listener
+        // before the next `bind`). Webhook handlers are sub-second, so this completes fast.
+        let _ = self.shutdown.send(());
+        let _ = self.server_task.await;
+        if let Some(drain) = self.drain_task {
+            drain.abort();
+            let _ = drain.await;
+        }
+        if let Some(mut child) = self.tunnel {
+            let _ = child.start_kill();
+            let _ = child.wait().await; // reap inline (no zombie, no detached task).
         }
     }
 }
@@ -219,10 +279,12 @@ impl WebhookManager {
     ///   `public_url` is empty). Does NOT require cloudflared.
     /// - `Listener`: bind only, spawn no child; `public_url` from config. Does NOT
     ///   require cloudflared.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
         port: u16,
         secret: String,
+        repo: String,
         review_label: String,
         check_label: String,
         cloudflared_bin: String,
@@ -234,7 +296,17 @@ impl WebhookManager {
             public_url,
         } = tunnel;
         let _guard = self.start_lock.lock().await;
-        self.stop_inner(); // restart semantics — avoid double-bind.
+        // Restart: tear down any prior runtime and AWAIT the old server task's end so the
+        // bound port is actually released before we re-bind below. A sync abort (the old
+        // `stop_inner`) only schedules cancellation, racing the re-bind into a transient
+        // "address in use" (F3). Holding `start_lock` across the whole start also closes
+        // the F1 window: `stop`/`shutdown` issued mid-start can't interleave (see `stop`).
+        // Take out of the std mutex BEFORE awaiting (never hold a `StdMutex` guard across
+        // an `.await` — it would make the command future non-`Send`).
+        let prior = self.runtime.lock().unwrap().take();
+        if let Some(rt) = prior {
+            rt.teardown_awaiting().await;
+        }
 
         // Only the `quick` mode owns/depends on cloudflared; check it up front there so a
         // missing binary short-circuits BEFORE we bind. `command` / `listener` never
@@ -257,12 +329,43 @@ impl WebhookManager {
 
         // LOCAL bind only — the public path is the tunnel; the raw port is never
         // world-reachable. Shared by all three modes.
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-            .await
-            .map_err(|e| AppError::new(format!("webhookPort 监听失败（端口 {port}）：{e}")))?;
+        //
+        // Bind with a brief bounded retry (F3): on a rapid restart the prior server's
+        // graceful shutdown has been awaited, but the OS can still need a beat to release
+        // the listening socket, so an immediate re-bind may transiently see "address in
+        // use". Retry a few times before surfacing the error rather than failing the
+        // restart on a race the user can't act on.
+        let listener = {
+            let mut last_err = None;
+            let mut bound = None;
+            for attempt in 0..BIND_RETRIES {
+                match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                    Ok(l) => {
+                        bound = Some(l);
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        if attempt + 1 < BIND_RETRIES {
+                            tokio::time::sleep(BIND_RETRY_DELAY).await;
+                        }
+                    }
+                }
+            }
+            match bound {
+                Some(l) => l,
+                None => {
+                    let e = last_err.expect("a failed bind recorded its error");
+                    return Err(AppError::new(format!(
+                        "webhookPort 监听失败（端口 {port}）：{e}"
+                    )));
+                }
+            }
+        };
 
         let ctx = Arc::new(WebhookCtx {
             secret,
+            repo,
             review_label,
             check_label,
             dispatcher,
@@ -274,8 +377,17 @@ impl WebhookManager {
             // can make us buffer before the HMAC check rejects it.
             .layer(DefaultBodyLimit::max(1024 * 1024))
             .with_state(ctx);
+        // Graceful-shutdown signal: on teardown we fire `shutdown_tx` and AWAIT
+        // `server_task`, so axum stops accepting + drops the listener BEFORE teardown
+        // returns — the deterministic basis for an immediate same-port re-bind (F3). A
+        // bare `abort()` does not reliably drop the listener before the next `bind`.
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let server_task = spawn(async move {
-            let _ = axum::serve(listener, router.into_make_service()).await;
+            let _ = axum::serve(listener, router.into_make_service())
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
         });
 
         // Configured public URL for the non-scraping modes (empty → None, so the status
@@ -285,35 +397,44 @@ impl WebhookManager {
         // Resolve the tunnel per mode. On a spawn error the server task (already holding
         // the bound port) MUST be aborted here — otherwise it detaches, leaks the port,
         // and `self.runtime` stays `None` so a later `stop_inner` can't reap it.
-        let (tunnel, drain_task, resolved_url): (
-            Option<Child>,
-            Option<JoinHandle<()>>,
-            Option<String>,
-        ) = match mode {
+        let (tunnel, drain_task, public_url): TunnelParts = match mode {
             WebhookTunnelMode::Quick => match spawn_quick_tunnel(&cloudflared_bin, port).await {
                 Ok((child, drain, url)) => (Some(child), Some(drain), url),
                 Err(e) => {
-                    server_task.abort();
+                    let _ = shutdown_tx.send(());
+                    let _ = server_task.await; // graceful stop frees the bound port on failed start.
                     return Err(e);
                 }
             },
             WebhookTunnelMode::Command => match spawn_custom_tunnel(&tunnel_command, port) {
-                Ok((child, drain)) => (Some(child), Some(drain), configured_url),
+                Ok((child, drain)) => (
+                    Some(child),
+                    Some(drain),
+                    Arc::new(StdMutex::new(configured_url)),
+                ),
                 Err(e) => {
-                    server_task.abort();
+                    let _ = shutdown_tx.send(());
+                    let _ = server_task.await;
                     return Err(e);
                 }
             },
             // No child: bind-only. The tunnel is external; the URL is whatever the
             // user configured.
-            WebhookTunnelMode::Listener => (None, None, configured_url),
+            WebhookTunnelMode::Listener => (None, None, Arc::new(StdMutex::new(configured_url))),
         };
+
+        // Snapshot the URL known at this instant for the immediate return status. In
+        // `quick` mode it may still be `None` (cloudflared hasn't printed the URL yet) —
+        // the drain task fills the shared `public_url` in later (F4), and the UI re-polls
+        // status to surface it. `command`/`listener` already have the configured URL.
+        let resolved_url = public_url.lock().unwrap().clone();
 
         *self.runtime.lock().unwrap() = Some(WebhookRuntime {
             server_task,
+            shutdown: shutdown_tx,
             drain_task,
             tunnel,
-            public_url: resolved_url.clone(),
+            public_url,
             mode,
         });
 
@@ -338,21 +459,33 @@ impl WebhookManager {
         Ok(WebhookStatus::new(true, resolved_url, true, message))
     }
 
-    /// Tear down the running receiver + tunnel (abort the server task, drop/kill the
-    /// child). Sync + idempotent — safe from the app-exit `RunEvent` handler.
+    /// Sync teardown used where no `.await` is available — `shutdown` (app exit) and
+    /// `status`'s crash self-heal. Idempotent. Does NOT wait for the port to free; an
+    /// awaiting caller that re-binds uses [`Self::stop`] / the restart path instead.
     fn stop_inner(&self) {
         if let Some(rt) = self.runtime.lock().unwrap().take() {
             rt.teardown();
         }
     }
 
-    /// Explicit stop (the `stop_webhook` command).
-    pub fn stop(&self) {
-        self.stop_inner();
+    /// Explicit stop (the `stop_webhook` command). Async + serialized against `start` via
+    /// `start_lock`: a stop issued WHILE a start is in flight waits for the start to
+    /// finish, then tears the just-started runtime down — so the stop is honored rather
+    /// than silently lost in the pre-registration window (F1). Awaits the server task's
+    /// end so a subsequent start can re-bind the port cleanly (F3).
+    pub async fn stop(&self) {
+        let _guard = self.start_lock.lock().await;
+        // Take out of the std mutex BEFORE awaiting (never hold a `StdMutex` guard across
+        // an `.await`).
+        let runtime = self.runtime.lock().unwrap().take();
+        if let Some(rt) = runtime {
+            rt.teardown_awaiting().await;
+        }
     }
 
     /// App-shutdown cleanup (wired to `RunEvent::Exit` in `lib.rs`, like
-    /// `CodexManager::shutdown`) so the cloudflared child never outlives the app.
+    /// `CodexManager::shutdown`) so the tunnel child never outlives the app. Sync
+    /// best-effort (the exit handler can't await); the OS reaps anything in flight.
     pub fn shutdown(&self) {
         self.stop_inner();
     }
@@ -394,7 +527,9 @@ impl WebhookManager {
             // tunnel (listener mode) has no child to probe → `None` try_wait = "alive".
             let probe = guard.as_mut().map(|rt| {
                 let wait = rt.tunnel.as_mut().map(Child::try_wait);
-                (wait, rt.public_url.clone(), rt.mode)
+                // Read the LIVE shared URL: in quick mode the drain task may have filled
+                // it in after `start` returned (F4), so a late URL surfaces here.
+                (wait, rt.public_url.lock().unwrap().clone(), rt.mode)
             });
             match probe {
                 // Tunnel child exited → dead tunnel: take + teardown, report not-running.
@@ -452,6 +587,10 @@ impl WebhookManager {
 /// Shared, runtime-agnostic state for the axum handler.
 struct WebhookCtx {
     secret: String,
+    /// The monitored repo `owner/name` (from `AppConfig.repo`). The handler requires a
+    /// verified payload's repository to match this (F2) — HMAC proves the secret is
+    /// known, not that the event is for the repo this app reviews.
+    repo: String,
     review_label: String,
     check_label: String,
     dispatcher: Dispatcher,
@@ -490,7 +629,9 @@ async fn handle_webhook(
         Err(_) => return StatusCode::BAD_REQUEST,
     };
 
-    if let Some(candidate) = payload_to_candidate(&payload, &ctx.review_label, &ctx.check_label) {
+    if let Some(candidate) =
+        payload_to_candidate(&payload, &ctx.repo, &ctx.review_label, &ctx.check_label)
+    {
         // Detached: the dispatcher future is `Send + 'static`; the gates + review
         // start run independently of this response.
         let dispatcher = ctx.dispatcher.clone();
@@ -530,10 +671,35 @@ fn verify_signature(secret: &str, body: &[u8], header: &str) -> bool {
 /// Pure — unit-tested without a server.
 fn payload_to_candidate(
     payload: &Value,
+    repo: &str,
     review_label: &str,
     check_label: &str,
 ) -> Option<Candidate> {
     let pr = payload.get("pull_request")?;
+
+    // Repo-ownership gate (F2): the HMAC proves the POST came from a sender who knows the
+    // secret — NOT that the event is for the repo THIS app monitors/reviews. A webhook
+    // misconfigured onto a different repo, or a reused secret, would otherwise let a
+    // label event elsewhere cross-trigger a review of the configured repo (the engine
+    // always reviews `cfg.repo`, so the payload's PR number would be applied to the wrong
+    // repo). Require the event's repo (top-level `repository.full_name`, falling back to
+    // the PR's `base.repo.full_name`) to equal the configured `repo`; missing or
+    // mismatched → no candidate (fail closed). Case-insensitive, matching GitHub's
+    // repo-name semantics (and the poll path's `gh --repo`).
+    let event_repo = payload
+        .get("repository")
+        .and_then(|r| r.get("full_name"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            pr.get("base")
+                .and_then(|b| b.get("repo"))
+                .and_then(|r| r.get("full_name"))
+                .and_then(Value::as_str)
+        });
+    match event_repo {
+        Some(r) if r.eq_ignore_ascii_case(repo) => {}
+        _ => return None,
+    }
 
     // Parity with the poll path's `--state open` (`gh.rs`): only an OPEN PR is a
     // dispatch candidate. A closed/merged PR still carrying a trigger label (a
@@ -622,7 +788,7 @@ async fn cloudflared_installed(bin: &str) -> bool {
 async fn spawn_quick_tunnel(
     bin: &str,
     port: u16,
-) -> AppResult<(Child, JoinHandle<()>, Option<String>)> {
+) -> AppResult<(Child, JoinHandle<()>, Arc<StdMutex<Option<String>>>)> {
     let mut cmd = Command::new(bin);
     cmd.args([
         "tunnel",
@@ -645,7 +811,8 @@ async fn spawn_quick_tunnel(
         .ok_or_else(|| AppError::new("cloudflared stderr 不可用".to_string()))?;
     let mut lines = BufReader::new(stderr).lines();
 
-    let url = tokio::time::timeout(TUNNEL_URL_TIMEOUT, scan_for_url(&mut lines))
+    // Initial bounded scan: the happy path prints the URL within a few seconds.
+    let initial = tokio::time::timeout(TUNNEL_URL_TIMEOUT, scan_for_url(&mut lines))
         .await
         .ok()
         .flatten();
@@ -654,8 +821,8 @@ async fn spawn_quick_tunnel(
     // collapses both into `None`, but a child that EXITED before printing a URL is a
     // failed tunnel — fail fast rather than hand back a dead child the manager would
     // report as `running`. `try_wait` is non-blocking; a live-but-slow child stays
-    // `Ok((.., None))` (the tunnel may still resolve, and `status` re-probes liveness).
-    if url.is_none() {
+    // alive and its URL is captured late by the drain task below (F4).
+    if initial.is_none() {
         if let Ok(Some(exit)) = child.try_wait() {
             return Err(AppError::new(format!(
                 "cloudflared 在解析公网 URL 前已退出（{exit}）；请检查 cloudflared 日志"
@@ -663,13 +830,14 @@ async fn spawn_quick_tunnel(
         }
     }
 
-    // Keep draining stderr for the child's lifetime so a full pipe can't stall
-    // cloudflared after we stop scanning (mirrors codex's stderr drain). The handle
-    // is returned so `stop_inner` can abort it; absent that, the child-kill → pipe-EOF
-    // chain would still end it, but we prefer explicit teardown.
-    let drain_task = spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+    // Shared URL handle: seeded with the initial scan, then kept current by the drain
+    // task. If the initial scan TIMED OUT (slow cloudflared) the drain loop captures the
+    // URL when it finally appears and `status` surfaces it — the old drain DISCARDED
+    // every post-scan line, stranding a late URL forever (F4).
+    let public_url = Arc::new(StdMutex::new(initial));
+    let drain_task = spawn(drain_scanning_url(lines, public_url.clone()));
 
-    Ok((child, drain_task, url))
+    Ok((child, drain_task, public_url))
 }
 
 /// Tokenize a user-supplied tunnel command into `(program, args)`, substituting the
@@ -729,14 +897,35 @@ fn spawn_custom_tunnel(command: &str, port: u16) -> AppResult<(Child, JoinHandle
     Ok((child, drain_task))
 }
 
-/// Read cloudflared's stderr line-by-line until a trycloudflare URL appears (or EOF).
-async fn scan_for_url(lines: &mut Lines<BufReader<ChildStderr>>) -> Option<String> {
+/// Read a tunnel child's stderr line-by-line until a trycloudflare URL appears (or EOF).
+/// Generic over the reader so it (and [`drain_scanning_url`]) are unit-testable with an
+/// in-memory cursor, not only a real `ChildStderr`.
+async fn scan_for_url<R: AsyncBufRead + Unpin>(lines: &mut Lines<R>) -> Option<String> {
     while let Ok(Some(line)) = lines.next_line().await {
         if let Some(url) = extract_trycloudflare_url(&line) {
             return Some(url);
         }
     }
     None
+}
+
+/// Drain the tunnel child's stderr for its lifetime (so a full pipe can't stall
+/// cloudflared after the initial scan), AND while the shared URL is still unresolved
+/// keep scanning for the `*.trycloudflare.com` URL — capturing a URL cloudflared prints
+/// after the initial scan window (F4). Once the URL is set it is a pure drain. Generic
+/// over the reader for unit-testing with an in-memory cursor.
+async fn drain_scanning_url<R: AsyncBufRead + Unpin>(
+    mut lines: Lines<R>,
+    url: Arc<StdMutex<Option<String>>>,
+) {
+    while let Ok(Some(line)) = lines.next_line().await {
+        // Cheap pre-check avoids re-extracting once resolved (the common steady state).
+        if url.lock().unwrap().is_none() {
+            if let Some(found) = extract_trycloudflare_url(&line) {
+                *url.lock().unwrap() = Some(found);
+            }
+        }
+    }
 }
 
 /// Extract a `https://*.trycloudflare.com` URL from one cloudflared log line (it
@@ -813,7 +1002,8 @@ mod tests {
     #[test]
     fn payload_to_candidate_maps_review_label() {
         let p = pr_payload(&["needs-review"], serde_json::json!({}));
-        let c = payload_to_candidate(&p, "needs-review", "needs-check").expect("review candidate");
+        let c = payload_to_candidate(&p, "owner/repo", "needs-review", "needs-check")
+            .expect("review candidate");
         assert_eq!(c.number, 42);
         assert_eq!(c.kind, "review");
         assert_eq!(c.head_sha, "abc123");
@@ -826,7 +1016,8 @@ mod tests {
     #[test]
     fn payload_to_candidate_maps_check_label() {
         let p = pr_payload(&["needs-check"], serde_json::json!({}));
-        let c = payload_to_candidate(&p, "needs-review", "needs-check").expect("check candidate");
+        let c = payload_to_candidate(&p, "owner/repo", "needs-review", "needs-check")
+            .expect("check candidate");
         assert_eq!(c.kind, "check");
     }
 
@@ -834,10 +1025,10 @@ mod tests {
     fn payload_to_candidate_skips_conflict_and_no_trigger_label() {
         // Both trigger labels → conflict → None (mirrors the poll path).
         let both = pr_payload(&["needs-review", "needs-check"], serde_json::json!({}));
-        assert!(payload_to_candidate(&both, "needs-review", "needs-check").is_none());
+        assert!(payload_to_candidate(&both, "owner/repo", "needs-review", "needs-check").is_none());
         // No trigger label → None.
         let none = pr_payload(&["unrelated"], serde_json::json!({}));
-        assert!(payload_to_candidate(&none, "needs-review", "needs-check").is_none());
+        assert!(payload_to_candidate(&none, "owner/repo", "needs-review", "needs-check").is_none());
     }
 
     #[test]
@@ -845,15 +1036,21 @@ mod tests {
         // A closed/merged PR carrying a trigger label must NOT dispatch (parity with
         // the poll path's `--state open`). closed / merged / missing state → None.
         let closed = pr_payload(&["needs-review"], serde_json::json!({ "state": "closed" }));
-        assert!(payload_to_candidate(&closed, "needs-review", "needs-check").is_none());
+        assert!(
+            payload_to_candidate(&closed, "owner/repo", "needs-review", "needs-check").is_none()
+        );
         let merged = pr_payload(&["needs-review"], serde_json::json!({ "state": "merged" }));
-        assert!(payload_to_candidate(&merged, "needs-review", "needs-check").is_none());
+        assert!(
+            payload_to_candidate(&merged, "owner/repo", "needs-review", "needs-check").is_none()
+        );
         // Defensive: a payload with no `state` field fails safe to no candidate.
         let no_state = pr_payload(&["needs-review"], serde_json::json!({ "state": null }));
-        assert!(payload_to_candidate(&no_state, "needs-review", "needs-check").is_none());
+        assert!(
+            payload_to_candidate(&no_state, "owner/repo", "needs-review", "needs-check").is_none()
+        );
         // Sanity: the default helper payload IS open and still maps.
         let open = pr_payload(&["needs-review"], serde_json::json!({}));
-        assert!(payload_to_candidate(&open, "needs-review", "needs-check").is_some());
+        assert!(payload_to_candidate(&open, "owner/repo", "needs-review", "needs-check").is_some());
     }
 
     #[test]
@@ -863,7 +1060,7 @@ mod tests {
         // gate, not the parse, decides to skip it.
         let draft = pr_payload(&["needs-review"], serde_json::json!({ "draft": true }));
         assert!(
-            payload_to_candidate(&draft, "needs-review", "needs-check")
+            payload_to_candidate(&draft, "owner/repo", "needs-review", "needs-check")
                 .unwrap()
                 .is_draft
         );
@@ -873,7 +1070,7 @@ mod tests {
             serde_json::json!({ "head": { "sha": "s", "ref": "r", "repo": { "full_name": "forker/repo" } } }),
         );
         assert!(
-            payload_to_candidate(&fork, "needs-review", "needs-check")
+            payload_to_candidate(&fork, "owner/repo", "needs-review", "needs-check")
                 .unwrap()
                 .is_cross_repository
         );
@@ -888,7 +1085,7 @@ mod tests {
             serde_json::json!({ "head": { "sha": "s", "ref": "r", "repo": null } }),
         );
         assert!(
-            payload_to_candidate(&p, "needs-review", "needs-check")
+            payload_to_candidate(&p, "owner/repo", "needs-review", "needs-check")
                 .unwrap()
                 .is_cross_repository
         );
@@ -897,7 +1094,7 @@ mod tests {
     #[test]
     fn payload_to_candidate_none_without_pull_request() {
         let p = serde_json::json!({ "action": "labeled" });
-        assert!(payload_to_candidate(&p, "needs-review", "needs-check").is_none());
+        assert!(payload_to_candidate(&p, "owner/repo", "needs-review", "needs-check").is_none());
     }
 
     #[test]
@@ -958,9 +1155,12 @@ mod tests {
         let mgr = WebhookManager::default();
         *mgr.runtime.lock().unwrap() = Some(WebhookRuntime {
             server_task: spawn(async {}),
+            shutdown: oneshot::channel().0, // rx dropped; the dead-child self-heal path doesn't await it.
             drain_task: Some(spawn(async {})),
             tunnel: Some(child),
-            public_url: Some("https://x.trycloudflare.com".to_string()),
+            public_url: Arc::new(StdMutex::new(Some(
+                "https://x.trycloudflare.com".to_string(),
+            ))),
             mode: WebhookTunnelMode::Quick,
         });
 
@@ -1064,6 +1264,7 @@ mod tests {
             .start(
                 0,
                 "shh".to_string(),
+                "owner/repo".to_string(),
                 "review".to_string(),
                 "check".to_string(),
                 "prmonitor-no-such-cloudflared".to_string(),
@@ -1092,7 +1293,7 @@ mod tests {
         assert!(s2.running);
         assert_eq!(s2.public_url.as_deref(), Some("https://my.example.com"));
 
-        mgr.stop();
+        mgr.stop().await;
     }
 
     /// `command` mode with a child that exits IMMEDIATELY (`true`) self-heals on the next
@@ -1107,6 +1308,7 @@ mod tests {
             .start(
                 0,
                 "shh".to_string(),
+                "owner/repo".to_string(),
                 "review".to_string(),
                 "check".to_string(),
                 "bogus".to_string(),
@@ -1153,6 +1355,7 @@ mod tests {
             .start(
                 0,
                 "shh".to_string(),
+                "owner/repo".to_string(),
                 "review".to_string(),
                 "check".to_string(),
                 "prmonitor-no-such-cloudflared".to_string(),
@@ -1194,7 +1397,7 @@ mod tests {
             "listener runtime is never self-heal-taken"
         );
 
-        mgr.stop();
+        mgr.stop().await;
     }
 
     /// G1: `stop` (→ `teardown`) must explicitly kill AND reap the tunnel child, not
@@ -1211,6 +1414,7 @@ mod tests {
             .start(
                 0,
                 "shh".to_string(),
+                "owner/repo".to_string(),
                 "review".to_string(),
                 "check".to_string(),
                 "bogus".to_string(),
@@ -1245,7 +1449,7 @@ mod tests {
         };
         assert!(alive(pid), "sleep child is alive before stop");
 
-        mgr.stop();
+        mgr.stop().await;
         assert!(
             mgr.runtime.lock().unwrap().is_none(),
             "stop tears down the runtime"
@@ -1277,6 +1481,7 @@ mod tests {
             .start(
                 0,
                 "shh".to_string(),
+                "owner/repo".to_string(),
                 "review".to_string(),
                 "check".to_string(),
                 "prmonitor-no-such-cloudflared".to_string(),
@@ -1305,7 +1510,7 @@ mod tests {
             "non-quick mode reports cloudflared_installed: true (probe skipped)"
         );
 
-        mgr.stop();
+        mgr.stop().await;
     }
 
     /// G2/G3 (stopped path): a non-quick `configured_mode` on a STOPPED manager skips the
@@ -1355,6 +1560,7 @@ mod tests {
             .start(
                 0,
                 "shh".to_string(),
+                "owner/repo".to_string(),
                 "review".to_string(),
                 "check".to_string(),
                 "bogus".to_string(),
@@ -1366,5 +1572,161 @@ mod tests {
             )
             .await;
         assert!(r.is_err(), "blank command-mode command must Err");
+    }
+
+    /// F2: a verified payload whose repository is NOT the configured repo must NOT map to
+    /// a candidate — the HMAC proves the secret is known, not that the event is for the
+    /// repo this app reviews. A misconfigured webhook / reused secret on another repo is
+    /// dropped (fail closed).
+    #[test]
+    fn payload_to_candidate_requires_matching_repo() {
+        // A different `base.repo.full_name` (no top-level `repository`) → None despite a
+        // valid trigger label.
+        let other = pr_payload(
+            &["needs-review"],
+            serde_json::json!({ "base": { "repo": { "full_name": "evil/repo" } } }),
+        );
+        assert!(
+            payload_to_candidate(&other, "owner/repo", "needs-review", "needs-check").is_none(),
+            "a payload for a different repo must not dispatch"
+        );
+
+        // Top-level `repository.full_name` (what GitHub actually sends) is honored and
+        // takes precedence: matching it admits the candidate.
+        let mut top = pr_payload(&["needs-review"], serde_json::json!({}));
+        top.as_object_mut().unwrap().insert(
+            "repository".to_string(),
+            serde_json::json!({ "full_name": "owner/repo" }),
+        );
+        assert!(payload_to_candidate(&top, "owner/repo", "needs-review", "needs-check").is_some());
+
+        // Case-insensitive (GitHub repo-name semantics): configured `Owner/Repo` matches
+        // the event's `owner/repo`.
+        let p = pr_payload(&["needs-review"], serde_json::json!({}));
+        assert!(payload_to_candidate(&p, "Owner/Repo", "needs-review", "needs-check").is_some());
+
+        // Missing repo entirely (no top-level `repository`, no `base.repo`) → None.
+        let no_repo = pr_payload(
+            &["needs-review"],
+            serde_json::json!({ "base": { "repo": null } }),
+        );
+        assert!(
+            payload_to_candidate(&no_repo, "owner/repo", "needs-review", "needs-check").is_none()
+        );
+    }
+
+    /// F7: a user-entered public URL with a trailing slash (command/listener mode) must
+    /// still yield a single-slash payload URL — `https://host//webhook` would 404 every
+    /// delivery against the receiver's `/webhook` route.
+    #[test]
+    fn webhook_status_payload_url_trims_trailing_slash() {
+        let one = WebhookStatus::new(
+            true,
+            Some("https://example.com/".to_string()),
+            true,
+            "ok".to_string(),
+        );
+        assert_eq!(
+            one.payload_url.as_deref(),
+            Some("https://example.com/webhook")
+        );
+        // Multiple trailing slashes collapse too.
+        let many = WebhookStatus::new(
+            true,
+            Some("https://example.com///".to_string()),
+            true,
+            "ok".to_string(),
+        );
+        assert_eq!(
+            many.payload_url.as_deref(),
+            Some("https://example.com/webhook")
+        );
+        // No trailing slash (quick-mode scraped URL): unchanged.
+        let none = WebhookStatus::new(
+            true,
+            Some("https://x.trycloudflare.com".to_string()),
+            true,
+            "ok".to_string(),
+        );
+        assert_eq!(
+            none.payload_url.as_deref(),
+            Some("https://x.trycloudflare.com/webhook")
+        );
+    }
+
+    /// F4: the drain loop keeps scanning AFTER the initial window and captures a URL
+    /// cloudflared prints late, writing it to the shared handle (the old drain DISCARDED
+    /// post-scan lines, stranding a late URL forever). Driven with an in-memory reader.
+    #[tokio::test]
+    async fn drain_scanning_url_captures_late_url() {
+        let stderr: &[u8] =
+            b"INF starting tunnel\nINF connecting...\nINF |  https://late-words.trycloudflare.com  |\nINF registered\n";
+        let url = Arc::new(StdMutex::new(None));
+        drain_scanning_url(BufReader::new(stderr).lines(), url.clone()).await;
+        assert_eq!(
+            url.lock().unwrap().as_deref(),
+            Some("https://late-words.trycloudflare.com")
+        );
+    }
+
+    /// The drain never OVERWRITES an already-resolved URL (the initial scan won): a later
+    /// line carrying a different URL is ignored.
+    #[tokio::test]
+    async fn drain_scanning_url_keeps_first_resolved_url() {
+        let stderr: &[u8] = b"INF |  https://second.trycloudflare.com  |\n";
+        let url = Arc::new(StdMutex::new(Some(
+            "https://first.trycloudflare.com".to_string(),
+        )));
+        drain_scanning_url(BufReader::new(stderr).lines(), url.clone()).await;
+        assert_eq!(
+            url.lock().unwrap().as_deref(),
+            Some("https://first.trycloudflare.com")
+        );
+    }
+
+    /// F3: `stop` fires graceful shutdown and AWAITS the server task, so an immediate
+    /// restart on the SAME port re-binds cleanly (a bare abort raced the re-bind into
+    /// "address in use"). Uses listener mode (no child / no cloudflared) on a freed
+    /// ephemeral port, looped. Runs on tauri's runtime via `block_on` — the same runtime
+    /// `start`'s `TcpListener::bind` + `spawn` share in production, so the listener and
+    /// the server task that owns it live on ONE IO driver (a `#[tokio::test]` would bind
+    /// on the test runtime but spawn the server on tauri's global one, deferring the
+    /// listener's close and defeating the determinism this asserts).
+    #[test]
+    fn restart_on_same_port_rebinds_after_stop() {
+        // Grab a likely-free port: bind to :0, read the assigned port, drop the listener.
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("bind ephemeral")
+            .local_addr()
+            .expect("local addr")
+            .port();
+
+        tauri::async_runtime::block_on(async move {
+            let mgr = WebhookManager::default();
+            mgr.set_dispatcher(Arc::new(|_| Box::pin(async {})));
+
+            for i in 0..3 {
+                let s = mgr
+                    .start(
+                        port,
+                        "shh".to_string(),
+                        "owner/repo".to_string(),
+                        "review".to_string(),
+                        "check".to_string(),
+                        "bogus".to_string(),
+                        TunnelSpec {
+                            mode: WebhookTunnelMode::Listener,
+                            command: String::new(),
+                            public_url: String::new(),
+                        },
+                    )
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("restart #{i} must re-bind port {port}: {}", e.message)
+                    });
+                assert!(s.running, "restart #{i} running");
+                mgr.stop().await;
+            }
+        });
     }
 }

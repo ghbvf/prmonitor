@@ -295,6 +295,7 @@ pub async fn start_webhook<R: tauri::Runtime>(
         .start(
             cfg.webhook_port,
             cfg.webhook_secret,
+            cfg.repo,
             cfg.review_label,
             cfg.check_label,
             cfg.cloudflared_bin,
@@ -314,7 +315,7 @@ pub async fn stop_webhook<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, crate::state::AppState>,
 ) -> AppResult<WebhookStatus> {
-    state.webhook.stop();
+    state.webhook.stop().await;
     let cfg = config_service::load(&app)?;
     Ok(state
         .webhook
