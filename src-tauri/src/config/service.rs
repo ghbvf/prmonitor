@@ -7,13 +7,25 @@
 use serde_json::{json, Map, Value};
 use tauri_plugin_store::StoreExt;
 
-use super::model::{AppConfig, Project};
+use super::model::AppConfig;
 use crate::error::{AppError, AppResult};
+
+/// Re-export the project domain type THROUGH the config public service surface (#35,
+/// F9). The `pr` slice (scheduler / commands) depends on `Project` via
+/// `config::service::Project`, not `config::model::Project` — so its cross-slice
+/// coupling is to the service (the slice's public API), keeping the model an internal
+/// detail the service mediates. The functions below (`project` / `project_validated`)
+/// use `Project` through this same re-export.
+pub use super::model::Project;
 
 /// Store file holding the persisted config.
 const STORE_FILE: &str = "config.json";
 /// Key under which the [`AppConfig`] value lives in the store.
 const CONFIG_KEY: &str = "appConfig";
+/// `id`/`name` assigned to the single project lifted out of a legacy flat config by
+/// [`migrate_value`] (#35). One source so the migration and its tests agree on the
+/// id the active-project pointer (`activeProjectId`) is also set to.
+const MIGRATED_PROJECT_ID: &str = "default";
 
 /// The 11 per-project keys lifted out of the legacy flat single-project config
 /// into the migrated [`Project`] object (#35). camelCase wire names (the persisted
@@ -82,8 +94,8 @@ fn migrate_value(raw: Value) -> Value {
 
     // Legacy flat single-project shape: lift the per-project keys into one project.
     let mut project = Map::new();
-    project.insert("id".to_string(), json!("default"));
-    project.insert("name".to_string(), json!("default"));
+    project.insert("id".to_string(), json!(MIGRATED_PROJECT_ID));
+    project.insert("name".to_string(), json!(MIGRATED_PROJECT_ID));
     project.insert("enabled".to_string(), json!(true));
     for key in PROJECT_KEYS {
         if let Some(v) = old.get(*key) {
@@ -93,7 +105,7 @@ fn migrate_value(raw: Value) -> Value {
 
     let mut new = Map::new();
     new.insert("projects".to_string(), json!([Value::Object(project)]));
-    new.insert("activeProjectId".to_string(), json!("default"));
+    new.insert("activeProjectId".to_string(), json!(MIGRATED_PROJECT_ID));
     for key in WEBHOOK_KEYS {
         if let Some(v) = old.get(*key) {
             new.insert((*key).to_string(), v.clone());
@@ -208,6 +220,14 @@ fn persist<R: tauri::Runtime>(app: &tauri::AppHandle<R>, config: &AppConfig) -> 
 /// stale. Verifies the target project exists (a stale id is rejected), then writes
 /// the pointer through the same store as [`save`]. The frontend `useProjects().setActive`
 /// calls the `set_active_project` command, which funnels here.
+///
+/// **Concurrency (intentional, no lock).** This does a load→mutate→persist with NO
+/// `config.json` write lock, so it is last-write-wins against a concurrent [`save`]:
+/// a `set_active_project` and a `save` racing could each clobber the other's write.
+/// That is acceptable because `active_project_id` is UI navigation state, not a
+/// correctness-critical field — the worst case is the focused project momentarily
+/// reverts and the next UI action re-sets it. (The dedup/retention stores that ARE
+/// correctness-critical have their own write locks; this pointer does not warrant one.)
 pub fn set_active_project<R: tauri::Runtime>(app: &tauri::AppHandle<R>, id: &str) -> AppResult<()> {
     let mut config = load(app)?;
     if !config.projects.iter().any(|p| p.id == id) {
@@ -245,13 +265,13 @@ mod tests {
         let migrated = migrate_value(raw);
 
         // Top-level multi-project shape.
-        assert_eq!(migrated["activeProjectId"], "default");
+        assert_eq!(migrated["activeProjectId"], MIGRATED_PROJECT_ID);
         let projects = migrated["projects"].as_array().expect("projects array");
         assert_eq!(projects.len(), 1);
 
         let project = &projects[0];
-        assert_eq!(project["id"], "default");
-        assert_eq!(project["name"], "default");
+        assert_eq!(project["id"], MIGRATED_PROJECT_ID);
+        assert_eq!(project["name"], MIGRATED_PROJECT_ID);
         assert_eq!(project["enabled"], true);
         // The 11 lifted per-project keys carried over verbatim.
         assert_eq!(project["repo"], "octocat/hello");
@@ -270,7 +290,7 @@ mod tests {
         // `load` uses) with the lifted values intact.
         let config: AppConfig =
             serde_json::from_value(migrated).expect("migrated shape deserializes");
-        assert_eq!(config.active_project_id, "default");
+        assert_eq!(config.active_project_id, MIGRATED_PROJECT_ID);
         assert_eq!(config.projects.len(), 1);
         assert_eq!(config.projects[0].repo, "octocat/hello");
         assert!(config.projects[0].auto_review);

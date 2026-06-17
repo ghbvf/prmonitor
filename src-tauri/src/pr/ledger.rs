@@ -138,6 +138,16 @@ impl Ledger {
     /// in-process registry guard then drops for any still-active session). Reads only
     /// this project's keys (`dispatched:{project_id}` / `events:{project_id}`), so a
     /// `has_dispatched` / cooldown check for one project never sees another's records.
+    ///
+    /// **Lock-free read (intentional).** The discovery path (`commands::discover`) and
+    /// the webhook gate (`commands::gate_dispatchable`) call this OUTSIDE
+    /// [`LEDGER_WRITE_LOCK`]; a load is a single whole-value store read (no torn read)
+    /// and a stale-by-one-round snapshot is acceptable because it only gates an
+    /// OPTIMIZATION — the real double-dispatch backstop is the session registry's
+    /// `try_reserve_pair` atomic test-and-set at start time. A read racing a concurrent
+    /// write at worst lets one extra candidate through the cooldown/dedup gate, which
+    /// the reservation then rejects. The write path ([`record_dispatched`]) DOES hold
+    /// the lock across its own load→stage→save (a lost write there is unrecoverable).
     pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>, project_id: &str) -> AppResult<Self> {
         let store = app
             .store(STORE_FILE)

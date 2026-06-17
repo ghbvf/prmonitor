@@ -278,6 +278,24 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
     let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut seen_repos: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for project in &config.projects {
+        // id-format lock (Medium carrier): the id becomes a store-key PREFIX
+        // (`dispatched:{id}` / `events:{id}` in ledger.rs, `tracked:{id}` in
+        // registry.rs). An id containing `:` would split the partition wrong and an
+        // empty / whitespace id would alias or corrupt a key — either silently merges
+        // two projects' dedup/retention partitions → dedup failure → re-review storm.
+        // Checked for EVERY project (not just enabled): a disabled project's stores
+        // persist and its id re-enters the key space the moment it is re-enabled. The
+        // Hard path (future) is a `ProjectId` newtype whose typed constructor rejects
+        // these at the type level, making the bad shape unexpressible.
+        if project.id.is_empty()
+            || project.id.contains(':')
+            || project.id.chars().any(char::is_whitespace)
+        {
+            return Err(AppError::new(format!(
+                "projectId 非法（不能为空、含 `:` 或空白字符）: {:?}",
+                project.id
+            )));
+        }
         if !seen_ids.insert(project.id.as_str()) {
             return Err(AppError::new(format!(
                 "项目 id 重复: {}（每个项目的 id 必须唯一）",
@@ -528,6 +546,37 @@ mod tests {
         };
         // Both share the default `repo` (ghbvf/gocell) → reject.
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_project_id_with_colon_or_whitespace() {
+        // The id becomes a store-key prefix (`dispatched:{id}` / `events:{id}` /
+        // `tracked:{id}`); a `:`, whitespace, or empty id corrupts that partition →
+        // dedup failure → re-review storm. Rejected for EVERY project (even disabled),
+        // since a disabled project's id re-enters the key space when re-enabled.
+        for bad in ["", "a:b", "has space", "tab\tid", "\n"] {
+            assert!(
+                validate(&with_project(Project {
+                    id: bad.to_string(),
+                    ..valid_project()
+                }))
+                .is_err(),
+                "expected id {bad:?} to be rejected"
+            );
+        }
+        // A disabled project with a bad id is STILL rejected (its store key persists).
+        assert!(validate(&with_project(Project {
+            id: "a:b".to_string(),
+            enabled: false,
+            ..valid_project()
+        }))
+        .is_err());
+        // A clean id (no `:`, no whitespace, non-empty) is accepted.
+        assert!(validate(&with_project(Project {
+            id: "default".to_string(),
+            ..valid_project()
+        }))
+        .is_ok());
     }
 
     #[test]

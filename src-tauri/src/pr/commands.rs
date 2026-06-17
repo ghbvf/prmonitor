@@ -74,6 +74,10 @@ pub(crate) async fn discover<R: tauri::Runtime>(
         pr_cooldown_seconds: project.pr_cooldown_seconds,
     };
 
+    // Lock-free ledger read (no `LEDGER_WRITE_LOCK`): a stale-by-one-round snapshot is
+    // fine here — this gate is an optimization, and the session registry's atomic
+    // `try_reserve_pair` test-and-set is the real double-dispatch backstop (see
+    // `Ledger::load`). The write path (`record_dispatched`) is the half that locks.
     let ledger = Ledger::load(app, project_id)?;
     let source = GithubCli::new(
         params.repo.clone(),
@@ -203,7 +207,9 @@ pub fn get_prs<R: tauri::Runtime>(
     project_id: &str,
 ) -> AppResult<Vec<crate::model::TrackedPrView>> {
     let tracked = super::registry::TrackedPrs::load(&app, project_id)?;
-    Ok(super::registry::project(&tracked, &app, project_id))
+    Ok(super::registry::project_snapshot(
+        &tracked, &app, project_id,
+    ))
 }
 
 /// Sets a tracked PR's `archived` flag within `project_id`'s set (#35) and re-emits
@@ -229,7 +235,11 @@ pub fn set_pr_archived<R: tauri::Runtime>(
         if tracked.set_archived(number, archived) {
             (
                 true,
-                Some(super::registry::project(tracked, &app, &project_id)),
+                Some(super::registry::project_snapshot(
+                    tracked,
+                    &app,
+                    &project_id,
+                )),
             )
         } else {
             (false, None) // unknown number — nothing changed, skip persist + emit.

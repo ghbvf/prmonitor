@@ -282,9 +282,10 @@ pub fn presence_grace_secs<R: tauri::Runtime>(app: &tauri::AppHandle<R>, project
 /// — the common `to_view_list(tracked, now_epoch(), presence_grace_secs(app, pid))`
 /// the command call sites (`get_prs`, `set_pr_archived`'s re-emit) share. The
 /// scheduler keeps its inline `to_view_list` form because it already holds the cycle's
-/// `now`. (#35: NOT the config-slice `config::service::project` — this is the registry
-/// PROJECTION of tracked rows into wire views, distinct responsibility, same module.)
-pub fn project<R: tauri::Runtime>(
+/// `now`. Named `project_snapshot` (#35) to avoid colliding with the config slice's
+/// `config::service::project` (which looks up a `Project` by id) — this is the registry
+/// PROJECTION of tracked rows into wire views, a distinct responsibility.
+pub fn project_snapshot<R: tauri::Runtime>(
     tracked: &TrackedPrs,
     app: &tauri::AppHandle<R>,
     project_id: &str,

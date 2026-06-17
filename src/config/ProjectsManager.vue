@@ -6,6 +6,7 @@
 // existing save flow alongside the global webhook fields.
 import type { AppConfig, Project } from "./types";
 import type { ProjectFieldKey } from "./fields";
+import { NEW_PROJECT_DEFAULTS } from "./defaults";
 import ProjectCard from "./ProjectCard.vue";
 
 // The live AppConfig draft (reactive, owned by SettingsView). We mutate `projects`
@@ -13,27 +14,11 @@ import ProjectCard from "./ProjectCard.vue";
 const props = defineProps<{ draft: AppConfig }>();
 const emit = defineEmits<{ edit: [] }>();
 
-// Sensible defaults for a fresh project — mirror the backend single-project defaults
-// (AppConfig::default in config/model.rs) so an added project is immediately valid
-// except for the user-supplied repo/repoRoot. Identity (id/name/enabled) is set here;
-// the rest match the wizard/SettingsView seed values.
+// Sensible defaults for a fresh project — identity (id/name) is minted here, the rest
+// come from the shared NEW_PROJECT_DEFAULTS (single-sourced with the onboarding wizard
+// in defaults.ts) so the two seed paths can't drift.
 function newProject(): Project {
-  return {
-    id: crypto.randomUUID(),
-    name: "新项目",
-    enabled: true,
-    repo: "",
-    repoRoot: "",
-    pollIntervalSecs: 120,
-    authors: [],
-    reviewLabel: "pr-status/needs-review-again",
-    checkLabel: "pr-status/needs-check-fix",
-    skillRelPath: ".codex/skills/pr-review/SKILL.md",
-    prCooldownSeconds: 1800,
-    sourceKind: "github",
-    engineKind: "codex",
-    autoReview: false,
-  };
+  return { ...NEW_PROJECT_DEFAULTS, id: crypto.randomUUID(), name: "新项目" };
 }
 
 function addProject() {
@@ -60,6 +45,8 @@ function onUpdate(
 function deleteProject(id: string) {
   // Guard: never delete the last project — the app always monitors ≥1 project.
   if (props.draft.projects.length <= 1) return;
+  // Confirm before the destructive splice — a project carries its repo/label config.
+  if (!window.confirm("确认删除该项目？/ Delete this project?")) return;
   const idx = props.draft.projects.findIndex((x) => x.id === id);
   if (idx === -1) return;
   props.draft.projects.splice(idx, 1);

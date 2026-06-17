@@ -441,6 +441,11 @@ pub async fn start_review<R: tauri::Runtime>(
 /// app-server (PR #47 F2). The params stay in the signature because the
 /// `ReviewEngine` impl (`engine.rs`) passes them; Rust does not lint unused fn
 /// params, so this is clippy-clean.
+///
+/// Keys on `session_id` (the codex `threadId`) ONLY — never reads any per-project
+/// config — so the command builds its `CodexEngine` with `project_id: ""` (and empty
+/// repo/skill fields, `commands.rs::stop_review`). A missing / invalid config must not
+/// be able to block stopping a running review.
 pub async fn stop_review(
     codex: &CodexManager,
     registry: &SessionRegistry,
@@ -1047,6 +1052,10 @@ mod tests {
         assert_eq!(v["threadId"], "t1");
         assert_eq!(v["turnId"], "tn1");
         assert_eq!(v["prNumber"], 7);
+        // `kind` ("review"/"check") is a frontend contract field (mirrored by
+        // `ReviewSession.kind` in `src/review/types.ts`); pin it so a rename / drop
+        // surfaces here in lockstep with the camelCase keys.
+        assert_eq!(v["kind"], "review");
         assert_eq!(v["status"], "running");
         assert!(v.get("project_id").is_none());
         assert!(v.get("thread_id").is_none());

@@ -47,8 +47,7 @@ use tauri::Emitter; // for app.emit
 use tokio::sync::Notify;
 use tokio::time::MissedTickBehavior;
 
-use crate::config::model::Project;
-use crate::config::service as config_service;
+use crate::config::service::{self as config_service, Project};
 use crate::error::AppResult;
 use crate::events::{PrEvent, PRS_UPDATED_EVENT};
 use crate::model::{Candidate, TrackedPrView};

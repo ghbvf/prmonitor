@@ -18,6 +18,7 @@ import {
   stopCodex,
   stopReview,
 } from "./api";
+import { useProjects } from "../projects";
 import type { CodexStatus, ReviewSession, SessionStatus, StreamItem } from "./types";
 
 // A rejected Tauri invoke throws the AppError object `{ message }`; fall back to
@@ -279,11 +280,15 @@ async function hydrateActiveSession() {
     const sessions = [...(await listReviewSessions())].sort((a, b) =>
       a.threadId.localeCompare(b.threadId),
     );
+    // Reattach only within the active project (#35): focusing a session from a
+    // non-active project would mismatch the PR # shown in the (active-project) PrList.
+    const activeProjectId = useProjects().activeProjectId.value;
     const active = sessions.find(
       (s) =>
-        s.status === "running" ||
-        s.status === "starting" ||
-        s.status === "interrupting",
+        s.projectId === activeProjectId &&
+        (s.status === "running" ||
+          s.status === "starting" ||
+          s.status === "interrupting"),
     );
     if (active) {
       activeThreadId.value = active.threadId;

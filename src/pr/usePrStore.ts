@@ -156,9 +156,14 @@ export const usePrStore = defineStore("pr", {
     async loadSnapshot(projectId: string) {
       if (this.snapshotLoaded[projectId]) return;
       this.snapshotLoaded[projectId] = true;
+      // Show "拉取中…" while the first read is in flight, so switching to a not-yet-
+      // loaded project doesn't flash the "暂无 PR" empty state before the list lands.
+      this.loading[projectId] = true;
       try {
         this.prs[projectId] = await getPrs(projectId);
+        this.loading[projectId] = false;
       } catch (err) {
+        this.loading[projectId] = false;
         // Reset the guard so a later retry (e.g. after fixing auth) can re-fetch.
         this.snapshotLoaded[projectId] = false;
         this.error[projectId] = toMessage(err);

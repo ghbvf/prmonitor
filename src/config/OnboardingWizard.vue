@@ -10,6 +10,7 @@
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useConfigStore } from "./useConfigStore";
 import type { AppConfig, Project } from "./types";
+import { DEFAULT_PROJECT_ID, NEW_PROJECT_DEFAULTS } from "./defaults";
 import {
   PROJECT_GROUPS,
   STEPS,
@@ -26,23 +27,14 @@ const store = useConfigStore();
 // Emitted only after a validated, successful save.
 const emit = defineEmits<{ done: [] }>();
 
-// The first project being created. Per-project fields only — identity (id/name) and
-// the global webhook fields are filled in by `finish()` when composing the AppConfig.
+// The first project being created. Per-project fields seed from the shared
+// NEW_PROJECT_DEFAULTS (single-sourced with ProjectsManager in defaults.ts) so the two
+// seed paths can't drift; identity uses the fixed DEFAULT_PROJECT_ID. The global
+// webhook fields are filled in by `finish()` when composing the AppConfig.
 const draft = reactive<Project>({
-  id: "default",
+  ...NEW_PROJECT_DEFAULTS,
+  id: DEFAULT_PROJECT_ID,
   name: "默认项目",
-  enabled: true,
-  repo: "",
-  repoRoot: "",
-  pollIntervalSecs: 120,
-  authors: [],
-  reviewLabel: "pr-status/needs-review-again",
-  checkLabel: "pr-status/needs-check-fix",
-  skillRelPath: ".codex/skills/pr-review/SKILL.md",
-  prCooldownSeconds: 1800,
-  sourceKind: "github",
-  engineKind: "codex",
-  autoReview: false,
 });
 
 const authorsInput = ref("");
@@ -167,8 +159,8 @@ function authorsArray(): string[] {
 // migration's fixed id for symmetry) and `activeProjectId` points at it.
 function composeConfig(): AppConfig {
   return {
-    projects: [{ ...draft, id: "default", authors: authorsArray() }],
-    activeProjectId: "default",
+    projects: [{ ...draft, id: DEFAULT_PROJECT_ID, authors: authorsArray() }],
+    activeProjectId: DEFAULT_PROJECT_ID,
     webhookEnabled: false,
     webhookPort: 8787,
     webhookSecret: "",

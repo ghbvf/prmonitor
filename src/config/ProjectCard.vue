@@ -28,6 +28,11 @@ const emit = defineEmits<{
 // re-seeded whenever the bound project identity changes (e.g. the list reorders or a
 // card is deleted and instances re-key) so the buffer never bleeds across projects.
 const authorsInput = ref(props.project.authors.join(", "));
+// Re-seed ONLY on id change (card now bound to a different project — delete/reorder).
+// While the id is stable, authorsInput is a local-first buffer NOT re-seeded from
+// props: the card emits normalized string[] back up on every edit, so props.authors
+// already reflects local edits — re-seeding on every authors change would fight the
+// user's in-progress typing (e.g. clobber a trailing comma).
 watch(
   () => props.project.id,
   () => {

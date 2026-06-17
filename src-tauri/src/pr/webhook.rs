@@ -1168,6 +1168,31 @@ mod tests {
     }
 
     #[test]
+    fn payload_to_candidate_fails_closed_when_repo_matches_no_route() {
+        // Repo-routing gate (#35): a verified payload whose repo matches NO enabled
+        // route is DROPPED (HMAC proves the secret is known, not that the event is for
+        // a repo this app monitors). A reused secret on an unmonitored repo must not
+        // cross-trigger a review. Payload repo `owner/repo` (the helper default)
+        // against routes for `owner/a` + `owner/b` → no match → None.
+        let p = pr_payload(&["needs-review"], serde_json::json!({}));
+        let routes = vec![
+            route("a", "owner/a", "needs-review", "needs-check"),
+            route("b", "owner/b", "needs-review", "needs-check"),
+        ];
+        assert!(
+            payload_to_candidate(&p, &routes).is_none(),
+            "a payload matching no enabled route must fail closed (None)"
+        );
+        // Sanity: adding the matching route makes the SAME payload route + dispatch,
+        // so the None above is the routing gate, not a parse failure.
+        let mut routes_with_match = routes;
+        routes_with_match.push(route("c", "owner/repo", "needs-review", "needs-check"));
+        let (project_id, _c) = payload_to_candidate(&p, &routes_with_match)
+            .expect("payload routes to the matching project");
+        assert_eq!(project_id, "c");
+    }
+
+    #[test]
     fn extract_trycloudflare_url_from_boxed_log_line() {
         let line = "2024-01-01T00:00:00Z INF |  https://random-words-here.trycloudflare.com  |";
         assert_eq!(

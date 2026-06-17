@@ -27,6 +27,7 @@ vi.mock("./api", () => ({
 
 import * as api from "./api";
 import { useReviewStore } from "./useReviewStore";
+import { useProjects } from "../projects";
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -52,6 +53,9 @@ beforeEach(() => {
   s.listenerReady.value = false;
   s.listenerError.value = null;
   s.dispatchError.value = {};
+  // hydrateActiveSession (#35) reattaches only within the active project; reset the
+  // shared singleton so each test starts from a known active selection.
+  useProjects().activeProjectId.value = "";
 });
 
 // One backend session row; spread an override to vary a field.
@@ -365,7 +369,9 @@ describe("useReviewStore init()", () => {
   });
 
   it("reattaches to a still-active backend session", async () => {
-    vi.mocked(api.listReviewSessions).mockResolvedValueOnce([
+    // init() calls listReviewSessions twice (hydrateActiveSession + refreshSessions);
+    // a persistent mock so BOTH the reattach pick and the session-list seed see it.
+    vi.mocked(api.listReviewSessions).mockResolvedValue([
       {
         projectId: "p1",
         threadId: "th_live",
@@ -376,12 +382,17 @@ describe("useReviewStore init()", () => {
       },
     ]);
     const store = useReviewStore();
+    // hydrateActiveSession filters by the active project (#35) — point it at p1.
+    useProjects().activeProjectId.value = "p1";
 
     await store.init();
 
     expect(store.activeThreadId.value).toBe("th_live");
     expect(store.activePr.value).toBe(42);
     expect(store.running.value).toBe(true);
+    // init()'s refreshSessions ran: the concurrent-session list is seeded too.
+    expect(store.sessions.value.length).toBeGreaterThan(0);
+    expect(store.sessions.value[0]?.threadId).toBe("th_live");
   });
 
   it("leaves state clean when no backend session is active", async () => {
@@ -396,6 +407,9 @@ describe("useReviewStore init()", () => {
       },
     ]);
     const store = useReviewStore();
+    // Active project matches the session's, so the terminal STATUS is what blocks the
+    // reattach here (not the #35 project filter).
+    useProjects().activeProjectId.value = "p1";
 
     await store.init();
 
