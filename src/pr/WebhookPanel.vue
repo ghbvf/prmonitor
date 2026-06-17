@@ -60,7 +60,8 @@ function onRefresh() {
 }
 
 async function copyUrl() {
-  const url = status.value?.publicUrl;
+  // Copy the full Payload URL (incl. `/webhook`) — the tunnel root alone 404s.
+  const url = status.value?.payloadUrl;
   if (!url) return;
   try {
     await navigator.clipboard.writeText(url);
@@ -105,21 +106,21 @@ async function copyUrl() {
       </button>
     </div>
 
-    <div v-if="status?.running && status.publicUrl" class="url-box">
+    <div v-if="status?.running && status.payloadUrl" class="url-box">
       <div class="url-row">
-        <code class="url">{{ status.publicUrl }}</code>
+        <code class="url">{{ status.payloadUrl }}</code>
         <button type="button" class="copy" @click="copyUrl">
           {{ copied ? "已复制" : "复制" }}
         </button>
       </div>
       <p class="hint">
-        把上面的 URL 粘贴到 GitHub 仓库 Settings → Webhooks → Add webhook：Payload URL
-        填此 URL，Content type 选 application/json，Secret 填与设置里相同的 Webhook
-        Secret，events 选 Pull requests。
+        把上面的完整 URL（已含 /webhook 路径）粘贴到 GitHub 仓库 Settings → Webhooks →
+        Add webhook：Payload URL 填此 URL，Content type 选 application/json，Secret
+        填与设置里相同的 Webhook Secret，events 选 Pull requests。
       </p>
     </div>
 
-    <div v-else-if="status?.running && !status.publicUrl" class="url-box">
+    <div v-else-if="status?.running && !status.payloadUrl" class="url-box">
       <p class="hint">公网 URL 尚未解析（cloudflared 可能仍在建立隧道）。</p>
       <button type="button" class="copy" :disabled="busy" @click="onRefresh">
         重新查询状态
