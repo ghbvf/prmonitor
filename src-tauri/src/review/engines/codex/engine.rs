@@ -28,7 +28,7 @@ pub struct CodexEngine<'a, R: tauri::Runtime> {
 }
 
 impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
-    async fn start(&self, pr_number: u64, kind: &str) -> AppResult<SessionId> {
+    async fn start(&self, pr_number: u64, kind: &str) -> AppResult<Option<SessionId>> {
         session::start_review(
             self.app,
             self.codex,

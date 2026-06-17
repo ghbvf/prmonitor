@@ -14,8 +14,11 @@ pub type SessionId = String;
 /// out-of-band to the frontend; a running session can be interrupted.
 #[allow(async_fn_in_trait)]
 pub trait ReviewEngine {
-    /// Start a review. `kind` is `"review"` or `"check"`.
-    async fn start(&self, pr_number: u64, kind: &str) -> AppResult<SessionId>;
+    /// Start a review. `kind` is `"review"` or `"check"`. Returns `Ok(Some(id))` when
+    /// a session started, or `Ok(None)` when the `(pr, kind)` was DEDUPED (already
+    /// covered by an in-flight review) — a first-class "not started, not an error"
+    /// outcome so a caller never confuses a dedup with a start failure.
+    async fn start(&self, pr_number: u64, kind: &str) -> AppResult<Option<SessionId>>;
     /// Interrupt a running session.
     async fn stop(&self, session: &SessionId) -> AppResult<()>;
 }

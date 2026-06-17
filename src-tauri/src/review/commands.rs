@@ -1,7 +1,7 @@
 //! Review slice Tauri commands.
 
 use crate::config::service as config_service;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::review::engine::{ReviewEngine, SessionId};
 use crate::review::engines::codex::{CodexEngine, CodexStatus};
 use crate::review::session::SessionInfo;
@@ -76,7 +76,15 @@ pub async fn start_review<R: tauri::Runtime>(
         repo_root: &cfg.repo_root,
         skill_abs_path: &skill_abs,
     };
-    engine.start(pr_number, &kind).await
+    // `Ok(None)` = the registry already has an in-flight review for this `(pr, kind)`:
+    // a manual re-start is a benign no-op surfaced as an error (the UI shows it; nothing
+    // double-starts). Stop the running one first to re-review.
+    match engine.start(pr_number, &kind).await? {
+        Some(session_id) => Ok(session_id),
+        None => Err(AppError::new(format!(
+            "PR {pr_number} 的 {kind} review 已在进行中"
+        ))),
+    }
 }
 
 /// Interrupt a running review session (by its `threadId`). The terminal
