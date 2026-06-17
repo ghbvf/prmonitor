@@ -19,6 +19,10 @@ pub struct CodexEngine<'a, R: tauri::Runtime> {
     pub registry: &'a SessionRegistry,
     /// The codex binary name (PATH-resolved; matches `get_codex_status`).
     pub codex_bin: &'a str,
+    /// Owning project id (#35): scopes the registry reservation / dedup and stamps
+    /// every streamed `ReviewEvent` so the frontend attributes it to the right
+    /// project. The composition root (lib.rs) sets it from the project being acted on.
+    pub project_id: &'a str,
     /// Monitored repo `owner/name` (named in the review prompt).
     pub repo: &'a str,
     /// Absolute local clone path codex runs the skill against (the turn cwd).
@@ -37,6 +41,7 @@ impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
             self.repo,
             self.repo_root,
             self.skill_abs_path,
+            self.project_id,
             pr_number,
             kind,
         )

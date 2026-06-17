@@ -17,26 +17,28 @@ pub(crate) const CODEX_BIN: &str = "codex";
 /// reports `available` + version. The probe never errors (failures map to a
 /// status struct); only the config read can fail.
 ///
-/// `repo_root` (the codex cwd) is read from the config slice's public service —
-/// the same cross-slice, function-level read the pr slice uses; `AppConfig` stays
-/// config-private.
+/// The codex app-server is GLOBAL and single (one resident process for all
+/// projects); its spawn-handshake cwd is the ACTIVE project's `repo_root`, read from
+/// the config slice's public service (#35). Per-turn `cwd` scopes each review's
+/// working dir, so this is only the handshake cwd. `AppConfig` stays config-private.
 #[tauri::command]
 pub async fn get_codex_status<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, AppState>,
 ) -> AppResult<CodexStatus> {
-    let cfg = config_service::load(&app)?;
-    Ok(state.codex.status(CODEX_BIN, &cfg.repo_root).await)
+    let repo_root = config_service::active_repo_root(&app)?;
+    Ok(state.codex.status(CODEX_BIN, &repo_root).await)
 }
 
 /// 显式启动常驻 codex app-server（清除「已停止」标记并拉起握手）。返回最新状态。
+/// 全局单例 codex 的握手 cwd 取「活动项目」的 `repo_root`（#35）；每轮 review 的实际工作目录由 per-turn `cwd` 覆盖。
 #[tauri::command]
 pub async fn start_codex<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, AppState>,
 ) -> AppResult<CodexStatus> {
-    let cfg = config_service::load(&app)?;
-    Ok(state.codex.start(CODEX_BIN, &cfg.repo_root).await)
+    let repo_root = config_service::active_repo_root(&app)?;
+    Ok(state.codex.start(CODEX_BIN, &repo_root).await)
 }
 
 /// 显式停止常驻 codex app-server（设「已停止」标记 + 杀进程；被动状态探测此后不再自动拉起，显式 review 仍会强制启动）。
@@ -46,22 +48,25 @@ pub fn stop_codex(state: tauri::State<'_, AppState>) -> AppResult<CodexStatus> {
     Ok(state.codex.stop())
 }
 
-/// Start a review for `pr_number` (`kind` = `"review"` or `"check"`), returning
-/// the session id (codex `threadId`). Output streams out-of-band via the
-/// `review:event` Tauri event ([`crate::events::ReviewEvent`]).
+/// Start a review for `(project_id, pr_number)` (`kind` = `"review"` or `"check"`),
+/// returning the session id (codex `threadId`). Output streams out-of-band via the
+/// `review:event` Tauri event ([`crate::events::ReviewEvent`]), each event stamped
+/// with `project_id` (#35) so the frontend routes it to the owning project.
 #[tauri::command]
 pub async fn start_review<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, AppState>,
+    project_id: String,
     pr_number: u64,
     kind: String,
 ) -> AppResult<SessionId> {
-    // `load_validated` re-checks the persisted config's paths so an absent /
-    // escaping `skillRelPath` (e.g. a hand-edited config) fails before we attach
-    // the skill path to the turn, rather than handing codex a bad path. The review
-    // slice depends only on `config::service`, never `config::model`.
-    let cfg = config_service::load_validated(&app)?;
-    let skill_abs = skill_abs_path(&cfg.repo_root, &cfg.skill_rel_path);
+    // Resolve the project being reviewed (#35) and re-check ITS filesystem-dependent
+    // paths so an absent / escaping `skillRelPath` (e.g. a hand-edited config) fails
+    // before we attach the skill path to the turn, rather than handing codex a bad path.
+    // `project_validated` is the per-project analogue of the old `load_validated`; the
+    // review slice still depends only on `config::service`, never `config::model`.
+    let project = config_service::project_validated(&app, &project_id)?;
+    let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
     // MANUAL force-start: a user asking to review overrides a prior `stop_codex`.
     // `resume()` clears the user-stop flag BEFORE `engine.start()` reaches the
     // `connection()` funnel (which refuses when stopped). Auto-dispatch does NOT
@@ -72,13 +77,14 @@ pub async fn start_review<R: tauri::Runtime>(
         codex: &state.codex,
         registry: &state.sessions,
         codex_bin: CODEX_BIN,
-        repo: &cfg.repo,
-        repo_root: &cfg.repo_root,
+        project_id: &project.id,
+        repo: &project.repo,
+        repo_root: &project.repo_root,
         skill_abs_path: &skill_abs,
     };
-    // `Deduped` = the registry already has an in-flight review for this `(pr, kind)`:
-    // a manual re-start is a benign no-op surfaced as an error (the UI shows it; nothing
-    // double-starts). Stop the running one first to re-review.
+    // `Deduped` = the registry already has an in-flight review for this
+    // `(project_id, pr, kind)`: a manual re-start is a benign no-op surfaced as an error
+    // (the UI shows it; nothing double-starts). Stop the running one first to re-review.
     match engine.start(pr_number, &kind).await? {
         StartReviewOutcome::Started(session_id) => Ok(session_id),
         StartReviewOutcome::Deduped => Err(AppError::new(format!(
@@ -95,16 +101,19 @@ pub async fn stop_review<R: tauri::Runtime>(
     state: tauri::State<'_, AppState>,
     session_id: String,
 ) -> AppResult<()> {
-    let cfg = config_service::load(&app)?;
+    // `stop` interrupts an already-live turn purely by its session id (codex
+    // `threadId`); it needs neither the project, the repo, nor the skill path (see
+    // `session::stop_review`, where `codex_bin`/`repo_root` are bound to `_`). So we
+    // build the engine with empty context fields and skip the config read entirely —
+    // a missing / invalid config must not block stopping a running review.
     let engine = CodexEngine {
         app: &app,
         codex: &state.codex,
         registry: &state.sessions,
         codex_bin: CODEX_BIN,
-        repo: &cfg.repo,
-        repo_root: &cfg.repo_root,
-        // `stop` interrupts by session id; it needs neither the repo nor the skill
-        // path, so we skip resolving the skill path here.
+        project_id: "",
+        repo: "",
+        repo_root: "",
         skill_abs_path: "",
     };
     engine.stop(&session_id).await

@@ -21,12 +21,22 @@
 //! longer drops a row — it flips presence `Current`→`Stale` after the grace window.
 //!
 //! **Auto-trigger (#8).** Each cycle also passes its dispatchable candidates (the
-//! clean rows) to an injected [`Dispatcher`] hook. The hook is the seam that keeps
-//! the `pr` slice review-agnostic: the loop knows nothing about how a review
-//! starts, only that a closure consumes `Vec<Candidate>`. The composition root
-//! ([`crate::dispatch`]) installs the real dispatcher via [`Scheduler::set_dispatcher`]
-//! before `start`, so even the immediate first tick dispatches.
+//! clean rows) to an injected [`ProjectDispatcher`] hook. The hook is the seam that
+//! keeps the `pr` slice review-agnostic: the loop knows nothing about how a review
+//! starts, only that a closure consumes `(project_id, Vec<Candidate>)`. The
+//! composition root ([`crate::dispatch`]) installs the real dispatcher via
+//! [`SchedulerSet::set_dispatcher`] before reconciling, so even the immediate first
+//! tick dispatches.
+//!
+//! **Multi-project (#35).** A single [`Scheduler`] drives ONE project's poll loop;
+//! [`SchedulerSet`] owns a `project_id → Arc<Scheduler>` map and reconciles it to the
+//! enabled projects (create/stop/reconfigure). Each scheduler captures its
+//! `project_id` into the cycle closure, so every `PrEvent` it emits and every
+//! dispatcher call it makes carries the routing key (#35). The dispatcher is shared:
+//! [`SchedulerSet::set_dispatcher`] is installed once and cloned into each scheduler
+//! on `reconcile`, so a project added later still inherits it.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -37,6 +47,7 @@ use tauri::Emitter; // for app.emit
 use tokio::sync::Notify;
 use tokio::time::MissedTickBehavior;
 
+use crate::config::model::Project;
 use crate::config::service as config_service;
 use crate::error::AppResult;
 use crate::events::{PrEvent, PRS_UPDATED_EVENT};
@@ -44,14 +55,16 @@ use crate::model::{Candidate, TrackedPrView};
 
 use super::registry;
 
-/// Abstract per-cycle dispatch hook: consumes the cycle's dispatchable
-/// [`Candidate`]s and drives them to completion (in practice: auto-start their
-/// reviews concurrently). Boxed-future + `Arc` so it is `Clone`able into the cycle
-/// closure and erased of the review slice's types — the `pr` slice stays
-/// review-agnostic (the only cross-slice contract it sees is `Candidate`). The
+/// Abstract per-cycle dispatch hook: consumes a cycle's `project_id` plus its
+/// dispatchable [`Candidate`]s and drives them to completion (in practice:
+/// auto-start their reviews concurrently). The leading `project_id` (#35) is the
+/// routing key the composition root's dispatcher needs to resolve the project's repo
+/// / engine / ledger partition. Boxed-future + `Arc` so it is `Clone`able into each
+/// scheduler's cycle closure and erased of the review slice's types — the `pr` slice
+/// stays review-agnostic (the only cross-slice contract it sees is `Candidate`). The
 /// real implementation lives in the composition root ([`crate::dispatch`]).
-pub type Dispatcher =
-    Arc<dyn Fn(Vec<Candidate>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub type ProjectDispatcher =
+    Arc<dyn Fn(String, Vec<Candidate>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Default poll period when config is unreadable or non-positive. Mirrors
 /// `AppConfig::default().poll_interval_secs`. A 0 period would make
@@ -60,17 +73,19 @@ pub type Dispatcher =
 /// window rather than re-hardcoding the default.
 pub(crate) const DEFAULT_POLL_INTERVAL_SECS: u64 = 120;
 
-/// The composition-root handle for the scheduled-pull loop. Lives in
-/// [`crate::state::AppState`]; all methods take `&self` and use interior
-/// mutability so a single shared `State<AppState>` can drive it.
+/// The poll-loop handle for ONE project (#35). Owned by a [`SchedulerSet`] entry
+/// keyed by `project_id`; all methods take `&self` and use interior mutability so the
+/// set can drive it through an `Arc<Scheduler>`. Pre-#35 this was the single
+/// composition-root handle in `AppState`; now `AppState` holds the [`SchedulerSet`].
 #[derive(Default)]
 pub struct Scheduler {
     task: StdMutex<Option<RunningTask>>,
-    /// The auto-trigger dispatch hook (#8), installed by the composition root via
-    /// [`Self::set_dispatcher`] before `start`. `Mutex<Option<_>>` defaults to
-    /// `None` (so `#[derive(Default)]` still holds) — a `None` dispatcher means a
-    /// cycle discovers + emits but starts no reviews (the pre-#8 behavior).
-    dispatcher: StdMutex<Option<Dispatcher>>,
+    /// The auto-trigger dispatch hook (#8), installed via [`Self::set_dispatcher`]
+    /// before `start` ([`SchedulerSet::reconcile`] clones the set's shared dispatcher
+    /// into each scheduler). `Mutex<Option<_>>` defaults to `None` (so
+    /// `#[derive(Default)]` still holds) — a `None` dispatcher means a cycle discovers
+    /// + emits but starts no reviews (the pre-#8 behavior).
+    dispatcher: StdMutex<Option<ProjectDispatcher>>,
 }
 
 /// The live task plus the channels the loop selects on.
@@ -82,17 +97,19 @@ struct RunningTask {
 }
 
 impl Scheduler {
-    /// Installs the auto-trigger dispatch hook (#8). Called once by the composition
-    /// root *before* `start`, so the immediate first tick already dispatches.
-    /// Replaces any prior hook (last writer wins); a never-set dispatcher leaves
-    /// cycles discover-and-emit only.
-    pub fn set_dispatcher(&self, d: Dispatcher) {
+    /// Installs the auto-trigger dispatch hook (#8). Called *before* `start` (by
+    /// [`SchedulerSet::reconcile`], cloning the set's shared dispatcher), so the
+    /// immediate first tick already dispatches. Replaces any prior hook (last writer
+    /// wins); a never-set dispatcher leaves cycles discover-and-emit only.
+    pub fn set_dispatcher(&self, d: ProjectDispatcher) {
         *self.dispatcher.lock().unwrap() = Some(d);
     }
 
-    /// Spawns the poll loop. Idempotent: if a task is already live this is a
-    /// no-op (no double-spawn). A finished task slot is replaced.
-    pub fn start<R: tauri::Runtime>(&self, app: tauri::AppHandle<R>) {
+    /// Spawns this project's poll loop (#35), capturing `project_id` into the cycle so
+    /// every emit / dispatch it makes is routed to that project. Idempotent: if a task
+    /// is already live this is a no-op (no double-spawn). A finished task slot is
+    /// replaced.
+    pub fn start<R: tauri::Runtime>(&self, app: tauri::AppHandle<R>, project_id: String) {
         let mut slot = self.task.lock().unwrap();
         if let Some(task) = slot.as_ref() {
             if !task.handle.inner().is_finished() {
@@ -105,23 +122,33 @@ impl Scheduler {
         let stop = Arc::new(Notify::new());
 
         // Snapshot the installed dispatcher once into the cycle closure: the loop
-        // task outlives this `start` call, so it captures an owned `Option<Dispatcher>`
-        // rather than re-locking `self` each cycle. `None` ⇒ no auto-trigger.
+        // task outlives this `start` call, so it captures an owned
+        // `Option<ProjectDispatcher>` rather than re-locking `self` each cycle.
+        // `None` ⇒ no auto-trigger.
         let dispatcher = self.dispatcher.lock().unwrap().clone();
 
-        // Production wiring: the period comes from the live config each rebuild,
-        // and each cycle discovers → upserts the persisted set → emits → dispatches.
-        // Both are injected into the generic `run_loop` so the lifecycle is testable (F4).
+        // Production wiring: the period comes from THIS project's live config each
+        // rebuild (resolved by id, with a default fallback if the project is gone), and
+        // each cycle discovers → upserts the persisted set → emits → dispatches, all
+        // scoped to `project_id`. Both are injected into the generic `run_loop` so the
+        // lifecycle is testable (F4).
         let period_provider = {
             let app = app.clone();
-            move || resolve_period(config_service::load(&app).map(|c| c.poll_interval_secs))
+            let project_id = project_id.clone();
+            move || {
+                resolve_period(
+                    config_service::project(&app, &project_id).map(|p| p.poll_interval_secs),
+                )
+            }
         };
         let on_cycle = {
             let app = app.clone();
+            let project_id = project_id.clone();
             move || {
                 let app = app.clone();
+                let project_id = project_id.clone();
                 let dispatcher = dispatcher.clone();
-                async move { discover_emit_dispatch(&app, dispatcher.as_ref()).await }
+                async move { discover_emit_dispatch(&app, &project_id, dispatcher.as_ref()).await }
             }
         };
 
@@ -170,6 +197,115 @@ impl Scheduler {
         if let Some(task) = self.task.lock().unwrap().as_ref() {
             task.reconfigure.notify_one();
         }
+    }
+}
+
+/// The composition-root handle for ALL projects' poll loops (#35). Lives in
+/// [`crate::state::AppState`]; all methods take `&self` and use interior mutability so
+/// a single shared `State<AppState>` can drive every project. Owns a
+/// `project_id → Arc<Scheduler>` map plus the one shared [`ProjectDispatcher`] cloned
+/// into each scheduler on [`Self::reconcile`].
+#[derive(Default)]
+pub struct SchedulerSet {
+    /// One [`Scheduler`] per RUNNING project, keyed by `project_id`. `Arc` so a
+    /// scheduler outlives a transient map borrow (the spawned loop holds no map
+    /// reference; the map only holds the control handle).
+    inner: StdMutex<HashMap<String, Arc<Scheduler>>>,
+    /// The auto-trigger dispatch hook (#8), installed once by the composition root via
+    /// [`Self::set_dispatcher`] and cloned into each scheduler on `reconcile`. `None`
+    /// (the `#[derive(Default)]` value) leaves every cycle discover-and-emit only.
+    dispatcher: StdMutex<Option<ProjectDispatcher>>,
+}
+
+impl SchedulerSet {
+    /// Installs the shared auto-trigger dispatch hook (#8/#35). Called once by the
+    /// composition root *before* the first [`Self::reconcile`], so a scheduler created
+    /// by that reconcile inherits it and its immediate first tick already dispatches.
+    /// Replaces any prior hook (last writer wins); already-running schedulers keep the
+    /// dispatcher they were created with (a re-install only affects future creates).
+    pub fn set_dispatcher(&self, d: ProjectDispatcher) {
+        *self.dispatcher.lock().unwrap() = Some(d);
+    }
+
+    /// Reconciles the running schedulers to `projects` (#35). Idempotent — safe to call
+    /// on every config save:
+    /// - an `enabled` project NOT yet in the map → create a [`Scheduler`], install the
+    ///   shared dispatcher, and `start` it (captures the project's id);
+    /// - a mapped id that is no longer enabled (disabled, removed, or absent from
+    ///   `projects`) → `stop` it and drop it from the map;
+    /// - a surviving enabled project → `reconfigure` (re-read its period; the first
+    ///   tick fires immediately, so this also re-polls).
+    ///
+    /// A DISABLED project is treated identically to a removed one (stopped), so the
+    /// scheduler set always mirrors exactly the enabled projects.
+    pub fn reconcile<R: tauri::Runtime>(&self, app: &tauri::AppHandle<R>, projects: &[Project]) {
+        let dispatcher = self.dispatcher.lock().unwrap().clone();
+        let mut map = self.inner.lock().unwrap();
+
+        // The set of ids that SHOULD be running (enabled projects).
+        let enabled_ids: std::collections::HashSet<&str> = projects
+            .iter()
+            .filter(|p| p.enabled)
+            .map(|p| p.id.as_str())
+            .collect();
+
+        // Stop + drop schedulers whose project is no longer enabled (disabled / removed).
+        map.retain(|id, scheduler| {
+            if enabled_ids.contains(id.as_str()) {
+                true
+            } else {
+                scheduler.stop();
+                false
+            }
+        });
+
+        // Create-or-reconfigure each enabled project.
+        for project in projects.iter().filter(|p| p.enabled) {
+            match map.get(&project.id) {
+                Some(scheduler) => scheduler.reconfigure(), // survivor: re-read period + re-poll.
+                None => {
+                    let scheduler = Arc::new(Scheduler::default());
+                    if let Some(d) = dispatcher.clone() {
+                        scheduler.set_dispatcher(d);
+                    }
+                    scheduler.start(app.clone(), project.id.clone());
+                    map.insert(project.id.clone(), scheduler);
+                }
+            }
+        }
+    }
+
+    /// Triggers an immediate discovery on `project_id`'s running loop ("立即拉取").
+    /// Returns whether a running scheduler was actually woken: `false` when that
+    /// project is unknown / stopped, so the caller (`poll_now`) can surface an error
+    /// instead of leaving the frontend awaiting a `prs:updated` that never arrives.
+    pub fn wake(&self, project_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(project_id)
+            .map(|s| s.wake())
+            .unwrap_or(false)
+    }
+
+    /// Asks `project_id`'s running loop to rebuild its ticker with a fresh period
+    /// (no-op if that project is unknown / stopped). Because the first tick fires
+    /// immediately, this also triggers an immediate discovery.
+    pub fn reconfigure(&self, project_id: &str) {
+        if let Some(s) = self.inner.lock().unwrap().get(project_id) {
+            s.reconfigure();
+        }
+    }
+
+    /// Stops + drops EVERY project's loop (the `stop_polling`-all path + app shutdown).
+    /// After this the set is empty; a later [`Self::reconcile`] re-creates the enabled
+    /// schedulers from scratch.
+    pub fn stop_all(&self) {
+        let mut map = self.inner.lock().unwrap();
+        for scheduler in map.values() {
+            scheduler.stop();
+        }
+        map.clear();
     }
 }
 
@@ -235,33 +371,44 @@ async fn run_loop<P, C, Fut>(
 /// empty dispatchable list skips the hook entirely.
 async fn discover_emit_dispatch<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    dispatcher: Option<&Dispatcher>,
+    project_id: &str,
+    dispatcher: Option<&ProjectDispatcher>,
 ) {
-    let (event, dispatchable) = match super::commands::discover(app).await {
+    let (event, dispatchable) = match super::commands::discover(app, project_id).await {
         Ok((views, dispatchable)) => {
             // Upsert this round and persist it through the registry's single
             // serialized write seam (F1): `mutate_tracked` holds the cross-writer lock
             // across load→upsert→save so a concurrent `set_pr_archived` can't interleave
-            // and lose a write. The closure always persists (an upsert always changes
-            // the set); the projection is built inside the seam from the just-upserted
-            // set. `now`/`grace` are read before the lock to keep the critical section
+            // and lose a write. Scoped to `project_id` (#35) so this project's set is
+            // isolated. The closure always persists (an upsert always changes the set);
+            // the projection is built inside the seam from the just-upserted set.
+            // `now`/`grace` are read before the lock to keep the critical section
             // minimal. A store failure (load or save) maps to Error, not a misleading
             // Updated (F2). Auto-dispatch is independent of persistence and still runs.
             let now = super::ledger::now_epoch();
-            let grace = registry::presence_grace_secs(app);
-            let event = persist_event(registry::mutate_tracked(app, |tracked| {
-                tracked.upsert(&views, now);
-                (true, registry::to_view_list(tracked, now, grace))
-            }));
+            let grace = registry::presence_grace_secs(app, project_id);
+            let event = persist_event(
+                project_id,
+                registry::mutate_tracked(app, project_id, |tracked| {
+                    tracked.upsert(&views, now);
+                    (true, registry::to_view_list(tracked, now, grace))
+                }),
+            );
             (event, dispatchable)
         }
         // On discovery error the dispatchable list is empty — nothing auto-starts.
-        Err(e) => (PrEvent::Error { message: e.message }, Vec::new()),
+        Err(e) => (
+            PrEvent::Error {
+                project_id: project_id.to_string(),
+                message: e.message,
+            },
+            Vec::new(),
+        ),
     };
     let _ = app.emit(PRS_UPDATED_EVENT, &event); // ignore emit error (window may be gone)
 
     if let Some(d) = dispatcher {
-        if !dispatchable.is_empty() && auto_review_enabled(app) {
+        if !dispatchable.is_empty() && auto_review_enabled(app, project_id) {
             // Spawn the dispatch DETACHED rather than awaiting it inline. This cycle
             // runs inside the loop's stop-cancellable `select!` (the F1 cancellation
             // domain that lets a stop reap the in-flight `gh` child). Awaiting
@@ -276,34 +423,46 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
             // guard. Discovery itself stays cancellable (it is awaited above), so a
             // stop still reaps `gh`. The JoinHandle is dropped explicitly (detached):
             // the task runs to completion regardless of the poll loop.
-            drop(tauri::async_runtime::spawn(d(dispatchable)));
+            drop(tauri::async_runtime::spawn(d(
+                project_id.to_string(),
+                dispatchable,
+            )));
         }
     }
 }
 
-/// 每轮重读自动 review 开关（运行时切换无需重启）。
-/// 这是 pr→config 的**函数级跨切片读**（走 config 公有 service，AppConfig 仍 config 私有）。
-/// load 失败 → 返回 false（不派发）：config 不可读时不擅自消耗 review 额度/算力，
-/// 宁可漏触发也不误触发；下一轮 load 成功即恢复。
+/// 每轮重读 `project_id` 的自动 review 开关（运行时切换无需重启，#35 按项目）。
+/// 这是 pr→config 的**函数级跨切片读**（走 config 公有 service `project`，`AppConfig`
+/// 仍 config 私有；`auto_review` 现为 [`Project`] 字段）。load / 找不到项目 → 返回 false
+/// （不派发）：config 不可读或项目缺失时不擅自消耗 review 额度/算力，宁可漏触发也不误触发；
+/// 下一轮 load 成功即恢复。
 /// `pub(crate)`：webhook trigger（[`crate::pr::webhook`]）的派发闭包复用同一开关，
-/// 与本轮询调用点一致——两条 auto-trigger 路径共用同一 autoReview gate。
-pub(crate) fn auto_review_enabled<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
-    config_service::load(app)
-        .map(|c| c.auto_review)
+/// 与本轮询调用点一致——两条 auto-trigger 路径共用同一 per-project autoReview gate。
+pub(crate) fn auto_review_enabled<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_id: &str,
+) -> bool {
+    config_service::project(app, project_id)
+        .map(|p| p.auto_review)
         .unwrap_or(false)
 }
 
-/// Maps the locked persist seam's result to the cycle event (F2). A successful
-/// load→upsert→save yields the retained projection (`Updated`); any store failure
-/// (load or save, surfaced as `Err` by [`registry::mutate_tracked`]) yields `Error`
-/// instead of a misleading `Updated` — the in-memory set was not durably persisted
-/// (it vanishes on restart), so claiming "retained snapshot updated" would lie to the
-/// UI. Pure over the seam's result, so the decision is unit-testable without an
-/// `AppHandle` or a store (the emit + dispatch around it need a live app).
-fn persist_event(result: AppResult<Vec<TrackedPrView>>) -> PrEvent {
+/// Maps the locked persist seam's result to the cycle event (F2), scoped to
+/// `project_id` (#35). A successful load→upsert→save yields the retained projection
+/// (`Updated`); any store failure (load or save, surfaced as `Err` by
+/// [`registry::mutate_tracked`]) yields `Error` instead of a misleading `Updated` —
+/// the in-memory set was not durably persisted (it vanishes on restart), so claiming
+/// "retained snapshot updated" would lie to the UI. Pure over the seam's result, so
+/// the decision is unit-testable without an `AppHandle` or a store (the emit +
+/// dispatch around it need a live app).
+fn persist_event(project_id: &str, result: AppResult<Vec<TrackedPrView>>) -> PrEvent {
     match result {
-        Ok(list) => PrEvent::Updated { prs: list },
+        Ok(list) => PrEvent::Updated {
+            project_id: project_id.to_string(),
+            prs: list,
+        },
         Err(e) => PrEvent::Error {
+            project_id: project_id.to_string(),
             message: format!("PR 列表持久化失败：{}", e.message),
         },
     }
@@ -351,21 +510,28 @@ mod tests {
     // un-persisted in-memory set as the retained snapshot (silently lost on restart).
     #[test]
     fn persist_event_on_persist_ok_is_updated() {
-        let ev = persist_event(Ok(Vec::new()));
-        assert!(
-            matches!(ev, PrEvent::Updated { .. }),
-            "a successful persist emits Updated"
-        );
+        let ev = persist_event("p1", Ok(Vec::new()));
+        // #35: the event carries the routing `project_id`.
+        match ev {
+            PrEvent::Updated { project_id, .. } => assert_eq!(project_id, "p1"),
+            other => panic!("a successful persist emits Updated, not {other:?}"),
+        }
     }
 
     #[test]
     fn persist_event_on_store_failure_is_error_not_updated() {
-        let ev = persist_event(Err(AppError::new("写入 PR 存储失败: disk full")));
+        let ev = persist_event("p1", Err(AppError::new("写入 PR 存储失败: disk full")));
         match ev {
-            PrEvent::Error { message } => assert!(
-                message.contains("持久化失败"),
-                "Error carries a persist-failure message, got {message:?}"
-            ),
+            PrEvent::Error {
+                project_id,
+                message,
+            } => {
+                assert_eq!(project_id, "p1", "Error is routed to the project (#35)");
+                assert!(
+                    message.contains("持久化失败"),
+                    "Error carries a persist-failure message, got {message:?}"
+                );
+            }
             other => panic!("a store failure must emit Error, not {other:?}"),
         }
     }
@@ -387,23 +553,29 @@ mod tests {
     #[tokio::test]
     async fn set_dispatcher_stores_and_retrieves_the_hook() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex as TestMutex;
 
         // The hook plumbing in isolation: `set_dispatcher` stores a counting
         // closure; retrieving it (the same `lock().clone()` `start` does) and
-        // invoking it with sample candidates must run the closure. This verifies
-        // storage/retrieval without needing an `AppHandle` or real dispatch.
+        // invoking it with a project id + sample candidates must run the closure.
+        // Verifies storage/retrieval AND that the leading `project_id` (#35) reaches
+        // the hook — without needing an `AppHandle` or real dispatch.
         let scheduler = Scheduler::default();
         let count = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(AtomicUsize::new(0));
-        let dispatcher: Dispatcher = {
+        let seen_pid: Arc<TestMutex<Option<String>>> = Arc::new(TestMutex::new(None));
+        let dispatcher: ProjectDispatcher = {
             let count = Arc::clone(&count);
             let seen = Arc::clone(&seen);
-            Arc::new(move |cands: Vec<Candidate>| {
+            let seen_pid = Arc::clone(&seen_pid);
+            Arc::new(move |project_id: String, cands: Vec<Candidate>| {
                 let count = Arc::clone(&count);
                 let seen = Arc::clone(&seen);
+                let seen_pid = Arc::clone(&seen_pid);
                 Box::pin(async move {
                     count.fetch_add(1, Ordering::SeqCst);
                     seen.fetch_add(cands.len(), Ordering::SeqCst);
+                    *seen_pid.lock().unwrap() = Some(project_id);
                 })
             })
         };
@@ -415,10 +587,74 @@ mod tests {
             .unwrap()
             .clone()
             .expect("set_dispatcher stores the hook");
-        stored(vec![candidate(1, "review"), candidate(2, "check")]).await;
+        stored(
+            "p1".to_string(),
+            vec![candidate(1, "review"), candidate(2, "check")],
+        )
+        .await;
 
         assert_eq!(count.load(Ordering::SeqCst), 1, "hook ran once");
         assert_eq!(seen.load(Ordering::SeqCst), 2, "hook saw both candidates");
+        assert_eq!(
+            seen_pid.lock().unwrap().as_deref(),
+            Some("p1"),
+            "the routing project_id reached the hook (#35)"
+        );
+    }
+
+    // ── SchedulerSet (#35) ──────────────────────────────────────────────────
+    // The map-management methods that don't need an `AppHandle` (`reconcile` does,
+    // so it's exercised in the live app). These lock the multi-project invariants:
+    // a default set is empty + dispatcher-less, `wake`/`reconfigure` on an unknown
+    // project are safe no-ops, and `stop_all` clears the map.
+
+    #[test]
+    fn default_scheduler_set_is_empty_and_dispatcherless() {
+        let set = SchedulerSet::default();
+        assert!(set.inner.lock().unwrap().is_empty());
+        assert!(set.dispatcher.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn scheduler_set_wake_unknown_project_is_false() {
+        // `poll_now` relies on this: waking a project with no running scheduler
+        // returns false so the command can surface "paused" rather than hang.
+        let set = SchedulerSet::default();
+        assert!(!set.wake("nope"));
+    }
+
+    #[test]
+    fn scheduler_set_reconfigure_and_stop_all_unknown_are_noops() {
+        let set = SchedulerSet::default();
+        set.reconfigure("nope"); // no panic on an empty map
+        set.stop_all(); // no panic on an empty map
+        assert!(set.inner.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn scheduler_set_set_dispatcher_stores_shared_hook() {
+        // The set's shared dispatcher is what `reconcile` clones into each scheduler;
+        // installing it before any reconcile is what lets a later-added project
+        // inherit auto-dispatch.
+        let set = SchedulerSet::default();
+        let dispatcher: ProjectDispatcher =
+            Arc::new(|_pid: String, _cands: Vec<Candidate>| Box::pin(async {}));
+        set.set_dispatcher(dispatcher);
+        assert!(set.dispatcher.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn scheduler_set_stop_all_clears_running_entries() {
+        // Seed the map directly with a never-started scheduler (no `AppHandle`
+        // needed): `stop_all` must drop every entry so a later reconcile rebuilds.
+        let set = SchedulerSet::default();
+        set.inner
+            .lock()
+            .unwrap()
+            .insert("p1".to_string(), Arc::new(Scheduler::default()));
+        assert_eq!(set.inner.lock().unwrap().len(), 1);
+        set.stop_all();
+        assert!(set.inner.lock().unwrap().is_empty());
     }
 
     fn candidate(number: u64, kind: &str) -> Candidate {

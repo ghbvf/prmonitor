@@ -23,11 +23,20 @@ use crate::model::{PrPresence, PullRequestView, TrackedPrView};
 
 /// Store file holding the persisted tracked-PR set.
 const STORE_FILE: &str = "prs.json";
-/// Key holding the list of tracked PRs.
-const TRACKED_KEY: &str = "tracked";
-/// Unbounded-growth cap. Beyond this, [`TrackedPrs::prune`] drops the least
-/// recently seen records (never the recent working set) — see its doc.
+/// Key PREFIX holding the per-project list of tracked PRs (#35). The effective key
+/// is `tracked:{project_id}` (see [`tracked_key`]); a single `prs.json` holds every
+/// project's tracked set under its own key, so two projects' PRs never mingle in one
+/// list.
+const TRACKED_KEY_PREFIX: &str = "tracked";
+/// Unbounded-growth cap, applied PER PROJECT (#35). Beyond this, [`TrackedPrs::prune`]
+/// drops the least recently seen records (never the recent working set) — see its doc.
 const MAX_TRACKED: usize = 500;
+
+/// Store key for a project's tracked-PR set: `tracked:{project_id}` (#35).
+/// Partitions the shared `prs.json` so each project's retained list is isolated.
+fn tracked_key(project_id: &str) -> String {
+    format!("{TRACKED_KEY_PREFIX}:{project_id}")
+}
 
 /// Serializes every read-modify-write of the persisted set (F1, PR #43). The two
 /// writers — the poll cycle's upsert and the `set_pr_archived` command — each do a
@@ -40,6 +49,13 @@ const MAX_TRACKED: usize = 500;
 /// serialize on the wrong mutex, which closes the funnel downstream as well as up.
 /// `std` (not `tokio`) `Mutex`: the guarded section is fully synchronous, so no
 /// `.await` is ever held across the guard.
+///
+/// **Multi-project (#35):** the lock stays GLOBAL (not per-project) on purpose. Each
+/// project's set lives under its own store key (`tracked:{project_id}`), but
+/// `Store::save` rewrites the WHOLE `prs.json` — so two projects' parallel poll cycles
+/// each doing a load→mutate→save would still clobber each other's just-written key. A
+/// single global gate over the shared file is the correct granularity; a per-project
+/// lock would reopen that cross-project lost-update race.
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// One persisted PR. `first_seen_epoch` is set once on insert and preserved across
@@ -66,16 +82,18 @@ pub struct TrackedPrs {
 }
 
 impl TrackedPrs {
-    /// Loads the persisted set, defaulting to empty when nothing is stored or the
-    /// value is corrupt (a corrupt registry must never block discovery — the worst
-    /// case is the list rebuilds from the next round's discovery).
-    pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResult<Self> {
+    /// Loads `project_id`'s persisted set (#35), defaulting to empty when nothing is
+    /// stored or the value is corrupt (a corrupt registry must never block discovery —
+    /// the worst case is the list rebuilds from the next round's discovery). Reads only
+    /// this project's key (`tracked:{project_id}`), so one project's retained list never
+    /// shows another's PRs.
+    pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>, project_id: &str) -> AppResult<Self> {
         let store = app
             .store(STORE_FILE)
             .map_err(|e| AppError::new(format!("打开 PR 存储失败: {e}")))?;
 
         let prs = store
-            .get(TRACKED_KEY)
+            .get(tracked_key(project_id))
             .and_then(|v| serde_json::from_value::<Vec<TrackedPr>>(v).ok())
             .unwrap_or_default();
 
@@ -89,13 +107,17 @@ impl TrackedPrs {
     /// *not expressible* outside this module: a new writer has no way to call `save`,
     /// so it must go through `mutate_tracked` and inherit the serialization. Making
     /// this `pub` reopens the lost-update race — do not.
-    fn save<R: tauri::Runtime>(&self, app: &tauri::AppHandle<R>) -> AppResult<()> {
+    fn save<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        project_id: &str,
+    ) -> AppResult<()> {
         let store = app
             .store(STORE_FILE)
             .map_err(|e| AppError::new(format!("打开 PR 存储失败: {e}")))?;
         // tauri-plugin-store 2.x: `Store::set` is infallible and returns `()`.
         store.set(
-            TRACKED_KEY,
+            tracked_key(project_id),
             serde_json::to_value(&self.prs).map_err(|e| AppError::new(e.to_string()))?,
         );
         store
@@ -188,8 +210,12 @@ impl TrackedPrs {
 /// fixes F1 (upstream: `save` private; downstream: one fixed static [`WRITE_LOCK`]).
 /// Reads (`get_prs`, the projection below) need no lock: a load is a single whole-value
 /// store read, so a torn read can't happen and a stale-by-one-round snapshot self-heals.
+///
+/// `project_id` (#35) scopes the load + save to that project's key; the GLOBAL
+/// [`WRITE_LOCK`] still guards the whole-file `prs.json` rewrite across projects.
 pub fn mutate_tracked<R, T>(
     app: &tauri::AppHandle<R>,
+    project_id: &str,
     mutate: impl FnOnce(&mut TrackedPrs) -> (bool, T),
 ) -> AppResult<T>
 where
@@ -201,10 +227,10 @@ where
     // `.await` and no panic-prone step (load/save return `Result`, the closures are
     // pure), so the guard is never poisoned in practice.
     let _guard = WRITE_LOCK.lock().unwrap();
-    let mut tracked = TrackedPrs::load(app)?;
+    let mut tracked = TrackedPrs::load(app, project_id)?;
     let (persist, out) = mutate(&mut tracked);
     if persist {
-        tracked.save(app)?;
+        tracked.save(app, project_id)?;
     }
     Ok(out)
 }
@@ -239,28 +265,34 @@ pub fn to_view_list(tracked: &TrackedPrs, now: u64, grace_secs: u64) -> Vec<Trac
     views
 }
 
-/// Presence grace window: `2 ×` the resolved poll period, so a single missed round
-/// keeps a PR `Current` (it only flips `Stale` after the window). Single-sources
-/// the period clamp via [`super::scheduler::resolve_period`] rather than
-/// re-hardcoding the default — a config-read failure degrades to the default
-/// period (×2).
-pub fn presence_grace_secs<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> u64 {
-    super::scheduler::resolve_period(config_service::load(app).map(|c| c.poll_interval_secs))
-        .saturating_mul(2)
+/// Presence grace window for `project_id`: `2 ×` that project's resolved poll period
+/// (#35), so a single missed round keeps a PR `Current` (it only flips `Stale` after
+/// the window). The period is THAT project's `poll_interval_secs` (resolved via
+/// [`config_service::project`]), clamped through [`super::scheduler::resolve_period`]
+/// rather than re-hardcoding the default — a missing project or config-read failure
+/// degrades to the default period (×2), matching the scheduler's per-project fallback.
+pub fn presence_grace_secs<R: tauri::Runtime>(app: &tauri::AppHandle<R>, project_id: &str) -> u64 {
+    super::scheduler::resolve_period(
+        config_service::project(app, project_id).map(|p| p.poll_interval_secs),
+    )
+    .saturating_mul(2)
 }
 
-/// Projects the tracked set at *now* with the live grace window — the common
-/// `to_view_list(tracked, now_epoch(), presence_grace_secs(app))` the command
-/// call sites (`get_prs`, `set_pr_archived`'s re-emit) share. The scheduler keeps
-/// its inline `to_view_list` form because it already holds the cycle's `now`.
+/// Projects `project_id`'s tracked set at *now* with that project's live grace window
+/// — the common `to_view_list(tracked, now_epoch(), presence_grace_secs(app, pid))`
+/// the command call sites (`get_prs`, `set_pr_archived`'s re-emit) share. The
+/// scheduler keeps its inline `to_view_list` form because it already holds the cycle's
+/// `now`. (#35: NOT the config-slice `config::service::project` — this is the registry
+/// PROJECTION of tracked rows into wire views, distinct responsibility, same module.)
 pub fn project<R: tauri::Runtime>(
     tracked: &TrackedPrs,
     app: &tauri::AppHandle<R>,
+    project_id: &str,
 ) -> Vec<TrackedPrView> {
     to_view_list(
         tracked,
         super::ledger::now_epoch(),
-        presence_grace_secs(app),
+        presence_grace_secs(app, project_id),
     )
 }
 

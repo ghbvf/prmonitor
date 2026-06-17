@@ -55,6 +55,11 @@ pub enum SessionStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
+    /// Owning project (#35): the routing key the UI filters its session list by.
+    /// A PR number is unique only *within* a project, so a session is identified
+    /// to the user by `(project_id, pr_number, kind)` — `thread_id` stays the
+    /// globally-unique registry key (codex assigns one per `thread/start`).
+    pub project_id: String,
     pub thread_id: String,
     pub turn_id: String,
     pub pr_number: u64,
@@ -72,17 +77,23 @@ pub struct SessionRegistry {
     inner: Arc<Mutex<RegistryState>>,
 }
 
-/// The registry's single critical section: the session map AND the set of `(pr, kind)`
-/// pairs RESERVED by an in-flight [`start_review`] that has not yet inserted its
-/// `Starting` session. Both live under ONE mutex, so reserve / promote-to-session /
-/// [`SessionRegistry::active_pairs`] are mutually atomic — the reservation closes the
-/// window where a session exists conceptually (its `thread/start` is mid-flight) but
-/// isn't yet in `sessions`, the gap the old snapshot-then-act guard could not see (two
-/// concurrent webhook deliveries both passing an empty snapshot → double review).
+/// The registry's single critical section: the session map AND the set of
+/// `(project_id, pr, kind)` triples RESERVED by an in-flight [`start_review`] that has
+/// not yet inserted its `Starting` session. Both live under ONE mutex, so reserve /
+/// promote-to-session / [`SessionRegistry::active_pairs`] are mutually atomic — the
+/// reservation closes the window where a session exists conceptually (its
+/// `thread/start` is mid-flight) but isn't yet in `sessions`, the gap the old
+/// snapshot-then-act guard could not see (two concurrent webhook deliveries both
+/// passing an empty snapshot → double review).
+///
+/// The reservation key carries `project_id` (#35): a PR number is unique only within a
+/// project, so a PR #7 review in project A must NOT dedup against a PR #7 review in
+/// project B. `sessions` stays keyed by `thread_id` alone — codex assigns a globally
+/// unique `threadId` per `thread/start`, so it needs no project dimension.
 #[derive(Default)]
 struct RegistryState {
     sessions: HashMap<ThreadId, SessionInfo>,
-    reserved: HashSet<(u64, String)>,
+    reserved: HashSet<(String, u64, String)>,
 }
 
 /// Outcome of [`SessionRegistry::begin_interrupt`] — the atomic guard that makes
@@ -124,29 +135,37 @@ impl SessionRegistry {
         }
     }
 
-    /// Atomically reserve `(pr_number, kind)` for a dispatch about to start a review,
-    /// BEFORE the async `thread/start` — so the pair is visible to a concurrent
-    /// dispatch's guard the instant this returns, not only after the `Starting` insert.
-    /// `true` = the caller now OWNS the reservation; `false` = the pair is already
-    /// covered (a prior reservation OR an in-flight session), so the caller must NOT
-    /// start and must NOT release (it owns nothing). One synchronous critical section
-    /// against the same mutex as `sessions`, so two concurrent reservations for the
-    /// same pair cannot both win (test-and-set) — this is what makes the idempotency
-    /// boundary atomic rather than a snapshot.
-    pub fn try_reserve_pair(&self, pr_number: u64, kind: &str) -> bool {
+    /// Atomically reserve `(project_id, pr_number, kind)` for a dispatch about to start
+    /// a review, BEFORE the async `thread/start` — so the triple is visible to a
+    /// concurrent dispatch's guard the instant this returns, not only after the
+    /// `Starting` insert. `true` = the caller now OWNS the reservation; `false` = the
+    /// triple is already covered (a prior reservation OR an in-flight session), so the
+    /// caller must NOT start and must NOT release (it owns nothing). One synchronous
+    /// critical section against the same mutex as `sessions`, so two concurrent
+    /// reservations for the same triple cannot both win (test-and-set) — this is what
+    /// makes the idempotency boundary atomic rather than a snapshot. `project_id` scopes
+    /// the dedup (#35): the same PR number in two different projects reserves
+    /// independently.
+    pub fn try_reserve_pair(&self, project_id: &str, pr_number: u64, kind: &str) -> bool {
         let mut st = self.inner.lock().unwrap();
         let covered_by_session = st.sessions.values().any(|s| {
-            s.pr_number == pr_number
+            s.project_id == project_id
+                && s.pr_number == pr_number
                 && s.kind == kind
                 && matches!(
                     s.status,
                     SessionStatus::Starting | SessionStatus::Running | SessionStatus::Interrupting
                 )
         });
-        if covered_by_session || st.reserved.contains(&(pr_number, kind.to_string())) {
+        if covered_by_session
+            || st
+                .reserved
+                .contains(&(project_id.to_string(), pr_number, kind.to_string()))
+        {
             return false;
         }
-        st.reserved.insert((pr_number, kind.to_string()));
+        st.reserved
+            .insert((project_id.to_string(), pr_number, kind.to_string()));
         true
     }
 
@@ -154,13 +173,14 @@ impl SessionRegistry {
     /// reach a `Starting` session (a `thread/start` failure / early return / panic
     /// before the insert). A successful start hands the reservation to the inserted
     /// session via [`Self::promote_reservation`], so the happy path never calls this.
-    /// Idempotent (a missing pair is a no-op).
-    fn release_pair(&self, pr_number: u64, kind: &str) {
-        self.inner
-            .lock()
-            .unwrap()
-            .reserved
-            .remove(&(pr_number, kind.to_string()));
+    /// Idempotent (a missing triple is a no-op). Keyed by the full
+    /// `(project_id, pr, kind)` so it frees exactly the triple `try_reserve_pair` took.
+    fn release_pair(&self, project_id: &str, pr_number: u64, kind: &str) {
+        self.inner.lock().unwrap().reserved.remove(&(
+            project_id.to_string(),
+            pr_number,
+            kind.to_string(),
+        ));
     }
 
     /// Insert the just-started session as `Starting` AND drop its reservation in ONE
@@ -170,7 +190,8 @@ impl SessionRegistry {
     /// in-flight session.
     fn promote_reservation(&self, info: SessionInfo) {
         let mut st = self.inner.lock().unwrap();
-        st.reserved.remove(&(info.pr_number, info.kind.clone()));
+        st.reserved
+            .remove(&(info.project_id.clone(), info.pr_number, info.kind.clone()));
         st.sessions.insert(info.thread_id.clone(), info);
     }
 
@@ -217,31 +238,43 @@ impl SessionRegistry {
     }
 
     /// The `(pr_number, kind)` of every in-flight session
-    /// (`Starting`/`Running`/`Interrupting`) PLUS every RESERVED pair — the
-    /// auto-trigger registry guard's view. A PR with an in-flight (or reserved) session
-    /// of a given kind must not be re-dispatched; a terminal (`Done`/`Failed`) session
-    /// is finished and excluded. Including reservations is what lets a not-yet-`Starting`
-    /// dispatch still block a concurrent one. Owning the "what counts as active" rule
-    /// here keeps [`SessionStatus`] inside the review slice — the composition-layer
-    /// dispatcher consumes only the pairs, so it never imports the session state machine.
-    pub fn active_pairs(&self) -> Vec<(u64, String)> {
+    /// (`Starting`/`Running`/`Interrupting`) PLUS every RESERVED triple **belonging to
+    /// `project_id`** — the auto-trigger registry guard's view, scoped to one project
+    /// (#35). A PR with an in-flight (or reserved) session of a given kind must not be
+    /// re-dispatched *within the same project*; a PR #7 in project A does NOT block a PR
+    /// #7 in project B. A terminal (`Done`/`Failed`) session is finished and excluded.
+    /// Including reservations is what lets a not-yet-`Starting` dispatch still block a
+    /// concurrent one. Owning the "what counts as active" rule here keeps
+    /// [`SessionStatus`] inside the review slice — the composition-layer dispatcher
+    /// consumes only the pairs, so it never imports the session state machine. The
+    /// returned pairs drop the project dimension because the caller already scopes its
+    /// candidate batch to this project.
+    pub fn active_pairs(&self, project_id: &str) -> Vec<(u64, String)> {
         let st = self.inner.lock().unwrap();
         let mut pairs: Vec<(u64, String)> = st
             .sessions
             .values()
             .filter(|s| {
-                matches!(
-                    s.status,
-                    SessionStatus::Starting | SessionStatus::Running | SessionStatus::Interrupting
-                )
+                s.project_id == project_id
+                    && matches!(
+                        s.status,
+                        SessionStatus::Starting
+                            | SessionStatus::Running
+                            | SessionStatus::Interrupting
+                    )
             })
             .map(|s| (s.pr_number, s.kind.clone()))
             .collect();
-        // A reserved pair has no session yet (its `thread/start` is mid-flight) but is
-        // every bit as "in flight" — include it so the dispatch guard and a concurrent
-        // reserve both see it. A duplicate vs a just-promoted session is harmless (the
-        // guard does set membership, not counting).
-        pairs.extend(st.reserved.iter().cloned());
+        // A reserved triple has no session yet (its `thread/start` is mid-flight) but is
+        // every bit as "in flight" — include it (scoped to this project) so the dispatch
+        // guard and a concurrent reserve both see it. A duplicate vs a just-promoted
+        // session is harmless (the guard does set membership, not counting).
+        pairs.extend(
+            st.reserved
+                .iter()
+                .filter(|(pid, _, _)| pid == project_id)
+                .map(|(_, pr, kind)| (*pr, kind.clone())),
+        );
         pairs
     }
 }
@@ -254,6 +287,7 @@ impl SessionRegistry {
 /// unrepresentable, not merely hand-avoided on each return path.
 struct ReservationGuard<'a> {
     registry: &'a SessionRegistry,
+    project_id: String,
     pr_number: u64,
     kind: String,
     armed: bool,
@@ -269,7 +303,8 @@ impl ReservationGuard<'_> {
 impl Drop for ReservationGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.registry.release_pair(self.pr_number, &self.kind);
+            self.registry
+                .release_pair(&self.project_id, self.pr_number, &self.kind);
         }
     }
 }
@@ -292,14 +327,17 @@ pub async fn start_review<R: tauri::Runtime>(
     repo: &str,
     repo_root: &str,
     skill_abs_path: &str,
+    project_id: &str,
     pr_number: u64,
     kind: &str,
 ) -> AppResult<StartReviewOutcome> {
-    // Atomic test-and-set BEFORE any `.await`: if this `(pr, kind)` is already reserved
-    // or covered by an in-flight session, do NOT start a second review. This is the
-    // idempotency boundary — atomic, not the old snapshot-then-act guard that two
-    // concurrent webhook deliveries could both pass before either's `Starting` landed.
-    if !registry.try_reserve_pair(pr_number, kind) {
+    // Atomic test-and-set BEFORE any `.await`: if this `(project_id, pr, kind)` is
+    // already reserved or covered by an in-flight session, do NOT start a second review.
+    // This is the idempotency boundary — atomic, not the old snapshot-then-act guard
+    // that two concurrent webhook deliveries could both pass before either's `Starting`
+    // landed. `project_id` scopes the dedup (#35) so the same PR in two projects starts
+    // independently.
+    if !registry.try_reserve_pair(project_id, pr_number, kind) {
         return Ok(StartReviewOutcome::Deduped);
     }
     // From here, ANY early return / `?` / panic before `promote_reservation` releases
@@ -307,6 +345,7 @@ pub async fn start_review<R: tauri::Runtime>(
     // it to the inserted session instead.
     let reservation = ReservationGuard {
         registry,
+        project_id: project_id.to_string(),
         pr_number,
         kind: kind.to_string(),
         armed: true,
@@ -332,6 +371,7 @@ pub async fn start_review<R: tauri::Runtime>(
     // `turn/start` failure flips it to `Failed` (visible to `list_review_sessions`,
     // not vanished); `turn_id` is filled once the turn starts.
     registry.promote_reservation(SessionInfo {
+        project_id: project_id.to_string(),
         thread_id: thread_id.clone(),
         turn_id: String::new(),
         pr_number,
@@ -375,7 +415,18 @@ pub async fn start_review<R: tauri::Runtime>(
 
     registry.set_running(&thread_id, turn_id);
 
-    tauri::async_runtime::spawn(pump(rx, thread_id.clone(), app.clone(), registry.clone()));
+    // Capture `project_id` as an owned String at spawn time so the pump stamps every
+    // emitted `ReviewEvent` with it WITHOUT re-looking-up the session per event (#35):
+    // the routing key is fixed for the session's life, and a lookup would also race the
+    // terminal removal. The pump filters the shared notification stream by `thread_id`
+    // but carries `project_id` to attribute each delta to the owning project.
+    tauri::async_runtime::spawn(pump(
+        rx,
+        project_id.to_string(),
+        thread_id.clone(),
+        app.clone(),
+        registry.clone(),
+    ));
 
     Ok(StartReviewOutcome::Started(thread_id))
 }
@@ -443,9 +494,12 @@ pub async fn stop_review(
 
 /// Pump task: forward this session's notifications to the frontend as
 /// [`ReviewEvent`]s until the turn completes (or the connection drops). Filters by
-/// `thread_id` since the broadcast carries every session's stream.
+/// `thread_id` since the broadcast carries every session's stream; stamps every
+/// emitted event with `project_id` (#35), the owning-project routing key captured at
+/// spawn (fixed for the session's life — never re-looked-up per event).
 async fn pump<R: tauri::Runtime>(
     mut rx: broadcast::Receiver<Arc<ServerNotification>>,
+    project_id: String,
     thread_id: String,
     app: tauri::AppHandle<R>,
     registry: SessionRegistry,
@@ -459,11 +513,11 @@ async fn pump<R: tauri::Runtime>(
             // `Sender` alive across a dead reader, so `RecvError::Closed` below never
             // fires for a process-death; this is what catches that case).
             Ok(note) if matches!(note.as_ref(), ServerNotification::ConnectionClosed) => {
-                fail_connection_closed(&registry, &app, &thread_id);
+                fail_connection_closed(&registry, &app, &project_id, &thread_id);
                 break;
             }
             Ok(note) => {
-                let Some(event) = map_notification(&note, &thread_id) else {
+                let Some(event) = map_notification(&note, &project_id, &thread_id) else {
                     continue;
                 };
                 if let ReviewEvent::TurnCompleted { status, .. } = &event {
@@ -485,6 +539,7 @@ async fn pump<R: tauri::Runtime>(
                 let _ = app.emit(
                     REVIEW_EVENT,
                     &ReviewEvent::Error {
+                        project_id: project_id.clone(),
                         thread_id: thread_id.clone(),
                         message: format!("codex 输出流滞后，丢弃 {n} 条消息（review 中断）"),
                     },
@@ -495,7 +550,7 @@ async fn pump<R: tauri::Runtime>(
             // `RpcClient` was torn down, e.g. manager shutdown). Same terminal
             // outcome as the synthetic `ConnectionClosed` above.
             Err(broadcast::error::RecvError::Closed) => {
-                fail_connection_closed(&registry, &app, &thread_id);
+                fail_connection_closed(&registry, &app, &project_id, &thread_id);
                 break;
             }
         }
@@ -509,12 +564,14 @@ async fn pump<R: tauri::Runtime>(
 fn fail_connection_closed<R: tauri::Runtime>(
     registry: &SessionRegistry,
     app: &tauri::AppHandle<R>,
+    project_id: &str,
     thread_id: &str,
 ) {
     registry.set_status(thread_id, SessionStatus::Failed);
     let _ = app.emit(
         REVIEW_EVENT,
         &ReviewEvent::Error {
+            project_id: project_id.to_string(),
             thread_id: thread_id.to_string(),
             message: "codex 连接已关闭".to_string(),
         },
@@ -522,12 +579,18 @@ fn fail_connection_closed<R: tauri::Runtime>(
 }
 
 /// Map one codex notification to a [`ReviewEvent`] for this session, or `None`
-/// if it belongs to another thread / is not a streamed unit we forward. Pure —
-/// unit-tested below.
-fn map_notification(note: &ServerNotification, thread_id: &str) -> Option<ReviewEvent> {
+/// if it belongs to another thread / is not a streamed unit we forward. Every
+/// produced event is stamped with `project_id` (#35), the owning-project routing key
+/// the pump captured at spawn. Pure — unit-tested below.
+fn map_notification(
+    note: &ServerNotification,
+    project_id: &str,
+    thread_id: &str,
+) -> Option<ReviewEvent> {
     match note {
         ServerNotification::AgentMessageDelta(d) if d.thread_id == thread_id => {
             Some(ReviewEvent::MessageDelta {
+                project_id: project_id.to_string(),
                 thread_id: d.thread_id.clone(),
                 item_id: d.item_id.clone(),
                 text: d.delta.clone(),
@@ -535,6 +598,7 @@ fn map_notification(note: &ServerNotification, thread_id: &str) -> Option<Review
         }
         ServerNotification::ReasoningTextDelta(d) if d.thread_id == thread_id => {
             Some(ReviewEvent::ReasoningDelta {
+                project_id: project_id.to_string(),
                 thread_id: d.thread_id.clone(),
                 item_id: d.item_id.clone(),
                 text: d.delta.clone(),
@@ -542,6 +606,7 @@ fn map_notification(note: &ServerNotification, thread_id: &str) -> Option<Review
         }
         ServerNotification::TurnCompleted(d) if d.thread_id == thread_id => {
             Some(ReviewEvent::TurnCompleted {
+                project_id: project_id.to_string(),
                 thread_id: d.thread_id.clone(),
                 status: d.turn.status.clone(),
             })
@@ -603,12 +668,15 @@ mod tests {
 
     #[test]
     fn map_notification_forwards_own_thread_message_delta() {
-        match map_notification(&msg_delta("t1"), "t1") {
+        match map_notification(&msg_delta("t1"), "p1", "t1") {
             Some(ReviewEvent::MessageDelta {
+                project_id,
                 thread_id,
                 item_id,
                 text,
             }) => {
+                // The pump stamps the captured owning-project id on every event (#35).
+                assert_eq!(project_id, "p1");
                 assert_eq!(thread_id, "t1");
                 assert_eq!(item_id, "it");
                 assert_eq!(text, "hello");
@@ -620,7 +688,7 @@ mod tests {
     #[test]
     fn map_notification_drops_other_thread() {
         // A delta for a different session must not leak into this pump.
-        assert!(map_notification(&msg_delta("other"), "t1").is_none());
+        assert!(map_notification(&msg_delta("other"), "p1", "t1").is_none());
     }
 
     #[test]
@@ -634,13 +702,13 @@ mod tests {
             delta_base64: "dGhl".to_string(),
             cap_reached: false,
         });
-        assert!(map_notification(&output, "t1").is_none());
+        assert!(map_notification(&output, "p1", "t1").is_none());
 
         let other = ServerNotification::Other {
             method: "thread/futureThing".to_string(),
             params: serde_json::json!({}),
         };
-        assert!(map_notification(&other, "t1").is_none());
+        assert!(map_notification(&other, "p1", "t1").is_none());
     }
 
     #[test]
@@ -652,7 +720,7 @@ mod tests {
             delta: "thinking".to_string(),
         });
         assert!(matches!(
-            map_notification(&n, "t1"),
+            map_notification(&n, "p1", "t1"),
             Some(ReviewEvent::ReasoningDelta { .. })
         ));
     }
@@ -665,8 +733,13 @@ mod tests {
                 status: "interrupted".to_string(),
             },
         });
-        match map_notification(&n, "t1") {
-            Some(ReviewEvent::TurnCompleted { status, .. }) => assert_eq!(status, "interrupted"),
+        match map_notification(&n, "p1", "t1") {
+            Some(ReviewEvent::TurnCompleted {
+                project_id, status, ..
+            }) => {
+                assert_eq!(project_id, "p1");
+                assert_eq!(status, "interrupted");
+            }
             other => panic!("expected TurnCompleted, got {other:?}"),
         }
     }
@@ -699,6 +772,7 @@ mod tests {
     fn registry_insert_status_and_list_roundtrip() {
         let reg = SessionRegistry::default();
         reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
             thread_id: "t1".to_string(),
             turn_id: "tn1".to_string(),
             pr_number: 7,
@@ -721,6 +795,7 @@ mod tests {
         let reg = SessionRegistry::default();
         let info = |thread: &str, pr: u64, kind: &str, status| {
             reg.insert(SessionInfo {
+                project_id: "p1".to_string(),
                 thread_id: thread.to_string(),
                 turn_id: String::new(),
                 pr_number: pr,
@@ -734,7 +809,7 @@ mod tests {
         info("d", 4, "review", SessionStatus::Done); // terminal → excluded
         info("e", 5, "check", SessionStatus::Failed); // terminal → excluded
 
-        let mut pairs = reg.active_pairs();
+        let mut pairs = reg.active_pairs("p1");
         pairs.sort();
         assert_eq!(
             pairs,
@@ -749,20 +824,23 @@ mod tests {
     #[test]
     fn try_reserve_pair_is_atomic_test_and_set() {
         let reg = SessionRegistry::default();
-        assert!(reg.try_reserve_pair(7, "review"), "first reservation wins");
         assert!(
-            !reg.try_reserve_pair(7, "review"),
+            reg.try_reserve_pair("p1", 7, "review"),
+            "first reservation wins"
+        );
+        assert!(
+            !reg.try_reserve_pair("p1", 7, "review"),
             "second is rejected while reserved"
         );
         // A reservation shows up in active_pairs BEFORE any Starting session exists —
         // exactly the gap the old snapshot-then-act guard could not see.
-        assert!(reg.active_pairs().contains(&(7, "review".to_string())));
-        // A different kind for the same PR is independent (key is (pr, kind)).
-        assert!(reg.try_reserve_pair(7, "check"));
+        assert!(reg.active_pairs("p1").contains(&(7, "review".to_string())));
+        // A different kind for the same PR is independent (key is (project, pr, kind)).
+        assert!(reg.try_reserve_pair("p1", 7, "check"));
         // Release frees it for a later cycle.
-        reg.release_pair(7, "review");
+        reg.release_pair("p1", 7, "review");
         assert!(
-            reg.try_reserve_pair(7, "review"),
+            reg.try_reserve_pair("p1", 7, "review"),
             "reservable again after release"
         );
     }
@@ -772,23 +850,86 @@ mod tests {
         let reg = SessionRegistry::default();
         // An in-flight (Running) session covers the pair even with no reservation.
         reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
             thread_id: "t1".to_string(),
             turn_id: "tn".to_string(),
             pr_number: 7,
             kind: "review".to_string(),
             status: SessionStatus::Running,
         });
-        assert!(!reg.try_reserve_pair(7, "review"));
+        assert!(!reg.try_reserve_pair("p1", 7, "review"));
         // A different kind is still reservable; a terminal session would not block
         // (covered by the active_pairs in-flight filter, exercised elsewhere).
-        assert!(reg.try_reserve_pair(7, "check"));
+        assert!(reg.try_reserve_pair("p1", 7, "check"));
+    }
+
+    #[test]
+    fn reservations_and_active_pairs_are_isolated_per_project() {
+        // #35: a PR number is unique only WITHIN a project. The same `(pr, kind)` in two
+        // projects must reserve independently, and `active_pairs` must scope to its
+        // project — a PR #7 review in project A must never block PR #7 in project B,
+        // nor leak into B's active-pairs snapshot.
+        let reg = SessionRegistry::default();
+        assert!(reg.try_reserve_pair("A", 7, "review"), "A reserves freely");
+        assert!(
+            reg.try_reserve_pair("B", 7, "review"),
+            "B reserves the same (pr, kind) independently of A"
+        );
+        // Re-reserving within the SAME project still dedups (the within-project guard).
+        assert!(
+            !reg.try_reserve_pair("A", 7, "review"),
+            "dedup within a project is preserved"
+        );
+
+        // Each project's active_pairs sees ONLY its own reservation.
+        assert_eq!(reg.active_pairs("A"), vec![(7, "review".to_string())]);
+        assert_eq!(reg.active_pairs("B"), vec![(7, "review".to_string())]);
+        assert!(
+            reg.active_pairs("C").is_empty(),
+            "a project with nothing in flight sees an empty snapshot"
+        );
+
+        // An in-flight SESSION (not just a reservation) is likewise project-scoped:
+        // A's promoted session does not appear in B's active_pairs and does not block B.
+        reg.promote_reservation(SessionInfo {
+            project_id: "A".to_string(),
+            thread_id: "tA".to_string(),
+            turn_id: String::new(),
+            pr_number: 9,
+            kind: "review".to_string(),
+            status: SessionStatus::Running,
+        });
+        assert!(
+            reg.active_pairs("A").contains(&(9, "review".to_string())),
+            "A's session shows in A"
+        );
+        assert!(
+            !reg.active_pairs("B").contains(&(9, "review".to_string())),
+            "A's session must not leak into B"
+        );
+        assert!(
+            reg.try_reserve_pair("B", 9, "review"),
+            "A's in-flight (9, review) session does not block B's (9, review)"
+        );
+
+        // Releasing A's reservation leaves B's untouched (full-triple keying).
+        reg.release_pair("A", 7, "review");
+        assert!(
+            reg.try_reserve_pair("A", 7, "review"),
+            "A reservable again after its own release"
+        );
+        assert!(
+            !reg.try_reserve_pair("B", 7, "review"),
+            "B's reservation was not disturbed by A's release"
+        );
     }
 
     #[test]
     fn promote_reservation_hands_off_without_a_gap() {
         let reg = SessionRegistry::default();
-        assert!(reg.try_reserve_pair(7, "review"));
+        assert!(reg.try_reserve_pair("p1", 7, "review"));
         reg.promote_reservation(SessionInfo {
+            project_id: "p1".to_string(),
             thread_id: "t1".to_string(),
             turn_id: String::new(),
             pr_number: 7,
@@ -797,9 +938,9 @@ mod tests {
         });
         // After promotion the pair is covered by the Starting session, not the reserved
         // set — and a concurrent reserve still loses (continuous coverage, no gap).
-        assert!(!reg.try_reserve_pair(7, "review"));
+        assert!(!reg.try_reserve_pair("p1", 7, "review"));
         // The reservation was CONSUMED, not double-counted: exactly one active pair.
-        let pairs = reg.active_pairs();
+        let pairs = reg.active_pairs("p1");
         assert_eq!(
             pairs
                 .iter()
@@ -822,7 +963,7 @@ mod tests {
             let reg = reg.clone();
             let winners = Arc::clone(&winners);
             handles.push(tokio::spawn(async move {
-                if reg.try_reserve_pair(7, "review") {
+                if reg.try_reserve_pair("p1", 7, "review") {
                     winners.fetch_add(1, Ordering::SeqCst);
                 }
             }));
@@ -841,6 +982,7 @@ mod tests {
     fn begin_interrupt_is_atomic_and_idempotent() {
         let reg = SessionRegistry::default();
         reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
             thread_id: "t1".to_string(),
             turn_id: "tn1".to_string(),
             pr_number: 7,
@@ -869,6 +1011,7 @@ mod tests {
     fn rollback_interrupt_reverts_only_interrupting() {
         let reg = SessionRegistry::default();
         reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
             thread_id: "t1".to_string(),
             turn_id: "tn1".to_string(),
             pr_number: 7,
@@ -888,8 +1031,11 @@ mod tests {
 
     #[test]
     fn session_info_wire_shape_is_camel_case() {
-        // Locks the contract with `src/review/types.ts` (Medium carrier).
+        // Locks the contract with `src/review/types.ts` (Medium carrier). The
+        // `projectId` routing key (#35) must serialize camelCase and mirror
+        // `ReviewSession.projectId` on the TS side; snake_case must stay absent.
         let v = serde_json::to_value(SessionInfo {
+            project_id: "p1".to_string(),
             thread_id: "t1".to_string(),
             turn_id: "tn1".to_string(),
             pr_number: 7,
@@ -897,10 +1043,12 @@ mod tests {
             status: SessionStatus::Running,
         })
         .expect("SessionInfo serializes");
+        assert_eq!(v["projectId"], "p1");
         assert_eq!(v["threadId"], "t1");
         assert_eq!(v["turnId"], "tn1");
         assert_eq!(v["prNumber"], 7);
         assert_eq!(v["status"], "running");
+        assert!(v.get("project_id").is_none());
         assert!(v.get("thread_id").is_none());
     }
 
@@ -925,6 +1073,7 @@ mod tests {
         // `Failed` if the turn never starts (so it stays visible, not vanished).
         let reg = SessionRegistry::default();
         reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
             thread_id: "t1".to_string(),
             turn_id: String::new(),
             pr_number: 7,

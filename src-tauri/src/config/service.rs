@@ -133,6 +133,41 @@ pub fn project<R: tauri::Runtime>(app: &tauri::AppHandle<R>, id: &str) -> AppRes
         .ok_or_else(|| AppError::new(format!("找不到项目: {id}")))
 }
 
+/// Looks up a [`Project`] by `id` and validates its filesystem-dependent fields
+/// before returning it. The per-project analogue of [`load_validated`]: the review
+/// slice calls this right before attaching the project's skill path to a codex turn
+/// so a broken/escaped skill path is rejected at dispatch time (the same guarantee
+/// the old single-project `load_validated` gave). Validation stays inside the config
+/// slice (via [`crate::config::model::validate_project`]) so review depends only on
+/// `config::service`, never `config::model`.
+pub fn project_validated<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    id: &str,
+) -> AppResult<Project> {
+    let p = project(app, id)?;
+    crate::config::model::validate_project(&p)?;
+    Ok(p)
+}
+
+/// Returns the `repo_root` of the active project, or an empty string when there is
+/// no active project (first launch, or `active_project_id` matches nothing).
+///
+/// Degrades gracefully (returns `Ok("")` rather than an error) so the GLOBAL codex
+/// status probe — which only needs *a* repo root to spawn its app-server check — can
+/// treat "no active project yet" as "unavailable" instead of surfacing an error. It
+/// also does NOT validate the path (mirroring `load`'s leniency for read-only
+/// consumers); callers that will actually *use* the path go through
+/// [`project_validated`] instead.
+pub fn active_repo_root<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResult<String> {
+    let config = load(app)?;
+    Ok(config
+        .projects
+        .iter()
+        .find(|p| p.id == config.active_project_id)
+        .map(|p| p.repo_root.clone())
+        .unwrap_or_default())
+}
+
 /// Loads the persisted config and validates its filesystem-dependent fields, for
 /// callers that will *use* those paths (e.g. the review slice attaching the skill
 /// path to a codex turn). Keeps validation inside the config slice so callers
@@ -147,18 +182,39 @@ pub fn load_validated<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResult
 /// Persists the configuration after validating filesystem-dependent fields.
 pub fn save<R: tauri::Runtime>(app: &tauri::AppHandle<R>, config: AppConfig) -> AppResult<()> {
     super::model::validate(&config)?;
+    persist(app, &config)
+}
 
+/// Writes `config` to the store (no validation). Private — the validating [`save`]
+/// and the lenient [`set_active_project`] both funnel through here so the
+/// store-write plumbing lives in one place.
+fn persist<R: tauri::Runtime>(app: &tauri::AppHandle<R>, config: &AppConfig) -> AppResult<()> {
     let store = app
         .store(STORE_FILE)
         .map_err(|e| AppError::new(format!("打开配置存储失败: {e}")))?;
 
-    let value = serde_json::to_value(&config).map_err(|e| AppError::new(e.to_string()))?;
+    let value = serde_json::to_value(config).map_err(|e| AppError::new(e.to_string()))?;
     // tauri-plugin-store 2.x: `Store::set` is infallible and returns `()`.
     store.set(CONFIG_KEY, value);
     store
         .save()
         .map_err(|e| AppError::new(format!("写入配置存储失败: {e}")))?;
     Ok(())
+}
+
+/// Persists `active_project_id` (#35) WITHOUT re-validating the whole config —
+/// switching the viewed project is a UI navigation action, not a config edit, and
+/// must not be blocked because some OTHER enabled project's filesystem field went
+/// stale. Verifies the target project exists (a stale id is rejected), then writes
+/// the pointer through the same store as [`save`]. The frontend `useProjects().setActive`
+/// calls the `set_active_project` command, which funnels here.
+pub fn set_active_project<R: tauri::Runtime>(app: &tauri::AppHandle<R>, id: &str) -> AppResult<()> {
+    let mut config = load(app)?;
+    if !config.projects.iter().any(|p| p.id == id) {
+        return Err(AppError::new(format!("找不到项目: {id}")));
+    }
+    config.active_project_id = id.to_string();
+    persist(app, &config)
 }
 
 /// `migrate_value` correctness lock (#35). The migration is the bridge between the
