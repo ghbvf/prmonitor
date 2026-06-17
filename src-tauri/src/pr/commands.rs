@@ -298,6 +298,11 @@ pub async fn start_webhook<R: tauri::Runtime>(
             cfg.review_label,
             cfg.check_label,
             cfg.cloudflared_bin,
+            super::webhook::TunnelSpec {
+                mode: cfg.webhook_tunnel_mode,
+                command: cfg.webhook_tunnel_command,
+                public_url: cfg.webhook_public_url,
+            },
         )
         .await
 }

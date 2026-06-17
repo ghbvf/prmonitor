@@ -1,6 +1,17 @@
 //! Webhook PR-trigger source (#9): a local `POST /webhook` receiver exposed to the
-//! public internet via a Cloudflare Quick Tunnel, so GitHub pushes a PR event the
-//! instant a trigger label lands instead of waiting for the poll interval.
+//! public internet so GitHub pushes a PR event the instant a trigger label lands
+//! instead of waiting for the poll interval.
+//!
+//! **Tunnel is decoupled from the receiver.** The receiver only ever binds
+//! `127.0.0.1`, verifies the HMAC, parses, and dispatches; HOW the local port reaches
+//! the public internet is a config choice ([`WebhookTunnelMode`]) the manager branches
+//! on in [`WebhookManager::start`]:
+//! - `quick` (default, unchanged): spawn a Cloudflare Quick Tunnel and scrape the
+//!   `*.trycloudflare.com` URL.
+//! - `command`: spawn a user-supplied tunnel command (`{port}` placeholder, exec'd
+//!   directly — never via a shell); the public URL comes from config, not scraped.
+//! - `listener`: bind only, spawn NO child; the tunnel is fully external; the public
+//!   URL comes from config.
 //!
 //! **Push, not pull — so it does NOT implement [`super::source::PrSource`].** That
 //! trait's `discover()` is pull-shaped (the scheduler asks `gh` for the current
@@ -45,7 +56,7 @@ use tokio::process::{Child, ChildStderr, Command};
 
 use super::scheduler::Dispatcher;
 use crate::error::{AppError, AppResult};
-use crate::model::Candidate;
+use crate::model::{Candidate, WebhookTunnelMode};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -104,6 +115,23 @@ impl WebhookStatus {
     }
 }
 
+/// How the receiver's local port reaches the public internet — the tunnel half of a
+/// [`WebhookManager::start`] call, grouped so the receiver params (port / secret /
+/// labels / cloudflared_bin) and the tunnel params don't blur into one flat arg list.
+/// All three fields come straight off `AppConfig` (`webhook_tunnel_mode` /
+/// `webhook_tunnel_command` / `webhook_public_url`); `start` branches on `mode`:
+/// `command` reads `command`, `command`/`listener` read `public_url` (`quick` ignores
+/// both and scrapes the URL from cloudflared).
+pub struct TunnelSpec {
+    pub mode: WebhookTunnelMode,
+    /// The `command`-mode tunnel command (`{port}` placeholder; whitespace-split; exec'd
+    /// directly, no shell). Ignored by `quick` / `listener`.
+    pub command: String,
+    /// The `command`/`listener`-mode public URL root (empty → `None`). Ignored by `quick`
+    /// (which scrapes the `*.trycloudflare.com` URL instead).
+    pub public_url: String,
+}
+
 /// Owns the running receiver + tunnel. `&self` methods + interior mutability so it
 /// lives in `AppState` (which stays `Default`), mirroring `Scheduler`/`CodexManager`.
 #[derive(Default)]
@@ -119,30 +147,42 @@ pub struct WebhookManager {
     start_lock: tokio::sync::Mutex<()>,
 }
 
-/// The live receiver + tunnel handles. [`Self::teardown`] aborts `server_task` and
-/// `drain_task` (explicit — neither is aborted by `Drop`) before dropping this value;
-/// `tunnel` (the cloudflared child) is then killed via `kill_on_drop(true)` on drop.
-/// `status` reaps a dead `tunnel` via `try_wait` to self-heal a crashed tunnel.
+/// The live receiver + (optional) tunnel handles. [`Self::teardown`] aborts
+/// `server_task` and (if present) `drain_task` (explicit — neither is aborted by
+/// `Drop`) before dropping this value; `tunnel` (the tunnel child) is then killed via
+/// `kill_on_drop(true)` on drop. `status` reaps a dead `tunnel` via `try_wait` to
+/// self-heal a crashed tunnel.
+///
+/// `tunnel` / `drain_task` are `Option` because the `listener` mode spawns NO child
+/// process (the tunnel is fully external) — both are `None` there, and `teardown` /
+/// `status` treat `None` as "nothing to abort / always-running" (no crash self-heal
+/// applies when there's no child to crash).
 struct WebhookRuntime {
     server_task: JoinHandle<()>,
-    /// stderr-drain task for the cloudflared child (keeps the pipe from filling).
-    /// Aborted in `teardown` for lifecycle symmetry rather than relying on the
-    /// child-kill → pipe-EOF chain to end it.
-    drain_task: JoinHandle<()>,
-    /// The cloudflared child. Kept to keep the tunnel alive (and `kill_on_drop` it on
-    /// drop), and probed by `status` via `try_wait` to detect a crashed tunnel.
-    tunnel: Child,
+    /// stderr-drain task for the tunnel child (keeps the pipe from filling). Aborted in
+    /// `teardown` for lifecycle symmetry rather than relying on the child-kill →
+    /// pipe-EOF chain to end it. `None` in `listener` mode (no child to drain).
+    drain_task: Option<JoinHandle<()>>,
+    /// The tunnel child (cloudflared in `quick` mode, the user command in `command`
+    /// mode). Kept to keep the tunnel alive (and `kill_on_drop` it on drop), and probed
+    /// by `status` via `try_wait` to detect a crashed tunnel. `None` in `listener` mode
+    /// (tunnel external — no child).
+    tunnel: Option<Child>,
     public_url: Option<String>,
 }
 
 impl WebhookRuntime {
-    /// Abort the server + drain tasks; the cloudflared child is then killed on drop
-    /// (`kill_on_drop`) — or, on the `status` self-heal path, has already exited.
-    /// The single teardown shared by `stop_inner` and `status`'s crash self-heal.
+    /// Abort the server task + (if any) drain task; the tunnel child is then killed on
+    /// drop (`kill_on_drop`) — or, on the `status` self-heal path, has already exited.
+    /// A `None` `tunnel` (listener mode) drops as a no-op. The single teardown shared by
+    /// `stop_inner` and `status`'s crash self-heal.
     fn teardown(self) {
         self.server_task.abort();
-        self.drain_task.abort();
-        // self.tunnel dropped here → kill_on_drop kills cloudflared (no-op if already exited).
+        if let Some(drain) = self.drain_task {
+            drain.abort();
+        }
+        // self.tunnel dropped here → kill_on_drop kills the child (no-op if already
+        // exited, or if None in listener mode).
     }
 }
 
@@ -152,11 +192,19 @@ impl WebhookManager {
         *self.dispatcher.lock().unwrap() = Some(d);
     }
 
-    /// Start (or restart) the local receiver + Quick Tunnel. Tears down any prior
-    /// runtime first (so a config change re-binds cleanly). Returns the resolved
-    /// status; a missing `cloudflared` is reported as `running: false` +
-    /// `cloudflared_installed: false` rather than an error so the UI can prompt to
-    /// install it.
+    /// Start (or restart) the local receiver + (per-`mode`) tunnel. Tears down any prior
+    /// runtime first (so a config change re-binds cleanly). Returns the resolved status.
+    ///
+    /// Branches on [`WebhookTunnelMode`]:
+    /// - `Quick` (unchanged): require `cloudflared` (a missing binary short-circuits to
+    ///   `running: false` + `cloudflared_installed: false` rather than an error, so the
+    ///   UI can prompt to install it), bind, spawn the Quick Tunnel, scrape the
+    ///   `*.trycloudflare.com` URL.
+    /// - `Command`: bind, spawn `tunnel_command` (split on whitespace, `{port}` →
+    ///   actual port, exec'd directly — no shell), `public_url` from config (`None` if
+    ///   `public_url` is empty). Does NOT require cloudflared.
+    /// - `Listener`: bind only, spawn no child; `public_url` from config. Does NOT
+    ///   require cloudflared.
     pub async fn start(
         &self,
         port: u16,
@@ -164,11 +212,20 @@ impl WebhookManager {
         review_label: String,
         check_label: String,
         cloudflared_bin: String,
+        tunnel: TunnelSpec,
     ) -> AppResult<WebhookStatus> {
+        let TunnelSpec {
+            mode,
+            command: tunnel_command,
+            public_url,
+        } = tunnel;
         let _guard = self.start_lock.lock().await;
         self.stop_inner(); // restart semantics — avoid double-bind.
 
-        if !cloudflared_installed(&cloudflared_bin).await {
+        // Only the `quick` mode owns/depends on cloudflared; check it up front there so a
+        // missing binary short-circuits BEFORE we bind. `command` / `listener` never
+        // touch cloudflared (their tunnel is the user command / fully external).
+        if mode == WebhookTunnelMode::Quick && !cloudflared_installed(&cloudflared_bin).await {
             return Ok(WebhookStatus::new(
                 false,
                 None,
@@ -184,8 +241,8 @@ impl WebhookManager {
             .clone()
             .ok_or_else(|| AppError::new("webhook dispatcher 未初始化".to_string()))?;
 
-        // LOCAL bind only — the public path is the cloudflared tunnel; the raw port
-        // is never world-reachable.
+        // LOCAL bind only — the public path is the tunnel; the raw port is never
+        // world-reachable. Shared by all three modes.
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
             .map_err(|e| AppError::new(format!("webhookPort 监听失败（端口 {port}）：{e}")))?;
@@ -207,30 +264,63 @@ impl WebhookManager {
             let _ = axum::serve(listener, router.into_make_service()).await;
         });
 
-        // If the tunnel can't start, the server task (already spawned, holding the
-        // bound port) must be aborted here — otherwise it detaches and leaks the port,
+        // Configured public URL for the non-scraping modes (empty → None, so the status
+        // honestly reports "no URL yet" rather than a blank string).
+        let configured_url = (!public_url.trim().is_empty()).then(|| public_url.trim().to_string());
+
+        // Resolve the tunnel per mode. On a spawn error the server task (already holding
+        // the bound port) MUST be aborted here — otherwise it detaches, leaks the port,
         // and `self.runtime` stays `None` so a later `stop_inner` can't reap it.
-        let (tunnel, drain_task, public_url) =
-            match spawn_quick_tunnel(&cloudflared_bin, port).await {
-                Ok(parts) => parts,
+        let (tunnel, drain_task, resolved_url): (
+            Option<Child>,
+            Option<JoinHandle<()>>,
+            Option<String>,
+        ) = match mode {
+            WebhookTunnelMode::Quick => match spawn_quick_tunnel(&cloudflared_bin, port).await {
+                Ok((child, drain, url)) => (Some(child), Some(drain), url),
                 Err(e) => {
                     server_task.abort();
                     return Err(e);
                 }
-            };
+            },
+            WebhookTunnelMode::Command => match spawn_custom_tunnel(&tunnel_command, port) {
+                Ok((child, drain)) => (Some(child), Some(drain), configured_url),
+                Err(e) => {
+                    server_task.abort();
+                    return Err(e);
+                }
+            },
+            // No child: bind-only. The tunnel is external; the URL is whatever the
+            // user configured.
+            WebhookTunnelMode::Listener => (None, None, configured_url),
+        };
 
         *self.runtime.lock().unwrap() = Some(WebhookRuntime {
             server_task,
             drain_task,
             tunnel,
-            public_url: public_url.clone(),
+            public_url: resolved_url.clone(),
         });
 
-        let message = match &public_url {
-            Some(u) => format!("已启动，公网 URL：{u}"),
-            None => "隧道已启动，但未能在超时内解析公网 URL（请查看 cloudflared 日志）".to_string(),
+        let message = match (mode, &resolved_url) {
+            (WebhookTunnelMode::Quick, Some(u)) => format!("已启动，公网 URL：{u}"),
+            (WebhookTunnelMode::Quick, None) => {
+                "隧道已启动，但未能在超时内解析公网 URL（请查看 cloudflared 日志）".to_string()
+            }
+            (WebhookTunnelMode::Command, Some(u)) => format!("已启动自定义隧道，公网 URL：{u}"),
+            (WebhookTunnelMode::Command, None) => {
+                "已启动自定义隧道（未配置 webhookPublicUrl，无法显示公网 URL）".to_string()
+            }
+            (WebhookTunnelMode::Listener, Some(u)) => format!("接收端已监听，公网 URL：{u}"),
+            (WebhookTunnelMode::Listener, None) => {
+                "接收端已监听（隧道外置，未配置 webhookPublicUrl）".to_string()
+            }
         };
-        Ok(WebhookStatus::new(true, public_url, true, message))
+        // `cloudflared_installed` is always `true` on this success path: `quick` mode
+        // only reaches here past the install short-circuit above, and the non-quick
+        // modes don't use cloudflared (reporting `true` keeps the UI's "install
+        // cloudflared" prompt from firing spuriously for a mode that doesn't need it).
+        Ok(WebhookStatus::new(true, resolved_url, true, message))
     }
 
     /// Tear down the running receiver + tunnel (abort the server task, drop/kill the
@@ -254,32 +344,39 @@ impl WebhookManager {
 
     /// Current status (running + URL) plus a fresh `cloudflared` install probe.
     ///
-    /// Self-heals a crashed tunnel: a `runtime: Some` whose cloudflared child has
-    /// exited is a DEAD tunnel that would otherwise still report `running: true`. We
-    /// probe the child with `try_wait` (non-blocking — no await held across the
-    /// `StdMutex`), and on an exited child take the runtime + tear it down (mirroring
-    /// `stop_inner`) and report not-running. Mirrors codex's "drop a dead resident
-    /// process" self-heal (`engines/codex/process.rs::kill_and_reap`).
+    /// Self-heals a crashed tunnel: a `runtime: Some` whose tunnel child has exited is a
+    /// DEAD tunnel that would otherwise still report `running: true`. We probe the child
+    /// with `try_wait` (non-blocking — no await held across the `StdMutex`), and on an
+    /// exited child take the runtime + tear it down (mirroring `stop_inner`) and report
+    /// not-running. Mirrors codex's "drop a dead resident process" self-heal
+    /// (`engines/codex/process.rs::kill_and_reap`).
+    ///
+    /// `listener` mode has NO tunnel child (`tunnel: None`), so there is nothing to
+    /// crash and nothing to self-heal — it stays `running` until an explicit stop.
     pub async fn status(&self, cloudflared_bin: &str) -> WebhookStatus {
         let mut crashed = false;
         let (running, public_url) = {
             let mut guard = self.runtime.lock().unwrap();
             // Probe liveness + snapshot the URL in one borrow, then release it so the
-            // self-heal `take()` below can re-borrow the guard mutably.
-            let probe = guard
-                .as_mut()
-                .map(|rt| (rt.tunnel.try_wait(), rt.public_url.clone()));
+            // self-heal `take()` below can re-borrow the guard mutably. A `None` tunnel
+            // (listener mode) has no child to probe → `None` try_wait result = "alive".
+            let probe = guard.as_mut().map(|rt| {
+                let wait = rt.tunnel.as_mut().map(Child::try_wait);
+                (wait, rt.public_url.clone())
+            });
             match probe {
-                // Child exited → dead tunnel: take + teardown, report not-running.
-                Some((Ok(Some(_exit)), _)) => {
+                // Tunnel child exited → dead tunnel: take + teardown, report not-running.
+                Some((Some(Ok(Some(_exit))), _)) => {
                     crashed = true;
                     if let Some(dead) = guard.take() {
                         dead.teardown();
                     }
                     (false, None)
                 }
-                // Alive (Ok(None)) or a transient wait Err (best-effort: stay running,
-                // the next probe retries) — never tear down a healthy tunnel.
+                // Alive: a live child (`Some(Ok(None))`), a transient wait Err
+                // (`Some(Err(_))` — best-effort: stay running, the next probe retries),
+                // or no child at all (`None`, listener mode). Never tear down a healthy
+                // (or childless) tunnel.
                 Some((_, url)) => (true, url),
                 None => (false, None),
             }
@@ -524,6 +621,63 @@ async fn spawn_quick_tunnel(
     Ok((child, drain_task, url))
 }
 
+/// Tokenize a user-supplied tunnel command into `(program, args)`, substituting the
+/// literal `{port}` placeholder in EACH token with the actual listen `port`.
+///
+/// Splits on ASCII whitespace (so quoting / shell metacharacters carry NO meaning):
+/// the result is exec'd directly via [`Command::new`] in [`spawn_custom_tunnel`], never
+/// handed to a shell, so a token can't word-split further or inject (`command` mode
+/// keeps the same anti-injection property `spawn_quick_tunnel` has for `bin`). Returns
+/// `None` when the command is blank (no program token) — the caller turns that into an
+/// `AppError` (defense in depth; `validate` rejects an empty command for this mode
+/// upstream). Pure — unit-tested.
+fn build_tunnel_command_argv(command: &str, port: u16) -> Option<(String, Vec<String>)> {
+    let port = port.to_string();
+    let mut tokens = command
+        .split_whitespace()
+        .map(|tok| tok.replace("{port}", &port));
+    let program = tokens.next()?;
+    let args: Vec<String> = tokens.collect();
+    Some((program, args))
+}
+
+/// Spawn a user-supplied tunnel command (`command` mode) bridging the public internet
+/// to `http://127.0.0.1:<port>`. Mirrors [`spawn_quick_tunnel`]'s child handling
+/// (`kill_on_drop(true)` so the runtime drop kills it; stdout nulled + stderr drained so
+/// a full pipe can't stall the child), but does NOT scan for a URL — the public URL in
+/// `command` mode comes from config, not the child's output. Returns `(child,
+/// drain_task)`; the caller owns the drain task and aborts it on stop.
+///
+/// The command is tokenized by [`build_tunnel_command_argv`] (`{port}` substituted) and
+/// exec'd DIRECTLY via [`Command::new`] — NOT via a shell — so no token is word-split
+/// or shell-interpreted (same anti-injection property as `spawn_quick_tunnel`'s `bin`).
+/// A blank command is an `AppError` (defense in depth; `validate` already rejects it
+/// upstream for this mode).
+fn spawn_custom_tunnel(command: &str, port: u16) -> AppResult<(Child, JoinHandle<()>)> {
+    let (program, args) = build_tunnel_command_argv(command, port).ok_or_else(|| {
+        AppError::new("webhookTunnelCommand 不能为空（command 模式需填隧道命令）".to_string())
+    })?;
+
+    let mut cmd = Command::new(&program);
+    cmd.args(&args)
+        // stdout unused → null it; stderr piped + drained so an unread pipe can't block.
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| AppError::new(format!("无法启动自定义隧道命令（{program}）：{e}")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::new("自定义隧道命令 stderr 不可用".to_string()))?;
+    let mut lines = BufReader::new(stderr).lines();
+    let drain_task = spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+
+    Ok((child, drain_task))
+}
+
 /// Read cloudflared's stderr line-by-line until a trycloudflare URL appears (or EOF).
 async fn scan_for_url(lines: &mut Lines<BufReader<ChildStderr>>) -> Option<String> {
     while let Ok(Some(line)) = lines.next_line().await {
@@ -753,8 +907,8 @@ mod tests {
         let mgr = WebhookManager::default();
         *mgr.runtime.lock().unwrap() = Some(WebhookRuntime {
             server_task: spawn(async {}),
-            drain_task: spawn(async {}),
-            tunnel: child,
+            drain_task: Some(spawn(async {})),
+            tunnel: Some(child),
             public_url: Some("https://x.trycloudflare.com".to_string()),
         });
 
@@ -784,5 +938,213 @@ mod tests {
             msg.contains("已退出"),
             "error reports the early exit: {msg}"
         );
+    }
+
+    /// Pure tokenization lock for `command` mode: split on whitespace, substitute every
+    /// literal `{port}`, first token = program, rest = args. Exec'd directly (no shell),
+    /// so this is the whole parse surface.
+    #[test]
+    fn build_tunnel_command_argv_splits_and_substitutes_port() {
+        let (prog, args) = build_tunnel_command_argv(
+            "cloudflared tunnel run --url http://127.0.0.1:{port} my-tunnel",
+            8787,
+        )
+        .expect("non-empty command");
+        assert_eq!(prog, "cloudflared");
+        assert_eq!(
+            args,
+            vec![
+                "tunnel".to_string(),
+                "run".to_string(),
+                "--url".to_string(),
+                "http://127.0.0.1:8787".to_string(),
+                "my-tunnel".to_string(),
+            ]
+        );
+
+        // `{port}` substituted even when it is the whole token, and multiple
+        // occurrences across tokens are all replaced.
+        let (prog, args) = build_tunnel_command_argv("ngrok http {port} --log {port}", 9000)
+            .expect("non-empty command");
+        assert_eq!(prog, "ngrok");
+        assert_eq!(
+            args,
+            vec![
+                "http".to_string(),
+                "9000".to_string(),
+                "--log".to_string(),
+                "9000".to_string(),
+            ]
+        );
+
+        // Extra whitespace collapses (split_whitespace), and a port-only program token
+        // still substitutes.
+        let (prog, args) =
+            build_tunnel_command_argv("  proxy-{port}   --to   {port}  ", 80).expect("non-empty");
+        assert_eq!(prog, "proxy-80");
+        assert_eq!(args, vec!["--to".to_string(), "80".to_string()]);
+
+        // Blank command → None (the caller turns this into an AppError; validate also
+        // rejects it upstream for command mode).
+        assert!(build_tunnel_command_argv("", 8787).is_none());
+        assert!(build_tunnel_command_argv("   ", 8787).is_none());
+    }
+
+    /// `command` mode `start` → `status`: spawns the user command (no URL scrape) and
+    /// reports the CONFIGURED `public_url` (not a scraped one). CI-safe — `sleep` is a
+    /// long-lived child on darwin + Linux, so the tunnel stays "alive" for the probe.
+    #[tokio::test]
+    async fn command_mode_start_reports_configured_public_url() {
+        let mgr = WebhookManager::default();
+        mgr.set_dispatcher(Arc::new(|_| Box::pin(async {})));
+
+        // port 0 → OS picks a free port; `{port}` substitutes into the (harmless) sleep
+        // args. cloudflared_bin is bogus on purpose — command mode must NOT require it.
+        let s = mgr
+            .start(
+                0,
+                "shh".to_string(),
+                "review".to_string(),
+                "check".to_string(),
+                "prmonitor-no-such-cloudflared".to_string(),
+                TunnelSpec {
+                    mode: WebhookTunnelMode::Command,
+                    command: "sleep 30 {port}".to_string(),
+                    public_url: "https://my.example.com".to_string(),
+                },
+            )
+            .await
+            .expect("command-mode start succeeds without cloudflared");
+
+        assert!(s.running);
+        assert_eq!(s.public_url.as_deref(), Some("https://my.example.com"));
+        assert_eq!(
+            s.payload_url.as_deref(),
+            Some("https://my.example.com/webhook")
+        );
+
+        // status() re-reports the configured URL while the child is alive (no self-heal).
+        let s2 = mgr.status("prmonitor-no-such-cloudflared").await;
+        assert!(s2.running);
+        assert_eq!(s2.public_url.as_deref(), Some("https://my.example.com"));
+
+        mgr.stop();
+    }
+
+    /// `command` mode with a child that exits IMMEDIATELY (`true`) self-heals on the next
+    /// `status` exactly like quick mode — the `Option<Child>` probe still flips a dead
+    /// tunnel to not-running.
+    #[tokio::test]
+    async fn command_mode_self_heals_when_child_exits() {
+        let mgr = WebhookManager::default();
+        mgr.set_dispatcher(Arc::new(|_| Box::pin(async {})));
+
+        let s = mgr
+            .start(
+                0,
+                "shh".to_string(),
+                "review".to_string(),
+                "check".to_string(),
+                "bogus".to_string(),
+                TunnelSpec {
+                    mode: WebhookTunnelMode::Command,
+                    command: "true".to_string(), // exits 0 immediately
+                    public_url: String::new(),
+                },
+            )
+            .await
+            .expect("start spawns the (short-lived) child");
+        assert!(s.running);
+        // Empty public_url → None.
+        assert!(s.public_url.is_none());
+
+        // Give the child a moment to exit, then status must self-heal to not-running.
+        let mut child = Command::new("true").kill_on_drop(true).spawn().unwrap();
+        let _ = child.wait().await;
+        let s2 = mgr.status("bogus").await;
+        assert!(
+            !s2.running,
+            "an exited command-mode child flips running → false"
+        );
+        assert!(mgr.runtime.lock().unwrap().is_none());
+    }
+
+    /// `listener` mode spawns NO child (`tunnel: None`): it stays running across
+    /// repeated `status` probes (no crash self-heal — there's no child to crash) and
+    /// reports the configured `public_url`. The bogus cloudflared bin proves listener
+    /// mode doesn't require it.
+    #[tokio::test]
+    async fn listener_mode_has_no_child_and_does_not_self_heal() {
+        let mgr = WebhookManager::default();
+        mgr.set_dispatcher(Arc::new(|_| Box::pin(async {})));
+
+        let s = mgr
+            .start(
+                0,
+                "shh".to_string(),
+                "review".to_string(),
+                "check".to_string(),
+                "prmonitor-no-such-cloudflared".to_string(),
+                TunnelSpec {
+                    mode: WebhookTunnelMode::Listener,
+                    command: String::new(),
+                    public_url: "https://external.example.com".to_string(),
+                },
+            )
+            .await
+            .expect("listener-mode start succeeds without cloudflared");
+        assert!(s.running);
+        assert_eq!(
+            s.public_url.as_deref(),
+            Some("https://external.example.com")
+        );
+
+        // No tunnel child → runtime carries `tunnel: None` / `drain_task: None`.
+        {
+            let guard = mgr.runtime.lock().unwrap();
+            let rt = guard.as_ref().expect("runtime present");
+            assert!(rt.tunnel.is_none(), "listener mode spawns no tunnel child");
+            assert!(rt.drain_task.is_none(), "listener mode has no drain task");
+        }
+
+        // Probe repeatedly: a childless runtime never self-heals to not-running.
+        for _ in 0..3 {
+            let st = mgr.status("prmonitor-no-such-cloudflared").await;
+            assert!(st.running, "listener mode stays running across probes");
+            assert_eq!(
+                st.public_url.as_deref(),
+                Some("https://external.example.com")
+            );
+        }
+        assert!(
+            mgr.runtime.lock().unwrap().is_some(),
+            "listener runtime is never self-heal-taken"
+        );
+
+        mgr.stop();
+    }
+
+    /// `command` mode with a blank command is a defensive `AppError` at `start` (validate
+    /// rejects it upstream, but `start` must not silently spawn nothing).
+    #[tokio::test]
+    async fn command_mode_blank_command_errs() {
+        let mgr = WebhookManager::default();
+        mgr.set_dispatcher(Arc::new(|_| Box::pin(async {})));
+
+        let r = mgr
+            .start(
+                0,
+                "shh".to_string(),
+                "review".to_string(),
+                "check".to_string(),
+                "bogus".to_string(),
+                TunnelSpec {
+                    mode: WebhookTunnelMode::Command,
+                    command: "   ".to_string(),
+                    public_url: String::new(),
+                },
+            )
+            .await;
+        assert!(r.is_err(), "blank command-mode command must Err");
     }
 }
