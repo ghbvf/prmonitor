@@ -78,7 +78,10 @@ impl Default for AppConfig {
             pr_cooldown_seconds: 1800,
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
-            auto_review: true,
+            // Boot defaults to manual review: scheduler polls/emits but does NOT
+            // auto-dispatch codex at startup (avoids clashing with other review
+            // processes). Flip-back guarded by `default_auto_review_is_off`.
+            auto_review: false,
             webhook_enabled: false,
             webhook_port: 8787,
             webhook_secret: String::new(),
@@ -308,6 +311,17 @@ mod tests {
     #[test]
     fn default_repo_root_is_empty_first_launch_marker() {
         assert_eq!(AppConfig::default().repo_root, "");
+    }
+
+    /// Default-manual-review lock (Medium). A fresh/reset config must NOT
+    /// auto-dispatch codex review at boot: `auto_review` defaults off, so the
+    /// scheduler only polls/emits PRs and codex is left to the explicit triggers
+    /// (`start_review` / `start_codex`). Locking the default here makes that intent
+    /// machine-checked — a silent flip back to `true` would reintroduce the
+    /// boot-time review-process clash this guards against, and fails CI first.
+    #[test]
+    fn default_auto_review_is_off() {
+        assert!(!AppConfig::default().auto_review);
     }
 
     #[test]
