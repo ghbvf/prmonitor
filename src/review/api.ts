@@ -21,10 +21,15 @@ export function stopCodex(): Promise<CodexStatus> {
   return invoke<CodexStatus>("stop_codex");
 }
 
-// Starts a review; resolves with the session id (codex threadId). Output streams
-// out-of-band via `onReviewEvent`. `kind` is "review" or "check".
-export function startReview(prNumber: number, kind: string): Promise<string> {
-  return invoke<string>("start_review", { prNumber, kind });
+// Starts a review for a PR in the given project (#35); resolves with the session
+// id (codex threadId). Output streams out-of-band via `onReviewEvent`. `kind` is
+// "review" or "check".
+export function startReview(
+  projectId: string,
+  prNumber: number,
+  kind: string,
+): Promise<string> {
+  return invoke<string>("start_review", { projectId, prNumber, kind });
 }
 
 export function stopReview(sessionId: string): Promise<void> {

@@ -5,10 +5,19 @@
 // both) — from the shared store's `sessions` ref, and lets the user point the
 // focused panel at any one. Reads the module-level singleton store — no second
 // instance, no props. Mirrors PrList/PrRow's badge + muted conventions.
+import { computed } from "vue";
+import { useProjects } from "../projects";
 import { useReviewStore } from "./useReviewStore";
 import type { SessionStatus } from "./types";
 
 const { sessions, activeThreadId, focus } = useReviewStore();
+const { activeProjectId } = useProjects();
+
+// Scope the list to the active project (#35): the store tracks every project's
+// sessions, but the panel only ever focuses one project's at a time.
+const visibleSessions = computed(() =>
+  sessions.value.filter((s) => s.projectId === activeProjectId.value),
+);
 
 // Bilingual label for each session lifecycle status (mirrors ReviewPanel's
 // finalLabel style). Default keeps the raw value so a new SessionStatus still
@@ -37,11 +46,13 @@ function statusLabel(status: SessionStatus): string {
       <h2>Review 会话 / Review sessions</h2>
     </header>
 
-    <p v-if="sessions.length === 0" class="muted">暂无会话 / No review sessions</p>
+    <p v-if="visibleSessions.length === 0" class="muted">
+      暂无会话 / No review sessions
+    </p>
 
     <ul v-else class="rows">
       <li
-        v-for="s in sessions"
+        v-for="s in visibleSessions"
         :key="s.threadId"
         class="session-row"
         :class="{ focused: s.threadId === activeThreadId }"

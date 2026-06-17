@@ -1,14 +1,17 @@
 <script setup lang="ts">
-// Settings page (#34): a grouped editor over the persisted AppConfig. Left nav
-// lists the GROUPS; the right pane renders the active group's fields via
-// ConfigField. Reuses the useConfigStore draft/hydrate/save flow verbatim from the
-// old ConfigPanel — edits land on a local `draft`, committed via store.save();
-// the draft re-hydrates whenever the store's config arrives/changes.
+// Settings page (#34, multi-project #35): a grouped editor over the persisted
+// AppConfig. Left nav lists a "项目" (projects) section plus the GLOBAL_GROUPS
+// (webhook) groups; the right pane renders the active section. The projects section
+// hosts ProjectsManager (the per-project list/editor); webhook fields render via
+// ConfigField. Reuses the useConfigStore draft/hydrate/save flow — edits land on a
+// local reactive `draft` (the full AppConfig), committed via store.save(); the draft
+// re-hydrates whenever the store's config arrives/changes.
 import { onMounted, reactive, ref, watch } from "vue";
 import { useConfigStore } from "./useConfigStore";
 import type { AppConfig } from "./types";
-import { GROUPS, type FieldDef, type FieldKey } from "./fields";
+import { GLOBAL_GROUPS, type FieldDef, type GlobalFieldKey } from "./fields";
 import ConfigField from "./ConfigField.vue";
+import ProjectsManager from "./ProjectsManager.vue";
 // The webhook control panel lives in the `pr` slice; mounting it here would be a
 // config→pr edge. Instead we expose a `webhook` scoped slot (saved config + live
 // draft + saving flag) and let the composition root (App.vue) fill it — keeping
@@ -20,20 +23,17 @@ const store = useConfigStore();
 // `close` returns to the monitor view.
 const emit = defineEmits<{ saved: []; close: [] }>();
 
-// Editable draft (decoupled from the store). `authors` is surfaced as a
-// comma-joined string via `authorsInput` and normalized back to string[] on save.
+// The synthetic nav id for the projects section (not a GLOBAL_GROUPS id). The
+// per-project authors csv state now lives inside each ProjectCard, so SettingsView
+// no longer carries a top-level authorsInput.
+const PROJECTS_NAV_ID = "projects";
+
+// Editable draft (decoupled from the store). The full multi-project AppConfig:
+// `projects`/`activeProjectId` are edited by ProjectsManager; the webhook fields by
+// the GLOBAL_GROUPS form below.
 const draft = reactive<AppConfig>({
-  repo: "",
-  repoRoot: "",
-  pollIntervalSecs: 0,
-  authors: [],
-  reviewLabel: "",
-  checkLabel: "",
-  skillRelPath: "",
-  prCooldownSeconds: 0,
-  sourceKind: "github",
-  engineKind: "codex",
-  autoReview: false,
+  projects: [],
+  activeProjectId: "",
   webhookEnabled: false,
   webhookPort: 8787,
   webhookSecret: "",
@@ -43,20 +43,11 @@ const draft = reactive<AppConfig>({
   webhookPublicUrl: "",
 });
 
-const authorsInput = ref("");
-
 function hydrate(cfg: AppConfig) {
-  draft.repo = cfg.repo;
-  draft.repoRoot = cfg.repoRoot;
-  draft.pollIntervalSecs = cfg.pollIntervalSecs;
-  draft.authors = [...cfg.authors];
-  draft.reviewLabel = cfg.reviewLabel;
-  draft.checkLabel = cfg.checkLabel;
-  draft.skillRelPath = cfg.skillRelPath;
-  draft.prCooldownSeconds = cfg.prCooldownSeconds;
-  draft.sourceKind = cfg.sourceKind;
-  draft.engineKind = cfg.engineKind;
-  draft.autoReview = cfg.autoReview;
+  // Deep-copy projects so card edits never mutate the store's config object before a
+  // save (the store replaces `config` only on a successful setConfig).
+  draft.projects = cfg.projects.map((p) => ({ ...p, authors: [...p.authors] }));
+  draft.activeProjectId = cfg.activeProjectId;
   draft.webhookEnabled = cfg.webhookEnabled;
   draft.webhookPort = cfg.webhookPort;
   draft.webhookSecret = cfg.webhookSecret;
@@ -64,7 +55,6 @@ function hydrate(cfg: AppConfig) {
   draft.webhookTunnelMode = cfg.webhookTunnelMode;
   draft.webhookTunnelCommand = cfg.webhookTunnelCommand;
   draft.webhookPublicUrl = cfg.webhookPublicUrl;
-  authorsInput.value = cfg.authors.join(", ");
 }
 
 // Populate the draft once the async config lands (and on any later replacement).
@@ -78,25 +68,24 @@ watch(
 
 onMounted(() => store.load());
 
-const activeGroupId = ref(GROUPS[0].id);
+// Default to the projects section.
+const activeGroupId = ref(PROJECTS_NAV_ID);
 
-// Read/write a field's draft value by key. `authors` is special-cased to the
-// comma-joined `authorsInput` so the csv ConfigField round-trips through one
-// string source (mirrors the old ConfigPanel join/split on ", ").
+// Read/write a GLOBAL (webhook) field's draft value by key. Only webhook FieldDefs
+// reach here (GLOBAL_GROUPS holds the webhook group; `projects`/`activeProjectId` are
+// structural, edited by ProjectsManager — not a field group), so every value is a
+// string/number/boolean. The cast narrows the over-wide `AppConfig[GlobalFieldKey]`
+// (which structurally includes `Project[]`) to the heterogeneous field-value union.
+// Webhook fields carry no csv kind, so no authors-style special-casing is needed.
 function fieldValue(def: FieldDef): string | number | boolean | string[] {
-  if (def.key === "authors") return authorsInput.value;
-  return draft[def.key];
+  return draft[def.key as GlobalFieldKey] as string | number | boolean | string[];
 }
 
 function setField(def: FieldDef, value: string | number | boolean | string[]) {
-  if (def.key === "authors") {
-    authorsInput.value = Array.isArray(value) ? value.join(", ") : String(value);
-    return;
-  }
-  // Each FieldDef.kind matches its AppConfig field's value type (number kinds map
-  // to numeric keys, select/text to string keys), so the per-key assignment is
+  // Each global FieldDef.kind matches its AppConfig field's value type (number kinds
+  // map to numeric keys, select/text to string keys), so the per-key assignment is
   // type-correct at runtime; the cast bridges the heterogeneous emit signature.
-  (draft as Record<FieldKey, unknown>)[def.key] = value;
+  (draft as Record<GlobalFieldKey, unknown>)[def.key as GlobalFieldKey] = value;
 }
 
 // Clear the "已保存。" banner / stale error the moment the user resumes editing.
@@ -106,13 +95,13 @@ function onEdit() {
 }
 
 async function onSave() {
-  const authors = authorsInput.value
-    .split(",")
-    .map((a) => a.trim())
-    .filter((a) => a.length > 0);
-  // store.save() resolves regardless of outcome (it catches and sets
-  // store.error / store.savedOk); gate the emit on the success flag.
-  await store.save({ ...draft, authors });
+  // Projects already hold normalized authors arrays (each ProjectCard emits string[]),
+  // so the whole draft persists as-is. Spread to a plain object so the store keeps a
+  // detached snapshot (not the live reactive draft).
+  await store.save({
+    ...draft,
+    projects: draft.projects.map((p) => ({ ...p, authors: [...p.authors] })),
+  });
   if (store.savedOk) emit("saved");
 }
 </script>
@@ -130,7 +119,15 @@ async function onSave() {
     <div v-else class="body">
       <nav class="nav">
         <button
-          v-for="g in GROUPS"
+          type="button"
+          class="nav-item"
+          :class="{ active: activeGroupId === PROJECTS_NAV_ID }"
+          @click="activeGroupId = PROJECTS_NAV_ID"
+        >
+          项目
+        </button>
+        <button
+          v-for="g in GLOBAL_GROUPS"
           :key="g.id"
           type="button"
           class="nav-item"
@@ -142,7 +139,11 @@ async function onSave() {
       </nav>
 
       <form class="pane" @submit.prevent="onSave">
-        <template v-for="g in GROUPS" :key="g.id">
+        <div v-if="activeGroupId === PROJECTS_NAV_ID" class="group projects-group">
+          <ProjectsManager :draft="draft" @edit="onEdit" />
+        </div>
+
+        <template v-for="g in GLOBAL_GROUPS" :key="g.id">
           <div v-if="g.id === activeGroupId" class="group">
             <ConfigField
               v-for="def in g.fields"
@@ -257,6 +258,10 @@ async function onSave() {
   flex-direction: column;
   gap: var(--space-5);
   max-width: 480px;
+}
+/* The projects section hosts a full-width list of cards — let it use the pane width. */
+.projects-group {
+  max-width: 720px;
 }
 .actions {
   display: flex;

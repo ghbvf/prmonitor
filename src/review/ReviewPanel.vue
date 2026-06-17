@@ -3,9 +3,12 @@
 // the streamed deltas. The selected PR is passed down by the composition root
 // (App.vue) so the pr slice and review slice stay decoupled.
 import { computed, onMounted, onUnmounted } from "vue";
+import { useProjects } from "../projects";
 import type { PullRequestView } from "../types";
 import ReviewStream from "./ReviewStream.vue";
 import { useReviewStore } from "./useReviewStore";
+
+const { activeProjectId } = useProjects();
 
 const props = defineProps<{ selectedPr: PullRequestView | null }>();
 
@@ -47,7 +50,8 @@ onMounted(async () => {
 onUnmounted(() => unlisten?.());
 
 function onStart() {
-  if (props.selectedPr) start(props.selectedPr.number, props.selectedPr.kind);
+  if (props.selectedPr)
+    start(activeProjectId.value, props.selectedPr.number, props.selectedPr.kind);
 }
 </script>
 

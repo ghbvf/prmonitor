@@ -15,7 +15,10 @@ export type SessionStatus =
   | "failed";
 
 // Mirrors `session.rs::SessionInfo` — one review session (list_review_sessions).
+// `projectId` (#35) attributes each session to its monitored project so the
+// ReviewSessions list can filter to the active project.
 export interface ReviewSession {
+  projectId: string;
   threadId: string;
   turnId: string;
   prNumber: number;

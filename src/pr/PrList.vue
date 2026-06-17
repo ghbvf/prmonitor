@@ -8,12 +8,18 @@
 import { computed, onMounted, ref } from "vue";
 import type { TrackedPrView } from "../types";
 import { usePrStore } from "./usePrStore";
+import { useProjects } from "../projects";
 import PrRow from "./PrRow.vue";
 
 defineProps<{ selectedNumber: number | null }>();
 const emit = defineEmits<{ select: [pr: TrackedPrView] }>();
 
 const store = usePrStore();
+const { activeProjectId } = useProjects();
+
+// The active project's retained list (#35) — drives the empty/loading states the
+// three section getters partition.
+const activePrs = computed(() => store.prs[activeProjectId.value] ?? []);
 
 // Stale section: collapsed by default; when open, window to STALE_LIMIT rows with
 // a nested "显示更多 / 显示更少" toggle so a long inactive backlog stays bounded.
@@ -45,13 +51,13 @@ onMounted(() => store.refreshGhStatus());
       <h2>Pull requests</h2>
     </header>
 
-    <p v-if="store.error" class="error">{{ store.error }}</p>
+    <p v-if="store.errorActive" class="error">{{ store.errorActive }}</p>
 
-    <p v-else-if="store.loading && store.prs.length === 0" class="muted">
+    <p v-else-if="store.loadingActive && activePrs.length === 0" class="muted">
       拉取中…
     </p>
 
-    <p v-else-if="store.prs.length === 0" class="muted">暂无 PR / No PRs</p>
+    <p v-else-if="activePrs.length === 0" class="muted">暂无 PR / No PRs</p>
 
     <template v-else>
       <p v-if="!store.currentPrs.length" class="muted">
@@ -65,7 +71,7 @@ onMounted(() => store.refreshGhStatus());
           :pr="pr"
           :selected="pr.number === selectedNumber"
           @select="(p) => emit('select', p)"
-          @set-archived="(e) => store.setArchived(e.number, e.archived)"
+          @set-archived="(e) => store.setArchived(activeProjectId, e.number, e.archived)"
         />
       </ul>
 
@@ -81,7 +87,7 @@ onMounted(() => store.refreshGhStatus());
               :pr="pr"
               :selected="pr.number === selectedNumber"
               @select="(p) => emit('select', p)"
-              @set-archived="(e) => store.setArchived(e.number, e.archived)"
+              @set-archived="(e) => store.setArchived(activeProjectId, e.number, e.archived)"
             />
           </ul>
           <button
@@ -116,7 +122,7 @@ onMounted(() => store.refreshGhStatus());
             :key="pr.number"
             :pr="pr"
             :selected="false"
-            @set-archived="(e) => store.setArchived(e.number, e.archived)"
+            @set-archived="(e) => store.setArchived(activeProjectId, e.number, e.archived)"
           />
         </ul>
       </section>

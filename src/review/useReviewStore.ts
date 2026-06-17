@@ -36,9 +36,12 @@ const sessions = ref<ReviewSession[]>([]);
 
 // App-level auto-trigger (#8) notice, session-less: set from a `dispatchError`
 // event (the backend dispatcher hit a bad config, one/more start failures, or a
-// ledger-write failure). Surfaced in the availability banner; dismissed via
-// `clearDispatchError`. Not tied to any session, so it survives panel focus changes.
-const dispatchError = ref<string | null>(null);
+// ledger-write failure). Keyed per project (#35): the dispatcher runs per
+// monitored project, so a bad-config / start-failure notice belongs to the project
+// it fired for — App.vue reads `dispatchError[activeProjectId]`. Surfaced in the
+// availability banner; dismissed per-project via `clearDispatchError`. Not tied to
+// any session, so it survives panel focus changes.
+const dispatchError = ref<Record<string, string | null>>({});
 
 // Active session (single-active-panel model): the most recently started review.
 const activeThreadId = ref<string | null>(null);
@@ -142,10 +145,10 @@ async function refreshSessions() {
   }
 }
 
-// Dismiss the auto-trigger notice (the banner's ✕). The next `dispatchError` event
-// re-sets it.
-function clearDispatchError() {
-  dispatchError.value = null;
+// Dismiss the auto-trigger notice for a project (the banner's ✕). The next
+// `dispatchError` event for that project re-sets it.
+function clearDispatchError(projectId: string) {
+  dispatchError.value[projectId] = null;
 }
 
 // Append a streamed delta, concatenating onto the existing item for `itemId`
@@ -165,7 +168,7 @@ function applyEvent(ev: ReviewEvent) {
   // The early return narrows `ev` to the session-scoped variants, so the `never`
   // exhaustiveness guard in the switch still covers the remaining four.
   if (ev.kind === "dispatchError") {
-    dispatchError.value = ev.message;
+    dispatchError.value[ev.projectId] = ev.message;
     return;
   }
 
@@ -219,8 +222,9 @@ function applyEvent(ev: ReviewEvent) {
   }
 }
 
-// Start a review for a PR. Resets the panel, then records the returned session id.
-async function start(prNumber: number, kind: string) {
+// Start a review for a PR in the given project (#35). Resets the panel, then
+// records the returned session id.
+async function start(projectId: string, prNumber: number, kind: string) {
   // Single-active MVP: one start at a time. A non-null buffer means a start is
   // already in flight; bail so two overlapping starts can't race the shared buffer.
   if (inFlightBuffer !== null) return;
@@ -232,7 +236,7 @@ async function start(prNumber: number, kind: string) {
   running.value = true;
   inFlightBuffer = []; // buffer events until the id is known (see applyEvent).
   try {
-    const id = await startReview(prNumber, kind);
+    const id = await startReview(projectId, prNumber, kind);
     activeThreadId.value = id;
     // Replay what arrived during the start; applyEvent now drops foreign sessions.
     const buffered = inFlightBuffer;
