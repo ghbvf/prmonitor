@@ -54,6 +54,10 @@ type HmacSha256 = Hmac<Sha256>;
 const TUNNEL_URL_TIMEOUT: Duration = Duration::from_secs(20);
 /// `cloudflared --version` probe budget (the install check).
 const CLOUDFLARED_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+/// The single path the axum receiver serves — also the suffix appended to the tunnel
+/// root to form the GitHub "Payload URL". ONE source for both the route registration
+/// and the URL the UI tells the user to paste; they must match or every delivery 404s.
+const WEBHOOK_PATH: &str = "/webhook";
 
 /// webhook receiver + tunnel status reported to the frontend (pr-slice-private wire
 /// type; not a cross-slice contract, so it is mirrored in `src/pr/types.ts`, not
@@ -63,13 +67,41 @@ const CLOUDFLARED_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct WebhookStatus {
     /// Whether the local receiver + tunnel are currently running.
     pub running: bool,
-    /// The public `https://*.trycloudflare.com` URL to paste into GitHub, when
-    /// resolved. `None` while stopped or if the URL didn't appear within the timeout.
+    /// The public `https://*.trycloudflare.com` tunnel ROOT, when resolved. `None`
+    /// while stopped or if the URL didn't appear within the timeout. This is the
+    /// tunnel itself, NOT the value to paste into GitHub — see [`Self::payload_url`].
     pub public_url: Option<String>,
+    /// The full GitHub "Payload URL" = [`Self::public_url`] + [`WEBHOOK_PATH`], the
+    /// ONLY route the receiver serves. The UI shows/copies THIS (pasting `public_url`
+    /// alone 404s every delivery). Derived in [`Self::new`] so it can't drift.
+    pub payload_url: Option<String>,
     /// Whether `cloudflared` is runnable (so the UI can prompt to install it).
     pub cloudflared_installed: bool,
     /// Human-readable (Chinese) status line for the UI.
     pub message: String,
+}
+
+impl WebhookStatus {
+    /// Build a status, deriving [`Self::payload_url`] from `public_url` + the route
+    /// the receiver serves ([`WEBHOOK_PATH`]) as the SINGLE source — a route rename
+    /// forces this format to follow (locked by `webhook_status_wire_shape_*`), so the
+    /// pasted URL and the served path can never disagree. The ONLY constructor, so no
+    /// caller can build a status whose `payload_url` drifts from `public_url`.
+    fn new(
+        running: bool,
+        public_url: Option<String>,
+        cloudflared_installed: bool,
+        message: String,
+    ) -> Self {
+        let payload_url = public_url.as_ref().map(|u| format!("{u}{WEBHOOK_PATH}"));
+        Self {
+            running,
+            public_url,
+            payload_url,
+            cloudflared_installed,
+            message,
+        }
+    }
 }
 
 /// Owns the running receiver + tunnel. `&self` methods + interior mutability so it
@@ -87,19 +119,31 @@ pub struct WebhookManager {
     start_lock: tokio::sync::Mutex<()>,
 }
 
-/// The live receiver + tunnel handles. `stop_inner` aborts `server_task` and
-/// `_drain` (explicit — neither is aborted by `Drop`) before dropping this value;
-/// `_tunnel` (the cloudflared child) is then killed via `kill_on_drop(true)` on drop.
+/// The live receiver + tunnel handles. [`Self::teardown`] aborts `server_task` and
+/// `drain_task` (explicit — neither is aborted by `Drop`) before dropping this value;
+/// `tunnel` (the cloudflared child) is then killed via `kill_on_drop(true)` on drop.
+/// `status` reaps a dead `tunnel` via `try_wait` to self-heal a crashed tunnel.
 struct WebhookRuntime {
     server_task: JoinHandle<()>,
     /// stderr-drain task for the cloudflared child (keeps the pipe from filling).
-    /// Aborted in `stop_inner` for lifecycle symmetry rather than relying on the
+    /// Aborted in `teardown` for lifecycle symmetry rather than relying on the
     /// child-kill → pipe-EOF chain to end it.
     drain_task: JoinHandle<()>,
-    /// Held only to keep the child alive (and `kill_on_drop` it when the runtime
-    /// drops); never read after construction.
-    _tunnel: Child,
+    /// The cloudflared child. Kept to keep the tunnel alive (and `kill_on_drop` it on
+    /// drop), and probed by `status` via `try_wait` to detect a crashed tunnel.
+    tunnel: Child,
     public_url: Option<String>,
+}
+
+impl WebhookRuntime {
+    /// Abort the server + drain tasks; the cloudflared child is then killed on drop
+    /// (`kill_on_drop`) — or, on the `status` self-heal path, has already exited.
+    /// The single teardown shared by `stop_inner` and `status`'s crash self-heal.
+    fn teardown(self) {
+        self.server_task.abort();
+        self.drain_task.abort();
+        // self.tunnel dropped here → kill_on_drop kills cloudflared (no-op if already exited).
+    }
 }
 
 impl WebhookManager {
@@ -125,12 +169,12 @@ impl WebhookManager {
         self.stop_inner(); // restart semantics — avoid double-bind.
 
         if !cloudflared_installed(&cloudflared_bin).await {
-            return Ok(WebhookStatus {
-                running: false,
-                public_url: None,
-                cloudflared_installed: false,
-                message: "未找到 cloudflared，请先安装：brew install cloudflared".to_string(),
-            });
+            return Ok(WebhookStatus::new(
+                false,
+                None,
+                false,
+                "未找到 cloudflared，请先安装：brew install cloudflared".to_string(),
+            ));
         }
 
         let dispatcher = self
@@ -153,7 +197,7 @@ impl WebhookManager {
             dispatcher,
         });
         let router = Router::new()
-            .route("/webhook", post(handle_webhook))
+            .route(WEBHOOK_PATH, post(handle_webhook))
             // Cap the public endpoint's request body. GitHub webhook payloads are well
             // under this (typically < 25 KiB); the limit bounds the memory a forged POST
             // can make us buffer before the HMAC check rejects it.
@@ -178,7 +222,7 @@ impl WebhookManager {
         *self.runtime.lock().unwrap() = Some(WebhookRuntime {
             server_task,
             drain_task,
-            _tunnel: tunnel,
+            tunnel,
             public_url: public_url.clone(),
         });
 
@@ -186,21 +230,14 @@ impl WebhookManager {
             Some(u) => format!("已启动，公网 URL：{u}"),
             None => "隧道已启动，但未能在超时内解析公网 URL（请查看 cloudflared 日志）".to_string(),
         };
-        Ok(WebhookStatus {
-            running: true,
-            public_url,
-            cloudflared_installed: true,
-            message,
-        })
+        Ok(WebhookStatus::new(true, public_url, true, message))
     }
 
     /// Tear down the running receiver + tunnel (abort the server task, drop/kill the
     /// child). Sync + idempotent — safe from the app-exit `RunEvent` handler.
     fn stop_inner(&self) {
         if let Some(rt) = self.runtime.lock().unwrap().take() {
-            rt.server_task.abort();
-            rt.drain_task.abort();
-            // rt._tunnel dropped here → kill_on_drop kills cloudflared.
+            rt.teardown();
         }
     }
 
@@ -216,11 +253,34 @@ impl WebhookManager {
     }
 
     /// Current status (running + URL) plus a fresh `cloudflared` install probe.
+    ///
+    /// Self-heals a crashed tunnel: a `runtime: Some` whose cloudflared child has
+    /// exited is a DEAD tunnel that would otherwise still report `running: true`. We
+    /// probe the child with `try_wait` (non-blocking — no await held across the
+    /// `StdMutex`), and on an exited child take the runtime + tear it down (mirroring
+    /// `stop_inner`) and report not-running. Mirrors codex's "drop a dead resident
+    /// process" self-heal (`engines/codex/process.rs::kill_and_reap`).
     pub async fn status(&self, cloudflared_bin: &str) -> WebhookStatus {
+        let mut crashed = false;
         let (running, public_url) = {
-            let guard = self.runtime.lock().unwrap();
-            match guard.as_ref() {
-                Some(rt) => (true, rt.public_url.clone()),
+            let mut guard = self.runtime.lock().unwrap();
+            // Probe liveness + snapshot the URL in one borrow, then release it so the
+            // self-heal `take()` below can re-borrow the guard mutably.
+            let probe = guard
+                .as_mut()
+                .map(|rt| (rt.tunnel.try_wait(), rt.public_url.clone()));
+            match probe {
+                // Child exited → dead tunnel: take + teardown, report not-running.
+                Some((Ok(Some(_exit)), _)) => {
+                    crashed = true;
+                    if let Some(dead) = guard.take() {
+                        dead.teardown();
+                    }
+                    (false, None)
+                }
+                // Alive (Ok(None)) or a transient wait Err (best-effort: stay running,
+                // the next probe retries) — never tear down a healthy tunnel.
+                Some((_, url)) => (true, url),
                 None => (false, None),
             }
         };
@@ -230,17 +290,14 @@ impl WebhookManager {
                 Some(u) => format!("运行中，公网 URL：{u}"),
                 None => "运行中（公网 URL 尚未解析）".to_string(),
             }
+        } else if crashed {
+            "隧道已退出（cloudflared 进程已结束），请重新启动 Webhook".to_string()
         } else if installed {
             "未运行".to_string()
         } else {
             "未运行；未检测到 cloudflared（brew install cloudflared）".to_string()
         };
-        WebhookStatus {
-            running,
-            public_url,
-            cloudflared_installed: installed,
-            message,
-        }
+        WebhookStatus::new(running, public_url, installed, message)
     }
 }
 
@@ -329,6 +386,15 @@ fn payload_to_candidate(
     check_label: &str,
 ) -> Option<Candidate> {
     let pr = payload.get("pull_request")?;
+
+    // Parity with the poll path's `--state open` (`gh.rs`): only an OPEN PR is a
+    // dispatch candidate. A closed/merged PR still carrying a trigger label (a
+    // `closed` delivery, or a label touched post-merge) must NOT start a review — the
+    // poll path never lists closed PRs; this is the push-path equivalent. Missing /
+    // non-`"open"` state fails safe to no candidate.
+    if pr.get("state").and_then(Value::as_str) != Some("open") {
+        return None;
+    }
 
     let label_names: Vec<&str> = pr
         .get("labels")?
@@ -436,6 +502,19 @@ async fn spawn_quick_tunnel(
         .ok()
         .flatten();
 
+    // Distinguish "URL still coming up" from "child already dead". The timeout
+    // collapses both into `None`, but a child that EXITED before printing a URL is a
+    // failed tunnel — fail fast rather than hand back a dead child the manager would
+    // report as `running`. `try_wait` is non-blocking; a live-but-slow child stays
+    // `Ok((.., None))` (the tunnel may still resolve, and `status` re-probes liveness).
+    if url.is_none() {
+        if let Ok(Some(exit)) = child.try_wait() {
+            return Err(AppError::new(format!(
+                "cloudflared 在解析公网 URL 前已退出（{exit}）；请检查 cloudflared 日志"
+            )));
+        }
+    }
+
     // Keep draining stderr for the child's lifetime so a full pipe can't stall
     // cloudflared after we stop scanning (mirrors codex's stderr drain). The handle
     // is returned so `stop_inner` can abort it; absent that, the child-kill → pipe-EOF
@@ -511,6 +590,7 @@ mod tests {
             .collect();
         let mut pr = serde_json::json!({
             "number": 42,
+            "state": "open",
             "draft": false,
             "labels": label_objs,
             "user": { "login": "octocat" },
@@ -553,6 +633,22 @@ mod tests {
         // No trigger label → None.
         let none = pr_payload(&["unrelated"], serde_json::json!({}));
         assert!(payload_to_candidate(&none, "needs-review", "needs-check").is_none());
+    }
+
+    #[test]
+    fn payload_to_candidate_skips_non_open_pr() {
+        // A closed/merged PR carrying a trigger label must NOT dispatch (parity with
+        // the poll path's `--state open`). closed / merged / missing state → None.
+        let closed = pr_payload(&["needs-review"], serde_json::json!({ "state": "closed" }));
+        assert!(payload_to_candidate(&closed, "needs-review", "needs-check").is_none());
+        let merged = pr_payload(&["needs-review"], serde_json::json!({ "state": "merged" }));
+        assert!(payload_to_candidate(&merged, "needs-review", "needs-check").is_none());
+        // Defensive: a payload with no `state` field fails safe to no candidate.
+        let no_state = pr_payload(&["needs-review"], serde_json::json!({ "state": null }));
+        assert!(payload_to_candidate(&no_state, "needs-review", "needs-check").is_none());
+        // Sanity: the default helper payload IS open and still maps.
+        let open = pr_payload(&["needs-review"], serde_json::json!({}));
+        assert!(payload_to_candidate(&open, "needs-review", "needs-check").is_some());
     }
 
     #[test]
@@ -615,19 +711,78 @@ mod tests {
     // `gh_status_wire_shape_is_camel_case`.
     #[test]
     fn webhook_status_wire_shape_is_camel_case() {
-        let v = serde_json::to_value(WebhookStatus {
-            running: true,
-            public_url: Some("https://x.trycloudflare.com".to_string()),
-            cloudflared_installed: true,
-            message: "ok".to_string(),
-        })
+        let v = serde_json::to_value(WebhookStatus::new(
+            true,
+            Some("https://x.trycloudflare.com".to_string()),
+            true,
+            "ok".to_string(),
+        ))
         .expect("WebhookStatus serializes");
         assert!(v.get("running").is_some());
         assert!(v.get("publicUrl").is_some());
         assert!(v.get("cloudflaredInstalled").is_some());
         assert!(v.get("message").is_some());
+        // payloadUrl is derived from publicUrl + the served route (WEBHOOK_PATH). A
+        // route rename that forgets to follow surfaces here — the URL the UI tells the
+        // user to paste must equal the path the receiver actually serves.
+        assert_eq!(
+            v.get("payloadUrl").and_then(Value::as_str),
+            Some("https://x.trycloudflare.com/webhook")
+        );
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("public_url").is_none());
+        assert!(v.get("payload_url").is_none());
         assert!(v.get("cloudflared_installed").is_none());
+        // public_url None ⇒ payload_url None (no suffix on nothing).
+        assert!(WebhookStatus::new(false, None, false, String::new())
+            .payload_url
+            .is_none());
+    }
+
+    /// F3 self-heal: a `runtime: Some` whose cloudflared child has exited must flip
+    /// `status` to not-running (rather than the old "运行中（公网 URL 尚未解析）" for a
+    /// dead tunnel). CI-safe — `true` exits 0 on darwin + Linux, no custom test bin.
+    #[tokio::test]
+    async fn status_self_heals_when_tunnel_child_exited() {
+        let mut child = Command::new("true")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn `true`");
+        let _ = child.wait().await; // ensure it has exited before we probe.
+
+        let mgr = WebhookManager::default();
+        *mgr.runtime.lock().unwrap() = Some(WebhookRuntime {
+            server_task: spawn(async {}),
+            drain_task: spawn(async {}),
+            tunnel: child,
+            public_url: Some("https://x.trycloudflare.com".to_string()),
+        });
+
+        // Bogus install bin → the probe returns false fast (no real cloudflared in CI);
+        // the assertion is the self-heal flip, independent of install state.
+        let s = mgr.status("prmonitor-no-such-cloudflared").await;
+        assert!(!s.running, "a dead tunnel child must flip running → false");
+        assert!(s.public_url.is_none());
+        assert!(s.payload_url.is_none());
+        assert!(
+            s.message.contains("退出"),
+            "message reports the crash: {}",
+            s.message
+        );
+        // Runtime was taken (self-healed) → a second status is a clean not-running.
+        assert!(mgr.runtime.lock().unwrap().is_none());
+    }
+
+    /// F3 fail-fast: a cloudflared that exits BEFORE printing a URL is a failed tunnel
+    /// → `Err`, not `Ok((.., None))` (which the manager would report as running). CI-
+    /// safe — `false` exits 1 immediately on darwin + Linux.
+    #[tokio::test]
+    async fn spawn_quick_tunnel_errs_when_child_exits_without_url() {
+        let r = spawn_quick_tunnel("false", 0).await;
+        let msg = r.expect_err("child exiting before a URL must Err").message;
+        assert!(
+            msg.contains("已退出"),
+            "error reports the early exit: {msg}"
+        );
     }
 }
