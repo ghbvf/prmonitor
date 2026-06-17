@@ -316,7 +316,10 @@ pub async fn stop_webhook<R: tauri::Runtime>(
 ) -> AppResult<WebhookStatus> {
     state.webhook.stop();
     let cfg = config_service::load(&app)?;
-    Ok(state.webhook.status(&cfg.cloudflared_bin).await)
+    Ok(state
+        .webhook
+        .status(&cfg.cloudflared_bin, cfg.webhook_tunnel_mode)
+        .await)
 }
 
 /// Reports webhook receiver + tunnel status (running, public URL, cloudflared install)
@@ -327,7 +330,10 @@ pub async fn webhook_status<R: tauri::Runtime>(
     state: tauri::State<'_, crate::state::AppState>,
 ) -> AppResult<WebhookStatus> {
     let cfg = config_service::load(&app)?;
-    Ok(state.webhook.status(&cfg.cloudflared_bin).await)
+    Ok(state
+        .webhook
+        .status(&cfg.cloudflared_bin, cfg.webhook_tunnel_mode)
+        .await)
 }
 
 #[cfg(test)]
