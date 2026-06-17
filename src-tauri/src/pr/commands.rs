@@ -12,6 +12,15 @@ use super::ledger::{now_epoch, Ledger};
 use super::scheduler::{PollStatus, ProjectDispatcher};
 use super::webhook::{DeliveryStatus, IngestIntent, WebhookDelivery, WebhookEvent, WebhookStatus};
 
+/// Which registry write `ingest_webhook` performs for a parsed intent: `Upsert` is the
+/// insert-or-update Track path; `UpdatePresent` is the status-only path (refresh an
+/// EXISTING row, never insert). File-private + module-level (not defined inside the async
+/// fn body) so the ingest reads as one straight-line decision.
+enum WriteKind {
+    Upsert,
+    UpdatePresent,
+}
+
 /// Annotates one discovered row for the PR list and surfaces its dispatchable
 /// [`Candidate`] when nothing gates it. Conflict (both trigger labels) skips
 /// first, matching `router.py`'s discovery-stage drop; otherwise static gates
@@ -374,21 +383,20 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
     };
     let now = now_epoch();
 
-    // Build the list-row view + dispatch decision + terminal delivery status from the
-    // parsed intent. `upsert` is the insert-or-update Track path; `update_present` is the
-    // status-only path (refresh an EXISTING row, never insert). The `kind` for a row that
-    // has no candidate falls back to a sensible non-empty string.
-    enum WriteKind {
-        Upsert,
-        UpdatePresent,
-    }
-    let (view, dispatchable, status, message): (
+    // Build the list-row view + dispatch decision + (for the already-terminal cases) the
+    // delivery status from the parsed intent. The terminal status for a DISPATCHABLE
+    // candidate is NOT decided here — it depends on the autoReview gate below
+    // (Dispatched vs ListUpdated), so it is finalized in ONE place after persist+dispatch
+    // (`final_status`) rather than pre-assigned and overwritten. For the gated / conflict /
+    // status-only cases the status IS terminal (no dispatch can change it), so it is set
+    // here as `provisional_status`.
+    let (view, dispatchable, provisional_status, message, write_kind): (
         PullRequestView,
         Option<Candidate>,
         DeliveryStatus,
         Option<String>,
+        WriteKind,
     );
-    let write_kind: WriteKind;
 
     match intent {
         IngestIntent::Track {
@@ -396,16 +404,18 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
             ..
         } => {
             let (v, d) = webhook_view(cand, title, labels, url, &params, &ledger, now);
-            // A single trigger label. If the gate passed (skip_reason None) the candidate
-            // is dispatchable — the autoReview gate below decides Dispatched vs ListUpdated;
-            // a gated one (draft/fork/author/cooldown) is a `Gated` row carrying the reason.
+            // A single trigger label. A gated one (draft/fork/author/cooldown) is a `Gated`
+            // row carrying the reason — terminal. A clean (dispatchable) one's terminal
+            // status (Dispatched vs ListUpdated) is decided by the autoReview gate below, so
+            // `provisional_status` here is a placeholder ONLY consulted when `dispatchable`
+            // is `None`; `final_status` always overrides it for the dispatchable path.
             let (st, msg) = match (&d, &v.skip_reason) {
                 (Some(_), _) => (DeliveryStatus::Dispatched, None),
                 (None, reason) => (DeliveryStatus::Gated, reason.clone()),
             };
             view = v;
             dispatchable = d;
-            status = st;
+            provisional_status = st;
             message = msg;
             write_kind = WriteKind::Upsert;
         }
@@ -424,28 +434,21 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
                 skip_reason: Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string()),
             };
             dispatchable = None;
-            status = DeliveryStatus::Gated;
+            provisional_status = DeliveryStatus::Gated;
             message = Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string());
             write_kind = WriteKind::Upsert;
         }
-        IngestIntent::StatusOnly { reason } => {
+        IngestIntent::StatusOnly { kind: status_kind } => {
             // Closed/merged or trigger-label-removed: refresh an existing row's status,
-            // never insert, never dispatch. `kind` from the current labels (review/check)
-            // or "review" as a sensible default.
-            let kind = if labels.iter().any(|l| l == &params.review_label) {
-                "review"
-            } else if labels.iter().any(|l| l == &params.check_label) {
+            // never insert, never dispatch. `kind` from the current labels (check vs the
+            // review default). The reason text + terminal delivery status both come from the
+            // type-locked `StatusOnlyKind` (no string compare — see FIX 1 / ai-robust.md).
+            let kind = if labels.iter().any(|l| l == &params.check_label) {
                 "check"
             } else {
                 "review"
             };
-            // The terminal delivery status distinguishes a closed PR (NotOpen) from a
-            // trigger-label-removed one (NoTriggerLabel) by the reason `parse_delivery` set.
-            let st = if reason == "PR 已关闭或合并" {
-                DeliveryStatus::NotOpen
-            } else {
-                DeliveryStatus::NoTriggerLabel
-            };
+            let reason = status_kind.reason().to_string();
             view = PullRequestView {
                 number,
                 title,
@@ -455,7 +458,7 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
                 skip_reason: Some(reason.clone()),
             };
             dispatchable = None;
-            status = st;
+            provisional_status = status_kind.delivery_status();
             message = Some(reason);
             write_kind = WriteKind::UpdatePresent;
         }
@@ -496,28 +499,49 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
         }
         // Persist no-op (untracked status-only PR) — nothing to emit.
         Ok(None) => {}
-        // A store failure leaves the list unchanged; the delivery diagnostic below still
-        // records the (would-be) terminal status so the panel surfaces the event.
-        Err(_) => {}
+        // A store failure surfaces via `PrEvent::Error` (the project's error banner) —
+        // SYMMETRIC with the poll path (`scheduler::persist_event` emits `PrEvent::Error`
+        // on a persist failure). The delivery record below still reflects the dispatch
+        // decision: dispatch is INDEPENDENT of persistence (it still runs if
+        // dispatchable + autoReview), the same contract as the poll path. The list is
+        // unchanged, but the banner tells the user the persist failed.
+        Err(e) => {
+            let _ = app.emit(
+                crate::events::PRS_UPDATED_EVENT,
+                &crate::events::PrEvent::Error {
+                    project_id: project_id.clone(),
+                    message: format!("PR 列表持久化失败：{}", e.message),
+                },
+            );
+        }
     }
 
     // Dispatch the gated-clean candidate iff autoReview is on (the SAME per-project gate
     // the scheduler applies at its call site). Detached spawn, mirroring the scheduler's
-    // detached dispatch (a stop must not cancel a start in flight).
-    let mut final_status = status;
-    if let Some(cand) = dispatchable {
-        if super::scheduler::auto_review_enabled(app, &project_id) {
+    // detached dispatch (a stop must not cancel a start in flight). The terminal delivery
+    // status is decided HERE, in ONE place, from the dispatch decision — a `dispatchable`
+    // candidate becomes `Dispatched` (autoReview on) or `ListUpdated` (autoReview off);
+    // every other case keeps its already-terminal `provisional_status`.
+    let final_status = match dispatchable {
+        Some(cand) if super::scheduler::auto_review_enabled(app, &project_id) => {
             drop(tauri::async_runtime::spawn(dispatcher(
                 project_id.clone(),
                 vec![cand],
             )));
-            final_status = DeliveryStatus::Dispatched;
-        } else {
-            // A clean candidate but autoReview off: the list was updated, no dispatch —
-            // by design (#61: webhook PRs enter the list even with autoReview off).
-            final_status = DeliveryStatus::ListUpdated;
+            DeliveryStatus::Dispatched
         }
-    }
+        // A clean candidate but autoReview off: the list was updated, no dispatch — by
+        // design (#61: webhook PRs enter the list even with autoReview off). This
+        // AppHandle-bound path (autoReview-off → ListUpdated, the #61 core "PR enters the
+        // list even with autoReview off") is verified via integration / manual verify, NOT
+        // a unit test — `ingest_webhook` is generic over `tauri::Runtime` and an
+        // `AppHandle` isn't constructible in a plain `#[test]`, so the coverage story for
+        // this branch lives in the verify pass, not in `mod tests`.
+        Some(_) => DeliveryStatus::ListUpdated,
+        // No dispatch candidate (gated / conflict / status-only): the status set in the
+        // intent match is already terminal.
+        None => provisional_status,
+    };
 
     // Record the single terminal delivery diagnostic (#62) for this routable event.
     record_webhook_delivery(

@@ -18,9 +18,9 @@
 //! list); a webhook is push-shaped (GitHub hands us one event). Per the
 //! [`crate::dispatch`] doc, "a future webhook trigger calls the same `auto_dispatch`
 //! with the candidates a push event yields" — that is exactly this module: the
-//! handler maps a payload to a `(project_id, Candidate)` and hands it to the injected
-//! [`ProjectDispatcher`] (the composition root's gate + `auto_dispatch` closure),
-//! reusing the entire vetted dispatch path with zero duplication.
+//! handler maps a payload to a [`WebhookEvent`] and hands it to the injected
+//! [`WebhookIngestor`] (the composition root's upsert/emit + gate + `auto_dispatch`
+//! closure), reusing the entire vetted dispatch path with zero duplication.
 //!
 //! **Multi-project routing (#35).** One global receiver / port / secret / tunnel
 //! serves EVERY monitored project. The handler routes each verified event to the
@@ -75,13 +75,15 @@ use crate::model::{Candidate, WebhookTunnelMode};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// The webhook ingest hook the composition root installs (replacing the old raw
-/// `ProjectDispatcher`). Called with one parsed, routed [`WebhookEvent`]; its body
-/// (the root's `ingest_webhook` wrapper in `commands.rs`) upserts the persisted PR
-/// list, emits `prs:updated`, and dispatches the gated candidate — keeping the axum
-/// handler runtime-agnostic (the closure holds the concrete `AppHandle<R>`, the
-/// handler never names it). Boxed-future + `Arc` so it is `Clone`able into the
-/// `WebhookCtx` the handler shares, mirroring [`super::scheduler::ProjectDispatcher`].
+/// The webhook ingest hook the composition root installs. Called with one parsed, routed
+/// [`WebhookEvent`]; its body (the root's `ingest_webhook` wrapper in `commands.rs`)
+/// upserts the persisted PR list, emits `prs:updated`, and dispatches the gated candidate
+/// — keeping the axum handler runtime-agnostic (the closure holds the concrete
+/// `AppHandle<R>`, the handler never names it). Boxed-future + `Arc` so it is `Clone`able
+/// into the `WebhookCtx` the handler shares. Installed once as a closure and Arc-shared —
+/// the same lifecycle convention as [`super::scheduler::ProjectDispatcher`] (their
+/// signatures differ: this takes a [`WebhookEvent`], `ProjectDispatcher` takes
+/// `(String, Vec<Candidate>)`).
 pub type WebhookIngestor =
     Arc<dyn Fn(WebhookEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
@@ -201,8 +203,46 @@ pub enum IngestIntent {
     },
     /// The PR should appear in the list with a skip reason but never dispatch: a
     /// closed/merged PR, or an open PR whose trigger label was removed. The ingest
-    /// refreshes an EXISTING row's status (no insert).
-    StatusOnly { reason: String },
+    /// refreshes an EXISTING row's status (no insert). The [`StatusOnlyKind`]
+    /// SINGLE-SOURCES both the skip-reason text and the terminal [`DeliveryStatus`].
+    StatusOnly { kind: StatusOnlyKind },
+}
+
+/// Which status-only outcome a non-dispatch [`IngestIntent::StatusOnly`] is (#61). The
+/// Hard carrier (sealed enum) for the reason-text ↔ delivery-status pairing per
+/// `.claude/rules/prmonitor/ai-robust.md`: it SINGLE-SOURCES both the human-readable
+/// skip reason and the terminal [`DeliveryStatus`], so the ingest can no longer derive
+/// the status from a free-form string compare (the old `if reason == "PR 已关闭或合并"`
+/// cross-function string protocol — fragile, Soft). A new status-only case must add a
+/// variant here and the compiler forces both [`Self::reason`] and
+/// [`Self::delivery_status`] to handle it, making a reason/status mismatch unexpressible.
+#[derive(Debug, Clone, Copy)]
+pub enum StatusOnlyKind {
+    /// The PR is not open (closed / merged) — list row reflects it, never dispatched.
+    ClosedOrMerged,
+    /// An OPEN PR carrying neither trigger label (label removed) — list-only, no dispatch.
+    TriggerLabelRemoved,
+}
+
+impl StatusOnlyKind {
+    /// The human-readable (Chinese) skip reason for this status-only outcome — the row's
+    /// `skip_reason` and the delivery diagnostic's `message`. Single-sourced here so the
+    /// text can't drift between `parse_delivery` and `ingest_webhook`.
+    pub fn reason(self) -> &'static str {
+        match self {
+            StatusOnlyKind::ClosedOrMerged => "PR 已关闭或合并",
+            StatusOnlyKind::TriggerLabelRemoved => "触发 label 已移除",
+        }
+    }
+
+    /// The terminal [`DeliveryStatus`] for this status-only outcome. Single-sourced here
+    /// so `ingest_webhook` maps it by type, never by re-comparing the reason string.
+    pub fn delivery_status(self) -> DeliveryStatus {
+        match self {
+            StatusOnlyKind::ClosedOrMerged => DeliveryStatus::NotOpen,
+            StatusOnlyKind::TriggerLabelRemoved => DeliveryStatus::NoTriggerLabel,
+        }
+    }
 }
 
 /// cloudflared prints the assigned Quick Tunnel URL to stderr within a few seconds;
@@ -444,11 +484,10 @@ impl WebhookManager {
     /// status. Sync + interior-mutable so it is callable from the runtime-agnostic
     /// handler and from `ingest_webhook` alike (via `AppState`).
     pub fn record_delivery(&self, d: WebhookDelivery) {
-        let mut ring = self.deliveries.lock().unwrap();
-        if ring.len() >= DELIVERY_RING_CAP {
-            ring.pop_front();
-        }
-        ring.push_back(d);
+        // Delegate to the free `record_into` so the ring-push (cap + pop-front) lives in
+        // ONE implementation — the handler records via `record_into(&ctx.deliveries, ..)`,
+        // this records via the manager's own handle, both through the same body.
+        record_into(&self.deliveries, d);
     }
 
     /// Snapshot the delivery ring oldest→newest (#62) for the `webhook_deliveries`
@@ -1091,7 +1130,9 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
     let head_repo = full_name(head.and_then(|h| h.get("repo")));
     let base_repo = full_name(pr.get("base").and_then(|b| b.get("repo")));
     let is_cross_repository = match (head_repo, base_repo) {
-        (Some(h), Some(b)) => h != b,
+        // Case-insensitive: GitHub `full_name` is case-insensitive (same as the route
+        // match's `eq_ignore_ascii_case`), so a case-only difference is NOT a fork.
+        (Some(h), Some(b)) => !h.eq_ignore_ascii_case(&b),
         _ => true,
     };
 
@@ -1112,7 +1153,7 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
     // the closed state (StatusOnly — list-only, never dispatched).
     if pr.get("state").and_then(Value::as_str) != Some("open") {
         return ParseResult::Routable(Box::new(event(IngestIntent::StatusOnly {
-            reason: "PR 已关闭或合并".to_string(),
+            kind: StatusOnlyKind::ClosedOrMerged,
         })));
     }
 
@@ -1154,7 +1195,7 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
         // Neither trigger label (e.g. an `unlabeled` delivery removing the trigger):
         // the PR should still appear in the list with a skip reason, but never dispatch.
         (false, false) => IngestIntent::StatusOnly {
-            reason: "触发 label 已移除".to_string(),
+            kind: StatusOnlyKind::TriggerLabelRemoved,
         },
     };
     ParseResult::Routable(Box::new(event(intent)))
@@ -1433,8 +1474,11 @@ mod tests {
             IngestIntent::Track {
                 candidate: None, ..
             } => panic!("expected a dispatch candidate, got a conflict Track"),
-            IngestIntent::StatusOnly { reason } => {
-                panic!("expected a dispatch candidate, got StatusOnly: {reason}")
+            IngestIntent::StatusOnly { kind } => {
+                panic!(
+                    "expected a dispatch candidate, got StatusOnly: {}",
+                    kind.reason()
+                )
             }
         }
     }
@@ -1510,11 +1554,41 @@ mod tests {
     #[test]
     fn parse_delivery_no_trigger_label_is_status_only() {
         // No trigger label (e.g. an `unlabeled` removing the trigger) → StatusOnly so
-        // the row still appears with a skip reason, never dispatched (#61).
+        // the row still appears with a skip reason, never dispatched (#61). Assert via the
+        // type-locked `StatusOnlyKind` (no bare string coupling — the reason text lives on
+        // the enum), and that the kind's `reason()` is the expected one.
         let none = pr_payload(&["unrelated"], serde_json::json!({}));
         match routable(&none, &single_route("needs-review", "needs-check")).intent {
-            IngestIntent::StatusOnly { reason } => assert_eq!(reason, "触发 label 已移除"),
+            IngestIntent::StatusOnly { kind } => {
+                assert!(matches!(kind, StatusOnlyKind::TriggerLabelRemoved));
+                assert_eq!(kind.reason(), "触发 label 已移除");
+            }
             other => panic!("expected StatusOnly, got {other:?}"),
+        }
+
+        // `labels` null and the `labels` key absent both fall back via `unwrap_or_default()`
+        // to an empty label set → neither trigger label → StatusOnly { TriggerLabelRemoved }
+        // (locks the fallback: a missing/null `labels` is treated as "no trigger labels",
+        // not a malformed payload).
+        for labels in [serde_json::json!(null), serde_json::Value::Null] {
+            let mut p = pr_payload(&["unrelated"], serde_json::json!({}));
+            // Overwrite the PR's `labels` with null, then also test the key being absent.
+            p["pull_request"]["labels"] = labels;
+            match routable(&p, &single_route("needs-review", "needs-check")).intent {
+                IngestIntent::StatusOnly { kind } => {
+                    assert!(matches!(kind, StatusOnlyKind::TriggerLabelRemoved));
+                }
+                other => panic!("null labels: expected StatusOnly, got {other:?}"),
+            }
+        }
+        // `labels` key entirely absent (removed from the PR object) → same fallback.
+        let mut p = pr_payload(&["unrelated"], serde_json::json!({}));
+        p["pull_request"].as_object_mut().unwrap().remove("labels");
+        match routable(&p, &single_route("needs-review", "needs-check")).intent {
+            IngestIntent::StatusOnly { kind } => {
+                assert!(matches!(kind, StatusOnlyKind::TriggerLabelRemoved));
+            }
+            other => panic!("absent labels key: expected StatusOnly, got {other:?}"),
         }
     }
 
@@ -1523,17 +1597,23 @@ mod tests {
         // A closed/merged PR is now Routable as StatusOnly (list row reflects it) rather
         // than dropped — parity with the poll path's `--state open` for DISPATCH, but the
         // row still updates (#61). closed / merged → StatusOnly("PR 已关闭或合并").
+        // Assert via the type-locked `StatusOnlyKind` (no bare string coupling).
         for state in ["closed", "merged"] {
             let p = pr_payload(&["needs-review"], serde_json::json!({ "state": state }));
             match routable(&p, &single_route("needs-review", "needs-check")).intent {
-                IngestIntent::StatusOnly { reason } => assert_eq!(reason, "PR 已关闭或合并"),
+                IngestIntent::StatusOnly { kind } => {
+                    assert!(matches!(kind, StatusOnlyKind::ClosedOrMerged));
+                    assert_eq!(kind.reason(), "PR 已关闭或合并");
+                }
                 other => panic!("state {state}: expected StatusOnly, got {other:?}"),
             }
         }
-        // A payload with `state: null` is also non-open → StatusOnly.
+        // A payload with `state: null` is also non-open → StatusOnly { ClosedOrMerged }.
         let no_state = pr_payload(&["needs-review"], serde_json::json!({ "state": null }));
         match routable(&no_state, &single_route("needs-review", "needs-check")).intent {
-            IngestIntent::StatusOnly { reason } => assert_eq!(reason, "PR 已关闭或合并"),
+            IngestIntent::StatusOnly { kind } => {
+                assert!(matches!(kind, StatusOnlyKind::ClosedOrMerged))
+            }
             other => panic!("null state: expected StatusOnly, got {other:?}"),
         }
         // Sanity: the default helper payload IS open and dispatches.
@@ -1589,6 +1669,26 @@ mod tests {
         );
         assert!(matches!(
             parse_delivery(&no_sha, &single_route("needs-review", "needs-check")),
+            ParseResult::Malformed
+        ));
+        // Missing `number` (route matches, head is fine) → Malformed: no usable row key.
+        let mut no_number = pr_payload(&["needs-review"], serde_json::json!({}));
+        no_number["pull_request"]
+            .as_object_mut()
+            .unwrap()
+            .remove("number");
+        assert!(matches!(
+            parse_delivery(&no_number, &single_route("needs-review", "needs-check")),
+            ParseResult::Malformed
+        ));
+        // `head` present but missing `ref` (sha present) → Malformed: a partial head can't
+        // form a candidate (the head_ref extraction fails).
+        let no_head_ref = pr_payload(
+            &["needs-review"],
+            serde_json::json!({ "head": { "sha": "s", "repo": { "full_name": "owner/repo" } } }),
+        );
+        assert!(matches!(
+            parse_delivery(&no_head_ref, &single_route("needs-review", "needs-check")),
             ParseResult::Malformed
         ));
     }
@@ -2355,6 +2455,32 @@ mod tests {
         assert_eq!(v["message"], serde_json::Value::Null);
         // The status discriminator serializes camelCase (see the dedicated lock below).
         assert_eq!(v["status"], "dispatched");
+    }
+
+    // Every `Option` field of `WebhookDelivery` serializes to JSON `null` (NOT omitted)
+    // when `None`, so the TS mirror's `field: T | null` stays a closed contract (an
+    // `Option` that omitted-on-None would force the TS side to also mark the field
+    // optional `?`, drifting the shape). An all-None instance pins this for each field.
+    #[test]
+    fn webhook_delivery_all_none_fields_serialize_to_json_null() {
+        let d = WebhookDelivery {
+            received_at_epoch: 0,
+            event: String::new(),
+            action: None,
+            repo: None,
+            pr_number: None,
+            kind: None,
+            status: DeliveryStatus::Ignored,
+            message: None,
+        };
+        let v = serde_json::to_value(&d).expect("WebhookDelivery serializes");
+        for field in ["action", "repo", "prNumber", "kind", "message"] {
+            assert_eq!(
+                v[field],
+                serde_json::Value::Null,
+                "{field} must serialize to JSON null (not be omitted) when None"
+            );
+        }
     }
 
     // Cross-agent wire contract lock for `DeliveryStatus` (#62): the frontend mirrors

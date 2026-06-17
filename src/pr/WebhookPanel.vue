@@ -39,6 +39,13 @@ const copied = ref(false);
 // Recent webhook deliveries (#62) — the receiver's diagnostic ring (oldest→newest);
 // reversed for most-recent-first display. Self-contained local ref, no Pinia.
 const deliveries = ref<WebhookDelivery[]>([]);
+// Delivery fetch state, kept SEPARATE from the panel-wide `error`: `run()` resets
+// `error` to null on every start/stop/refresh, and these fire concurrently in
+// onMounted, so sharing one ref clobbers it. `deliveryLoading` also drives the
+// loading-vs-empty distinction and disables the refresh button while a fetch is in
+// flight (prevents overlapping refreshes).
+const deliveryError = ref<string | null>(null);
+const deliveryLoading = ref(false);
 
 // Are there unsaved webhook-field edits? `start_webhook` reads the PERSISTED config,
 // so any draft change that hasn't been saved would NOT take effect — gating start on
@@ -122,13 +129,18 @@ async function run(fn: () => Promise<WebhookStatus>) {
 }
 
 // Pull the delivery diagnostics ring (#62). Tolerates a rejected command via the
-// shared `error` ref + `toMessage` pattern — a failed fetch must not crash the panel
-// nor blank the tunnel controls.
+// dedicated `deliveryError` ref + `toMessage` pattern — a failed fetch must not crash
+// the panel nor blank the tunnel controls, and must NOT clobber the panel-wide
+// `error` (which `run()` owns). `deliveryLoading` is toggled via try/finally.
 async function loadDeliveries() {
+  deliveryLoading.value = true;
+  deliveryError.value = null;
   try {
     deliveries.value = await webhookDeliveries();
   } catch (e) {
-    error.value = toMessage(e);
+    deliveryError.value = toMessage(e);
+  } finally {
+    deliveryLoading.value = false;
   }
 }
 
@@ -172,18 +184,38 @@ function statusTone(s: DeliveryStatus): "ok" | "warn" | "danger" {
   }
 }
 
+// Include the date: the 50-cap ring can span midnight, and a time-only stamp makes
+// cross-day entries ambiguous.
 function deliveryTime(epochSecs: number): string {
-  return new Date(epochSecs * 1000).toLocaleTimeString();
+  return new Date(epochSecs * 1000).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
+
+// Per-delivery explanatory line: prefer the backend message; otherwise, for a
+// listUpdated delivery with no message, explain the #61 core scenario (autoReview off
+// → enqueued but not dispatched) so the green status isn't reasonless. Empty string =
+// nothing to show.
+function deliveryDetail(d: WebhookDelivery): string {
+  if (d.message) return d.message;
+  if (d.status === "listUpdated") return "autoReview 关闭：已入列表，未派发 review";
+  return "";
+}
+
+// Light backstop refresh cadence while the receiver is up: new deliveries arrive
+// server-side with no push channel, so poll the ring on this interval.
+const DELIVERY_REFRESH_MS = 5_000;
 
 onMounted(() => {
   run(webhookStatus);
   loadDeliveries();
-  // Light backstop refresh while the receiver is up: new deliveries arrive
-  // server-side with no push channel, so poll the ring every ~5s. Cleared on unmount.
   deliveryTimer = setInterval(() => {
     if (status.value?.running) loadDeliveries();
-  }, 5_000);
+  }, DELIVERY_REFRESH_MS);
 });
 
 let deliveryTimer: ReturnType<typeof setInterval> | null = null;
@@ -301,13 +333,15 @@ async function copyUrl() {
         <button
           type="button"
           class="copy"
-          :disabled="busy"
+          :disabled="deliveryLoading"
           @click="loadDeliveries"
         >
           刷新
         </button>
       </div>
-      <p v-if="recentDeliveries.length === 0" class="hint">暂无 delivery 记录</p>
+      <p v-if="deliveryError" class="error">{{ deliveryError }}</p>
+      <p v-if="deliveryLoading" class="hint">加载中…</p>
+      <p v-else-if="recentDeliveries.length === 0" class="hint">暂无 delivery 记录</p>
       <ul v-else class="delivery-list">
         <li
           v-for="(d, i) in recentDeliveries"
@@ -325,7 +359,7 @@ async function copyUrl() {
           <span class="badge" :class="`tone-${statusTone(d.status)}`">
             {{ statusLabels[d.status] }}
           </span>
-          <span v-if="d.message" class="d-msg">{{ d.message }}</span>
+          <span v-if="deliveryDetail(d)" class="d-msg">{{ deliveryDetail(d) }}</span>
         </li>
       </ul>
     </div>

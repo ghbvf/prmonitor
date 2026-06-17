@@ -1029,6 +1029,10 @@ mod tests {
         assert!(v.get("interval_secs").is_none());
         assert!(v.get("last_started_epoch").is_none());
         assert!(v.get("last_discovered_count").is_none());
+        assert!(v.get("last_success_epoch").is_none());
+        assert!(v.get("last_error_epoch").is_none());
+        assert!(v.get("last_error_message").is_none());
+        assert!(v.get("last_persist_epoch").is_none());
 
         // `None` fields serialize to JSON null (not omitted), so the TS mirror's
         // optional-or-null contract stays closed.

@@ -1,5 +1,5 @@
 //! Gating + dedup — pure port of `router.py`'s `should_skip` /
-//! `recent_dispatch_reason` / `live_gate_skip`.
+//! `recent_dispatch_reason` / `live_gate_skip` (reserved).
 //!
 //! These are pure predicates over a [`Candidate`], the [`MonitorParams`] config
 //! snapshot, the [`Ledger`], and a clock, so the discovery semantics are unit-
