@@ -140,7 +140,7 @@ impl Ledger {
     /// `has_dispatched` / cooldown check for one project never sees another's records.
     ///
     /// **Lock-free read (intentional).** The discovery path (`commands::discover`) and
-    /// the webhook gate (`commands::gate_dispatchable`) call this OUTSIDE
+    /// the webhook ingest (`commands::ingest_webhook` → `webhook_view`) call this OUTSIDE
     /// [`LEDGER_WRITE_LOCK`]; a load is a single whole-value store read (no torn read)
     /// and a stale-by-one-round snapshot is acceptable because it only gates an
     /// OPTIMIZATION — the real double-dispatch backstop is the session registry's

@@ -9,7 +9,8 @@ use crate::model::{Candidate, PullRequestView};
 use super::discover::{self, MonitorParams};
 use super::gh::{gh_auth_status, GhRow, GhStatus, GithubCli};
 use super::ledger::{now_epoch, Ledger};
-use super::webhook::WebhookStatus;
+use super::scheduler::{PollStatus, ProjectDispatcher};
+use super::webhook::{DeliveryStatus, IngestIntent, WebhookDelivery, WebhookEvent, WebhookStatus};
 
 /// Annotates one discovered row for the PR list and surfaces its dispatchable
 /// [`Candidate`] when nothing gates it. Conflict (both trigger labels) skips
@@ -257,36 +258,105 @@ pub fn set_pr_archived<R: tauri::Runtime>(
     Ok(())
 }
 
-/// Apply the SAME static + cooldown gates the poll path applies (via `build_view`)
-/// to `project_id`'s webhook-sourced candidates (#35), so a push trigger has dispatch
-/// parity with that project's scheduler: no draft / fork / disallowed-author /
-/// within-cooldown PR slips through just because it arrived by webhook. Resolves THAT
-/// project's config (authors / cooldown) and loads ITS ledger partition, then filters
-/// each candidate through [`discover::should_skip`] and [`discover::cooldown_skip`].
+/// Annotate a webhook-sourced candidate into a [`PullRequestView`] + dispatch decision
+/// (#61), applying the SAME static + cooldown gates the poll path applies via
+/// [`build_view`] — minus the conflict branch (the caller handles conflict / StatusOnly
+/// upstream from the parsed [`IngestIntent`], so this only ever sees a single-label
+/// candidate). The push-path counterpart to `build_view`: `skip_reason = should_skip(..)
+/// .or_else(|| cooldown_skip(..))`; `dispatchable = skip_reason.is_none().then(..)`, so a
+/// clean candidate dispatches and a gated one (draft / fork / disallowed-author /
+/// within-cooldown) becomes a skipped row with NO dispatch — dispatch parity with that
+/// project's scheduler, so nothing slips through just because it arrived by webhook.
 ///
-/// BOTH reads fail CLOSED: an unresolvable project / unreadable config OR an
-/// unreadable ledger returns an empty Vec (dispatch nothing), same spirit as
-/// [`super::scheduler::auto_review_enabled`]. The ledger is the dedup/cooldown source
-/// of truth — degrading it to an empty ledger (the prior `unwrap_or_default()`) would
-/// pass EVERY cooldown/dedup gate and re-review storm, so an unprovable "not a recent
+/// The view's title / labels / url come from the webhook payload (passed in by the
+/// caller), so the list row is built without a `gh pr view` round trip.
+///
+/// Pure (no `AppHandle`) so the gate composition is unit-tested without a Tauri handle —
+/// it replaces the deleted `gate_candidates` parity test (it asserts BOTH the static and
+/// the cooldown gate apply; the predicates themselves are tested at their source in
+/// `discover.rs`).
+fn webhook_view(
+    cand: Candidate,
+    title: String,
+    labels: Vec<String>,
+    url: String,
+    params: &MonitorParams,
+    ledger: &Ledger,
+    now: u64,
+) -> (PullRequestView, Option<Candidate>) {
+    let skip_reason = discover::should_skip(&cand, params, ledger)
+        .or_else(|| discover::cooldown_skip(&cand, params, ledger, now));
+    // Clone for dispatch only when it passes every static + cooldown gate; a gated row
+    // contributes a view but no dispatch candidate (parity with `build_view`).
+    let dispatchable = skip_reason.is_none().then(|| cand.clone());
+    let view = PullRequestView {
+        number: cand.number,
+        title,
+        labels,
+        url,
+        kind: cand.kind,
+        skip_reason,
+    };
+    (view, dispatchable)
+}
+
+/// The AppHandle-bound webhook ingest (#61): the body of the [`WebhookIngestor`] the
+/// composition root installs. Takes ONE parsed, routed [`WebhookEvent`] and (a) upserts /
+/// updates the persisted PR list row, (b) emits `prs:updated` so the list reflects the
+/// push WITHOUT waiting for the next poll round (the #61 fix — webhook PRs now enter the
+/// list even when autoReview is off), and (c) dispatches the gated-clean candidate iff
+/// that project's autoReview is on. Records EXACTLY ONE delivery diagnostic at the end
+/// (#62) — the handler records the early-exit classifications, this records the routable
+/// terminal status.
+///
+/// **Fail-closed (parity with the deleted `gate_dispatchable`'s fail-closed reads):** an
+/// unresolvable project / unreadable config OR an unreadable ledger records a `Gated`
+/// delivery with the error message and RETURNS without upsert/emit/dispatch. The ledger
+/// is the dedup/cooldown source of truth — degrading it to an empty ledger would pass
+/// EVERY cooldown/dedup gate and re-review storm, so an unprovable "not a recent
 /// duplicate" must fail closed, matching the poll path (`discover` uses
 /// `Ledger::load(app, project_id)?`).
 ///
-/// Called by the composition root's webhook dispatcher closure (`lib.rs`) with the
-/// `project_id` the route matched; the conflict (both-labels) gate already dropped in
-/// `webhook::payload_to_candidate`.
-///
-/// Coverage: the pure predicate composition is unit-tested via [`gate_candidates`];
-/// the predicates themselves at their source (`discover::should_skip` /
-/// `cooldown_skip`). The `AppHandle`-bound load branches run in the live app (a Tauri
-/// `AppHandle` isn't constructible in a plain test).
-pub(crate) fn gate_dispatchable<R: tauri::Runtime>(
+/// Reuses the registry's single serialized write seam ([`registry::mutate_tracked`]) for
+/// the upsert + emit (so this can't interleave with a poll-cycle upsert / `set_pr_archived`
+/// and lose a write) and the scheduler's per-project `auto_review_enabled` gate for the
+/// dispatch decision — the SAME primitives both auto-trigger paths share.
+pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    project_id: &str,
-    candidates: Vec<Candidate>,
-) -> Vec<Candidate> {
-    let Ok(project) = config_service::project(app, project_id) else {
-        return Vec::new();
+    dispatcher: &ProjectDispatcher,
+    ev: WebhookEvent,
+) {
+    let WebhookEvent {
+        project_id,
+        action,
+        repo,
+        number,
+        title,
+        labels,
+        url,
+        intent,
+    } = ev;
+
+    // Resolve config + ledger, failing closed on either error (see the fn doc). On a
+    // failure we record a `Gated` delivery with the error and return without touching the
+    // list — fail-closed parity with the deleted `gate_dispatchable`.
+    let record_failclosed = |app: &tauri::AppHandle<R>, msg: String| {
+        record_webhook_delivery(
+            app,
+            &repo,
+            &action,
+            number,
+            None,
+            DeliveryStatus::Gated,
+            Some(msg),
+        );
+    };
+    let project = match config_service::project(app, &project_id) {
+        Ok(p) => p,
+        Err(e) => {
+            record_failclosed(app, format!("项目配置不可读：{}", e.message));
+            return;
+        }
     };
     let params = MonitorParams {
         repo: project.repo,
@@ -295,30 +365,197 @@ pub(crate) fn gate_dispatchable<R: tauri::Runtime>(
         authors: project.authors,
         pr_cooldown_seconds: project.pr_cooldown_seconds,
     };
-    let Ok(ledger) = Ledger::load(app, project_id) else {
-        return Vec::new();
+    let ledger = match Ledger::load(app, &project_id) {
+        Ok(l) => l,
+        Err(e) => {
+            record_failclosed(app, format!("ledger 不可读：{}", e.message));
+            return;
+        }
     };
-    gate_candidates(candidates, &params, &ledger, now_epoch())
+    let now = now_epoch();
+
+    // Build the list-row view + dispatch decision + terminal delivery status from the
+    // parsed intent. `upsert` is the insert-or-update Track path; `update_present` is the
+    // status-only path (refresh an EXISTING row, never insert). The `kind` for a row that
+    // has no candidate falls back to a sensible non-empty string.
+    enum WriteKind {
+        Upsert,
+        UpdatePresent,
+    }
+    let (view, dispatchable, status, message): (
+        PullRequestView,
+        Option<Candidate>,
+        DeliveryStatus,
+        Option<String>,
+    );
+    let write_kind: WriteKind;
+
+    match intent {
+        IngestIntent::Track {
+            candidate: Some(cand),
+            ..
+        } => {
+            let (v, d) = webhook_view(cand, title, labels, url, &params, &ledger, now);
+            // A single trigger label. If the gate passed (skip_reason None) the candidate
+            // is dispatchable — the autoReview gate below decides Dispatched vs ListUpdated;
+            // a gated one (draft/fork/author/cooldown) is a `Gated` row carrying the reason.
+            let (st, msg) = match (&d, &v.skip_reason) {
+                (Some(_), _) => (DeliveryStatus::Dispatched, None),
+                (None, reason) => (DeliveryStatus::Gated, reason.clone()),
+            };
+            view = v;
+            dispatchable = d;
+            status = st;
+            message = msg;
+            write_kind = WriteKind::Upsert;
+        }
+        IngestIntent::Track {
+            candidate: None,
+            conflict: _,
+        } => {
+            // Both trigger labels (conflict): a skipped row, never dispatched. Kind
+            // "review" for the view (the parse picked review for the conflict view).
+            view = PullRequestView {
+                number,
+                title,
+                labels,
+                url,
+                kind: "review".to_string(),
+                skip_reason: Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string()),
+            };
+            dispatchable = None;
+            status = DeliveryStatus::Gated;
+            message = Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string());
+            write_kind = WriteKind::Upsert;
+        }
+        IngestIntent::StatusOnly { reason } => {
+            // Closed/merged or trigger-label-removed: refresh an existing row's status,
+            // never insert, never dispatch. `kind` from the current labels (review/check)
+            // or "review" as a sensible default.
+            let kind = if labels.iter().any(|l| l == &params.review_label) {
+                "review"
+            } else if labels.iter().any(|l| l == &params.check_label) {
+                "check"
+            } else {
+                "review"
+            };
+            // The terminal delivery status distinguishes a closed PR (NotOpen) from a
+            // trigger-label-removed one (NoTriggerLabel) by the reason `parse_delivery` set.
+            let st = if reason == "PR 已关闭或合并" {
+                DeliveryStatus::NotOpen
+            } else {
+                DeliveryStatus::NoTriggerLabel
+            };
+            view = PullRequestView {
+                number,
+                title,
+                labels,
+                url,
+                kind: kind.to_string(),
+                skip_reason: Some(reason.clone()),
+            };
+            dispatchable = None;
+            status = st;
+            message = Some(reason);
+            write_kind = WriteKind::UpdatePresent;
+        }
+    }
+
+    // Persist + emit through the single serialized write seam. The Upsert path always
+    // persists + emits (an upsert always changes the set); the UpdatePresent path persists
+    // + emits ONLY when the row existed (mirrors `set_pr_archived`'s no-op skip), so a
+    // status-only event for an untracked PR is a benign no-op.
+    let emitted = super::registry::mutate_tracked(app, &project_id, |tracked| match write_kind {
+        WriteKind::Upsert => {
+            tracked.upsert(std::slice::from_ref(&view), now);
+            (
+                true,
+                Some(super::registry::project_snapshot(tracked, app, &project_id)),
+            )
+        }
+        WriteKind::UpdatePresent => {
+            if tracked.update_present(&view, now) {
+                (
+                    true,
+                    Some(super::registry::project_snapshot(tracked, app, &project_id)),
+                )
+            } else {
+                (false, None) // untracked PR — nothing changed, skip persist + emit.
+            }
+        }
+    });
+    match emitted {
+        Ok(Some(list)) => {
+            let _ = app.emit(
+                crate::events::PRS_UPDATED_EVENT,
+                &crate::events::PrEvent::Updated {
+                    project_id: project_id.clone(),
+                    prs: list,
+                },
+            );
+        }
+        // Persist no-op (untracked status-only PR) — nothing to emit.
+        Ok(None) => {}
+        // A store failure leaves the list unchanged; the delivery diagnostic below still
+        // records the (would-be) terminal status so the panel surfaces the event.
+        Err(_) => {}
+    }
+
+    // Dispatch the gated-clean candidate iff autoReview is on (the SAME per-project gate
+    // the scheduler applies at its call site). Detached spawn, mirroring the scheduler's
+    // detached dispatch (a stop must not cancel a start in flight).
+    let mut final_status = status;
+    if let Some(cand) = dispatchable {
+        if super::scheduler::auto_review_enabled(app, &project_id) {
+            drop(tauri::async_runtime::spawn(dispatcher(
+                project_id.clone(),
+                vec![cand],
+            )));
+            final_status = DeliveryStatus::Dispatched;
+        } else {
+            // A clean candidate but autoReview off: the list was updated, no dispatch —
+            // by design (#61: webhook PRs enter the list even with autoReview off).
+            final_status = DeliveryStatus::ListUpdated;
+        }
+    }
+
+    // Record the single terminal delivery diagnostic (#62) for this routable event.
+    record_webhook_delivery(
+        app,
+        &repo,
+        &action,
+        number,
+        Some(view.kind),
+        final_status,
+        message,
+    );
 }
 
-/// Drop candidates a fresh `should_skip` / `cooldown_skip` rejects against `ledger`.
-/// Split from [`gate_dispatchable`] so the predicate composition is unit-testable
-/// without an `AppHandle` — locking that the webhook gate applies BOTH the static and
-/// the cooldown gate (the predicates themselves are tested at their source in
-/// `discover.rs`).
-fn gate_candidates(
-    candidates: Vec<Candidate>,
-    params: &MonitorParams,
-    ledger: &Ledger,
-    now: u64,
-) -> Vec<Candidate> {
-    candidates
-        .into_iter()
-        .filter(|c| {
-            discover::should_skip(c, params, ledger).is_none()
-                && discover::cooldown_skip(c, params, ledger, now).is_none()
-        })
-        .collect()
+/// Record one webhook-delivery diagnostic into the manager's ring (#62) via `AppState`.
+/// Helper so `ingest_webhook`'s several record sites (fail-closed + terminal) stay one
+/// liners and never leak the secret/token into the diagnostic.
+fn record_webhook_delivery<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    repo: &str,
+    action: &Option<String>,
+    number: u64,
+    kind: Option<String>,
+    status: DeliveryStatus,
+    message: Option<String>,
+) {
+    use tauri::Manager;
+    app.state::<crate::state::AppState>()
+        .webhook
+        .record_delivery(WebhookDelivery {
+            received_at_epoch: now_epoch(),
+            event: "pull_request".to_string(),
+            action: action.clone(),
+            repo: Some(repo.to_string()),
+            pr_number: Some(number),
+            kind,
+            status,
+            message,
+        });
 }
 
 /// Starts the webhook receiver + Cloudflare Quick Tunnel. Requires `webhook_enabled`
@@ -407,6 +644,29 @@ pub async fn webhook_status<R: tauri::Runtime>(
         .webhook
         .status(&cfg.cloudflared_bin, cfg.webhook_tunnel_mode)
         .await)
+}
+
+/// Snapshot of the webhook-delivery diagnostics ring (#62) for the settings panel —
+/// the recent window of "did GitHub reach us, and what did we do with each delivery".
+/// Oldest→newest; capped at the manager's ring size. Never carries the secret/token.
+#[tauri::command]
+pub async fn webhook_deliveries(
+    state: tauri::State<'_, crate::state::AppState>,
+) -> AppResult<Vec<WebhookDelivery>> {
+    Ok(state.webhook.deliveries_snapshot())
+}
+
+/// Reports `project_id`'s poll-loop status (#62) for the settings panel: whether the
+/// loop is running, its resolved interval, and the last cycle's diagnostics (started /
+/// success / error / persist epochs + discovered count). Pulled on demand — NO new event
+/// type, so the `events.rs` union stays untouched.
+#[tauri::command]
+pub async fn poll_status<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, crate::state::AppState>,
+    project_id: &str,
+) -> AppResult<PollStatus> {
+    Ok(state.scheduler.poll_status(&app, project_id))
 }
 
 #[cfg(test)]
@@ -505,8 +765,13 @@ mod tests {
         assert!(cand.is_none());
     }
 
+    // Migrated from the deleted `gate_candidates` parity test: `webhook_view` (#61) must
+    // apply BOTH the static (already-dispatched) and the cooldown gate to a webhook-sourced
+    // candidate — a clean one dispatches (Some), a gated one is a skipped row (None) — so a
+    // push trigger has dispatch parity with the poll path. The predicates themselves are
+    // tested at their source in `discover.rs`.
     #[test]
-    fn gate_candidates_drops_dispatched_and_cooldown_but_keeps_clean() {
+    fn webhook_view_applies_both_static_and_cooldown_gates() {
         use crate::pr::ledger::{dispatch_key, DispatchEvent};
         use std::collections::HashSet;
 
@@ -527,10 +792,56 @@ mod tests {
             }],
         };
 
-        // Locks that the webhook gate applies BOTH the static (dispatched) and the
-        // cooldown gate — only the clean candidate survives.
-        let kept = gate_candidates(vec![clean, dispatched, cooled], &params(), &ledger, 1_500);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].number, 1);
+        let meta = |n: u64| {
+            (
+                format!("PR {n}"),
+                vec!["review-label".to_string()],
+                format!("https://x/{n}"),
+            )
+        };
+
+        // Clean candidate → no skip_reason → dispatchable Some.
+        let (v1, d1) = {
+            let (t, l, u) = meta(1);
+            webhook_view(clean, t, l, u, &params(), &ledger, 1_500)
+        };
+        assert_eq!(v1.number, 1);
+        assert_eq!(v1.title, "PR 1");
+        assert_eq!(v1.skip_reason, None);
+        assert!(d1.is_some(), "a clean candidate is dispatchable");
+
+        // Already-dispatched (static gate) → skip_reason Some → dispatchable None.
+        let (v2, d2) = {
+            let (t, l, u) = meta(2);
+            webhook_view(dispatched, t, l, u, &params(), &ledger, 1_500)
+        };
+        assert!(
+            v2.skip_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("already dispatched")),
+            "static gate fires: {:?}",
+            v2.skip_reason
+        );
+        assert!(
+            d2.is_none(),
+            "a statically-gated candidate is not dispatchable"
+        );
+
+        // Within cooldown (cooldown gate) → skip_reason Some → dispatchable None.
+        let (v3, d3) = {
+            let (t, l, u) = meta(3);
+            webhook_view(cooled, t, l, u, &params(), &ledger, 1_500)
+        };
+        assert!(
+            v3.skip_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("within cooldown")),
+            "cooldown gate fires: {:?}",
+            v3.skip_reason
+        );
+        assert!(
+            d3.is_none(),
+            "a cooldown-gated candidate is not dispatchable"
+        );
     }
 }
