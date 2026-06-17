@@ -1324,10 +1324,19 @@ mod tests {
         // Empty public_url → None.
         assert!(s.public_url.is_none());
 
-        // Give the child a moment to exit, then status must self-heal to not-running.
-        let mut child = Command::new("true").kill_on_drop(true).spawn().unwrap();
-        let _ = child.wait().await;
-        let s2 = mgr.status("bogus", WebhookTunnelMode::Command).await;
+        // The command-mode child (`true`) exits ~immediately, but `status`'s `try_wait`
+        // is non-blocking, so the FIRST probe can still race the child's exit (this used
+        // a separate `true`+wait as a timing proxy, which flaked on CI). Poll status until
+        // the self-heal observes the exit — bounded so a genuine hang fails instead of
+        // looping. The child WILL exit, so this converges deterministically.
+        let mut s2 = mgr.status("bogus", WebhookTunnelMode::Command).await;
+        for _ in 0..200 {
+            if !s2.running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            s2 = mgr.status("bogus", WebhookTunnelMode::Command).await;
+        }
         assert!(
             !s2.running,
             "an exited command-mode child flips running → false"
