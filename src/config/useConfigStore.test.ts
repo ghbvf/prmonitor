@@ -25,7 +25,7 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
   prCooldownSeconds: 1800,
   sourceKind: "github",
   engineKind: "codex",
-  autoReview: true,
+  autoReview: false,
   webhookEnabled: false,
   webhookPort: 8787,
   webhookSecret: "",

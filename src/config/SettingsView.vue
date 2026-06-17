@@ -33,7 +33,7 @@ const draft = reactive<AppConfig>({
   prCooldownSeconds: 0,
   sourceKind: "github",
   engineKind: "codex",
-  autoReview: true,
+  autoReview: false,
   webhookEnabled: false,
   webhookPort: 8787,
   webhookSecret: "",
