@@ -625,4 +625,23 @@ describe("useReviewStore focus()", () => {
     expect(store.running.value).toBe(false);
     expect(store.finalStatus.value).toBe("failed");
   });
+
+  it("clearFocus() drops the focused session (#35 F5: project switch)", () => {
+    const store = useReviewStore();
+    // A focused, running session from the project the user is about to leave.
+    store.focus("th_other_project", 7, "running");
+    store.items.value = [{ itemId: "i1", kind: "message", text: "hi" }];
+
+    store.clearFocus();
+
+    // Nothing focused → ReviewPanel renders the empty "Select a PR" state for the new
+    // project instead of the previous project's session (which its 停止 button would
+    // otherwise still target).
+    expect(store.activeThreadId.value).toBeNull();
+    expect(store.activePr.value).toBeNull();
+    expect(store.running.value).toBe(false);
+    expect(store.finalStatus.value).toBeNull();
+    expect(store.error.value).toBeNull();
+    expect(store.items.value).toEqual([]);
+  });
 });

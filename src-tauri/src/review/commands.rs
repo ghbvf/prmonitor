@@ -12,6 +12,24 @@ use crate::state::AppState;
 /// `pub(crate)` const rather than re-stating the literal.
 pub(crate) const CODEX_BIN: &str = "codex";
 
+/// Rejects any review `kind` other than `review` / `check` at the command boundary.
+///
+/// `session.rs` branches on `kind == "check"` and treats EVERY other value as a
+/// `review` turn — so an unvalidated kind (a bogus string from a buggy/forged invoke)
+/// would silently run a full review while the registry/ledger key keeps the bogus
+/// kind, splitting dedup. Whitelisting here fails fast before any session starts. The
+/// Hard path (future) is a shared Rust enum ↔ TS union; this is the Medium guard until
+/// then. Pure (no `AppHandle`) so it is unit-testable.
+fn validate_kind(kind: &str) -> AppResult<()> {
+    if kind == "review" || kind == "check" {
+        Ok(())
+    } else {
+        Err(AppError::new(format!(
+            "kind 非法（只接受 review | check）: {kind:?}"
+        )))
+    }
+}
+
 /// Reports codex app-server availability for the StatusBar. Ensures the resident
 /// connection (lazy start: first call spawns + handshakes, later calls reuse) and
 /// reports `available` + version. The probe never errors (failures map to a
@@ -60,6 +78,10 @@ pub async fn start_review<R: tauri::Runtime>(
     pr_number: u64,
     kind: String,
 ) -> AppResult<SessionId> {
+    // Reject a bogus `kind` BEFORE any side effect (project resolve / codex resume):
+    // `session.rs` treats every non-"check" value as a review, so an unvalidated kind
+    // would run a full review under a bad registry key (see `validate_kind`).
+    validate_kind(&kind)?;
     // Resolve the project being reviewed (#35) and re-check ITS filesystem-dependent
     // paths so an absent / escaping `skillRelPath` (e.g. a hand-edited config) fails
     // before we attach the skill path to the turn, rather than handing codex a bad path.
@@ -133,4 +155,23 @@ fn skill_abs_path(repo_root: &str, skill_rel_path: &str) -> String {
         .join(skill_rel_path)
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_kind_accepts_review_and_check_only() {
+        assert!(validate_kind("review").is_ok());
+        assert!(validate_kind("check").is_ok());
+        // Any other value (incl. case variants / empty / arbitrary) is rejected so it
+        // can never reach `session.rs` and run as a review under a bogus key.
+        for bad in ["", "Review", "CHECK", "foo", "review ", "reviewcheck"] {
+            assert!(
+                validate_kind(bad).is_err(),
+                "expected kind {bad:?} rejected"
+            );
+        }
+    }
 }

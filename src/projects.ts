@@ -14,11 +14,16 @@ export function useProjects() {
     activeProjectId,
     projects,
     setActive: async (id: string) => {
-      activeProjectId.value = id;
+      // Persist FIRST, then update the local active id (#35 F6). The previous order
+      // (optimistic local update before the await) left the UI switched to a project the
+      // backend never persisted if the command rejected (stale/dangling id, IPC error) —
+      // and there was no rollback. Persisting first means a failure throws BEFORE any
+      // local switch, so the UI stays on the current project and the caller surfaces it.
       // Centralized with the other config commands (see config/api.ts). projects.ts is
       // a composition-root module (not a slice), so importing config/api is allowed —
       // and config/api never imports projects.ts, so there's no value-import cycle.
       await setActiveProject(id);
+      activeProjectId.value = id;
     },
     hydrate: (cfg: AppConfig) => {
       projects.value = cfg.projects;

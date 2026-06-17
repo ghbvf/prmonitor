@@ -321,6 +321,22 @@ function focus(threadId: string, prNumber: number, status: SessionStatus) {
   finalStatus.value = active ? null : status === "failed" ? "failed" : "completed";
 }
 
+// Drop the focused review (#35 F5). The focused stream is a GLOBAL single-active
+// singleton, so switching the active project must clear it — otherwise ReviewPanel
+// keeps rendering (and its 停止 button keeps stopping) a session belonging to the
+// project the user just left, whose PR # no longer matches the visible PrList. The
+// session itself keeps running in the backend and stays in the (project-filtered)
+// ReviewSessions list; the user re-focuses it by clicking there. Clears only the
+// focus refs — `sessions`/`dispatchError` are project-scoped elsewhere.
+function clearFocus() {
+  activeThreadId.value = null;
+  activePr.value = null;
+  running.value = false;
+  finalStatus.value = null;
+  error.value = null;
+  items.value = [];
+}
+
 // Attach the streamed-event listener, then reattach to any live session. Returns
 // a Promise<UnlistenFn> for cleanup. Marks `listenerReady` once attached (gates
 // the start button) so a review can't begin before events can be received.
@@ -353,6 +369,7 @@ export function useReviewStore() {
     dispatchError,
     clearDispatchError,
     focus,
+    clearFocus,
     activeThreadId,
     activePr,
     running,

@@ -276,7 +276,7 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
     // (their fields may be intentionally incomplete). The id/repo of every project
     // (enabled or not) is a routing/dedup key, so duplicates are rejected regardless.
     let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut seen_repos: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut seen_repos: std::collections::HashSet<String> = std::collections::HashSet::new();
     for project in &config.projects {
         // id-format lock (Medium carrier): the id becomes a store-key PREFIX
         // (`dispatched:{id}` / `events:{id}` in ledger.rs, `tracked:{id}` in
@@ -302,15 +302,37 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
                 project.id
             )));
         }
-        if !seen_repos.insert(project.repo.as_str()) {
+        // GitHub repo names are case-INSENSITIVE (`Owner/Repo` and `owner/repo` are the
+        // same repository), and the webhook router matches them with
+        // `eq_ignore_ascii_case` — so dedup must normalize too, or two case variants
+        // would each register a project for the SAME repo (duplicate PR rows, double
+        // dispatch). Normalize to lowercase before the uniqueness check.
+        if !seen_repos.insert(project.repo.to_ascii_lowercase()) {
             return Err(AppError::new(format!(
-                "项目 repo 重复: {}（同一仓库不能监控两次）",
+                "项目 repo 重复: {}（同一仓库不能监控两次，大小写不敏感）",
                 project.repo
             )));
         }
         if project.enabled {
             validate_project(project)?;
         }
+    }
+
+    // When there ARE projects, `active_project_id` must point at one of them. A dangling
+    // active id (e.g. the active project was deleted but the pointer wasn't updated) would
+    // leave the UI `hydrate`d on a non-existent project and make `active_repo_root` silently
+    // fall back to "" (codex handshake cwd lost). An empty `projects` keeps the first-launch
+    // semantics (active id "" + no projects → onboarding), so only guard the non-empty case.
+    if !config.projects.is_empty()
+        && !config
+            .projects
+            .iter()
+            .any(|p| p.id == config.active_project_id)
+    {
+        return Err(AppError::new(format!(
+            "activeProjectId 不指向任何现有项目: {:?}",
+            config.active_project_id
+        )));
     }
 
     Ok(())
@@ -546,6 +568,47 @@ mod tests {
         };
         // Both share the default `repo` (ghbvf/gocell) → reject.
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_project_repos_case_insensitive() {
+        // GitHub repo names are case-insensitive and the webhook router matches with
+        // `eq_ignore_ascii_case`, so `Owner/Repo` and `owner/repo` are the SAME repo →
+        // monitoring both must be rejected (else duplicate rows + double dispatch).
+        let config = AppConfig {
+            projects: vec![
+                Project {
+                    id: "a".to_string(),
+                    repo: "Owner/Repo".to_string(),
+                    ..valid_project()
+                },
+                Project {
+                    id: "b".to_string(),
+                    repo: "owner/repo".to_string(),
+                    ..valid_project()
+                },
+            ],
+            active_project_id: "a".to_string(),
+            ..AppConfig::default()
+        };
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_dangling_active_project_id() {
+        // Non-empty projects but `active_project_id` matches none → reject (a dangling
+        // pointer would strand the UI / lose the codex handshake cwd).
+        let config = AppConfig {
+            active_project_id: "ghost".to_string(),
+            ..valid_base()
+        };
+        assert!(validate(&config).is_err());
+
+        // The pointer matching an existing project is accepted.
+        assert!(validate(&valid_base()).is_ok());
+
+        // Empty projects keeps first-launch semantics: active id "" + no projects is OK.
+        assert!(validate(&AppConfig::default()).is_ok());
     }
 
     #[test]

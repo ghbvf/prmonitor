@@ -41,7 +41,7 @@ const { activeProjectId } = useProjects();
 // `dispatchError` is the session-less auto-trigger notice (#8): the backend
 // dispatcher emits it on a bad config / start failure / ledger-write failure, so
 // the same banner that warns "auto review paused" also reports "auto review failed".
-const { codex, dispatchError, clearDispatchError } = useReviewStore();
+const { codex, dispatchError, clearDispatchError, clearFocus } = useReviewStore();
 const ghBlocked = computed(() => prStore.gh?.authenticated === false);
 const codexBlocked = computed(() => codex.value?.available === false);
 const showPrompt = computed(() => ghBlocked.value || codexBlocked.value);
@@ -157,10 +157,13 @@ const selectedPr = computed(
       (p) => !p.archived && p.number === selectedNumber.value,
     ) ?? null,
 );
-// Switching projects clears the selection: PR numbers collide across repos, so a
-// number carried over from another project could point ReviewPanel at the wrong PR.
+// Switching projects clears the selection AND the focused review (#35). PR numbers
+// collide across repos, so a carried-over selection could point ReviewPanel at the
+// wrong PR; and the review focus is a global singleton, so without clearFocus the
+// panel would keep showing/stopping the previous project's session (pr-review F5).
 watch(activeProjectId, () => {
   selectedNumber.value = null;
+  clearFocus();
 });
 </script>
 
