@@ -6,11 +6,29 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import type { PrEvent, TrackedPrView } from "../types";
+import type { PollStatus } from "./types";
 import type { Project } from "../config/types";
 
 // Captured callback handed to `onPrsUpdated`, so a test can push a `PrEvent`
 // through the same path `subscribe()` wires up.
 let prsCb: ((e: PrEvent) => void) | null = null;
+
+// A full PollStatus shape (#66 F8) so the `pollStatus` mock resolves the same wire
+// form refreshPollStatus writes; `running` defaults true so the F4 reconciliation
+// keeps `polling` at its baseline unless a test overrides it.
+const pollStatus = (
+  over: Partial<PollStatus> = {},
+): PollStatus => ({
+  running: true,
+  intervalSecs: 60,
+  lastStartedEpoch: null,
+  lastSuccessEpoch: null,
+  lastErrorEpoch: null,
+  lastErrorMessage: null,
+  lastPersistEpoch: null,
+  lastDiscoveredCount: null,
+  ...over,
+});
 
 vi.mock("./api", () => ({
   pollNow: vi.fn(() => Promise.resolve()),
@@ -19,6 +37,20 @@ vi.mock("./api", () => ({
   ghStatus: vi.fn(() => Promise.resolve({ authenticated: true, message: "" })),
   getPrs: vi.fn(() => Promise.resolve([])),
   setPrArchived: vi.fn(() => Promise.resolve()),
+  // pollStatus mock (#66 F8): refreshPollStatus is fired from subscribe()/init()/
+  // toggle()/switchTo(), so the chains need a resolved PollStatus to write.
+  pollStatus: vi.fn(() =>
+    Promise.resolve({
+      running: true,
+      intervalSecs: 60,
+      lastStartedEpoch: null,
+      lastSuccessEpoch: null,
+      lastErrorEpoch: null,
+      lastErrorMessage: null,
+      lastPersistEpoch: null,
+      lastDiscoveredCount: null,
+    }),
+  ),
   onPrsUpdated: vi.fn((cb: (e: PrEvent) => void) => {
     prsCb = cb;
     // onPrsUpdated returns a Promise<UnlistenFn>.
@@ -82,6 +114,8 @@ beforeEach(() => {
   vi.mocked(api.stopPolling).mockResolvedValue(undefined);
   vi.mocked(api.getPrs).mockResolvedValue([]);
   vi.mocked(api.setPrArchived).mockResolvedValue(undefined);
+  // Restore the pollStatus default wiped by clearAllMocks (#66 F8).
+  vi.mocked(api.pollStatus).mockResolvedValue(pollStatus());
   vi.mocked(api.onPrsUpdated).mockImplementation((cb) => {
     prsCb = cb;
     return Promise.resolve(() => {});
@@ -166,6 +200,18 @@ describe("usePrStore subscribe()", () => {
     prsCb?.({ kind: "updated", projectId: "p2", prs: [view(10)] });
     expect(store.hasNewPr.p2).toBe(false);
   });
+
+  it("refreshes the backend poll status for the event's project (#66 F8)", () => {
+    const store = usePrStore();
+    store.subscribe();
+
+    prsCb?.({ kind: "updated", projectId: "p1", prs: [view(1)] });
+    expect(api.pollStatus).toHaveBeenCalledWith("p1");
+
+    // The error branch must refresh too, so a running-but-failing loop still surfaces.
+    prsCb?.({ kind: "error", projectId: "p2", message: "boom" });
+    expect(api.pollStatus).toHaveBeenCalledWith("p2");
+  });
 });
 
 describe("usePrStore pollNow()", () => {
@@ -190,15 +236,24 @@ describe("usePrStore pollNow()", () => {
 
 describe("usePrStore toggle()", () => {
   it("polling -> paused calls stopPolling and flips polling=false for all projects", async () => {
+    // Backend confirms the loop stopped, so the F4 reconciliation in the trailing
+    // refreshPollStatus agrees with the optimistic flip (default mock would report
+    // running:true and bounce p1 back, masking the optimistic stop under test).
+    vi.mocked(api.pollStatus).mockResolvedValue(pollStatus({ running: false }));
     const store = usePrStore();
     expect(store.pollingActive).toBe(true);
 
     await store.toggle();
+    // Let the fire-and-forget refreshPollStatus(activeId) settle so its reconciliation
+    // (p1 -> running:false) is reflected before asserting.
+    await Promise.resolve();
 
     expect(api.stopPolling).toHaveBeenCalledOnce();
     expect(store.pollingFor("p1")).toBe(false);
     expect(store.pollingFor("p2")).toBe(false);
     expect(store.errorActive).toBeNull();
+    // Reflects the start/stop in the active project's backend diagnostics (#66 F8).
+    expect(api.pollStatus).toHaveBeenCalledWith("p1");
   });
 
   it("on a rejected command sets error and does NOT flip polling", async () => {
@@ -263,6 +318,8 @@ describe("usePrStore init()", () => {
     expect(api.getPrs).toHaveBeenCalledWith("p1");
     expect(store.prs.p1).toEqual(snapshot);
     expect(typeof (await unlisten)).toBe("function");
+    // Baselines the active project's poll-loop diagnostics (#66 F8).
+    expect(api.pollStatus).toHaveBeenCalledWith("p1");
   });
 
   it("registers the listener BEFORE reading the snapshot (#27 F3 race guard)", async () => {
@@ -300,6 +357,8 @@ describe("usePrStore switchTo()", () => {
     expect(store.hasNewPr.p2).toBe(false);
     expect(api.getPrs).toHaveBeenCalledWith("p2");
     expect(store.prs.p2).toEqual(snapshot);
+    // Refreshes the switched-to project's poll diagnostics immediately (#66 F5/F8).
+    expect(api.pollStatus).toHaveBeenCalledWith("p2");
   });
 });
 
@@ -364,5 +423,38 @@ describe("usePrStore setArchived()", () => {
     await store.setArchived("p1", 7, false);
 
     expect(store.error.p1).toBe("archive failed");
+  });
+});
+
+describe("usePrStore refreshPollStatus() (#62, #66 F4/F8)", () => {
+  it("writes pollStatus and reconciles the optimistic polling flag to backend running", async () => {
+    // Backend reports the loop STOPPED — the optimistic flag (default true) must
+    // reconcile to false so the pause/resume button reads "恢复轮询" (#66 F4).
+    const status = pollStatus({ running: false, lastDiscoveredCount: 3 });
+    vi.mocked(api.pollStatus).mockResolvedValueOnce(status);
+    const store = usePrStore();
+    expect(store.pollingFor("p1")).toBe(true);
+
+    await store.refreshPollStatus("p1");
+
+    expect(api.pollStatus).toHaveBeenCalledWith("p1");
+    expect(store.pollStatus.p1).toEqual(status);
+    expect(store.pollingFor("p1")).toBe(false);
+  });
+
+  it("leaves the prior pollStatus AND polling flag unchanged on a rejected fetch (error swallowed)", async () => {
+    const store = usePrStore();
+    // Seed a prior good status + a known optimistic flag.
+    const prior = pollStatus({ running: true, lastDiscoveredCount: 1 });
+    store.pollStatus.p1 = prior;
+    store.polling.p1 = true;
+
+    vi.mocked(api.pollStatus).mockRejectedValueOnce({ message: "status failed" });
+    await store.refreshPollStatus("p1");
+
+    // Rejected fetch: no error banner, no mutation of either field.
+    expect(store.pollStatus.p1).toEqual(prior);
+    expect(store.polling.p1).toBe(true);
+    expect(store.error.p1).toBeUndefined();
   });
 });

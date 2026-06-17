@@ -163,7 +163,8 @@ pub enum ParseResult {
     /// Verified, but the event's repo matched no enabled route (fail-closed drop). The
     /// repo (when known) is carried for the delivery diagnostic.
     WrongRepo { repo: Option<String> },
-    /// No `pull_request`, or a required field (number / head.sha / head.ref) is missing.
+    /// No `pull_request`, or a required field (number / head.sha / head.ref / labels) is
+    /// missing or structurally invalid (`labels` not an array — F3).
     Malformed,
 }
 
@@ -1013,8 +1014,10 @@ fn verify_signature(secret: &str, body: &[u8], header: &str) -> bool {
 /// case, so a webhook never touched the persisted PR list), this surfaces the FULL
 /// outcome the ingest needs to upsert + emit even when nothing dispatches (the #61 fix):
 ///
-/// - missing `pull_request`, or a required field (`number` / `head.sha` / `head.ref`)
-///   absent → [`ParseResult::Malformed`];
+/// - missing `pull_request`, or a required field (`number` / `head.sha` / `head.ref` /
+///   `labels`) absent / structurally invalid → [`ParseResult::Malformed`] (`labels` must
+///   be an array — GitHub always sends one, possibly empty `[]`; an absent / `null` /
+///   non-array `labels` is malformed, NOT silently "no trigger label" — F3);
 /// - repo matches no enabled route → [`ParseResult::WrongRepo`] (fail-closed: HMAC
 ///   proves the secret is known, NOT that the event is for a monitored repo);
 /// - PR not open (closed/merged) → `Routable` with [`IngestIntent::StatusOnly`]
@@ -1097,15 +1100,22 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let labels: Vec<String> = pr
-        .get("labels")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    // `labels` is a REQUIRED structural field, same tier as number/head.sha/head.ref:
+    // GitHub ALWAYS sends a `labels` array on a real PR event (possibly empty `[]`), so an
+    // absent / `null` / non-array `labels` is a malformed payload, NOT "no labels". Coercing
+    // it to an empty Vec (the old `unwrap_or_default()`) silently turned a malformed payload
+    // into a valid "no trigger label" state update on a tracked PR (→ StatusOnly
+    // TriggerLabelRemoved) — F3. Validated HERE (alongside the other required-field
+    // extractions, before the open/closed + label classification that needs the names) so it
+    // rejects regardless of open/closed: a malformed payload is malformed either way. An
+    // EXPLICIT empty array `[]` is still valid → empty Vec → genuine "no trigger label".
+    let Some(labels_arr) = pr.get("labels").and_then(Value::as_array) else {
+        return ParseResult::Malformed;
+    };
+    let labels: Vec<String> = labels_arr
+        .iter()
+        .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect();
     let action = payload
         .get("action")
         .and_then(Value::as_str)
@@ -1566,29 +1576,53 @@ mod tests {
             other => panic!("expected StatusOnly, got {other:?}"),
         }
 
-        // `labels` null and the `labels` key absent both fall back via `unwrap_or_default()`
-        // to an empty label set → neither trigger label → StatusOnly { TriggerLabelRemoved }
-        // (locks the fallback: a missing/null `labels` is treated as "no trigger labels",
-        // not a malformed payload).
-        for labels in [serde_json::json!(null), serde_json::Value::Null] {
+        // F3: a `null` or non-array `labels`, and the `labels` key entirely absent, are
+        // structurally MALFORMED (GitHub always sends a `labels` array), NOT silently "no
+        // trigger label". The old behavior (`unwrap_or_default()` → empty Vec →
+        // TriggerLabelRemoved) turned a malformed payload into a valid state update on a
+        // tracked PR; this test now locks the rejection. (A `null` JSON value and a
+        // structurally non-array value both fail `Value::as_array`.)
+        for labels in [serde_json::json!(null), serde_json::json!("not-an-array")] {
             let mut p = pr_payload(&["unrelated"], serde_json::json!({}));
-            // Overwrite the PR's `labels` with null, then also test the key being absent.
             p["pull_request"]["labels"] = labels;
-            match routable(&p, &single_route("needs-review", "needs-check")).intent {
-                IngestIntent::StatusOnly { kind } => {
-                    assert!(matches!(kind, StatusOnlyKind::TriggerLabelRemoved));
-                }
-                other => panic!("null labels: expected StatusOnly, got {other:?}"),
-            }
+            assert!(
+                matches!(
+                    parse_delivery(&p, &single_route("needs-review", "needs-check")),
+                    ParseResult::Malformed
+                ),
+                "null/non-array labels must be Malformed, not a coerced empty set"
+            );
         }
-        // `labels` key entirely absent (removed from the PR object) → same fallback.
+        // `labels` key entirely absent (removed from the PR object) → Malformed too.
         let mut p = pr_payload(&["unrelated"], serde_json::json!({}));
         p["pull_request"].as_object_mut().unwrap().remove("labels");
-        match routable(&p, &single_route("needs-review", "needs-check")).intent {
+        assert!(
+            matches!(
+                parse_delivery(&p, &single_route("needs-review", "needs-check")),
+                ParseResult::Malformed
+            ),
+            "absent labels key must be Malformed"
+        );
+
+        // …but an EXPLICIT empty array `[]` is the GENUINE "no trigger label" case and stays
+        // valid: an OPEN PR with `[]` → StatusOnly { TriggerLabelRemoved } (list-only, no
+        // dispatch). This is the case the absent/null subcases above must NOT be conflated
+        // with — `[]` is a real "labels were removed" state, absent `labels` is malformed.
+        let empty_open = pr_payload(&[], serde_json::json!({}));
+        match routable(&empty_open, &single_route("needs-review", "needs-check")).intent {
             IngestIntent::StatusOnly { kind } => {
                 assert!(matches!(kind, StatusOnlyKind::TriggerLabelRemoved));
             }
-            other => panic!("absent labels key: expected StatusOnly, got {other:?}"),
+            other => panic!("empty [] on open PR: expected StatusOnly, got {other:?}"),
+        }
+        // An EXPLICIT empty array `[]` on a CLOSED PR → StatusOnly { ClosedOrMerged } (the
+        // closed-state check precedes label classification, so `[]` doesn't shadow it).
+        let empty_closed = pr_payload(&[], serde_json::json!({ "state": "closed" }));
+        match routable(&empty_closed, &single_route("needs-review", "needs-check")).intent {
+            IngestIntent::StatusOnly { kind } => {
+                assert!(matches!(kind, StatusOnlyKind::ClosedOrMerged));
+            }
+            other => panic!("empty [] on closed PR: expected StatusOnly, got {other:?}"),
         }
     }
 

@@ -204,6 +204,10 @@ export const usePrStore = defineStore("pr", {
       await useProjects().setActive(id);
       this.hasNewPr[id] = false;
       await this.loadSnapshot(id);
+      // Refresh the switched-to project's poll diagnostics now (#66 F5): otherwise
+      // PollControls shows stale/empty status until the 10s backstop timer or the
+      // next prs:updated event. Fire-and-forget — refreshPollStatus swallows errors.
+      void this.refreshPollStatus(id);
     },
     async pollNow(projectId: string) {
       if (this.loading[projectId]) return;
@@ -264,9 +268,16 @@ export const usePrStore = defineStore("pr", {
     // Read one project's backend poll-loop status into its partition (#62). Pure
     // diagnostics: a rejected command leaves the prior snapshot as-is (no error
     // banner, no list mutation) so a transient fetch failure can't blank the readout.
+    // On a SUCCESSFUL fetch, reconcile the optimistic `polling` flag to the backend
+    // truth (#66 F4): the pause/resume button reads `pollingActive` (optimistic), so
+    // if the backend loop is actually stopped the button must say "恢复轮询" — letting
+    // the first click resume rather than mistakenly stop. The catch leaves both
+    // `pollStatus` and `polling` unchanged so a transient failure can't flip the flag.
     async refreshPollStatus(id: string) {
       try {
-        this.pollStatus[id] = await fetchPollStatus(id);
+        const status = await fetchPollStatus(id);
+        this.pollStatus[id] = status;
+        this.polling[id] = status.running;
       } catch {
         /* leave as-is */
       }
