@@ -12,9 +12,14 @@
 // cross-slice reference is a TYPE-only `import type { AppConfig }` — erased at
 // compile time, so it creates no runtime dependency edge (the slice-boundary test
 // in src/slice-boundary.test.ts allows type-only imports for exactly this reason).
-import { computed, onMounted, ref } from "vue";
-import { startWebhook, stopWebhook, webhookStatus } from "./api";
-import type { WebhookStatus } from "./types";
+import { computed, onMounted, onUnmounted, ref } from "vue";
+import {
+  startWebhook,
+  stopWebhook,
+  webhookDeliveries,
+  webhookStatus,
+} from "./api";
+import type { DeliveryStatus, WebhookDelivery, WebhookStatus } from "./types";
 import { assertNever } from "../types";
 import type { AppConfig } from "../config/types";
 
@@ -31,6 +36,16 @@ const status = ref<WebhookStatus | null>(null);
 const busy = ref(false);
 const error = ref<string | null>(null);
 const copied = ref(false);
+// Recent webhook deliveries (#62) — the receiver's diagnostic ring (oldest→newest);
+// reversed for most-recent-first display. Self-contained local ref, no Pinia.
+const deliveries = ref<WebhookDelivery[]>([]);
+// Delivery fetch state, kept SEPARATE from the panel-wide `error`: `run()` resets
+// `error` to null on every start/stop/refresh, and these fire concurrently in
+// onMounted, so sharing one ref clobbers it. `deliveryLoading` also drives the
+// loading-vs-empty distinction and disables the refresh button while a fetch is in
+// flight (prevents overlapping refreshes).
+const deliveryError = ref<string | null>(null);
+const deliveryLoading = ref(false);
 
 // Are there unsaved webhook-field edits? `start_webhook` reads the PERSISTED config,
 // so any draft change that hasn't been saved would NOT take effect — gating start on
@@ -113,14 +128,111 @@ async function run(fn: () => Promise<WebhookStatus>) {
   }
 }
 
-onMounted(() => run(webhookStatus));
-
-function onStart() {
-  return run(startWebhook);
+// Pull the delivery diagnostics ring (#62). Tolerates a rejected command via the
+// dedicated `deliveryError` ref + `toMessage` pattern — a failed fetch must not crash
+// the panel nor blank the tunnel controls, and must NOT clobber the panel-wide
+// `error` (which `run()` owns). `deliveryLoading` is toggled via try/finally.
+async function loadDeliveries() {
+  deliveryLoading.value = true;
+  deliveryError.value = null;
+  try {
+    deliveries.value = await webhookDeliveries();
+  } catch (e) {
+    deliveryError.value = toMessage(e);
+  } finally {
+    deliveryLoading.value = false;
+  }
 }
 
-function onStop() {
-  return run(stopWebhook);
+// Most-recent-first view: the backend returns the ring oldest→newest, so reverse a
+// shallow copy for display.
+const recentDeliveries = computed(() => [...deliveries.value].reverse());
+
+// Short Chinese labels for each DeliveryStatus. Keyed by the full union so adding a
+// backend arm without a label fails type-checking here (Record over the union).
+const statusLabels: Record<DeliveryStatus, string> = {
+  unauthorized: "签名校验失败",
+  badPayload: "载荷无效",
+  ignored: "已忽略",
+  wrongRepo: "仓库不匹配",
+  noTriggerLabel: "无触发标签",
+  notOpen: "PR 非 open",
+  gated: "被拦截",
+  dispatched: "已派发",
+  listUpdated: "已更新列表",
+};
+
+// Tone class per status, so dispatched/listUpdated read as success, the skip/gate
+// outcomes as warn, and the hard failures as danger.
+function statusTone(s: DeliveryStatus): "ok" | "warn" | "danger" {
+  switch (s) {
+    case "dispatched":
+    case "listUpdated":
+      return "ok";
+    case "unauthorized":
+    case "badPayload":
+    case "wrongRepo":
+      return "danger";
+    case "ignored":
+    case "noTriggerLabel":
+    case "notOpen":
+    case "gated":
+      return "warn";
+    default:
+      // Exhaustive: a new DeliveryStatus arm fails to compile here (#62).
+      return assertNever(s);
+  }
+}
+
+// Include the date: the 50-cap ring can span midnight, and a time-only stamp makes
+// cross-day entries ambiguous.
+function deliveryTime(epochSecs: number): string {
+  return new Date(epochSecs * 1000).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+// Per-delivery explanatory line: prefer the backend message; otherwise, for a
+// listUpdated delivery with no message, explain the #61 core scenario (autoReview off
+// → enqueued but not dispatched) so the green status isn't reasonless. Mode-agnostic
+// wording (#66 F6): a delivery may carry kind "review" OR "check", so the hardcoded
+// "未派发 review" was wrong for check-kind PRs — say "自动任务" instead. Empty string =
+// nothing to show.
+function deliveryDetail(d: WebhookDelivery): string {
+  if (d.message) return d.message;
+  if (d.status === "listUpdated") return "autoReview 关闭：已入列表，未派发自动任务";
+  return "";
+}
+
+// Light backstop refresh cadence while the receiver is up: new deliveries arrive
+// server-side with no push channel, so poll the ring on this interval.
+const DELIVERY_REFRESH_MS = 5_000;
+
+onMounted(() => {
+  run(webhookStatus);
+  loadDeliveries();
+  deliveryTimer = setInterval(() => {
+    if (status.value?.running) loadDeliveries();
+  }, DELIVERY_REFRESH_MS);
+});
+
+let deliveryTimer: ReturnType<typeof setInterval> | null = null;
+onUnmounted(() => {
+  if (deliveryTimer !== null) clearInterval(deliveryTimer);
+});
+
+async function onStart() {
+  await run(startWebhook);
+  await loadDeliveries();
+}
+
+async function onStop() {
+  await run(stopWebhook);
+  await loadDeliveries();
 }
 
 // Re-query status without a full restart — useful when the tunnel is up but the
@@ -214,6 +326,45 @@ async function copyUrl() {
 
     <p v-if="status?.message" class="msg">{{ status.message }}</p>
     <p v-if="error" class="error">{{ error }}</p>
+
+    <!-- Recent deliveries diagnostics (#62): "did GitHub reach us, and what did we
+         do with it". Most-recent-first; never carries secrets/tokens (backend strips). -->
+    <div class="deliveries">
+      <div class="deliveries-head">
+        <h4 class="sub-title">最近 deliveries</h4>
+        <button
+          type="button"
+          class="copy"
+          :disabled="deliveryLoading"
+          @click="loadDeliveries"
+        >
+          刷新
+        </button>
+      </div>
+      <p v-if="deliveryError" class="error">{{ deliveryError }}</p>
+      <p v-if="deliveryLoading" class="hint">加载中…</p>
+      <p v-else-if="recentDeliveries.length === 0" class="hint">暂无 delivery 记录</p>
+      <ul v-else class="delivery-list">
+        <li
+          v-for="(d, i) in recentDeliveries"
+          :key="`${d.receivedAtEpoch}-${i}`"
+          class="delivery-row"
+        >
+          <span class="d-time">{{ deliveryTime(d.receivedAtEpoch) }}</span>
+          <span class="d-event">
+            {{ d.event }}<template v-if="d.action">/{{ d.action }}</template>
+          </span>
+          <span v-if="d.repo || d.prNumber !== null" class="d-repo">
+            <template v-if="d.repo">{{ d.repo }}</template
+            ><template v-if="d.prNumber !== null"> #{{ d.prNumber }}</template>
+          </span>
+          <span class="badge" :class="`tone-${statusTone(d.status)}`">
+            {{ statusLabels[d.status] }}
+          </span>
+          <span v-if="deliveryDetail(d)" class="d-msg">{{ deliveryDetail(d) }}</span>
+        </li>
+      </ul>
+    </div>
   </section>
 </template>
 
@@ -314,5 +465,74 @@ async function copyUrl() {
   margin: 0;
   font-size: var(--font-size-sm);
   color: var(--color-danger);
+}
+.deliveries {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.deliveries-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.sub-title {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text);
+}
+.delivery-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-height: 240px;
+  overflow-y: auto;
+}
+.delivery-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-size-xs);
+  background: var(--color-neutral-bg);
+  border-radius: var(--radius-sm);
+}
+.d-time {
+  font-family: var(--font-mono);
+  color: var(--color-text-muted);
+}
+.d-event {
+  font-family: var(--font-mono);
+  color: var(--color-text);
+}
+.d-repo {
+  color: var(--color-text-muted);
+}
+.d-msg {
+  flex-basis: 100%;
+  color: var(--color-text-muted);
+  word-break: break-word;
+}
+.badge {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+.tone-ok {
+  color: var(--color-success);
+  background: var(--color-success-bg);
+}
+.tone-warn {
+  color: var(--color-warn);
+  background: var(--color-warn-bg);
+}
+.tone-danger {
+  color: var(--color-danger);
+  background: var(--color-danger-bg);
 }
 </style>

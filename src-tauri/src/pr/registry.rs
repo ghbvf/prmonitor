@@ -193,6 +193,32 @@ impl TrackedPrs {
             false
         }
     }
+
+    /// Refreshes an EXISTING tracked row's display fields (title / labels / url / kind /
+    /// skip_reason) and bumps its `last_seen_epoch` to `now`, returning `true`. Returns
+    /// `false` and inserts NOTHING when no row with `view.number` exists.
+    ///
+    /// The status-only counterpart to [`Self::upsert`] (#61): a webhook event that should
+    /// update an ALREADY-TRACKED PR's status (a closed/merged PR, or one whose trigger
+    /// label was removed) without conjuring a brand-new row for a PR the poll path never
+    /// surfaced. `first_seen_epoch` / `archived` are preserved (same as the upsert hit
+    /// path). The caller skips persist + re-emit when this returns `false` (mirroring
+    /// `set_archived`'s unknown-number no-op), so a status-only event for an untracked PR
+    /// is a benign no-op rather than a phantom insert.
+    pub fn update_present(&mut self, view: &PullRequestView, now: u64) -> bool {
+        if let Some(existing) = self.prs.iter_mut().find(|p| p.number == view.number) {
+            existing.title = view.title.clone();
+            existing.labels = view.labels.clone();
+            existing.url = view.url.clone();
+            existing.kind = view.kind.clone();
+            existing.skip_reason = view.skip_reason.clone();
+            existing.last_seen_epoch = now;
+            // first_seen_epoch and archived are preserved (parity with the upsert hit).
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// The single serialized read-modify-write seam for the persisted set (F1). Holds
@@ -413,6 +439,50 @@ mod tests {
         // and must not panic or insert.
         assert!(!t.set_archived(999, true), "unknown number returns false");
         assert_eq!(t.prs.len(), 1);
+    }
+
+    #[test]
+    fn update_present_hit_refreshes_fields_and_bumps_last_seen() {
+        // #61 status-only path: an existing row is refreshed + its presence clock bumped,
+        // preserving first_seen_epoch + archived (parity with the upsert hit path).
+        let mut t = TrackedPrs::default();
+        t.upsert(&[view(1, "old title")], 1_000);
+        t.set_archived(1, true);
+
+        let mut refreshed = view(1, "new title");
+        refreshed.skip_reason = Some("PR 已关闭或合并".to_string());
+        refreshed.labels = vec!["closed-now".to_string()];
+        assert!(
+            t.update_present(&refreshed, 2_000),
+            "an existing row updates and returns true"
+        );
+
+        assert_eq!(t.prs.len(), 1, "update_present must not insert on a hit");
+        let pr = &t.prs[0];
+        assert_eq!(pr.title, "new title", "display fields refresh");
+        assert_eq!(pr.labels, vec!["closed-now".to_string()]);
+        assert_eq!(pr.skip_reason.as_deref(), Some("PR 已关闭或合并"));
+        assert_eq!(pr.first_seen_epoch, 1_000, "first_seen_epoch preserved");
+        assert_eq!(pr.last_seen_epoch, 2_000, "last_seen_epoch bumped");
+        assert!(
+            pr.archived,
+            "archived preserved across a status-only update"
+        );
+    }
+
+    #[test]
+    fn update_present_miss_returns_false_and_does_not_insert() {
+        // A status-only event for a PR the poll path never surfaced is a benign no-op:
+        // no row exists, so nothing is inserted and the caller skips persist + emit.
+        let mut t = TrackedPrs::default();
+        t.upsert(&[view(1, "PR one")], 1_000);
+
+        assert!(
+            !t.update_present(&view(999, "ghost"), 2_000),
+            "an unknown number returns false"
+        );
+        assert_eq!(t.prs.len(), 1, "no insert on a miss");
+        assert!(t.prs.iter().all(|p| p.number != 999));
     }
 
     #[test]

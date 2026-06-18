@@ -42,8 +42,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
+use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
-use tauri::Emitter; // for app.emit
+use tauri::{AppHandle, Emitter}; // Emitter for app.emit
 use tokio::sync::Notify;
 use tokio::time::MissedTickBehavior;
 
@@ -53,6 +54,83 @@ use crate::events::{PrEvent, PRS_UPDATED_EVENT};
 use crate::model::{Candidate, TrackedPrView};
 
 use super::registry;
+
+/// Internal poll-loop diagnostics (#62): timestamps + counters the panel reads to
+/// answer "is the loop alive, when did it last run, and what happened". Pure data with
+/// pure mutators (unit-tested below) — the `Scheduler` owns one behind an `Arc<StdMutex>`
+/// and the cycle updates it; `SchedulerSet::poll_status` snapshots it into the wire
+/// [`PollStatus`]. NO new event type: the frontend pulls this via the `poll_status`
+/// command, keeping the `events.rs` union untouched. `pub(crate)` only so the
+/// `pub(crate)` [`Scheduler::poll_diag`] accessor's return type is visibility-consistent;
+/// it is not a public surface — the public wire type is [`PollStatus`].
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PollDiag {
+    /// Epoch of the most recent cycle entry (a tick / wake / reconfigure fired a cycle).
+    last_started_epoch: Option<u64>,
+    /// Epoch of the most recent successful discovery (discover returned `Ok`).
+    last_success_epoch: Option<u64>,
+    /// Epoch of the most recent discovery error.
+    last_error_epoch: Option<u64>,
+    /// The most recent discovery error message (kept until the next error overwrites it).
+    last_error_message: Option<String>,
+    /// Epoch of the most recent SUCCESSFUL persist of the round's list.
+    last_persist_epoch: Option<u64>,
+    /// PR count discovered in the most recent successful cycle.
+    last_discovered_count: Option<u64>,
+}
+
+impl PollDiag {
+    /// A cycle started (entered the body). Bumps `last_started_epoch`.
+    fn mark_started(&mut self, now: u64) {
+        self.last_started_epoch = Some(now);
+    }
+
+    /// Discovery succeeded with `count` rows. Records the success epoch + count.
+    fn mark_discovered(&mut self, count: u64, now: u64) {
+        self.last_success_epoch = Some(now);
+        self.last_discovered_count = Some(count);
+    }
+
+    /// The round's list persisted successfully. Records the persist epoch.
+    fn mark_persist(&mut self, now: u64) {
+        self.last_persist_epoch = Some(now);
+    }
+
+    /// Discovery (or persist) failed. Records the error epoch + message.
+    fn mark_error(&mut self, msg: String, now: u64) {
+        self.last_error_epoch = Some(now);
+        self.last_error_message = Some(msg);
+    }
+}
+
+/// Poll-loop status reported to the settings panel (#62), pulled via the `poll_status`
+/// command (NOT a new event type — the `events.rs` union stays untouched). `running` +
+/// `interval_secs` describe the loop; the rest mirror [`PollDiag`]'s last-cycle fields.
+///
+/// camelCase wire type mirrored in `src/pr/types.ts` (Medium carrier per
+/// `.claude/rules/prmonitor/ai-robust.md`; a `poll_status_wire_shape_*` golden test pins
+/// the key shape so a rename can't silently drift the TS mirror). pr-slice-private (not a
+/// cross-slice contract), same placement as [`super::webhook::WebhookStatus`].
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PollStatus {
+    /// Whether this project's poll loop is currently running.
+    pub running: bool,
+    /// The resolved poll period (secs) — that project's `poll_interval_secs`, clamped.
+    pub interval_secs: u64,
+    /// Epoch of the most recent cycle entry.
+    pub last_started_epoch: Option<u64>,
+    /// Epoch of the most recent successful discovery.
+    pub last_success_epoch: Option<u64>,
+    /// Epoch of the most recent discovery error.
+    pub last_error_epoch: Option<u64>,
+    /// The most recent discovery error message.
+    pub last_error_message: Option<String>,
+    /// Epoch of the most recent successful persist.
+    pub last_persist_epoch: Option<u64>,
+    /// PR count discovered in the most recent successful cycle.
+    pub last_discovered_count: Option<u64>,
+}
 
 /// Abstract per-cycle dispatch hook: consumes a cycle's `project_id` plus its
 /// dispatchable [`Candidate`]s and drives them to completion (in practice:
@@ -85,6 +163,11 @@ pub struct Scheduler {
     /// `#[derive(Default)]` still holds) — a `None` dispatcher means a cycle discovers
     /// + emits but starts no reviews (the pre-#8 behavior).
     dispatcher: StdMutex<Option<ProjectDispatcher>>,
+    /// Per-loop poll diagnostics (#62), shared with the cycle closure so each cycle
+    /// records its started / discovered / persist / error timestamps. `Arc<StdMutex<_>>`
+    /// (defaults to an empty `PollDiag`, so `#[derive(Default)]` still holds) read by
+    /// [`Self::poll_diag`] for the `poll_status` command.
+    diag: Arc<StdMutex<PollDiag>>,
 }
 
 /// The live task plus the channels the loop selects on.
@@ -140,6 +223,9 @@ impl Scheduler {
                 )
             }
         };
+        // Snapshot the shared diag handle into the cycle closure (#62) so each cycle
+        // records its timestamps into the same `PollDiag` `poll_diag` reads.
+        let diag = self.diag.clone();
         let on_cycle = {
             let app = app.clone();
             let project_id = project_id.clone();
@@ -147,7 +233,10 @@ impl Scheduler {
                 let app = app.clone();
                 let project_id = project_id.clone();
                 let dispatcher = dispatcher.clone();
-                async move { discover_emit_dispatch(&app, &project_id, dispatcher.as_ref()).await }
+                let diag = diag.clone();
+                async move {
+                    discover_emit_dispatch(&app, &project_id, dispatcher.as_ref(), &diag).await
+                }
             }
         };
 
@@ -196,6 +285,27 @@ impl Scheduler {
         if let Some(task) = self.task.lock().unwrap().as_ref() {
             task.reconfigure.notify_one();
         }
+    }
+
+    /// Whether this scheduler's loop task is live (a slot present whose handle hasn't
+    /// finished). Drives [`SchedulerSet::poll_status`]'s `running` flag (#62). A finished
+    /// task slot (the loop exited) reports `false`. `pub(crate)`: only `SchedulerSet`
+    /// (this module) reads it — not a public surface.
+    pub(crate) fn is_running(&self) -> bool {
+        self.task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|t| !t.handle.inner().is_finished())
+            .unwrap_or(false)
+    }
+
+    /// Snapshot of this loop's diagnostics (#62) for [`SchedulerSet::poll_status`]. A
+    /// clone so the lock is released before the caller maps it into the wire
+    /// [`PollStatus`]. `pub(crate)` (returns the module-private [`PollDiag`]): only
+    /// `SchedulerSet` reads it — the public wire surface is [`PollStatus`].
+    pub(crate) fn poll_diag(&self) -> PollDiag {
+        self.diag.lock().unwrap().clone()
     }
 }
 
@@ -306,6 +416,47 @@ impl SchedulerSet {
         }
         map.clear();
     }
+
+    /// Reports `project_id`'s poll-loop status (#62) for the settings panel, pulled via
+    /// the `poll_status` command. When that project's scheduler exists AND is running, the
+    /// diag fields are copied from its live [`PollDiag`]; otherwise `running: false` with
+    /// the default (all-`None`) diag. `interval_secs` is always the resolved period for
+    /// that project (so the panel shows the configured cadence even while stopped),
+    /// clamped through [`resolve_period`] from the persisted `poll_interval_secs`.
+    pub fn poll_status<R: tauri::Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        project_id: &str,
+    ) -> PollStatus {
+        let interval_secs =
+            resolve_period(config_service::project(app, project_id).map(|p| p.poll_interval_secs));
+        // Snapshot the running scheduler's diag (if any) without holding the map lock
+        // across the projection.
+        let diag = {
+            let map = self.inner.lock().unwrap();
+            match map.get(project_id) {
+                Some(s) if s.is_running() => Some(s.poll_diag()),
+                _ => None,
+            }
+        };
+        match diag {
+            Some(d) => PollStatus {
+                running: true,
+                interval_secs,
+                last_started_epoch: d.last_started_epoch,
+                last_success_epoch: d.last_success_epoch,
+                last_error_epoch: d.last_error_epoch,
+                last_error_message: d.last_error_message,
+                last_persist_epoch: d.last_persist_epoch,
+                last_discovered_count: d.last_discovered_count,
+            },
+            None => PollStatus {
+                running: false,
+                interval_secs,
+                ..PollStatus::default()
+            },
+        }
+    }
 }
 
 /// The poll loop, with its period source and per-cycle action injected (F4) so
@@ -372,9 +523,19 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     project_id: &str,
     dispatcher: Option<&ProjectDispatcher>,
+    diag: &Arc<StdMutex<PollDiag>>,
 ) {
+    // Mark this cycle as started (#62) before the (possibly slow) discovery, so the panel
+    // shows the loop is actively working even while `gh` is in flight.
+    diag.lock()
+        .unwrap()
+        .mark_started(super::ledger::now_epoch());
     let (event, dispatchable) = match super::commands::discover(app, project_id).await {
         Ok((views, dispatchable)) => {
+            // Discovery succeeded: record the success epoch + count (#62).
+            diag.lock()
+                .unwrap()
+                .mark_discovered(views.len() as u64, super::ledger::now_epoch());
             // Upsert this round and persist it through the registry's single
             // serialized write seam (F1): `mutate_tracked` holds the cross-writer lock
             // across load→upsert→save so a concurrent `set_pr_archived` can't interleave
@@ -386,23 +547,39 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
             // Updated (F2). Auto-dispatch is independent of persistence and still runs.
             let now = super::ledger::now_epoch();
             let grace = registry::presence_grace_secs(app, project_id);
-            let event = persist_event(
-                project_id,
-                registry::mutate_tracked(app, project_id, |tracked| {
-                    tracked.upsert(&views, now);
-                    (true, registry::to_view_list(tracked, now, grace))
-                }),
-            );
-            (event, dispatchable)
+            let persisted = registry::mutate_tracked(app, project_id, |tracked| {
+                tracked.upsert(&views, now);
+                (true, registry::to_view_list(tracked, now, grace))
+            });
+            // Record the persist outcome (#62): a successful persist bumps the persist
+            // clock; a store failure records the error (it surfaces as `PrEvent::Error`
+            // below — keep the diag's error state in lockstep with what the UI sees).
+            match &persisted {
+                Ok(_) => diag
+                    .lock()
+                    .unwrap()
+                    .mark_persist(super::ledger::now_epoch()),
+                Err(e) => diag
+                    .lock()
+                    .unwrap()
+                    .mark_error(e.message.clone(), super::ledger::now_epoch()),
+            }
+            (persist_event(project_id, persisted), dispatchable)
         }
         // On discovery error the dispatchable list is empty — nothing auto-starts.
-        Err(e) => (
-            PrEvent::Error {
-                project_id: project_id.to_string(),
-                message: e.message,
-            },
-            Vec::new(),
-        ),
+        Err(e) => {
+            // Record the discovery error (#62) so the panel surfaces "last cycle failed".
+            diag.lock()
+                .unwrap()
+                .mark_error(e.message.clone(), super::ledger::now_epoch());
+            (
+                PrEvent::Error {
+                    project_id: project_id.to_string(),
+                    message: e.message,
+                },
+                Vec::new(),
+            )
+        }
     };
     let _ = app.emit(PRS_UPDATED_EVENT, &event); // ignore emit error (window may be gone)
 
@@ -757,5 +934,109 @@ mod tests {
             .await
             .expect("stop should let the spawned task finish")
             .expect("loop task should not panic");
+    }
+
+    // ── Poll diagnostics (#62) ─────────────────────────────────────────────
+    // The pure `PollDiag` mutators in isolation (the cycle wiring that calls them
+    // needs an `AppHandle`, so it runs in the live app). Each mutator sets exactly
+    // its fields, so a snapshot taken by `poll_status` reflects the last cycle.
+
+    #[test]
+    fn default_scheduler_has_empty_poll_diag() {
+        // `#[derive(Default)]` must keep working with the new `diag` field: a fresh
+        // scheduler is not running and its diag is all-`None`.
+        let scheduler = Scheduler::default();
+        assert!(
+            !scheduler.is_running(),
+            "a default scheduler is not running"
+        );
+        let d = scheduler.poll_diag();
+        assert!(d.last_started_epoch.is_none());
+        assert!(d.last_success_epoch.is_none());
+        assert!(d.last_error_epoch.is_none());
+        assert!(d.last_persist_epoch.is_none());
+        assert!(d.last_discovered_count.is_none());
+    }
+
+    #[test]
+    fn poll_diag_mark_started_sets_started_epoch_only() {
+        let mut d = PollDiag::default();
+        d.mark_started(100);
+        assert_eq!(d.last_started_epoch, Some(100));
+        assert!(d.last_success_epoch.is_none());
+        assert!(d.last_error_epoch.is_none());
+    }
+
+    #[test]
+    fn poll_diag_mark_discovered_records_count_and_success() {
+        let mut d = PollDiag::default();
+        d.mark_discovered(7, 200);
+        assert_eq!(d.last_success_epoch, Some(200));
+        assert_eq!(d.last_discovered_count, Some(7));
+        // mark_discovered does not touch the error fields.
+        assert!(d.last_error_epoch.is_none());
+    }
+
+    #[test]
+    fn poll_diag_mark_persist_sets_persist_epoch() {
+        let mut d = PollDiag::default();
+        d.mark_persist(300);
+        assert_eq!(d.last_persist_epoch, Some(300));
+    }
+
+    #[test]
+    fn poll_diag_mark_error_records_epoch_and_message() {
+        let mut d = PollDiag::default();
+        d.mark_started(100);
+        d.mark_error("gh exploded".to_string(), 400);
+        assert_eq!(d.last_error_epoch, Some(400));
+        assert_eq!(d.last_error_message.as_deref(), Some("gh exploded"));
+        // A prior started epoch is untouched by an error (they are independent clocks).
+        assert_eq!(d.last_started_epoch, Some(100));
+        // An error does not advance the success clock.
+        assert!(d.last_success_epoch.is_none());
+    }
+
+    // Wire-shape lock for `PollStatus` (#62, Medium carrier per ai-robust.md): the
+    // `poll_status` command's wire type, mirrored in `src/pr/types.ts`; a field rename
+    // would drift the TS mirror silently. Same pattern as
+    // `webhook_status_wire_shape_is_camel_case`.
+    #[test]
+    fn poll_status_wire_shape_is_camel_case() {
+        let s = PollStatus {
+            running: true,
+            interval_secs: 120,
+            last_started_epoch: Some(1_700_000_000),
+            last_success_epoch: Some(1_700_000_010),
+            last_error_epoch: None,
+            last_error_message: None,
+            last_persist_epoch: Some(1_700_000_011),
+            last_discovered_count: Some(3),
+        };
+        let v = serde_json::to_value(&s).expect("PollStatus serializes");
+
+        // camelCase keys present.
+        assert!(v.get("running").is_some());
+        assert!(v.get("intervalSecs").is_some());
+        assert!(v.get("lastStartedEpoch").is_some());
+        assert!(v.get("lastSuccessEpoch").is_some());
+        assert!(v.get("lastErrorEpoch").is_some());
+        assert!(v.get("lastErrorMessage").is_some());
+        assert!(v.get("lastPersistEpoch").is_some());
+        assert!(v.get("lastDiscoveredCount").is_some());
+
+        // snake_case forms absent — a rename would surface here.
+        assert!(v.get("interval_secs").is_none());
+        assert!(v.get("last_started_epoch").is_none());
+        assert!(v.get("last_discovered_count").is_none());
+        assert!(v.get("last_success_epoch").is_none());
+        assert!(v.get("last_error_epoch").is_none());
+        assert!(v.get("last_error_message").is_none());
+        assert!(v.get("last_persist_epoch").is_none());
+
+        // `None` fields serialize to JSON null (not omitted), so the TS mirror's
+        // optional-or-null contract stays closed.
+        assert_eq!(v["lastErrorEpoch"], serde_json::Value::Null);
+        assert_eq!(v["lastErrorMessage"], serde_json::Value::Null);
     }
 }

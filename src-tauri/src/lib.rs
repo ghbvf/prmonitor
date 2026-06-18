@@ -47,35 +47,28 @@ pub fn run() {
             // is [`run_auto_dispatch`], the composition-root assembly that picks the
             // concrete engine and injects it into the engine-agnostic
             // [`dispatch::auto_dispatch`] (so adding an engine never edits `dispatch`).
-            state.scheduler.set_dispatcher(Arc::new({
+            state
+                .scheduler
+                .set_dispatcher(make_dispatcher(app.handle().clone()));
+            // Install the WEBHOOK trigger's ingest hook (#9 / #61). The webhook is a
+            // second auto-trigger source: its axum handler parses + routes a push payload
+            // into a `WebhookEvent` and hands it here. The ingest (`pr::commands::ingest_webhook`)
+            // upserts the persisted PR list + emits `prs:updated` (so webhook PRs enter the
+            // list even when autoReview is OFF — the #61 fix), applies that project's
+            // static/cooldown gates (`webhook_view`) + the SAME per-project `autoReview`
+            // gate the scheduler uses, and dispatches the clean candidate by reusing the
+            // very same `run_auto_dispatch` via the shared `make_dispatcher` helper (the
+            // SAME `ProjectDispatcher` the scheduler gets). Keeping all this in the ingest (not the handler) is
+            // what lets `pr::webhook` stay runtime-agnostic (never names AppHandle); the
+            // ingest also records the terminal delivery diagnostic (#62).
+            let webhook_dispatcher = make_dispatcher(app.handle().clone());
+            state.webhook.set_ingestor(Arc::new({
                 let app = app.handle().clone();
-                move |project_id, cands| {
+                move |ev| {
                     let app = app.clone();
-                    Box::pin(run_auto_dispatch(app, project_id, cands))
-                }
-            }));
-            // Install the WEBHOOK trigger's dispatch hook (#9). The webhook is a
-            // second auto-trigger source: its axum handler maps a push payload to a
-            // `Candidate` and hands it here. Unlike the scheduler (whose candidates
-            // are pre-gated by `build_view`), webhook candidates arrive raw, so this
-            // closure applies the parity gates the composition root owns — the same
-            // `autoReview` gate the scheduler applies at its call site, then the
-            // static/cooldown gates (`gate_dispatchable`) — before reusing the very
-            // same `run_auto_dispatch`. Keeping the gates here (not in the handler)
-            // is what lets `pr::webhook` stay runtime-agnostic (never names AppHandle).
-            state.webhook.set_dispatcher(Arc::new({
-                let app = app.handle().clone();
-                move |project_id: String, cands| {
-                    let app = app.clone();
+                    let dispatcher = webhook_dispatcher.clone();
                     Box::pin(async move {
-                        // The webhook handler already routed by repo to the owning
-                        // project (#35); apply that project's autoReview + static/cooldown
-                        // gates before reusing the same per-project run_auto_dispatch.
-                        if !pr::scheduler::auto_review_enabled(&app, &project_id) {
-                            return;
-                        }
-                        let gated = pr::commands::gate_dispatchable(&app, &project_id, cands);
-                        run_auto_dispatch(app, project_id, gated).await;
+                        pr::commands::ingest_webhook(&app, &dispatcher, ev).await;
                     })
                 }
             }));
@@ -104,6 +97,8 @@ pub fn run() {
             pr::commands::start_webhook,
             pr::commands::stop_webhook,
             pr::commands::webhook_status,
+            pr::commands::webhook_deliveries,
+            pr::commands::poll_status,
             review::commands::get_codex_status,
             review::commands::start_codex,
             review::commands::stop_codex,
@@ -126,6 +121,21 @@ pub fn run() {
                 state.webhook.shutdown();
             }
         });
+}
+
+/// Build the per-cycle [`pr::scheduler::ProjectDispatcher`] both auto-trigger sources
+/// share — the poll scheduler and the webhook ingestor. Both drive a dispatchable
+/// `(project_id, candidates)` through the SAME [`run_auto_dispatch`] (the composition
+/// root's gate + concrete-engine assembly), so this single helper removes the duplicated
+/// `Arc::new(move |..| Box::pin(run_auto_dispatch(..)))` closure that was built verbatim
+/// at both wiring sites.
+fn make_dispatcher<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> pr::scheduler::ProjectDispatcher {
+    Arc::new(move |project_id, cands| {
+        let app = app.clone();
+        Box::pin(run_auto_dispatch(app, project_id, cands))
+    })
 }
 
 /// Composition-root assembly for one auto-trigger cycle: this is the ONE place that

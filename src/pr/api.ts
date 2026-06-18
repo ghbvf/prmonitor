@@ -2,7 +2,12 @@
 // `prs:updated` event subscription.
 import { invoke, listen } from "../api";
 import type { PrEvent, TrackedPrView } from "../types";
-import type { GhStatus, WebhookStatus } from "./types";
+import type {
+  GhStatus,
+  PollStatus,
+  WebhookDelivery,
+  WebhookStatus,
+} from "./types";
 
 // Mirrors src-tauri/src/events.rs::PRS_UPDATED_EVENT (this TS side is the
 // open downstream end of the event-name funnel — keep in lockstep).
@@ -69,4 +74,17 @@ export function stopWebhook(): Promise<WebhookStatus> {
 
 export function webhookStatus(): Promise<WebhookStatus> {
   return invoke<WebhookStatus>("webhook_status");
+}
+
+// Webhook delivery diagnostics ring (#62): the most recent received deliveries the
+// receiver classified, oldest→newest (the WebhookPanel reverses for display). No
+// arguments — the ring is process-global.
+export function webhookDeliveries(): Promise<WebhookDelivery[]> {
+  return invoke<WebhookDelivery[]>("webhook_deliveries");
+}
+
+// One project's poll-loop status snapshot (#62). The JS `projectId` key maps to the
+// Rust `project_id` snake_case arg (same convention as pollNow/getPrs above).
+export function pollStatus(projectId: string): Promise<PollStatus> {
+  return invoke<PollStatus>("poll_status", { projectId });
 }
