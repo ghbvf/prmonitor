@@ -96,6 +96,30 @@ describe("PROJECT_GROUPS", () => {
       expect(f?.optionLabels?.[m]).toBeTruthy();
     }
   });
+
+  it("azure fields are visibleWhen sourceKind === azure (818 F14)", () => {
+    const byKey = new Map(
+      PROJECT_GROUPS.flatMap((g) => g.fields).map((f) => [f.key, f]),
+    );
+    const azureP = { ...validProject(), sourceKind: "azure" as const };
+    const githubP = { ...validProject(), sourceKind: "github" as const };
+    for (const key of ["azureOrg", "azureProject"] as const) {
+      const f = byKey.get(key);
+      expect(f?.visibleWhen).toBeTypeOf("function");
+      expect(f!.visibleWhen!(azureP)).toBe(true);
+      expect(f!.visibleWhen!(githubP)).toBe(false);
+    }
+  });
+
+  it("non-azure project fields have no visibleWhen (always visible)", () => {
+    // sourceKind, repo, updateMode, etc. must NOT be conditionally hidden — only the
+    // azure-specific fields carry a predicate.
+    const conditional = PROJECT_GROUPS.flatMap((g) => g.fields)
+      .filter((f) => f.visibleWhen)
+      .map((f) => f.key)
+      .sort();
+    expect(conditional).toEqual(["azureOrg", "azureProject"]);
+  });
 });
 
 describe("pollingEnabledForMode (818)", () => {

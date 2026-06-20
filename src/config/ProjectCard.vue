@@ -54,6 +54,14 @@ function fieldValue(def: FieldDef): string | number | boolean | string[] {
   return props.project[def.key as ProjectFieldKey];
 }
 
+// Conditional-visibility filter (818 F14): drop fields whose `visibleWhen` predicate is
+// false for THIS project draft (e.g. azureOrg/azureProject hidden for a github source).
+// A field without `visibleWhen` is always shown. Hidden fields keep their stored value —
+// we never clear them, so flipping sourceKind back to azure restores what was typed.
+function visibleFields(fields: FieldDef[]): FieldDef[] {
+  return fields.filter((f) => !f.visibleWhen || f.visibleWhen(props.project));
+}
+
 // Apply an edit. `authors` is held locally as a csv string and emitted normalized to
 // string[]; every other field emits its native value straight through.
 function setField(def: FieldDef, value: string | number | boolean | string[]) {
@@ -104,7 +112,7 @@ function onName(e: Event) {
     <div v-for="g in PROJECT_GROUPS" :key="g.id" class="group">
       <h4 class="group-title">{{ g.title }}</h4>
       <ConfigField
-        v-for="def in g.fields"
+        v-for="def in visibleFields(g.fields)"
         :key="def.key"
         :def="def"
         :model-value="fieldValue(def)"

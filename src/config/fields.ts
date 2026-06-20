@@ -35,6 +35,13 @@ export interface FieldDef<K extends FieldKey = FieldKey> {
   // masked (type=password) with a reveal toggle so it isn't exposed in screenshots
   // / screen-shares.
   secret?: boolean;
+  // Conditional visibility (818 F14): a project field that only applies under some
+  // sourceKind etc. (e.g. azureOrg/azureProject only for an Azure source). The Settings
+  // ProjectCard filters its render loop on this against the live project draft; a field
+  // without `visibleWhen` is always visible. Hidden fields keep their values (the
+  // backend ignores them when irrelevant), so toggling back restores them. Only used by
+  // per-project (Project-keyed) fields — the global webhook group never sets it.
+  visibleWhen?: (p: Project) => boolean;
 }
 
 interface FieldGroup<K extends FieldKey = FieldKey> {
@@ -79,7 +86,12 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
     id: "project",
     title: "项目",
     fields: [
-      { key: "repo", label: "仓库", kind: "text", hint: "owner/name，如 ghbvf/prmonitor" },
+      {
+        key: "repo",
+        label: "仓库",
+        kind: "text",
+        hint: "GitHub 源: owner/name（如 ghbvf/prmonitor）；Azure 源: 裸仓库名（org/project 见下方）",
+      },
       { key: "repoRoot", label: "本地路径", kind: "text", hint: "本地 clone 的绝对路径" },
       {
         key: "skillRelPath",
@@ -163,12 +175,16 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         key: "azureOrg",
         label: "Azure 组织",
         kind: "text",
+        // 818 F14: only shown for an Azure source; hidden (but value preserved) for github.
+        visibleWhen: (p) => p.sourceKind === "azure",
         hint: "(仅 Azure 源) Azure DevOps 组织名，如 shengming0923",
       },
       {
         key: "azureProject",
         label: "Azure 项目",
         kind: "text",
+        // 818 F14: only shown for an Azure source; hidden (but value preserved) for github.
+        visibleWhen: (p) => p.sourceKind === "azure",
         hint: "(仅 Azure 源) Azure DevOps 项目名，如 gocell",
       },
       {
