@@ -1,9 +1,13 @@
 //! Review slice Tauri commands.
 
+use tauri::Manager;
+
 use crate::config::service as config_service;
+use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
 use crate::review::engines::codex::{CodexEngine, CodexStatus};
+use crate::review::history_store::{self, HistoryItem};
 use crate::review::session::SessionInfo;
 use crate::state::AppState;
 
@@ -141,10 +145,37 @@ pub async fn stop_review<R: tauri::Runtime>(
     engine.stop(&session_id).await
 }
 
-/// Snapshot of all review sessions (running + finished) for the UI.
+/// Snapshot of all review sessions (running + finished) for the UI — the IN-MEMORY
+/// registry (live status). After a restart this is empty; [`get_pr_sessions`] reads the
+/// durable table instead.
 #[tauri::command]
 pub fn list_review_sessions(state: tauri::State<'_, AppState>) -> Vec<SessionInfo> {
     state.sessions.list()
+}
+
+/// A session's persisted history items in stream order (#70) — the message/reasoning
+/// blocks produced before the user opened the session. Drives the review panel's "open a
+/// history session and see prior content" (#67) by hydrating the per-session buffer.
+#[tauri::command]
+pub fn get_session_history<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    thread_id: String,
+) -> AppResult<Vec<HistoryItem>> {
+    let db = app.state::<Database>();
+    history_store::get_history(db.inner(), &thread_id)
+}
+
+/// A PR's persisted sessions, newest first, from the durable `review_session` table (#70)
+/// — so each PR can restore its session list after a restart (the #67 nav associates
+/// sessions per PR). Distinct from [`list_review_sessions`] (in-memory live snapshot).
+#[tauri::command]
+pub fn get_pr_sessions<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    project_id: String,
+    pr_number: u64,
+) -> AppResult<Vec<SessionInfo>> {
+    let db = app.state::<Database>();
+    history_store::get_pr_sessions(db.inner(), &project_id, pr_number)
 }
 
 /// Resolve the absolute path to the pr-review skill file codex attaches to the

@@ -11,6 +11,7 @@ import { ref } from "vue";
 import type { ReviewEvent } from "../types";
 import {
   getCodexStatus,
+  getSessionHistory,
   listReviewSessions,
   onReviewEvent,
   startCodex,
@@ -303,22 +304,40 @@ async function hydrateActiveSession() {
 }
 
 // Point the single focused stream at a chosen session (from the ReviewSessions
-// list). The backend doesn't replay past deltas, so `items` starts empty and new
-// deltas append from here. `running` mirrors the picked session's non-terminal
-// status so the stop button + waiting state behave like a fresh start would.
-function focus(threadId: string, prNumber: number, status: SessionStatus) {
+// list) and HYDRATE it with the session's persisted history (#70 / #67): opening a
+// past session now shows the content produced before it was opened, not just new
+// deltas. `running` mirrors the picked session's non-terminal status so the stop
+// button + waiting state behave like a fresh start would. Async (history load), but
+// safe to call fire-and-forget from a click handler.
+async function focus(threadId: string, prNumber: number, status: SessionStatus) {
   activeThreadId.value = threadId;
   activePr.value = prNumber;
   const active =
     status === "running" || status === "starting" || status === "interrupting";
   running.value = active;
-  items.value = []; // backend doesn't replay past deltas; the stream starts empty.
+  items.value = []; // clear for instant feedback; history fills in below.
   error.value = null;
   // A terminal session must render as ended, not "未开始": map its lifecycle status
   // to a turn-status string ReviewPanel can label (`done` collapses completed /
   // interrupted — that distinction isn't kept in SessionInfo). An active session
   // keeps `finalStatus` null (it shows "运行中").
   finalStatus.value = active ? null : status === "failed" ? "failed" : "completed";
+  // Hydrate from the durable history. Live deltas for a still-running session keep
+  // appending via `applyEvent` (coalesced by `itemId`), so seeding the stored prefix
+  // and streaming the tail compose without duplication.
+  try {
+    const history = await getSessionHistory(threadId);
+    // Guard against a focus switch during the await: only apply if still focused here.
+    if (activeThreadId.value === threadId) {
+      items.value = history.map((h) => ({
+        itemId: h.itemId,
+        kind: h.kind,
+        text: h.text,
+      }));
+    }
+  } catch (err) {
+    console.error("加载历史会话内容失败", err);
+  }
 }
 
 // Drop the focused review (#35 F5). The focused stream is a GLOBAL single-active

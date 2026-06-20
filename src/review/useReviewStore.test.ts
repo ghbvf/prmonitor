@@ -22,6 +22,8 @@ vi.mock("./api", () => ({
   startReview: vi.fn(() => Promise.resolve("th_1")),
   stopReview: vi.fn(() => Promise.resolve()),
   listReviewSessions: vi.fn(() => Promise.resolve([])),
+  getPrSessions: vi.fn(() => Promise.resolve([])),
+  getSessionHistory: vi.fn(() => Promise.resolve([])),
   onReviewEvent: vi.fn(() => Promise.resolve(() => {})),
 }));
 
@@ -40,6 +42,8 @@ beforeEach(() => {
   vi.mocked(api.startReview).mockResolvedValue("th_1");
   vi.mocked(api.stopReview).mockResolvedValue();
   vi.mocked(api.listReviewSessions).mockResolvedValue([]);
+  vi.mocked(api.getPrSessions).mockResolvedValue([]);
+  vi.mocked(api.getSessionHistory).mockResolvedValue([]);
   // Module-level singleton state: reset between tests so each starts clean.
   const s = useReviewStore();
   s.codex.value = null;
@@ -589,6 +593,42 @@ describe("useReviewStore focus()", () => {
     store.focus("th_done", 7, "done");
 
     expect(store.running.value).toBe(false);
+  });
+
+  it("hydrates the panel with the session's persisted history (#70)", async () => {
+    const store = useReviewStore();
+    vi.mocked(api.getSessionHistory).mockResolvedValueOnce([
+      { itemId: "i1", kind: "reasoning", text: "planned" },
+      { itemId: "i2", kind: "message", text: "done" },
+    ]);
+
+    await store.focus("th_hist", 7, "done");
+
+    expect(api.getSessionHistory).toHaveBeenCalledWith("th_hist");
+    expect(store.items.value).toEqual([
+      { itemId: "i1", kind: "reasoning", text: "planned" },
+      { itemId: "i2", kind: "message", text: "done" },
+    ]);
+  });
+
+  it("does not apply stale history after focus switched away mid-load", async () => {
+    const store = useReviewStore();
+    // First focus's history load is slow; a second focus lands before it resolves.
+    let resolveFirst!: (v: { itemId: string; kind: "message"; text: string }[]) => void;
+    vi.mocked(api.getSessionHistory)
+      .mockImplementationOnce(
+        () => new Promise((res) => (resolveFirst = res)),
+      )
+      .mockResolvedValueOnce([]);
+
+    const first = store.focus("th_a", 1, "done");
+    await store.focus("th_b", 2, "done"); // switches focus to th_b
+    resolveFirst([{ itemId: "x", kind: "message", text: "late" }]);
+    await first;
+
+    // th_a's late history must NOT clobber th_b's (now-focused) empty panel.
+    expect(store.activeThreadId.value).toBe("th_b");
+    expect(store.items.value).toEqual([]);
   });
 
   it("treats a starting session as running", () => {

@@ -19,6 +19,7 @@
 // `pr::source::PrSource`, `review::engine::ReviewEngine`) count as reachable API
 // in this skeleton rather than tripping `dead_code` before their first use.
 pub mod config;
+pub mod db;
 pub mod dispatch;
 pub mod error;
 pub mod events;
@@ -40,6 +41,15 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(AppState::default())
         .setup(|app| {
+            // Open + migrate the unified SQLite store and manage it as a `tauri::State`
+            // BEFORE anything that reads persistence (config load / poll start). It is a
+            // `State` rather than an `AppState` field because `app_data_dir()` only
+            // resolves here in `setup`, while `AppState` is `.manage()`d at builder time.
+            // Then run the one-time legacy JSON → SQLite import (#70) so existing users'
+            // config / tracked PRs / ledger carry over before the first read.
+            app.manage(db::Database::open(app.handle())?);
+            import_legacy_stores(app.handle())?;
+
             let state = app.state::<AppState>();
             // Install the auto-trigger dispatcher BEFORE starting the loop, so the
             // immediate first tick already auto-starts dispatchable reviews. The
@@ -105,6 +115,8 @@ pub fn run() {
             review::commands::start_review,
             review::commands::stop_review,
             review::commands::list_review_sessions,
+            review::commands::get_session_history,
+            review::commands::get_pr_sessions,
             config::commands::set_active_project,
         ])
         .build(tauri::generate_context!())
@@ -121,6 +133,76 @@ pub fn run() {
                 state.webhook.shutdown();
             }
         });
+}
+
+/// One-time legacy JSON → SQLite import (#70). Reads the pre-SQLite `tauri-plugin-store`
+/// files (`config.json` / `prs.json` / `ledger.json`) and hands each value to the OWNING
+/// slice's `import_legacy_*` helper (column knowledge stays in the slice), inserting all
+/// rows + the done-guard in ONE transaction so a crash mid-import rolls back and re-runs
+/// cleanly. A no-op once [`db::Database::legacy_imported`] is set, and on fresh installs
+/// (the legacy stores are empty, so nothing imports). The old JSON files are LEFT in
+/// place (recoverable / downgradeable); the guard makes them inert.
+///
+/// This is composition (it spans `config` + `pr` slices), so it lives at the root, not
+/// in `db` (which stays a pure horizontal owning only schema + connection).
+fn import_legacy_stores<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> error::AppResult<()> {
+    use tauri_plugin_store::StoreExt;
+
+    let db = app.state::<db::Database>();
+    if db.legacy_imported()? {
+        return Ok(());
+    }
+
+    // Gather the legacy values up front (reads, outside the write transaction). A
+    // missing store file just yields an empty store → nothing to import.
+    let config_value = app
+        .store("config.json")
+        .ok()
+        .and_then(|s| s.get("appConfig"));
+
+    let mut tracked: Vec<(String, serde_json::Value)> = Vec::new();
+    if let Ok(store) = app.store("prs.json") {
+        for key in store.keys() {
+            if let Some(pid) = key.strip_prefix("tracked:") {
+                if let Some(v) = store.get(&key) {
+                    tracked.push((pid.to_string(), v));
+                }
+            }
+        }
+    }
+
+    let mut dispatched: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut events: Vec<(String, serde_json::Value)> = Vec::new();
+    if let Ok(store) = app.store("ledger.json") {
+        for key in store.keys() {
+            if let Some(pid) = key.strip_prefix("dispatched:") {
+                if let Some(v) = store.get(&key) {
+                    dispatched.push((pid.to_string(), v));
+                }
+            } else if let Some(pid) = key.strip_prefix("events:") {
+                if let Some(v) = store.get(&key) {
+                    events.push((pid.to_string(), v));
+                }
+            }
+        }
+    }
+
+    db.with_tx(|tx| {
+        if let Some(v) = &config_value {
+            config::service::import_legacy_config(tx, v)?;
+        }
+        for (pid, v) in &tracked {
+            pr::registry::import_legacy_tracked(tx, pid, v)?;
+        }
+        for (pid, v) in &dispatched {
+            pr::ledger::import_legacy_dispatched(tx, pid, v)?;
+        }
+        for (pid, v) in &events {
+            pr::ledger::import_legacy_events(tx, pid, v)?;
+        }
+        db::mark_legacy_imported(tx)?;
+        Ok(())
+    })
 }
 
 /// Build the per-cycle [`pr::scheduler::ProjectDispatcher`] both auto-trigger sources

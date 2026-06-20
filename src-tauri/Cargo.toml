@@ -42,6 +42,13 @@ hex = "0.4"
 # review would require `'static` owned handles; `join_all` over borrowing futures
 # keeps the shared-borrow design. Only `futures` (no extra runtime) is pulled.
 futures = "0.3"
+# Unified local SQLite store (#70): the single persistence backend for config /
+# tracked PRs / dispatch ledger / review sessions + history / webhook PRs. `bundled`
+# compiles a pinned libsqlite3 from source (no system sqlite dependency), and the
+# synchronous `rusqlite` API fits the existing "sync store behind a std Mutex" pattern
+# (registry/ledger) — the pump's async path calls these sub-millisecond sync writes
+# directly without holding the connection lock across an `.await`.
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 # Pin: brotli 8.0.3 (pulled transitively by tauri-codegen/tauri-utils) requires
 # alloc-no-stdlib "^2.0", but alloc-stdlib/brotli-decompressor accept ">=2.0.4,<4"

@@ -1,23 +1,56 @@
 <script setup lang="ts">
-// Review-sessions list: the concurrent-aware companion to ReviewPanel's single
-// focused stream. #8 can auto-trigger several review sessions at once; this lists
-// them all — running AND finished (the backend's `list_review_sessions` returns
-// both) — from the shared store's `sessions` ref, and lets the user point the
-// focused panel at any one. Reads the module-level singleton store — no second
-// instance, no props. Mirrors PrList/PrRow's badge + muted conventions.
-import { computed } from "vue";
-import { useProjects } from "../projects";
+// Review-sessions list for the SELECTED PR (#67): the independent session panel
+// (sessions stay OUT of the PR box per the chosen layout). Lists that PR's sessions —
+// running AND finished — sourced from the DURABLE store (`getPrSessions`, #70) so they
+// survive a restart, overlaid with the live in-memory `sessions` for real-time status.
+// Clicking one points the focused panel at it (and hydrates its persisted history). The
+// composition root (App.vue) passes the selected PR down, keeping pr/review decoupled.
+import { computed, ref, watch } from "vue";
+import { getPrSessions } from "./api";
 import { useReviewStore } from "./useReviewStore";
-import type { SessionStatus } from "./types";
+import type { ReviewSession, SessionStatus } from "./types";
 
+const props = defineProps<{ projectId: string; prNumber: number | null }>();
 const { sessions, activeThreadId, focus } = useReviewStore();
-const { activeProjectId } = useProjects();
 
-// Scope the list to the active project (#35): the store tracks every project's
-// sessions, but the panel only ever focuses one project's at a time.
-const visibleSessions = computed(() =>
-  sessions.value.filter((s) => s.projectId === activeProjectId.value),
-);
+// Durable sessions for the selected PR (#70): persisted, so a PR's session list is
+// restored after a restart (the in-memory `sessions` is empty then).
+const durable = ref<ReviewSession[]>([]);
+
+async function loadDurable() {
+  if (props.prNumber == null) {
+    durable.value = [];
+    return;
+  }
+  try {
+    durable.value = await getPrSessions(props.projectId, props.prNumber);
+  } catch (err) {
+    console.error("加载 PR 会话列表失败", err);
+    durable.value = [];
+  }
+}
+
+// Reload when the selected PR changes, and when the live session set changes (a new
+// session started / a status transitioned → re-read the durable list to match).
+watch(() => [props.projectId, props.prNumber], loadDurable, { immediate: true });
+watch(sessions, loadDurable);
+
+// Merge durable + live for the selected PR: a matching live session overrides the
+// durable row (its status is real-time), and a brand-new live session not yet in the
+// durable snapshot still appears. Sorted by `threadId` for a stable order.
+const visibleSessions = computed<ReviewSession[]>(() => {
+  if (props.prNumber == null) return [];
+  const byThread = new Map<string, ReviewSession>();
+  for (const s of durable.value) byThread.set(s.threadId, s);
+  for (const s of sessions.value) {
+    if (s.projectId === props.projectId && s.prNumber === props.prNumber) {
+      byThread.set(s.threadId, s);
+    }
+  }
+  return [...byThread.values()].sort((a, b) =>
+    a.threadId.localeCompare(b.threadId),
+  );
+});
 
 // Bilingual label for each session lifecycle status (mirrors ReviewPanel's
 // finalLabel style). Default keeps the raw value so a new SessionStatus still
@@ -46,8 +79,12 @@ function statusLabel(status: SessionStatus): string {
       <h2>Review 会话 / Review sessions</h2>
     </header>
 
-    <p v-if="visibleSessions.length === 0" class="muted">
-      暂无会话 / No review sessions
+    <p v-if="prNumber == null" class="muted">
+      选择一个 PR 查看其会话 / Select a PR to see its sessions
+    </p>
+
+    <p v-else-if="visibleSessions.length === 0" class="muted">
+      该 PR 暂无会话 / No sessions for this PR
     </p>
 
     <ul v-else class="rows">

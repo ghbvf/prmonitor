@@ -1,13 +1,17 @@
 //! Config slice logic.
 //!
-//! Backend-owned persistence via `tauri-plugin-store`'s Rust `StoreExt`. The
-//! frontend calls the `get_config` / `set_config` commands (not the store plugin
-//! directly), so all reads/writes funnel through here.
+//! Backend-owned persistence in the unified SQLite store (#70): the whole [`AppConfig`]
+//! lives as one camelCase-JSON blob in the single-row `config_blob` table (swapping only
+//! the storage backend — the [`migrate_value`] / `validate` shape logic is unchanged).
+//! The frontend calls the `get_config` / `set_config` commands (not SQLite directly), so
+//! all reads/writes funnel through here.
 
+use rusqlite::OptionalExtension;
 use serde_json::{json, Map, Value};
-use tauri_plugin_store::StoreExt;
+use tauri::Manager;
 
 use super::model::AppConfig;
+use crate::db::{map_err, Database};
 use crate::error::{AppError, AppResult};
 
 /// Re-export the project domain type THROUGH the config public service surface (#35,
@@ -18,10 +22,6 @@ use crate::error::{AppError, AppResult};
 /// use `Project` through this same re-export.
 pub use super::model::Project;
 
-/// Store file holding the persisted config.
-const STORE_FILE: &str = "config.json";
-/// Key under which the [`AppConfig`] value lives in the store.
-const CONFIG_KEY: &str = "appConfig";
 /// `id`/`name` assigned to the single project lifted out of a legacy flat config by
 /// [`migrate_value`] (#35). One source so the migration and its tests agree on the
 /// id the active-project pointer (`activeProjectId`) is also set to.
@@ -120,16 +120,30 @@ fn migrate_value(raw: Value) -> Value {
 /// [`migrate_value`] first so a legacy flat single-project config (#35) upgrades to
 /// the multi-project shape before deserialization.
 pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResult<AppConfig> {
-    let store = app
-        .store(STORE_FILE)
-        .map_err(|e| AppError::new(format!("打开配置存储失败: {e}")))?;
+    load_db(app.state::<Database>().inner())
+}
 
-    match store.get(CONFIG_KEY) {
+/// SQLite-level load (no Tauri app) — reads the `config_blob` row, runs [`migrate_value`]
+/// on it, then deserializes. Split from [`load`] so the blob path + legacy migration are
+/// testable against an in-memory [`Database`].
+pub(crate) fn load_db(db: &Database) -> AppResult<AppConfig> {
+    let raw: Option<String> = db.with_conn(|conn| {
+        conn.query_row("SELECT json FROM config_blob WHERE id = 1", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+    })?;
+
+    match raw {
         None => Ok(AppConfig::default()),
-        // Surface (don't silently discard) a corrupt/incompatible persisted
-        // config so the user can fix it rather than lose their settings.
-        Some(value) => serde_json::from_value(migrate_value(value))
-            .map_err(|e| AppError::new(format!("解析持久化配置失败: {e}"))),
+        // Surface (don't silently discard) a corrupt/incompatible persisted config so the
+        // user can fix it rather than lose their settings.
+        Some(json) => {
+            let value: Value = serde_json::from_str(&json)
+                .map_err(|e| AppError::new(format!("解析持久化配置失败: {e}")))?;
+            serde_json::from_value(migrate_value(value))
+                .map_err(|e| AppError::new(format!("解析持久化配置失败: {e}")))
+        }
     }
 }
 
@@ -201,16 +215,35 @@ pub fn save<R: tauri::Runtime>(app: &tauri::AppHandle<R>, config: AppConfig) -> 
 /// and the lenient [`set_active_project`] both funnel through here so the
 /// store-write plumbing lives in one place.
 fn persist<R: tauri::Runtime>(app: &tauri::AppHandle<R>, config: &AppConfig) -> AppResult<()> {
-    let store = app
-        .store(STORE_FILE)
-        .map_err(|e| AppError::new(format!("打开配置存储失败: {e}")))?;
+    persist_db(app.state::<Database>().inner(), config)
+}
 
-    let value = serde_json::to_value(config).map_err(|e| AppError::new(e.to_string()))?;
-    // tauri-plugin-store 2.x: `Store::set` is infallible and returns `()`.
-    store.set(CONFIG_KEY, value);
-    store
-        .save()
-        .map_err(|e| AppError::new(format!("写入配置存储失败: {e}")))?;
+/// SQLite-level write of the whole [`AppConfig`] as the single `config_blob` row (#70).
+/// Split from [`persist`] so the blob round-trip is testable against an in-memory
+/// [`Database`]. Stores the camelCase JSON; [`load_db`] runs `migrate_value` on read
+/// (identity for an already-new shape).
+pub(crate) fn persist_db(db: &Database, config: &AppConfig) -> AppResult<()> {
+    let json = serde_json::to_string(config).map_err(|e| AppError::new(e.to_string()))?;
+    db.with_conn(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO config_blob (id, json) VALUES (1, ?1)",
+            [&json],
+        )
+        .map(|_| ())
+    })
+}
+
+/// One-time legacy import (#70) of the old `config.json` `appConfig` value into the
+/// `config_blob` row. Stores the RAW legacy value as-is (which may be the pre-#35 flat
+/// shape) — [`load_db`]'s [`migrate_value`] lifts it on the next read, so this needs no
+/// shape knowledge. Runs inside the composition root's import transaction.
+pub fn import_legacy_config(tx: &rusqlite::Transaction, value: &Value) -> AppResult<()> {
+    let json = serde_json::to_string(value).map_err(|e| AppError::new(e.to_string()))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO config_blob (id, json) VALUES (1, ?1)",
+        [&json],
+    )
+    .map_err(map_err)?;
     Ok(())
 }
 
@@ -245,6 +278,49 @@ pub fn set_active_project<R: tauri::Runtime>(app: &tauri::AppHandle<R>, id: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // SQLite blob round-trip (#70): an empty DB loads the default; a persisted config
+    // reads back equal. The blob path is the storage swap — `migrate_value`/`validate`
+    // (tested below) are unchanged.
+    #[test]
+    fn sqlite_blob_empty_loads_default_and_round_trips() {
+        let db = Database::open_in_memory().expect("open db");
+        // No row yet → default (first launch, empty projects).
+        let first = load_db(&db).expect("load empty");
+        assert!(first.projects.is_empty());
+        assert_eq!(first.active_project_id, "");
+
+        // Persist a non-default value (a webhook port) and read it back through the blob.
+        let config = AppConfig {
+            webhook_port: 9123,
+            ..Default::default()
+        };
+        persist_db(&db, &config).expect("persist");
+        let back = load_db(&db).expect("load");
+        assert_eq!(back.webhook_port, 9123);
+    }
+
+    // One-time legacy import (#70) of the highest-risk case: a pre-#35 FLAT `config.json`
+    // value imported into `config_blob` must, on the next `load_db`, surface as the
+    // migrated multi-project shape (the import stores it raw; `migrate_value` lifts it on
+    // read). This is the migration existing users depend on to keep their settings.
+    #[test]
+    fn legacy_flat_config_import_migrates_on_load() {
+        let db = Database::open_in_memory().expect("open db");
+        let legacy = json!({
+            "repo": "octocat/hello",
+            "repoRoot": "/tmp/hello",
+            "autoReview": true
+        });
+        db.with_tx(|tx| import_legacy_config(tx, &legacy))
+            .expect("import");
+
+        let config = load_db(&db).expect("load");
+        assert_eq!(config.projects.len(), 1, "flat shape lifted to one project");
+        assert_eq!(config.projects[0].repo, "octocat/hello");
+        assert_eq!(config.active_project_id, MIGRATED_PROJECT_ID);
+        assert!(config.projects[0].auto_review);
+    }
 
     #[test]
     fn migrate_old_flat_produces_single_default_project() {

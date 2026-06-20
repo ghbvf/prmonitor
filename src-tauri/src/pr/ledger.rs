@@ -1,60 +1,40 @@
 //! Dispatch de-duplication ledger + cooldown source.
 //!
 //! Port of `router.py`'s two state files (`dispatched` keys + `dispatch-events`
-//! epochs), unified into one `ledger.json` persisted via `tauri-plugin-store`'s
-//! `StoreExt` — the same backend-owned store pattern as the config slice.
+//! epochs), persisted in the unified SQLite store (#70) — the `dispatch_key` (dedup
+//! set) and `dispatch_event` (cooldown log) tables, each partitioned by a real
+//! `project_id` column (replacing the old `ledger.json` `prefix:{pid}` store keys).
 //!
 //! PR3 uses the **read** path (`has_dispatched` / `last_dispatch_at`) to annotate
 //! the PR list with "already dispatched" / cooldown skip reasons. The **write**
 //! path (`record_many`) is invoked by the auto-trigger dispatcher
 //! ([`crate::dispatch`]) once review turns actually start; recording it here keeps
-//! the dedup machinery complete. The write is batched (one persist for the whole
+//! the dedup machinery complete. The write is batched (one transaction for the whole
 //! cycle's started candidates) so unbounded concurrent starts can't race the store.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use tauri_plugin_store::StoreExt;
+use tauri::Manager;
 
-use crate::error::{AppError, AppResult};
+use crate::db::{map_err, Database};
+use crate::error::AppResult;
 use crate::model::Candidate;
 
-/// Store file holding the persisted ledger.
-const STORE_FILE: &str = "ledger.json";
-/// Key PREFIX holding the per-project set of dispatched dedup keys (#35). The
-/// effective key is `dispatched:{project_id}` (see [`dispatched_key`]); a single
-/// `ledger.json` holds every project's partition under its own key.
-const DISPATCHED_KEY_PREFIX: &str = "dispatched";
-/// Key PREFIX holding the per-project dispatch-event log for cooldown (#35). The
-/// effective key is `events:{project_id}` (see [`events_key`]).
-const EVENTS_KEY_PREFIX: &str = "events";
-
-/// Serializes EVERY load→stage→save of `ledger.json` across projects (#35). The
-/// store is one file holding all projects' partitions (`dispatched:{pid}` /
-/// `events:{pid}`); `Store::save` rewrites the WHOLE file, so two parallel project
-/// cycles each doing a load→stage→save would interleave and one would clobber the
-/// other's just-written partition (a lost dispatch record → re-review storm). A
-/// process-global `Mutex<()>` (the data lives in the store, not behind the lock)
-/// guards the critical section in [`Ledger::record_many`]; a module static so the
-/// lock IDENTITY is fixed (a caller cannot serialize on the wrong mutex). Mirrors
-/// the registry's `WRITE_LOCK` rationale. `std` (not `tokio`) `Mutex`: the guarded
-/// section is fully synchronous (`tauri-plugin-store` reads/writes are sync), so no
-/// `.await` is ever held across the guard.
+/// Serializes EVERY load→stage→save of the dispatch ledger across projects (#35). Two
+/// parallel project cycles each doing a load→stage→save would interleave and one would
+/// clobber the other's just-recorded partition (a lost dispatch record → re-review
+/// storm). A process-global `Mutex<()>` (the data lives in SQLite, not behind the lock)
+/// guards the critical section in [`Ledger::record_many`]; a module static so the lock
+/// IDENTITY is fixed (a caller cannot serialize on the wrong mutex). Mirrors the
+/// registry's `WRITE_LOCK` rationale. `std` (not `tokio`) `Mutex`: the guarded section
+/// is fully synchronous (the SQLite calls never `.await`), so no `.await` is held across
+/// the guard. The single SQLite connection's own mutex additionally serializes
+/// individual statements, but THIS lock is what makes a project's load→save one atomic
+/// critical section relative to other projects' cycles (so a `load` here can't read a
+/// partition another project is mid-rewrite of).
 static LEDGER_WRITE_LOCK: Mutex<()> = Mutex::new(());
-
-/// Store key for a project's dispatched dedup-key set: `dispatched:{project_id}`
-/// (#35). Partitions the shared `ledger.json` so two projects' identical
-/// `(number, head_sha, kind)` dedup keys never collide.
-fn dispatched_key(project_id: &str) -> String {
-    format!("{DISPATCHED_KEY_PREFIX}:{project_id}")
-}
-
-/// Store key for a project's dispatch-event (cooldown) log: `events:{project_id}`
-/// (#35). Same partitioning rationale as [`dispatched_key`].
-fn events_key(project_id: &str) -> String {
-    format!("{EVENTS_KEY_PREFIX}:{project_id}")
-}
 
 /// One recorded dispatch — the cooldown source (mirrors `router.py`
 /// dispatch-events: `(pr, kind, dispatchedAtEpoch)`).
@@ -107,13 +87,13 @@ pub fn record_dispatched<R: tauri::Runtime>(
     cands: &[Candidate],
 ) -> AppResult<()> {
     // Hold the cross-project write lock across the WHOLE load→stage→save (#35): N
-    // parallel project cycles each rewrite the same `ledger.json` (whole-file save),
-    // so a load here racing another project's save would drop that project's
+    // parallel project cycles each replace their `dispatch_*` partition (delete +
+    // re-insert), so a load here racing another project's save would drop that project's
     // just-recorded partition. The guard makes load + persist one atomic section.
     // `.unwrap()` matches the registry's std-Mutex convention; the section is
-    // synchronous (store reads/writes are sync) so no `.await` is held across it, and
-    // a panic mid-section can't leave torn state (the data lives in the store, each
-    // key rewritten wholesale by `record_many`). Poisoning is therefore benign.
+    // synchronous (the SQLite calls never `.await`) so no `.await` is held across it, and
+    // a panic mid-section can't leave torn state (the data lives in SQLite, the partition
+    // rewritten wholesale by `record_many` in one transaction). Poisoning is benign.
     let _guard = LEDGER_WRITE_LOCK.lock().unwrap();
     let mut ledger = Ledger::load(app, project_id)?;
     ledger.record_many(app, project_id, cands, now_epoch())
@@ -149,20 +129,42 @@ impl Ledger {
     /// the reservation then rejects. The write path ([`record_dispatched`]) DOES hold
     /// the lock across its own load→stage→save (a lost write there is unrecoverable).
     pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>, project_id: &str) -> AppResult<Self> {
-        let store = app
-            .store(STORE_FILE)
-            .map_err(|e| AppError::new(format!("打开 ledger 存储失败: {e}")))?;
+        Self::load_db(app.state::<Database>().inner(), project_id)
+    }
 
-        let dispatched = store
-            .get(dispatched_key(project_id))
-            .and_then(|v| serde_json::from_value::<HashSet<String>>(v).ok())
-            .unwrap_or_default();
-        let events = store
-            .get(events_key(project_id))
-            .and_then(|v| serde_json::from_value::<Vec<DispatchEvent>>(v).ok())
-            .unwrap_or_default();
+    /// SQLite-level load (no Tauri app) — reads this project's `dispatch_key` set +
+    /// `dispatch_event` log. Split from [`Self::load`] so store round-trips are
+    /// testable against an in-memory [`Database`]. Epochs/PR numbers are stored as
+    /// `i64` (SQLite's only integer type) and read back as `u64`.
+    pub(crate) fn load_db(db: &Database, project_id: &str) -> AppResult<Self> {
+        db.with_conn(|conn| {
+            let mut dispatched = HashSet::new();
+            let mut stmt = conn.prepare("SELECT key FROM dispatch_key WHERE project_id = ?1")?;
+            let rows = stmt.query_map([project_id], |r| r.get::<_, String>(0))?;
+            for k in rows {
+                dispatched.insert(k?);
+            }
 
-        Ok(Self { dispatched, events })
+            let mut events = Vec::new();
+            let mut stmt = conn.prepare(
+                "SELECT pr, kind, head_sha, key, dispatched_at_epoch \
+                 FROM dispatch_event WHERE project_id = ?1 ORDER BY id",
+            )?;
+            let rows = stmt.query_map([project_id], |r| {
+                Ok(DispatchEvent {
+                    pr: r.get::<_, i64>(0)? as u64,
+                    kind: r.get(1)?,
+                    head_sha: r.get(2)?,
+                    key: r.get(3)?,
+                    dispatched_at_epoch: r.get::<_, i64>(4)? as u64,
+                })
+            })?;
+            for e in rows {
+                events.push(e?);
+            }
+
+            Ok(Self { dispatched, events })
+        })
     }
 
     /// Whether `key` has already been dispatched.
@@ -192,12 +194,13 @@ impl Ledger {
     /// `record` calls would produce. An empty `cands` slice still touches the store
     /// (a harmless no-op save) — callers gate on non-empty before calling.
     ///
-    /// **Concurrency (#35):** writes ONLY this project's keys
-    /// (`dispatched:{project_id}` / `events:{project_id}`), but `Store::save` rewrites
-    /// the whole `ledger.json`. The cross-project lost-update race that creates is
-    /// closed by [`record_dispatched`], which holds [`LEDGER_WRITE_LOCK`] across its
-    /// `load` → this `record_many`, so the load this method's `self` came from and the
-    /// save below are one atomic critical section relative to other projects' cycles.
+    /// **Concurrency (#35):** writes ONLY this project's `dispatch_key` /
+    /// `dispatch_event` rows, but does so by replacing the whole partition (delete +
+    /// re-insert `self`). The cross-project lost-update race that the read→mutate→write
+    /// shape creates is closed by [`record_dispatched`], which holds [`LEDGER_WRITE_LOCK`]
+    /// across its `load` → this `record_many`, so the load this method's `self` came from
+    /// and the save below are one atomic critical section relative to other projects'
+    /// cycles. The delete+insert runs in one transaction (atomic on its own too).
     pub fn record_many<R: tauri::Runtime>(
         &mut self,
         app: &tauri::AppHandle<R>,
@@ -206,22 +209,56 @@ impl Ledger {
         epoch: u64,
     ) -> AppResult<()> {
         self.stage_all(cands, epoch);
+        self.save_db(app.state::<Database>().inner(), project_id)
+    }
 
-        let store = app
-            .store(STORE_FILE)
-            .map_err(|e| AppError::new(format!("打开 ledger 存储失败: {e}")))?;
-        store.set(
-            dispatched_key(project_id),
-            serde_json::to_value(&self.dispatched).map_err(|e| AppError::new(e.to_string()))?,
-        );
-        store.set(
-            events_key(project_id),
-            serde_json::to_value(&self.events).map_err(|e| AppError::new(e.to_string()))?,
-        );
-        store
-            .save()
-            .map_err(|e| AppError::new(format!("写入 ledger 存储失败: {e}")))?;
-        Ok(())
+    /// SQLite-level save (no Tauri app) — replaces this project's partition with the
+    /// full in-memory `self` (delete-all + insert-all, the SQLite analogue of the old
+    /// whole-partition `Store::set`). Split from [`Self::record_many`] so the round-trip
+    /// is testable against an in-memory [`Database`].
+    pub(crate) fn save_db(&self, db: &Database, project_id: &str) -> AppResult<()> {
+        db.with_tx(|tx| {
+            tx.execute(
+                "DELETE FROM dispatch_key WHERE project_id = ?1",
+                [project_id],
+            )
+            .map_err(map_err)?;
+            tx.execute(
+                "DELETE FROM dispatch_event WHERE project_id = ?1",
+                [project_id],
+            )
+            .map_err(map_err)?;
+            {
+                let mut stmt = tx
+                    .prepare("INSERT INTO dispatch_key (project_id, key) VALUES (?1, ?2)")
+                    .map_err(map_err)?;
+                for k in &self.dispatched {
+                    stmt.execute(rusqlite::params![project_id, k])
+                        .map_err(map_err)?;
+                }
+            }
+            {
+                let mut stmt = tx
+                    .prepare(
+                        "INSERT INTO dispatch_event \
+                         (project_id, pr, kind, head_sha, key, dispatched_at_epoch) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    )
+                    .map_err(map_err)?;
+                for e in &self.events {
+                    stmt.execute(rusqlite::params![
+                        project_id,
+                        e.pr as i64,
+                        e.kind,
+                        e.head_sha,
+                        e.key,
+                        e.dispatched_at_epoch as i64
+                    ])
+                    .map_err(map_err)?;
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Stages a batch into the in-memory ledger (the dedup key set + cooldown event
@@ -241,6 +278,56 @@ impl Ledger {
             });
         }
     }
+}
+
+/// One-time legacy import (#70) of a project's `dispatched:{pid}` dedup-key set from the
+/// old `ledger.json`. Parses the JSON array of keys and inserts `dispatch_key` rows.
+/// Lenient: a corrupt value imports nothing (parity with `load`'s `unwrap_or_default`).
+/// Runs inside the composition root's import transaction (see `lib::import_legacy_stores`).
+pub fn import_legacy_dispatched(
+    tx: &rusqlite::Transaction,
+    project_id: &str,
+    value: &serde_json::Value,
+) -> AppResult<()> {
+    let keys: HashSet<String> = serde_json::from_value(value.clone()).unwrap_or_default();
+    let mut stmt = tx
+        .prepare("INSERT OR IGNORE INTO dispatch_key (project_id, key) VALUES (?1, ?2)")
+        .map_err(map_err)?;
+    for k in &keys {
+        stmt.execute(rusqlite::params![project_id, k])
+            .map_err(map_err)?;
+    }
+    Ok(())
+}
+
+/// One-time legacy import (#70) of a project's `events:{pid}` cooldown log from the old
+/// `ledger.json`. Parses the JSON array of [`DispatchEvent`] and inserts `dispatch_event`
+/// rows (order preserved by insert order → `id`). Lenient like [`import_legacy_dispatched`].
+pub fn import_legacy_events(
+    tx: &rusqlite::Transaction,
+    project_id: &str,
+    value: &serde_json::Value,
+) -> AppResult<()> {
+    let events: Vec<DispatchEvent> = serde_json::from_value(value.clone()).unwrap_or_default();
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO dispatch_event \
+             (project_id, pr, kind, head_sha, key, dispatched_at_epoch) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .map_err(map_err)?;
+    for e in &events {
+        stmt.execute(rusqlite::params![
+            project_id,
+            e.pr as i64,
+            e.kind,
+            e.head_sha,
+            e.key,
+            e.dispatched_at_epoch as i64
+        ])
+        .map_err(map_err)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -322,21 +409,75 @@ mod tests {
         assert_eq!(dispatch_key(7, "deadbeef", "check"), "7@deadbeef:check");
     }
 
-    // Project store-key partitioning (#35). The persisted `ledger.json` holds every
-    // project's dedup set / cooldown log under a project-scoped store key; the dedup
-    // KEY format (`{number}@{head_sha}:{kind}`) is unchanged. This pins that two
-    // projects' keys differ so a same-(number, head, kind) dispatch in one project
-    // can't be read as already-dispatched in another (the `Store::set` slot is
-    // distinct), and that the suffix is the raw project id.
+    // SQLite store round-trip (#70, Medium carrier): staging a batch, `save_db` then
+    // `load_db` against an in-memory DB must round-trip the dedup set + cooldown log
+    // intact (a column/SQL drift surfaces here), and a different project's partition
+    // must read empty (the `project_id` column is the partitioning seam that replaced
+    // the old `tracked:{pid}` store keys).
     #[test]
-    fn project_store_keys_are_partitioned() {
-        assert_eq!(dispatched_key("alpha"), "dispatched:alpha");
-        assert_eq!(events_key("alpha"), "events:alpha");
-        assert_ne!(dispatched_key("alpha"), dispatched_key("beta"));
-        assert_ne!(events_key("alpha"), events_key("beta"));
-        // The dedup KEY format itself is project-agnostic and unchanged — isolation
-        // comes from the STORE key, not from baking the project into the dedup key.
-        assert_eq!(dispatch_key(1, "sha", "review"), "1@sha:review");
+    fn sqlite_round_trip_and_per_project_isolation() {
+        let db = Database::open_in_memory().expect("open db");
+        let mut ledger = Ledger::default();
+        ledger.stage_all(&[cand(12, "review"), cand(12, "check")], 1_700_000_000);
+        ledger.save_db(&db, "alpha").expect("save");
+
+        let back = Ledger::load_db(&db, "alpha").expect("load");
+        assert!(back.has_dispatched(&dispatch_key(12, "sha", "review")));
+        assert!(back.has_dispatched(&dispatch_key(12, "sha", "check")));
+        assert_eq!(back.events.len(), 2);
+        assert_eq!(back.last_dispatch_at(12, "review"), Some(1_700_000_000));
+
+        // A different project's partition is empty — same (number, head, kind) is not
+        // visible across projects.
+        let other = Ledger::load_db(&db, "beta").expect("load other");
+        assert!(other.dispatched.is_empty());
+        assert!(other.events.is_empty());
+    }
+
+    // `save_db` replaces the whole partition (delete + re-insert `self`), so a later
+    // save with FEWER rows shrinks the stored set rather than leaving orphans.
+    #[test]
+    fn save_db_replaces_partition() {
+        let db = Database::open_in_memory().expect("open db");
+        let mut full = Ledger::default();
+        full.stage_all(&[cand(1, "review"), cand(2, "review")], 1_000);
+        full.save_db(&db, "p").expect("save full");
+
+        let mut fewer = Ledger::default();
+        fewer.stage_all(&[cand(1, "review")], 1_000);
+        fewer.save_db(&db, "p").expect("save fewer");
+
+        let back = Ledger::load_db(&db, "p").expect("load");
+        assert_eq!(back.dispatched.len(), 1);
+        assert!(back.has_dispatched(&dispatch_key(1, "sha", "review")));
+        assert!(!back.has_dispatched(&dispatch_key(2, "sha", "review")));
+    }
+
+    // One-time legacy import (#70): the old `ledger.json` shapes (a JSON array of dedup
+    // keys, a JSON array of `DispatchEvent`) import into the SQLite partition and read
+    // back through `load_db`. Guards the migration path existing users rely on.
+    #[test]
+    fn legacy_import_round_trips_through_load() {
+        let db = Database::open_in_memory().expect("open db");
+        let dispatched_v = serde_json::json!(["12@sha:review", "13@sha:check"]);
+        let events_v = serde_json::to_value(vec![
+            event(12, "review", 1_700_000_000),
+            event(13, "check", 1_700_000_100),
+        ])
+        .expect("events serialize");
+
+        db.with_tx(|tx| {
+            import_legacy_dispatched(tx, "alpha", &dispatched_v)?;
+            import_legacy_events(tx, "alpha", &events_v)?;
+            Ok(())
+        })
+        .expect("import");
+
+        let back = Ledger::load_db(&db, "alpha").expect("load");
+        assert!(back.has_dispatched("12@sha:review"));
+        assert!(back.has_dispatched("13@sha:check"));
+        assert_eq!(back.last_dispatch_at(12, "review"), Some(1_700_000_000));
+        assert_eq!(back.last_dispatch_at(13, "check"), Some(1_700_000_100));
     }
 
     // Ledger isolation (#35): two projects whose dedup sets are loaded from distinct

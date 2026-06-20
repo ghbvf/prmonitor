@@ -12,8 +12,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
-use tauri::Emitter;
+use serde::{Deserialize, Serialize};
+use tauri::{Emitter, Manager};
 use tokio::sync::broadcast;
 
 use super::engines::codex::process;
@@ -34,8 +34,9 @@ pub type ThreadId = String;
 const PR_REVIEW_SKILL: &str = "pr-review";
 
 /// Lifecycle of one review session (the state machine). Serialized camelCase for
-/// `list_review_sessions`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// `list_review_sessions`; `Deserialize` so the persisted `review_session.status` wire
+/// string (#70) projects back into this enum in `history_store::get_pr_sessions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionStatus {
     /// `thread/start` / `turn/start` in flight (not yet observed on the stream).
@@ -370,14 +371,18 @@ pub async fn start_review<R: tauri::Runtime>(
     // dispatch never slips between `thread/start` success and this insert. A later
     // `turn/start` failure flips it to `Failed` (visible to `list_review_sessions`,
     // not vanished); `turn_id` is filled once the turn starts.
-    registry.promote_reservation(SessionInfo {
+    let starting = SessionInfo {
         project_id: project_id.to_string(),
         thread_id: thread_id.clone(),
         turn_id: String::new(),
         pr_number,
         kind: kind.to_string(),
         status: SessionStatus::Starting,
-    });
+    };
+    registry.promote_reservation(starting.clone());
+    // Mirror the in-memory session into the durable `review_session` table (#70) so this
+    // PR's session list survives a restart and its history can be reopened. Best-effort.
+    persist_session(app, &starting);
     reservation.disarm();
 
     let prompt = review_prompt(repo, &skill_command(pr_number, kind));
@@ -409,11 +414,24 @@ pub async fn start_review<R: tauri::Runtime>(
         Ok(turn_id) => turn_id,
         Err(e) => {
             registry.set_status(&thread_id, SessionStatus::Failed);
+            persist_status(app, &thread_id, SessionStatus::Failed);
             return Err(e);
         }
     };
 
-    registry.set_running(&thread_id, turn_id);
+    registry.set_running(&thread_id, turn_id.clone());
+    // Mirror the Running transition (+ the now-known turn id) into `review_session` (#70).
+    persist_session(
+        app,
+        &SessionInfo {
+            project_id: project_id.to_string(),
+            thread_id: thread_id.clone(),
+            turn_id,
+            pr_number,
+            kind: kind.to_string(),
+            status: SessionStatus::Running,
+        },
+    );
 
     // Capture `project_id` as an owned String at spawn time so the pump stamps every
     // emitted `ReviewEvent` with it WITHOUT re-looking-up the session per event (#35):
@@ -497,6 +515,58 @@ pub async fn stop_review(
     Ok(())
 }
 
+/// Best-effort mirror of an in-memory [`SessionInfo`] into the durable `review_session`
+/// table (#70). Logs + swallows errors: a persistence hiccup must never break the live
+/// session (the in-memory registry stays the authority for dedup / status).
+fn persist_session<R: tauri::Runtime>(app: &tauri::AppHandle<R>, info: &SessionInfo) {
+    let db = app.state::<crate::db::Database>();
+    if let Err(e) = super::history_store::upsert_session(db.inner(), info) {
+        eprintln!(
+            "review session 持久化失败（{}）：{}",
+            info.thread_id, e.message
+        );
+    }
+}
+
+/// Best-effort mirror of a session status transition into `review_session` (#70). Used at
+/// terminal transitions in the pump where only the thread id is at hand.
+fn persist_status<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    thread_id: &str,
+    status: SessionStatus,
+) {
+    let db = app.state::<crate::db::Database>();
+    if let Err(e) = super::history_store::set_status(db.inner(), thread_id, status) {
+        eprintln!(
+            "review session 状态持久化失败（{thread_id}）：{}",
+            e.message
+        );
+    }
+}
+
+/// Best-effort capture of a streamed delta into the persisted session history (#70).
+/// Called AFTER `app.emit` so the live stream never waits on the DB; a non-delta event is
+/// a no-op, and a persist error is logged + swallowed (the rendered stream is unaffected
+/// — at worst the last delta before a crash is missing from the reopened history).
+fn persist_delta<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    thread_id: &str,
+    event: &ReviewEvent,
+) {
+    let (item_id, kind, text) = match event {
+        ReviewEvent::MessageDelta { item_id, text, .. } => (item_id, "message", text),
+        ReviewEvent::ReasoningDelta { item_id, text, .. } => (item_id, "reasoning", text),
+        _ => return,
+    };
+    let db = app.state::<crate::db::Database>();
+    if let Err(e) = super::history_store::append_item(db.inner(), thread_id, item_id, kind, text) {
+        eprintln!(
+            "review history 持久化失败（{thread_id}/{item_id}）：{}",
+            e.message
+        );
+    }
+}
+
 /// Pump task: forward this session's notifications to the frontend as
 /// [`ReviewEvent`]s until the turn completes (or the connection drops). Filters by
 /// `thread_id` since the broadcast carries every session's stream; stamps every
@@ -526,11 +596,17 @@ async fn pump<R: tauri::Runtime>(
                     continue;
                 };
                 if let ReviewEvent::TurnCompleted { status, .. } = &event {
-                    registry.set_status(&thread_id, terminal_status(status));
+                    let terminal = terminal_status(status);
+                    registry.set_status(&thread_id, terminal);
                     let _ = app.emit(REVIEW_EVENT, &event);
+                    persist_status(&app, &thread_id, terminal); // mirror terminal to DB (#70)
                     break; // terminal — the turn is over.
                 }
+                // Emit FIRST (streaming latency must not wait on the DB), THEN persist the
+                // delta to the session history (#70) best-effort — a persist error is
+                // logged, never breaks the live stream.
                 let _ = app.emit(REVIEW_EVENT, &event);
+                persist_delta(&app, &thread_id, &event);
             }
             // The pump fell behind the shared ring and `n` notifications were
             // evicted. The terminal `turn/completed` may have been among them
@@ -541,6 +617,7 @@ async fn pump<R: tauri::Runtime>(
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 eprintln!("review pump（{thread_id}）滞后，丢弃 {n} 条通知");
                 registry.set_status(&thread_id, SessionStatus::Failed);
+                persist_status(&app, &thread_id, SessionStatus::Failed); // mirror to DB (#70)
                 let _ = app.emit(
                     REVIEW_EVENT,
                     &ReviewEvent::Error {
@@ -573,6 +650,7 @@ fn fail_connection_closed<R: tauri::Runtime>(
     thread_id: &str,
 ) {
     registry.set_status(thread_id, SessionStatus::Failed);
+    persist_status(app, thread_id, SessionStatus::Failed); // mirror to DB (#70)
     let _ = app.emit(
         REVIEW_EVENT,
         &ReviewEvent::Error {
