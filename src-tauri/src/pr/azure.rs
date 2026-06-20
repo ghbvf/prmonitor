@@ -14,7 +14,10 @@
 //! `kill_on_drop(true)`, so a hung / cancelled discovery kills the child (the same F1
 //! cancellation domain the scheduler relies on).
 
+use std::process::Stdio;
+
 use serde::Deserialize;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::error::{AppError, AppResult};
@@ -27,10 +30,17 @@ use super::source::PrSource;
 /// timed-out (or cancelled) future kills the child — mirrors `gh.rs`'s `GH_TIMEOUT`.
 const AZ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Max `az` stdout we will parse (#818 F9). A hostile / misconfigured `az` could emit an
-/// enormous body; cap it before `serde_json::from_str` so memory is bounded — past this
-/// we error instead of parsing. 10 MiB is far above any realistic active-PR JSON.
+/// Max `az` stdout we will read + parse (#818 F9 / #124 F6). A hostile / misconfigured `az`
+/// could emit an enormous body; the bounded reader stops at this many bytes (erroring rather
+/// than allocating unboundedly) BEFORE `serde_json::from_str`. 10 MiB is far above any
+/// realistic active-PR JSON.
 const AZ_MAX_STDOUT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Max `az` stderr we will read (#124 F6). Stderr only feeds [`stderr_tail`] (the last 512
+/// chars), so a small cap suffices — 64 KiB is ample headroom for the tail plus any preceding
+/// auth-debug while still bounding memory if `az` floods stderr. Reading is also drained
+/// concurrently with stdout to avoid a pipe-buffer deadlock.
+const AZ_STDERR_CAP: usize = 64 * 1024;
 
 /// Max `az` stderr chars surfaced in a non-zero-exit error (#818 F1). `az`'s user-facing
 /// error is at the END of stderr; the early lines are MSAL/ADAL auth debug where a token
@@ -52,6 +62,66 @@ fn stderr_tail(stderr: &str) -> String {
         .skip(char_count - AZ_STDERR_TAIL_CHARS)
         .collect();
     format!("…{tail}")
+}
+
+/// Reads `reader` to EOF but stops once more than `limit` bytes have arrived (#124 F6),
+/// returning `Err(<over_size_msg>)` instead of allocating unboundedly. The bound is applied
+/// at READ time: the output `Vec` never grows past `limit + 1` bytes (the one extra is what
+/// proves the limit was exceeded), so a hostile / runaway stream can't exhaust memory before
+/// a post-collection length check (the bug this replaces). Generic over [`AsyncRead`] so it
+/// is unit-tested with an in-memory `&[u8]` (itself an `AsyncRead` under tokio).
+async fn read_bounded<R: AsyncRead + Unpin>(
+    mut reader: R,
+    limit: usize,
+    over_size_msg: &str,
+) -> AppResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    // Read into a fixed scratch chunk so a single huge `read` can't pre-allocate the whole
+    // body; append until EOF or the limit is exceeded.
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|e| AppError::new(format!("读取 az 输出失败: {e}")))?;
+        if n == 0 {
+            return Ok(buf); // EOF within the limit.
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > limit {
+            // Stop as soon as we exceed the bound; do NOT keep draining (memory stays ~limit).
+            return Err(AppError::new(over_size_msg.to_string()));
+        }
+    }
+}
+
+/// Percent-encodes one URL PATH segment (#124 F5). The Azure org/project/repo config
+/// allows spaces / unicode (they go to `az` as separate argv, no URL parsing), so building
+/// the PR web URL by raw interpolation would yield a malformed link. This is a tiny inline
+/// encoder (no new crate — `percent-encoding` is only a transitive dep): each UTF-8 byte
+/// passes through iff it is RFC 3986 "unreserved" (`A-Za-z0-9-._~`), else it is emitted as
+/// `%XX` (uppercase hex). Encoding the byte stream covers multi-byte UTF-8 correctly. A
+/// path segment never contains `/`, so `/` is (correctly) encoded to `%2F` here.
+fn encode_path_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for &byte in segment.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(
+                char::from_digit((byte >> 4) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+            out.push(
+                char::from_digit((byte & 0xf) as u32, 16)
+                    .unwrap()
+                    .to_ascii_uppercase(),
+            );
+        }
+    }
+    out
 }
 
 /// `az repos pr list --createdBy` shape (`{ "uniqueName": "...", "displayName": "..." }`).
@@ -206,8 +276,14 @@ pub fn parse_rows(
             })
             .unwrap_or_default();
         // The Azure PR web URL (constructed — Azure's `az` JSON has no ready web url field).
+        // Each path segment is percent-encoded (#124 F5): config allows spaces / unicode in
+        // org/project/repo (separate argv, no URL parsing), so a raw interpolation would
+        // produce a malformed URL — encode them so the link is well-formed.
         let url = format!(
-            "https://dev.azure.com/{org}/{project}/_git/{repo}/pullrequest/{}",
+            "https://dev.azure.com/{}/{}/_git/{}/pullrequest/{}",
+            encode_path_segment(org),
+            encode_path_segment(project),
+            encode_path_segment(repo),
             pr.pull_request_id
         );
 
@@ -317,33 +393,63 @@ impl AzureDevOpsCli {
             "--output",
             "json",
         ])
+        // Pipe stdout + stderr so we can BOUND them at read time (#124 F6) rather than letting
+        // `output()` buffer the whole body first. `kill_on_drop` keeps the cancellation domain
+        // (a dropped future kills the child).
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
         .kill_on_drop(true);
 
-        let output = match tokio::time::timeout(AZ_TIMEOUT, cmd.output()).await {
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| AppError::new(format!("无法运行 az（未安装或不在 PATH？）: {e}")))?;
+        // Take the pipe handles. They are `Some` because we requested `Stdio::piped()` above.
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AppError::new("az stdout 管道缺失"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| AppError::new("az stderr 管道缺失"))?;
+
+        // Drain stdout AND stderr CONCURRENTLY under one timeout (#124 F6). Reading them
+        // concurrently is REQUIRED: reading stdout to EOF first can deadlock if the child
+        // fills the stderr pipe buffer (and vice-versa) — neither side drains, both block.
+        // `try_join!` polls both; stdout is bounded at the parse limit, stderr at a small cap
+        // (it only feeds the error tail).
+        let drained = tokio::time::timeout(AZ_TIMEOUT, async {
+            tokio::try_join!(
+                read_bounded(stdout, AZ_MAX_STDOUT_BYTES, "az repos pr list 输出过大"),
+                read_bounded(stderr, AZ_STDERR_CAP, "az repos pr list 错误输出过大"),
+            )
+        })
+        .await;
+        let (stdout_bytes, stderr_bytes) = match drained {
             Err(_) => return Err(AppError::new("az repos pr list 超时")),
-            Ok(Err(e)) => {
-                return Err(AppError::new(format!(
-                    "无法运行 az（未安装或不在 PATH？）: {e}"
-                )))
-            }
-            Ok(Ok(output)) => output,
+            Ok(Err(e)) => return Err(e), // a bounded-read error (over-size / IO)
+            Ok(Ok(pair)) => pair,
         };
 
-        if !output.status.success() {
+        // Reap the child for its exit status (the pipes are at EOF, so this won't block).
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| AppError::new(format!("等待 az 退出失败: {e}")))?;
+
+        if !status.success() {
             // Surface only the trailing tail of stderr (F1): bounds the message and avoids
-            // leaking early MSAL/ADAL auth-debug (where a token could appear).
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            // leaking early MSAL/ADAL auth-debug (where a token could appear). The stderr is
+            // already byte-bounded by `read_bounded`, so this never sees an unbounded buffer.
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             return Err(AppError::new(format!(
                 "az repos pr list 失败: {}",
                 stderr_tail(&stderr)
             )));
         }
-        // Cap stdout before parsing (F9): a hostile / huge response is rejected rather than
-        // deserialized, bounding memory. Check the raw byte length first (cheap, no alloc).
-        if output.stdout.len() > AZ_MAX_STDOUT_BYTES {
-            return Err(AppError::new("az repos pr list 输出过大"));
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        // stdout is already bounded at read time (no redundant post-collection length check).
+        Ok(String::from_utf8_lossy(&stdout_bytes).into_owned())
     }
 
     /// Discovers active PRs carrying either trigger label as display-ready [`AzRow`]s
@@ -429,6 +535,47 @@ mod tests {
             "https://dev.azure.com/myorg/myproject/_git/myrepo/pullrequest/12"
         );
         assert!(!row.conflict);
+    }
+
+    // #124 F5: the backend allows spaces / unicode in Azure project & repo names (separate
+    // argv, no URL parsing — see config validate), so the constructed PR web URL must
+    // percent-encode each path segment or it is malformed. Golden: a space → "%20".
+    #[test]
+    fn encode_path_segment_percent_encodes_unsafe_chars() {
+        // A plain unreserved segment is unchanged.
+        assert_eq!(encode_path_segment("myrepo"), "myrepo");
+        assert_eq!(encode_path_segment("my-repo_v2.0~x"), "my-repo_v2.0~x");
+        // A space → %20.
+        assert_eq!(encode_path_segment("my project"), "my%20project");
+        // Other reserved / non-ASCII bytes are %XX (uppercase hex), e.g. `/`, `#`, unicode.
+        assert_eq!(encode_path_segment("a/b#c"), "a%2Fb%23c");
+        assert_eq!(encode_path_segment("café"), "caf%C3%A9"); // é = U+00E9 → UTF-8 C3 A9
+    }
+
+    #[test]
+    fn parse_rows_url_percent_encodes_segments_with_spaces() {
+        // A project/repo carrying a space (allowed by config) yields a well-formed URL with
+        // "%20" in the segment, NOT a raw space.
+        let json = format!(
+            r#"[
+                {{
+                    "pullRequestId": 12,
+                    "title": "Add widget",
+                    "lastMergeSourceCommit": {{ "commitId": "abc123" }},
+                    "sourceRefName": "refs/heads/x",
+                    "createdBy": {{ "uniqueName": "dev@example.com" }},
+                    "isDraft": false,
+                    "labels": [{{ "name": "{REVIEW}" }}]
+                }}
+            ]"#
+        );
+        let r =
+            parse_rows(&json, "my org", "my project", "my repo", REVIEW, CHECK).expect("parses");
+        assert_eq!(r.len(), 1);
+        assert_eq!(
+            r[0].url,
+            "https://dev.azure.com/my%20org/my%20project/_git/my%20repo/pullrequest/12"
+        );
     }
 
     #[test]
@@ -744,5 +891,44 @@ mod tests {
         let out = stderr_tail(&long);
         assert!(out.starts_with('…'));
         assert_eq!(out.chars().count(), AZ_STDERR_TAIL_CHARS + 1);
+    }
+
+    // #124 F6: `read_bounded` drains a reader but stops once it would exceed `limit`,
+    // erroring rather than allocating unboundedly. A `&[u8]` is an `AsyncRead` under tokio,
+    // so the bound is unit-tested without a real subprocess. `<= limit` → Ok with the bytes;
+    // `limit + 1` → Err. The limit is applied at READ time (memory never exceeds ~limit).
+    #[tokio::test]
+    async fn read_bounded_accepts_up_to_limit_and_rejects_over() {
+        // Exactly at the limit → Ok with all bytes.
+        let exact = [b'a'; 100];
+        let got = read_bounded(&exact[..], 100, "测试")
+            .await
+            .expect("at-limit input is accepted");
+        assert_eq!(got, exact);
+
+        // Under the limit → Ok.
+        let under = [b'b'; 50];
+        assert_eq!(
+            read_bounded(&under[..], 100, "测试").await.expect("under"),
+            under
+        );
+
+        // One byte over the limit → Err carrying the supplied label.
+        let over = [b'c'; 101];
+        let err = read_bounded(&over[..], 100, "az repos pr list 输出过大")
+            .await
+            .expect_err("over-limit input is rejected");
+        assert!(
+            err.message.contains("输出过大"),
+            "error carries the over-size label: {}",
+            err.message
+        );
+
+        // Empty input → Ok empty.
+        let empty: [u8; 0] = [];
+        assert!(read_bounded(&empty[..], 100, "测试")
+            .await
+            .expect("empty")
+            .is_empty());
     }
 }

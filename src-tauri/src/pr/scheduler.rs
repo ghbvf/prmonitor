@@ -36,7 +36,7 @@
 //! [`SchedulerSet::set_dispatcher`] is installed once and cloned into each scheduler
 //! on `reconcile`, so a project added later still inherits it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -355,6 +355,32 @@ pub struct SchedulerSet {
     /// inner `Arc<StdMutex<PollDiag>>` mirrors a `Scheduler`'s own diag handle so the same
     /// "never hold the StdMutex across an await" discipline applies.
     manual_diags: StdMutex<HashMap<String, Arc<StdMutex<PollDiag>>>>,
+    /// In-flight project ids for MANUAL one-shot discoveries (#124 F4). Rapid "立即拉取"
+    /// presses would otherwise spawn concurrent `az` discoveries for the same project (the
+    /// double-DISPATCH is already backstopped by the dispatcher's in-flight registry + the
+    /// ledger, so this guards mainly against redundant `az` calls). [`Self::try_begin_manual`]
+    /// inserts the id under this lock and returns a [`ManualInflightGuard`] that removes it on
+    /// drop (every exit path, incl. panic); a second concurrent pull for the same id is
+    /// coalesced (the in-flight one will emit). The lock is held ONLY for the insert/remove,
+    /// never across the discovery await. `Arc` so the [`ManualInflightGuard`] can own a handle
+    /// to remove the id on drop without borrowing `self` across the await.
+    manual_inflight: Arc<StdMutex<HashSet<String>>>,
+}
+
+/// RAII guard for a MANUAL in-flight one-shot discovery (#124 F4): holds the `SchedulerSet`'s
+/// `manual_inflight` set + the project id, and removes the id from the set on `Drop` — so the
+/// in-flight mark is cleared on EVERY exit path of `discover_once` (normal return, early
+/// return, or a panic unwinding through it), never leaking an entry that would wedge a
+/// project's manual pulls permanently. Created only by [`SchedulerSet::try_begin_manual`].
+struct ManualInflightGuard {
+    inflight: Arc<StdMutex<HashSet<String>>>,
+    project_id: String,
+}
+
+impl Drop for ManualInflightGuard {
+    fn drop(&mut self) {
+        self.inflight.lock().unwrap().remove(&self.project_id);
+    }
 }
 
 impl SchedulerSet {
@@ -479,6 +505,12 @@ impl SchedulerSet {
         app: &tauri::AppHandle<R>,
         project_id: &str,
     ) {
+        // In-flight coalesce (#124 F4): admit ONE manual pull per project. If one is already
+        // running, return early — it will emit `prs:updated` for everyone. The `_guard`
+        // removes the id on EVERY exit path of this fn (drop at scope end), incl. a panic.
+        let Some(_guard) = self.try_begin_manual(project_id) else {
+            return;
+        };
         let dispatcher = self.dispatcher.lock().unwrap().clone();
         // Get-or-insert the retained diag, cloning the Arc out under ONLY the map lock; the
         // map lock is released at the end of this block (before the await below).
@@ -492,7 +524,27 @@ impl SchedulerSet {
         };
         // No StdMutex held here: `discover_emit_dispatch` locks the inner `PollDiag` only for
         // the brief mark_* calls, never across its own awaits (same as the loop's cycle).
+        // `_guard` (the in-flight mark) is held across the await but it is a plain owned value,
+        // NOT a lock guard — no StdMutex spans the await.
         discover_emit_dispatch(app, project_id, dispatcher.as_ref(), &diag).await;
+    }
+
+    /// Tries to mark `project_id` as having a MANUAL one-shot discovery in flight (#124 F4).
+    /// Inserts the id under the `manual_inflight` lock; returns `Some(guard)` when newly
+    /// inserted (the caller proceeds, and the [`ManualInflightGuard`] clears the mark on
+    /// drop) or `None` when a pull is already in flight for that project (coalesce — the
+    /// caller returns early). The lock is held ONLY for the test-and-insert, never across an
+    /// await.
+    fn try_begin_manual(&self, project_id: &str) -> Option<ManualInflightGuard> {
+        let newly_inserted = self
+            .manual_inflight
+            .lock()
+            .unwrap()
+            .insert(project_id.to_string());
+        newly_inserted.then(|| ManualInflightGuard {
+            inflight: Arc::clone(&self.manual_inflight),
+            project_id: project_id.to_string(),
+        })
     }
 
     /// Stops + drops EVERY project's loop (the `stop_polling`-all path + app shutdown).
@@ -1059,6 +1111,43 @@ mod tests {
 
         // Unknown project → no manual diag → the caller falls back to the empty default.
         assert!(set.manual_diags.lock().unwrap().get("ghost").is_none());
+    }
+
+    // ── Manual in-flight coalescing (#124 F4) ──────────────────────────────
+    // `discover_once` itself needs an `AppHandle`; these lock the testable seam:
+    // `try_begin_manual` admits ONE concurrent manual pull per project (Some guard the
+    // first time, None while it is in flight) and the RAII guard removes the id on drop so
+    // a later pull can begin again.
+
+    #[test]
+    fn try_begin_manual_admits_one_and_coalesces_concurrent() {
+        let set = SchedulerSet::default();
+        // First pull → admitted (guard held).
+        let guard = set
+            .try_begin_manual("p1")
+            .expect("first manual pull is admitted");
+        // While p1 is in flight, a second p1 pull is coalesced (None — no guard).
+        assert!(
+            set.try_begin_manual("p1").is_none(),
+            "a concurrent p1 pull is coalesced"
+        );
+        // A DIFFERENT project is independent → admitted concurrently.
+        let g2 = set.try_begin_manual("p2").expect("p2 is independent");
+        assert!(set.manual_inflight.lock().unwrap().contains("p1"));
+        assert!(set.manual_inflight.lock().unwrap().contains("p2"));
+        drop(g2);
+        assert!(!set.manual_inflight.lock().unwrap().contains("p2"));
+
+        // Drop p1's guard → the id is removed → a later p1 pull is admitted again.
+        drop(guard);
+        assert!(
+            !set.manual_inflight.lock().unwrap().contains("p1"),
+            "the RAII guard removes the id on drop"
+        );
+        assert!(
+            set.try_begin_manual("p1").is_some(),
+            "after the in-flight pull ends, p1 can begin again"
+        );
     }
 
     fn candidate(number: u64, kind: &str) -> Candidate {

@@ -822,6 +822,19 @@ fn record_webhook_delivery<R: tauri::Runtime>(
         });
 }
 
+/// Whether a project's [`UpdateMode`] accepts inbound webhook routes (#124 F1). The
+/// push-update counterpart to `scheduler::periodic_polling`: a wildcard-free EXHAUSTIVE
+/// match (so a new mode must be classified) — `WebhookOnly` / `Hybrid` / `Manual` accept
+/// webhooks (Manual lists webhooks as one of its refresh paths per the [`UpdateMode`] doc),
+/// while `PullOnly` is EXCLUDED: its periodic CLI poll is the SOLE update source, so a push
+/// must not enter / auto-dispatch it. Locked by `webhook_route_eligible_excludes_only_pull_only`.
+fn webhook_route_eligible(mode: UpdateMode) -> bool {
+    match mode {
+        UpdateMode::WebhookOnly | UpdateMode::Hybrid | UpdateMode::Manual => true,
+        UpdateMode::PullOnly => false,
+    }
+}
+
 /// Starts the webhook receiver + Cloudflare Quick Tunnel. Requires `webhook_enabled`
 /// in the persisted config; returns the resolved status (incl. the public
 /// `*.trycloudflare.com` URL to paste into GitHub). The local server binds
@@ -852,12 +865,14 @@ pub async fn start_webhook<R: tauri::Runtime>(
             "请先在设置中启用 Webhook 并保存配置",
         ));
     }
-    // One route per enabled project — the handler matches an event's repo against these
-    // and tags the dispatched candidate with the owning project's id (#35).
+    // One route per enabled, webhook-eligible project (#124 F1): a `pull-only` project's
+    // periodic CLI poll is its SOLE update source, so it gets NO route (a push must not
+    // update / auto-dispatch it). The handler matches an event's repo against these and
+    // tags the dispatched candidate with the owning project's id (#35).
     let routes: Vec<super::webhook::ProjectRoute> = cfg
         .projects
         .iter()
-        .filter(|p| p.enabled)
+        .filter(|p| p.enabled && webhook_route_eligible(p.update_mode))
         .map(|p| super::webhook::ProjectRoute {
             id: p.id.clone(),
             repo: p.repo.clone(),
@@ -1048,6 +1063,18 @@ mod tests {
         ] {
             assert_eq!(poll_now_action(true, mode), PollNowAction::Wake);
         }
+    }
+
+    // #124 F1: a webhook route is built ONLY for a project whose mode accepts push updates.
+    // `PullOnly`'s contract makes the periodic CLI poll the SOLE update source, so it must NOT
+    // get a route (else a push could update + auto-dispatch it). WebhookOnly / Hybrid / Manual
+    // all accept webhooks (Manual per the UpdateMode doc — webhook is one of its refresh paths).
+    #[test]
+    fn webhook_route_eligible_excludes_only_pull_only() {
+        assert!(webhook_route_eligible(UpdateMode::WebhookOnly));
+        assert!(webhook_route_eligible(UpdateMode::Hybrid));
+        assert!(webhook_route_eligible(UpdateMode::Manual));
+        assert!(!webhook_route_eligible(UpdateMode::PullOnly));
     }
 
     #[test]
