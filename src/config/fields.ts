@@ -257,9 +257,59 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
   },
 ];
 
-// Onboarding wizard step sequence. `source`/`done` are confirm-only steps.
+// Onboarding wizard step sequence. `done` is a confirm-only step; `source` is
+// confirm-only for github but gates the azure org/project for an azure source (F2).
 export type StepId = "repo" | "repoRoot" | "skill" | "source" | "autoReview" | "done";
 export const STEPS: StepId[] = ["repo", "repoRoot", "skill", "source", "autoReview", "done"];
+
+// Which per-project fields each onboarding step renders (818 F2/F3). Single-sourced here
+// (not in OnboardingWizard.vue) so the wizard and these unit tests agree. Keys are
+// `keyof Project`; the FieldDefs come from PROJECT_GROUPS. `source` lists the azure
+// fields too — they only render under an azure source via the FieldDef `visibleWhen`
+// predicate (see visibleStepFields). `autoReview` surfaces `updateMode` so the user
+// picks the data-update mode during onboarding instead of silently defaulting (F3).
+export const STEP_FIELDS: Record<StepId, ProjectFieldKey[]> = {
+  repo: ["repo"],
+  repoRoot: ["repoRoot"],
+  skill: ["skillRelPath"],
+  source: ["sourceKind", "azureOrg", "azureProject"],
+  autoReview: [
+    "updateMode",
+    "autoReview",
+    "pollIntervalSecs",
+    "prCooldownSeconds",
+    "reviewLabel",
+    "checkLabel",
+    "authors",
+  ],
+  done: [],
+};
+
+// All per-project FieldDefs addressable by key (PROJECT_GROUPS is the single source).
+const FIELD_BY_KEY = new Map<ProjectFieldKey, FieldDef<ProjectFieldKey>>(
+  PROJECT_GROUPS.flatMap((g) => g.fields).map((f) => [f.key, f]),
+);
+
+// The FieldDef for a per-project key. Throws if a STEP_FIELDS key isn't grouped (a
+// coverage invariant asserted in fields.test.ts), rather than render a half-broken step.
+export function fieldDefOf(key: ProjectFieldKey): FieldDef<ProjectFieldKey> {
+  const def = FIELD_BY_KEY.get(key);
+  if (!def) throw new Error(`missing field def: ${key}`);
+  return def;
+}
+
+// The FieldDefs a wizard step should render for a given draft (818 F2): STEP_FIELDS
+// filtered by each FieldDef's `visibleWhen` predicate (the same conditional-visibility
+// rule ProjectCard applies in Settings), so e.g. the source step shows azureOrg/
+// azureProject only for an azure source. A field without `visibleWhen` is always shown.
+export function visibleStepFields(
+  step: StepId,
+  draft: Project,
+): FieldDef<ProjectFieldKey>[] {
+  return STEP_FIELDS[step]
+    .map(fieldDefOf)
+    .filter((f) => !f.visibleWhen || f.visibleWhen(draft));
+}
 
 // owner/name with no whitespace and exactly one slash.
 const REPO_RE = /^[^/\s]+\/[^/\s]+$/;
@@ -292,7 +342,15 @@ export function validateStep(step: StepId, draft: Project): string | null {
       return null;
     }
     case "source":
-      // Single-option confirm step — nothing to validate.
+      // Azure source (818 F2): the backend `validate_project` requires a non-empty
+      // org + project, so gate them here too (errors start with the field token so
+      // errorToStep routes a backend rejection back to this step). github → nothing to
+      // validate (it's the single-option confirm path).
+      if (draft.sourceKind === "azure") {
+        if (draft.azureOrg.trim() === "") return "azureOrg 不能为空（azure 源需填组织名）";
+        if (draft.azureProject.trim() === "")
+          return "azureProject 不能为空（azure 源需填项目名）";
+      }
       return null;
     case "autoReview": {
       // `Number.isFinite` rejects NaN (a blank number input yields NaN, and
@@ -345,18 +403,17 @@ export function validateStep(step: StepId, draft: Project): string | null {
 // backend errors directly without `errorToStep`. Locked by an explicit
 // "webhook messages → null" case in fields.test.ts so this stays intentional, not a gap.
 //
-// Azure fields (`azureOrg` / `azureProject`, 818 F3) are likewise Settings-only: the
-// wizard's `source` step renders ONLY `sourceKind` (OnboardingWizard's STEP_FIELDS.source
-// = ["sourceKind"]) and validates nothing — azureOrg/azureProject live solely in the
-// Settings "engine" group, no STEPS entry owns them. So their backend `validate()`
-// messages (which start with the `azureOrg` / `azureProject` token) intentionally fall
-// through to `null` (→ done); SettingsView surfaces them directly. Locked by an explicit
-// "azure messages → null" case in fields.test.ts so the funnel stays closed, not a gap.
+// Azure fields (`azureOrg` / `azureProject`, 818 F2): the wizard `source` step NOW owns
+// them — it renders them (visibleWhen sourceKind==="azure") and `validateStep("source")`
+// gates them — so a backend rejection routes BACK to the source step (not null). Both
+// tokens are azure-prefixed and collide with no other field token, so order among them
+// is moot. Locked by an "azure messages → source" case in fields.test.ts.
 export function errorToStep(message: string): StepId | null {
   const m = message.trimStart();
   if (m.startsWith("skill")) return "skill";
   if (m.startsWith("repoRoot")) return "repoRoot";
   if (m.startsWith("repo")) return "repo";
+  if (m.startsWith("azureOrg") || m.startsWith("azureProject")) return "source";
   if (
     m.startsWith("pollIntervalSecs") ||
     m.startsWith("prCooldownSeconds") ||

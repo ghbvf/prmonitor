@@ -12,9 +12,10 @@ import {
   PROJECT_GROUPS,
   GLOBAL_GROUPS,
   STEPS,
+  STEP_FIELDS,
+  visibleStepFields,
   validateStep,
   errorToStep,
-  type StepId,
 } from "./fields";
 
 // A fully-valid single project; each test perturbs one field to assert its step's gate.
@@ -229,9 +230,42 @@ describe("validateStep — autoReview (intervals)", () => {
   });
 });
 
-describe("validateStep — source/done are confirm-only", () => {
-  it.each(["source", "done"] as StepId[])("accepts %s", (step) => {
-    expect(validateStep(step, validProject())).toBeNull();
+describe("validateStep — done is confirm-only", () => {
+  it("accepts done", () => {
+    expect(validateStep("done", validProject())).toBeNull();
+  });
+});
+
+describe("validateStep — source (818 F2)", () => {
+  it("accepts a github source (no azure fields needed)", () => {
+    // validProject() is a github source with empty azure fields — must pass.
+    expect(validateStep("source", validProject())).toBeNull();
+  });
+  it("accepts an azure source with both org + project filled", () => {
+    expect(
+      validateStep("source", {
+        ...validProject(),
+        sourceKind: "azure",
+        azureOrg: "shengming0923",
+        azureProject: "gocell",
+      }),
+    ).toBeNull();
+  });
+  it.each([
+    { azureOrg: "", azureProject: "gocell" },
+    { azureOrg: "  ", azureProject: "gocell" },
+    { azureOrg: "shengming0923", azureProject: "" },
+    { azureOrg: "shengming0923", azureProject: "   " },
+    { azureOrg: "", azureProject: "" },
+  ])("rejects an azure source with a blank azure field %o", (patch) => {
+    const err = validateStep("source", {
+      ...validProject(),
+      sourceKind: "azure",
+      ...patch,
+    });
+    expect(err).toBeTruthy();
+    // Error must start with the offending field token so errorToStep can route it.
+    expect(err!.startsWith("azureOrg") || err!.startsWith("azureProject")).toBe(true);
   });
 });
 
@@ -245,6 +279,40 @@ describe("STEPS ordering", () => {
       "autoReview",
       "done",
     ]);
+  });
+});
+
+describe("STEP_FIELDS — onboarding wizard step → field wiring (818 F2/F3)", () => {
+  it("the source step owns sourceKind + the azure fields (818 F2)", () => {
+    expect(STEP_FIELDS.source).toContain("sourceKind");
+    expect(STEP_FIELDS.source).toContain("azureOrg");
+    expect(STEP_FIELDS.source).toContain("azureProject");
+  });
+
+  it("the autoReview step surfaces updateMode (818 F3)", () => {
+    expect(STEP_FIELDS.autoReview).toContain("updateMode");
+  });
+
+  it("every STEP_FIELDS key is a real PROJECT_GROUPS field", () => {
+    const grouped = new Set(PROJECT_GROUPS.flatMap((g) => g.fields).map((f) => f.key));
+    for (const keys of Object.values(STEP_FIELDS)) {
+      for (const k of keys) expect(grouped.has(k)).toBe(true);
+    }
+  });
+});
+
+describe("visibleStepFields — conditional fields per step (818 F2)", () => {
+  it("hides the azure fields on the source step for a github source", () => {
+    const keys = visibleStepFields("source", validProject()).map((f) => f.key);
+    expect(keys).toContain("sourceKind");
+    expect(keys).not.toContain("azureOrg");
+    expect(keys).not.toContain("azureProject");
+  });
+
+  it("shows the azure fields on the source step for an azure source", () => {
+    const draft = { ...validProject(), sourceKind: "azure" as const };
+    const keys = visibleStepFields("source", draft).map((f) => f.key);
+    expect(keys).toEqual(["sourceKind", "azureOrg", "azureProject"]);
   });
 });
 
@@ -300,12 +368,11 @@ describe("errorToStep — routes backend AppError messages", () => {
       errorToStep("webhookTunnelCommand 不能为空（command 模式需填隧道命令，可用 {port} 占位）"),
     ).toBeNull();
   });
-  // Azure fields (818 F3) are Settings-only too: the wizard `source` step renders only
-  // `sourceKind`, so azureOrg/azureProject have no owning STEP. Their backend validate()
-  // messages intentionally fall through to null (→ done) — this case locks that the
-  // funnel is closed (intentional), not a routing gap.
-  it("azure messages → null (settings-only, not wizard-routed)", () => {
-    expect(errorToStep("azureOrg 不能为空（azure 源需填组织名）")).toBeNull();
-    expect(errorToStep("azureProject 不能为空（azure 源需填项目名）")).toBeNull();
+  // Azure fields (818 F2): the wizard `source` step NOW owns azureOrg/azureProject (it
+  // renders + validates them for an azure source), so a backend rejection routes back to
+  // the source step — not null. Both tokens map to "source".
+  it("azure messages → source step (818 F2, owned by the source step)", () => {
+    expect(errorToStep("azureOrg 不能为空（azure 源需填组织名）")).toBe("source");
+    expect(errorToStep("azureProject 不能为空（azure 源需填项目名）")).toBe("source");
   });
 });
