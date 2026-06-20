@@ -90,6 +90,26 @@ pub fn run() {
                     })
                 }
             }));
+            // Install the AZURE refresh hook (AB#822). Azure DevOps PR Service Hooks carry no
+            // labels and don't fire on label changes, so an Azure webhook can't classify a
+            // candidate from its payload — it's a refresh SIGNAL. The handler routes the event
+            // to a `project_id` and hands it here; this re-runs the SAME `az` discovery the
+            // poll path uses (`SchedulerSet::discover_once`, in-flight-coalesced), reading the
+            // authoritative current labels and dispatching via the shared dispatcher. Keeps
+            // `pr::webhook` runtime-agnostic (the closure holds the concrete AppHandle).
+            state.webhook.set_refresher(Arc::new({
+                let app = app.handle().clone();
+                move |project_id: String| {
+                    let app = app.clone();
+                    Box::pin(async move {
+                        use tauri::Manager;
+                        app.state::<AppState>()
+                            .scheduler
+                            .discover_once(&app, &project_id)
+                            .await;
+                    })
+                }
+            }));
             // Auto-start the poll loop only when the persisted config is valid, via the
             // shared start_if_config_valid gate — the SINGLE funnel point (PR #41 F1) the
             // public start_polling command also goes through. On first launch (empty

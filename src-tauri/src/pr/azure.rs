@@ -98,27 +98,20 @@ async fn read_bounded<R: AsyncRead + Unpin>(
 /// Percent-encodes one URL PATH segment (#124 F5). The Azure org/project/repo config
 /// allows spaces / unicode (they go to `az` as separate argv, no URL parsing), so building
 /// the PR web URL by raw interpolation would yield a malformed link. This is a tiny inline
-/// encoder (no new crate — `percent-encoding` is only a transitive dep): each UTF-8 byte
-/// passes through iff it is RFC 3986 "unreserved" (`A-Za-z0-9-._~`), else it is emitted as
-/// `%XX` (uppercase hex). Encoding the byte stream covers multi-byte UTF-8 correctly. A
-/// path segment never contains `/`, so `/` is (correctly) encoded to `%2F` here.
+/// encoder (no extra crate): each UTF-8 byte passes through iff it is RFC 3986 "unreserved"
+/// (`A-Za-z0-9-._~`), else it is emitted as `%XX` (uppercase hex via a nibble lookup table,
+/// so the per-byte path has no fallible `unwrap`). Encoding the byte stream covers multi-byte
+/// UTF-8 correctly. A path segment never contains `/`, so `/` is (correctly) encoded to `%2F`.
 fn encode_path_segment(segment: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = String::with_capacity(segment.len());
     for &byte in segment.as_bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             out.push(byte as char);
         } else {
             out.push('%');
-            out.push(
-                char::from_digit((byte >> 4) as u32, 16)
-                    .unwrap()
-                    .to_ascii_uppercase(),
-            );
-            out.push(
-                char::from_digit((byte & 0xf) as u32, 16)
-                    .unwrap()
-                    .to_ascii_uppercase(),
-            );
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0xf) as usize] as char);
         }
     }
     out

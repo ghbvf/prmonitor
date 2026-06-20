@@ -32,6 +32,18 @@
 //! the enabled projects; adding/removing/enabling a project requires a webhook restart
 //! to refresh it (the composition root wires that restart on `set_config`).
 //!
+//! **Two providers, one receiver (AB#822).** The same endpoint serves both GitHub and
+//! Azure DevOps. [`handle_webhook`] detects the provider by header — GitHub sends
+//! `X-GitHub-Event`; an Azure Service Hook does not — and branches to
+//! [`handle_github_delivery`] (HMAC over the body → [`parse_delivery`]) or
+//! [`handle_azure_delivery`] (a `{ eventType, resource }` payload). The GitHub path ingests
+//! the payload into a [`WebhookEvent`]; the Azure path is a REFRESH SIGNAL — Azure PR Service
+//! Hooks carry no labels and don't fire on label changes (only push/status/reviewer/vote), so
+//! [`route_azure_delivery`] only routes the event to a `project_id` and the injected
+//! [`WebhookRefresher`] re-runs `az` discovery to read the authoritative labels. Routing is
+//! provider-isolated: a route carries its [`ProjectRoute::source_kind`], so an Azure event
+//! (bare repo name) can never match a GitHub `owner/name` route and vice-versa.
+//!
 //! **Layering.** The axum handler is runtime-agnostic — it never names
 //! `AppHandle<R>`. The list upsert + `prs:updated` emit (#61) and the autoReview +
 //! static/cooldown gates (parity with the poll path) live in the [`WebhookIngestor`]
@@ -41,12 +53,15 @@
 //! diagnostics, #62).
 //!
 //! **Security.** The endpoint is public (via the tunnel), so every request is
-//! HMAC-verified (`X-Hub-Signature-256`) against the configured secret before the
-//! body is even parsed; an unverified or secret-less request is rejected. The local
+//! authenticated before it can act: a GitHub delivery is HMAC-verified
+//! (`X-Hub-Signature-256`) against the configured secret before the body is even parsed;
+//! an Azure delivery (no body HMAC) is verified by a constant-time compare of its
+//! `Authorization: Bearer <secret>` header against the SAME `webhookSecret` (AB#822). An
+//! unverified or secret-less request on either path is rejected (fail-closed). The local
 //! server binds `127.0.0.1` only — the raw port is never world-reachable, only the
-//! cloudflared tunnel is. The app registers NO webhook in GitHub (that would be a
-//! GitHub write, breaking the app's read-only `gh` surface) — the user pastes the
-//! tunnel URL + secret into the repo's webhook settings by hand.
+//! cloudflared tunnel is. The app registers NO webhook in GitHub or Azure (that would be a
+//! write, breaking the app's read-only CLI surface) — the user pastes the tunnel URL +
+//! secret into the repo's GitHub webhook / Azure Service Hook settings by hand.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -69,9 +84,11 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
+use subtle::ConstantTimeEq;
+
 use super::ledger;
 use crate::error::{AppError, AppResult};
-use crate::model::{Candidate, WebhookTunnelMode};
+use crate::model::{Candidate, SourceKind, WebhookTunnelMode};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -86,6 +103,17 @@ type HmacSha256 = Hmac<Sha256>;
 /// `(String, Vec<Candidate>)`).
 pub type WebhookIngestor =
     Arc<dyn Fn(WebhookEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// The Azure refresh hook the composition root installs (AB#822). Called with one routed
+/// `project_id` when an Azure DevOps Service Hook PR event arrives. Azure PR Service Hooks
+/// carry NO labels and do NOT fire on label changes (only push/status/reviewer/vote — see
+/// [`route_azure_delivery`]), so the payload can't classify review-vs-check; the event is a
+/// REFRESH SIGNAL. The closure (the root wires it to `scheduler::SchedulerSet::discover_once`)
+/// re-runs `az repos pr list` discovery for that project — reading the AUTHORITATIVE current
+/// labels — and upserts + dispatches via the same poll path. Same `Arc<dyn Fn>` lifecycle as
+/// [`WebhookIngestor`]; keeps the axum handler runtime-agnostic.
+pub type WebhookRefresher =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Cap on the retained webhook-delivery diagnostics ring (#62). Old deliveries are
 /// popped from the front once the buffer is full — the panel only ever needs a recent
@@ -121,6 +149,11 @@ pub enum DeliveryStatus {
     Dispatched,
     /// A clean candidate with autoReview OFF — list updated only (no dispatch by design).
     ListUpdated,
+    /// An Azure DevOps PR Service Hook (created/updated) was received and triggered a
+    /// re-discovery (AB#822). Azure hooks carry no labels and don't fire on label changes, so
+    /// the webhook is only a refresh signal — the actual list-update / dispatch outcome is
+    /// recorded by the poll path's `PollStatus` (via `discover_once`), not here.
+    Refreshed,
 }
 
 /// One recorded webhook delivery diagnostic (#62). MUST NOT carry the secret/token or
@@ -175,7 +208,17 @@ pub enum ParseResult {
 pub struct WebhookEvent {
     /// The routing key (the matched [`ProjectRoute::id`]).
     pub project_id: String,
-    /// The PR `action` (for the delivery diagnostic).
+    /// When the request was received (epoch secs), stamped by the handler so the routable
+    /// path's terminal delivery diagnostic uses the SAME receipt time as the early-exit
+    /// records (not the later record-time). The pure parsers leave this `0`; `handle_webhook`
+    /// overwrites it on the `Routable` arm before handing the event to the ingestor.
+    pub received_at: u64,
+    /// The wire event type for the delivery diagnostic — always `"pull_request"` (only the
+    /// GitHub path produces a `WebhookEvent`; the Azure path is a refresh signal that never
+    /// builds one, see [`route_azure_delivery`]). Carried on the event so
+    /// `commands::ingest_webhook` records it without a hardcoded literal.
+    pub event: String,
+    /// The PR `action` (for the delivery diagnostic): GitHub's `action` (`"labeled"`/…).
     pub action: Option<String>,
     /// The matched repo `owner/name` (for the delivery diagnostic).
     pub repo: String,
@@ -270,6 +313,12 @@ type TunnelParts = (
 /// and the URL the UI tells the user to paste; they must match or every delivery 404s.
 const WEBHOOK_PATH: &str = "/webhook";
 
+/// The two Azure DevOps Service Hook `eventType`s this receiver acts on (AB#822): a PR being
+/// opened and any subsequent update (label add/remove, push, status change). Single-sourced
+/// here so the handler's gate and the `route_azure_delivery` doc reference one spelling.
+const AZURE_PR_CREATED: &str = "git.pullrequest.created";
+const AZURE_PR_UPDATED: &str = "git.pullrequest.updated";
+
 /// webhook receiver + tunnel status reported to the frontend (pr-slice-private wire
 /// type; not a cross-slice contract, so it is mirrored in `src/pr/types.ts`, not
 /// `model.rs` / `src/types.ts` — same placement as [`super::gh::GhStatus`]).
@@ -348,9 +397,20 @@ pub struct TunnelSpec {
 pub struct ProjectRoute {
     /// The routing key emitted on the dispatched candidate (`Project::id`).
     pub id: String,
-    /// The monitored repo `owner/name` matched (case-insensitively) against the
-    /// event's repository.
+    /// Which provider this project is — GitHub or Azure DevOps (AB#822). Routing is
+    /// provider-isolated: [`parse_delivery`] only matches `Github` routes, and
+    /// [`route_azure_delivery`] only `Azure` routes, so a bare Azure repo name can never
+    /// collide with a GitHub `owner/name` (and vice-versa).
+    pub source_kind: SourceKind,
+    /// The monitored repo matched (case-insensitively) against the event's repository —
+    /// `owner/name` for GitHub, the bare repository name for Azure.
     pub repo: String,
+    /// The Azure DevOps project (AB#822) — matched against the event's
+    /// `resource.repository.project.name` as a routing guard so an Azure event for a
+    /// coincidentally same-named repo in a DIFFERENT project doesn't refresh this one
+    /// (config already rejects duplicate bare repo names, so repo is globally unique; this
+    /// is the extra provider-scoped guard). Empty for GitHub projects.
+    pub azure_project: String,
     /// Label that classifies an event as a `review` turn (this project's).
     pub review_label: String,
     /// Label that classifies an event as a `check` turn (this project's).
@@ -367,6 +427,10 @@ pub struct WebhookManager {
     /// emits `prs:updated`, and (when gated-clean) dispatches — keeping the axum handler
     /// runtime-agnostic (the closure holds the concrete `AppHandle<R>`).
     ingestor: StdMutex<Option<WebhookIngestor>>,
+    /// Installed once by the composition root alongside `ingestor` (AB#822). The Azure
+    /// refresh hook — called with a routed `project_id` to re-discover via `az` (see
+    /// [`WebhookRefresher`]). Keeps the handler runtime-agnostic, same as `ingestor`.
+    refresher: StdMutex<Option<WebhookRefresher>>,
     runtime: StdMutex<Option<WebhookRuntime>>,
     /// Serializes `start` (bind + spawn + tunnel-URL await) so concurrent starts
     /// can't double-bind the port.
@@ -479,6 +543,12 @@ impl WebhookManager {
         *self.ingestor.lock().unwrap() = Some(i);
     }
 
+    /// Install the Azure refresh hook (AB#822; composition root, before any start). Replaces
+    /// any prior hook (last writer wins). Mirror of [`Self::set_ingestor`].
+    pub fn set_refresher(&self, r: WebhookRefresher) {
+        *self.refresher.lock().unwrap() = Some(r);
+    }
+
     /// Record one webhook-delivery diagnostic (#62), popping the oldest when the ring is
     /// full ([`DELIVERY_RING_CAP`]). Called EXACTLY once per request — by the handler for
     /// the early-exit classifications, by `ingest_webhook` for the routable terminal
@@ -562,6 +632,12 @@ impl WebhookManager {
             .unwrap()
             .clone()
             .ok_or_else(|| AppError::new("webhook ingestor 未初始化".to_string()))?;
+        let refresher = self
+            .refresher
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| AppError::new("webhook refresher 未初始化".to_string()))?;
 
         // LOCAL bind only — the public path is the tunnel; the raw port is never
         // world-reachable. Shared by all three modes.
@@ -603,13 +679,14 @@ impl WebhookManager {
             secret,
             routes,
             ingestor,
+            refresher,
             deliveries: self.deliveries.clone(),
         });
         let router = Router::new()
             .route(WEBHOOK_PATH, post(handle_webhook))
-            // Cap the public endpoint's request body. GitHub webhook payloads are well
-            // under this (typically < 25 KiB); the limit bounds the memory a forged POST
-            // can make us buffer before the HMAC check rejects it.
+            // Cap the public endpoint's request body. GitHub webhook and Azure Service Hook
+            // PR payloads are well under this (typically < 25 KiB); the limit bounds the memory
+            // a forged POST can make us buffer before the auth check (HMAC / Bearer) rejects it.
             .layer(DefaultBodyLimit::max(1024 * 1024))
             .with_state(ctx);
         // Graceful-shutdown signal: on teardown we fire `shutdown_tx` and AWAIT
@@ -831,8 +908,10 @@ struct WebhookCtx {
     /// the runtime's life — a project add/remove/enable requires a webhook restart (the
     /// composition root wires that on `set_config`).
     routes: Vec<ProjectRoute>,
-    /// The injected ingest hook (#61): handed each parsed, routed [`WebhookEvent`].
+    /// The injected ingest hook (#61): handed each parsed, routed [`WebhookEvent`] (GitHub).
     ingestor: WebhookIngestor,
+    /// The injected Azure refresh hook (AB#822): handed a routed `project_id` to re-discover.
+    refresher: WebhookRefresher,
     /// The manager's delivery-diagnostics ring (#62), shared so the handler can record
     /// the early-exit classifications directly (the routable terminal status is recorded
     /// by `ingest_webhook` via `AppState`).
@@ -851,27 +930,63 @@ fn record_into(ring: &Arc<StdMutex<VecDeque<WebhookDelivery>>>, d: WebhookDelive
     ring.push_back(d);
 }
 
-/// `POST /webhook`. Verify the GitHub HMAC, parse + route the `pull_request` payload,
-/// and hand a [`ParseResult::Routable`] to the injected ingestor off the request path
-/// (so GitHub gets a fast 2xx). Non-`pull_request` events (e.g. the `ping` GitHub sends
-/// on setup) are acknowledged without acting.
+/// `POST /webhook`. Detect the provider by header (AB#822) and dispatch: GitHub sends
+/// `X-GitHub-Event`, an Azure Service Hook does not. BOTH branches authenticate before
+/// acting (GitHub: HMAC over the body; Azure: a `Bearer` token), so an unauthenticated POST
+/// is rejected whichever way it routes; the body parse + route + hand-off to the injected
+/// ingestor (off the request path, for a fast 2xx) is provider-specific but produces the
+/// SAME [`WebhookEvent`].
 ///
-/// Records EXACTLY ONE webhook-delivery diagnostic (#62) per request: the handler
-/// records the early-exit classifications (`Unauthorized` / `Ignored` / `BadPayload` /
-/// `WrongRepo`) here; for a `Routable` it records NOTHING and lets `ingest_webhook`
-/// record the terminal status (it knows whether the candidate gated / dispatched).
+/// Records EXACTLY ONE webhook-delivery diagnostic (#62) per request: the early-exit
+/// classifications (`Unauthorized` / `Ignored` / `BadPayload` / `WrongRepo`) are recorded by
+/// the provider helper; for a `Routable` nothing is recorded here — `ingest_webhook` records
+/// the terminal status (it knows whether the candidate gated / dispatched).
 async fn handle_webhook(
     State(ctx): State<Arc<WebhookCtx>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
     let received_at = ledger::now_epoch();
-    let event = headers
-        .get("x-github-event")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+    // Provider detection by the `X-GitHub-Event` header (GitHub sends it; an Azure Service
+    // Hook does not). A non-UTF-8 value on a PRESENT header is a corrupt GitHub delivery — it
+    // must NOT silently fall to the Azure branch (whose `Bearer` 401 would misdirect
+    // diagnosis), so it's recorded as `BadPayload`. A present-but-empty or absent header → the
+    // Azure branch (which fail-closes on its own Bearer check if it isn't a real Azure POST).
+    match headers.get("x-github-event").map(|v| v.to_str()) {
+        Some(Ok(event)) if !event.is_empty() => {
+            handle_github_delivery(&ctx, received_at, event.to_string(), &headers, &body)
+        }
+        Some(Err(_)) => {
+            record_into(
+                &ctx.deliveries,
+                WebhookDelivery {
+                    received_at_epoch: received_at,
+                    event: String::new(),
+                    action: None,
+                    repo: None,
+                    pr_number: None,
+                    kind: None,
+                    status: DeliveryStatus::BadPayload,
+                    message: Some("X-GitHub-Event 头不是合法 UTF-8".to_string()),
+                },
+            );
+            StatusCode::BAD_REQUEST
+        }
+        _ => handle_azure_delivery(&ctx, received_at, &headers, &body),
+    }
+}
 
+/// GitHub provider branch (AB#822 split out of `handle_webhook`; logic unchanged). Verify the
+/// `X-Hub-Signature-256` HMAC over the raw body, require a `pull_request` event, then parse +
+/// route via [`parse_delivery`]. Records the early-exit diagnostics; a `Routable` is handed to
+/// the ingestor and recorded by `ingest_webhook`.
+fn handle_github_delivery(
+    ctx: &Arc<WebhookCtx>,
+    received_at: u64,
+    event: String,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> StatusCode {
     // A missing header or a non-UTF-8 value both collapse to "" — equivalent to an
     // absent signature, which `verify_signature`'s `strip_prefix("sha256=")` gate then
     // rejects (fail-closed). The public endpoint never acts on an unverified request.
@@ -879,7 +994,7 @@ async fn handle_webhook(
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !verify_signature(&ctx.secret, &body, signature) {
+    if !verify_signature(&ctx.secret, body, signature) {
         // The signature/secret is NEVER recorded — only that verification failed.
         record_into(
             &ctx.deliveries,
@@ -914,7 +1029,7 @@ async fn handle_webhook(
         return StatusCode::OK;
     }
 
-    let payload: Value = match serde_json::from_slice(&body) {
+    let payload: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(_) => {
             record_into(
@@ -939,10 +1054,12 @@ async fn handle_webhook(
         .map(str::to_string);
 
     match parse_delivery(&payload, &ctx.routes) {
-        ParseResult::Routable(ev) => {
-            // Detached: the ingestor future is `Send + 'static`; the upsert / emit /
-            // dispatch run independently of this response. `ingest_webhook` records the
-            // terminal delivery status itself (it owns the gate/dispatch decision).
+        ParseResult::Routable(mut ev) => {
+            // Stamp the receipt time so the terminal diagnostic matches the early-exit records
+            // (the pure parser leaves it 0). Detached: the ingestor future is `Send + 'static`;
+            // the upsert / emit / dispatch run independently of this response. `ingest_webhook`
+            // records the terminal delivery status itself (it owns the gate/dispatch decision).
+            ev.received_at = received_at;
             let ingestor = ctx.ingestor.clone();
             drop(spawn(ingestor(*ev)));
             StatusCode::OK
@@ -984,6 +1101,151 @@ async fn handle_webhook(
     }
 }
 
+/// Azure DevOps provider branch (AB#822). An Azure Service Hook carries no `X-GitHub-Event`
+/// and no body HMAC; it authenticates via a user-configured `Authorization: Bearer <secret>`
+/// header (the same `webhookSecret`), constant-time compared by [`verify_azure_token`]. The
+/// PR event payload is `{ eventType, resource }`; only `git.pullrequest.created` /
+/// `git.pullrequest.updated` drive a refresh (others acknowledged, parity with GitHub's
+/// non-`pull_request` Ignored).
+///
+/// **Refresh signal, not a payload ingest.** Azure PR Service Hooks carry NO `labels` and do
+/// NOT fire on label changes (the documented triggers are push / reviewers / status / vote),
+/// so the payload can't classify review-vs-check the way the GitHub path does. Instead this
+/// routes the event to a project (by repo + Azure project) and hands the `project_id` to the
+/// injected [`WebhookRefresher`], which re-runs `az repos pr list` discovery — reading the
+/// AUTHORITATIVE current labels — and upserts + dispatches via the poll path. The webhook is a
+/// low-latency "PR activity happened, re-check now" nudge; the poll path remains the backstop
+/// for a pure label-add (which fires no hook). The list/dispatch outcome is recorded by
+/// `PollStatus`; here we only record `Refreshed` (or the early-exit drops).
+fn handle_azure_delivery(
+    ctx: &Arc<WebhookCtx>,
+    received_at: u64,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> StatusCode {
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !verify_azure_token(&ctx.secret, auth) {
+        // The token/secret is NEVER recorded — only that verification failed. `event` is ""
+        // (the eventType is only known after a successful auth + JSON parse).
+        record_into(
+            &ctx.deliveries,
+            WebhookDelivery {
+                received_at_epoch: received_at,
+                event: String::new(),
+                action: None,
+                repo: None,
+                pr_number: None,
+                kind: None,
+                status: DeliveryStatus::Unauthorized,
+                message: Some("Azure 鉴权失败（Authorization 缺失或不匹配）".to_string()),
+            },
+        );
+        return StatusCode::UNAUTHORIZED;
+    }
+
+    let payload: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => {
+            record_into(
+                &ctx.deliveries,
+                WebhookDelivery {
+                    received_at_epoch: received_at,
+                    event: String::new(),
+                    action: None,
+                    repo: None,
+                    pr_number: None,
+                    kind: None,
+                    status: DeliveryStatus::BadPayload,
+                    message: Some("请求体不是合法 JSON".to_string()),
+                },
+            );
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+    let event_type = payload
+        .get("eventType")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    // Only PR created/updated trigger a refresh; other Azure events (push outside a PR,
+    // comment, build, …) are acknowledged without acting (parity with GitHub's Ignored).
+    if event_type != AZURE_PR_CREATED && event_type != AZURE_PR_UPDATED {
+        record_into(
+            &ctx.deliveries,
+            WebhookDelivery {
+                received_at_epoch: received_at,
+                event: event_type,
+                action: None,
+                repo: None,
+                pr_number: None,
+                kind: None,
+                status: DeliveryStatus::Ignored,
+                message: Some("非 PR 创建/更新事件（已确认，不处理）".to_string()),
+            },
+        );
+        return StatusCode::OK;
+    }
+
+    match route_azure_delivery(&payload, &ctx.routes) {
+        AzureRoute::Refresh { project_id, repo } => {
+            // Detached: re-discovery (the refresher) runs off the request path so Azure gets a
+            // fast 2xx; `discover_once` coalesces concurrent refreshes per project.
+            let refresher = ctx.refresher.clone();
+            drop(spawn(refresher(project_id)));
+            record_into(
+                &ctx.deliveries,
+                WebhookDelivery {
+                    received_at_epoch: received_at,
+                    event: event_type,
+                    action: None,
+                    repo: Some(repo),
+                    pr_number: None,
+                    kind: None,
+                    status: DeliveryStatus::Refreshed,
+                    message: Some("已触发 az 重新发现（读取当前标签）".to_string()),
+                },
+            );
+            StatusCode::OK
+        }
+        AzureRoute::WrongRepo { repo } => {
+            record_into(
+                &ctx.deliveries,
+                WebhookDelivery {
+                    received_at_epoch: received_at,
+                    event: event_type,
+                    action: None,
+                    repo,
+                    pr_number: None,
+                    kind: None,
+                    status: DeliveryStatus::WrongRepo,
+                    message: Some("仓库/项目未匹配任何已启用 Azure 项目（已忽略）".to_string()),
+                },
+            );
+            StatusCode::OK
+        }
+        AzureRoute::Malformed => {
+            record_into(
+                &ctx.deliveries,
+                WebhookDelivery {
+                    received_at_epoch: received_at,
+                    event: event_type,
+                    action: None,
+                    repo: None,
+                    pr_number: None,
+                    kind: None,
+                    status: DeliveryStatus::BadPayload,
+                    message: Some("Azure PR 载荷缺少必要字段".to_string()),
+                },
+            );
+            StatusCode::OK
+        }
+    }
+}
+
 /// Constant-time verify of a GitHub `X-Hub-Signature-256` header (`sha256=<hex>`)
 /// against `HMAC-SHA256(secret, body)`. An empty secret, a malformed header, or a
 /// mismatch all fail closed (the public endpoint must never accept an unsigned POST).
@@ -1003,6 +1265,70 @@ fn verify_signature(secret: &str, body: &[u8], header: &str) -> bool {
     };
     mac.update(body);
     mac.verify_slice(&expected).is_ok()
+}
+
+/// Constant-time verify of an Azure Service Hook `Authorization: Bearer <secret>` header
+/// against the configured `webhookSecret` (AB#822). Azure Service Hooks carry no body HMAC,
+/// so the user configures this shared-secret header on the subscription (see the module
+/// **Security** note). An empty secret, an absent / non-`Bearer` header, or a token mismatch
+/// all fail closed — the public endpoint must never accept an unauthenticated Azure POST. The
+/// token compare is constant-time via [`subtle::ConstantTimeEq`] (the Azure analogue of the
+/// GitHub path's `hmac::Mac::verify_slice`): it leaks only the secret LENGTH (the `ct_eq`
+/// length short-circuit), never the secret CONTENT through timing. The `Bearer` scheme is
+/// matched case-INSENSITIVELY (RFC 7235 §2.1 auth-scheme is case-insensitive; a proxy / SDK
+/// may send `bearer`), so a correctly-configured delivery is never spuriously 401'd. Pure —
+/// unit-tested without a server.
+fn verify_azure_token(secret: &str, header: &str) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    // Split "<scheme> <token>" and accept the token only when the scheme is `Bearer`
+    // (case-insensitive). A header with no space, or a non-Bearer scheme, fails closed.
+    let Some(token) = header
+        .split_once(' ')
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token)
+    else {
+        return false;
+    };
+    // `ct_eq` on byte slices returns `Choice(0)` for differing lengths (leaking only length,
+    // never content) and otherwise compares in constant time.
+    token.as_bytes().ct_eq(secret.as_bytes()).into()
+}
+
+/// Classify an OPEN GitHub PR's trigger labels into an [`IngestIntent`] for [`parse_delivery`]
+/// — the (review/check/both/neither) → intent mapping kept out of the main parser for clarity.
+/// `base` carries the candidate fields EXCEPT `kind`, which this stamps (`"review"`/`"check"`)
+/// for the single trigger-label cases; both labels → conflict Track (no candidate); neither →
+/// StatusOnly. (The Azure path doesn't classify from the payload — it re-discovers via `az`.)
+fn classify_intent(has_review: bool, has_check: bool, base: Candidate) -> IngestIntent {
+    match (has_review, has_check) {
+        // Both trigger labels → conflict: track as a skipped row, never dispatch (mirrors the
+        // poll path's discovery-stage conflict drop).
+        (true, true) => IngestIntent::Track {
+            candidate: None,
+            conflict: true,
+        },
+        (true, false) => IngestIntent::Track {
+            candidate: Some(Candidate {
+                kind: "review".to_string(),
+                ..base
+            }),
+            conflict: false,
+        },
+        (false, true) => IngestIntent::Track {
+            candidate: Some(Candidate {
+                kind: "check".to_string(),
+                ..base
+            }),
+            conflict: false,
+        },
+        // Neither trigger label (e.g. an `unlabeled` delivery removing the trigger): the PR
+        // should still appear in the list with a skip reason, but never dispatch.
+        (false, false) => IngestIntent::StatusOnly {
+            kind: StatusOnlyKind::TriggerLabelRemoved,
+        },
+    }
 }
 
 /// Parse + route + classify a GitHub `pull_request` webhook payload (#61) into a
@@ -1053,9 +1379,12 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
                 .and_then(|r| r.get("full_name"))
                 .and_then(Value::as_str)
         });
-    let route = match event_repo
-        .and_then(|repo| routes.iter().find(|r| r.repo.eq_ignore_ascii_case(repo)))
-    {
+    let route = match event_repo.and_then(|repo| {
+        routes
+            .iter()
+            // Provider-isolated (AB#822): a GitHub delivery only matches GitHub routes.
+            .find(|r| r.source_kind == SourceKind::Github && r.repo.eq_ignore_ascii_case(repo))
+    }) {
         Some(r) => r,
         None => {
             // Carry the repo (when known) for the delivery diagnostic.
@@ -1147,8 +1476,11 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
     };
 
     // Helper to build the routed event with a given intent (the metadata is shared).
+    // `received_at` is left 0 here (pure parser) and stamped by `handle_webhook` on Routable.
     let event = |intent: IngestIntent| WebhookEvent {
         project_id: route.id.clone(),
+        received_at: 0,
+        event: "pull_request".to_string(),
         action: action.clone(),
         repo: route.repo.clone(),
         number,
@@ -1167,48 +1499,86 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
         })));
     }
 
-    // Classify with the MATCHED project's labels (#35) — review/check labels are
-    // per-project, so a payload routed to project B is classified by B's labels.
+    // Classify with the MATCHED project's labels (#35) — review/check labels are per-project,
+    // so a payload routed to project B is classified by B's labels. The (review/check) → intent
+    // mapping is shared with the Azure path via `classify_intent`.
     let has_review = labels.iter().any(|l| l == &route.review_label);
     let has_check = labels.iter().any(|l| l == &route.check_label);
-    let intent = match (has_review, has_check) {
-        // Both trigger labels → conflict: track as a skipped row, never dispatch (mirrors
-        // the poll path's discovery-stage conflict drop). Kind "review" for the view.
-        (true, true) => IngestIntent::Track {
-            candidate: None,
-            conflict: true,
+    let intent = classify_intent(
+        has_review,
+        has_check,
+        Candidate {
+            number,
+            head_sha,
+            head_ref,
+            author,
+            is_cross_repository,
+            is_draft,
+            kind: String::new(), // classify_intent stamps "review"/"check"
         },
-        (true, false) => IngestIntent::Track {
-            candidate: Some(Candidate {
-                number,
-                head_sha,
-                head_ref,
-                author,
-                is_cross_repository,
-                is_draft,
-                kind: "review".to_string(),
-            }),
-            conflict: false,
-        },
-        (false, true) => IngestIntent::Track {
-            candidate: Some(Candidate {
-                number,
-                head_sha,
-                head_ref,
-                author,
-                is_cross_repository,
-                is_draft,
-                kind: "check".to_string(),
-            }),
-            conflict: false,
-        },
-        // Neither trigger label (e.g. an `unlabeled` delivery removing the trigger):
-        // the PR should still appear in the list with a skip reason, but never dispatch.
-        (false, false) => IngestIntent::StatusOnly {
-            kind: StatusOnlyKind::TriggerLabelRemoved,
-        },
-    };
+    );
     ParseResult::Routable(Box::new(event(intent)))
+}
+
+/// Outcome of routing an Azure DevOps Service Hook PR event to a project (AB#822). Unlike the
+/// GitHub [`parse_delivery`], this does NOT build a [`WebhookEvent`]: Azure PR Service Hooks
+/// carry no labels and don't fire on label changes, so the payload can't classify a candidate
+/// — the matched project is re-discovered via `az` instead (see [`handle_azure_delivery`]).
+#[derive(Debug)]
+enum AzureRoute {
+    /// Routed to this project — trigger a re-discovery. `repo` is carried for the diagnostic.
+    Refresh { project_id: String, repo: String },
+    /// Repo + project both present but matching no enabled `Azure` route (fail-closed drop).
+    WrongRepo { repo: Option<String> },
+    /// No `resource`, or `resource.repository.name` / `…project.name` absent — a real Azure PR
+    /// Service Hook always carries them, so absence is a broken payload (not "not for us").
+    Malformed,
+}
+
+/// Route an Azure DevOps Service Hook PR payload (AB#822) to a `project_id` to re-discover. PURE
+/// (no `AppHandle`) so routing is unit-tested without a server. The handler has already gated
+/// `eventType` to created/updated.
+///
+/// Matches `resource.repository.name` (BARE repo name) AND `resource.repository.project.name`
+/// against an `Azure`-source route (provider-isolated — a bare name can't collide with a GitHub
+/// `owner/name`; config rejects duplicate bare repos, so repo is globally unique and the project
+/// match is the extra provider-scoped guard). Both present but no match → [`AzureRoute::WrongRepo`];
+/// missing `resource` / repo name / project name → [`AzureRoute::Malformed`].
+///
+/// It deliberately does NOT read `resource.labels`: Azure Service Hooks omit labels and don't
+/// fire on label changes, so the current labels are read authoritatively by the subsequent `az`
+/// discovery the refresh triggers — not from this payload.
+fn route_azure_delivery(payload: &Value, routes: &[ProjectRoute]) -> AzureRoute {
+    let Some(res) = payload.get("resource") else {
+        return AzureRoute::Malformed;
+    };
+    let repository = res.get("repository");
+    let Some(repo_name) = repository
+        .and_then(|r| r.get("name"))
+        .and_then(Value::as_str)
+    else {
+        return AzureRoute::Malformed;
+    };
+    let Some(project_name) = repository
+        .and_then(|r| r.get("project"))
+        .and_then(|p| p.get("name"))
+        .and_then(Value::as_str)
+    else {
+        return AzureRoute::Malformed;
+    };
+    match routes.iter().find(|r| {
+        r.source_kind == SourceKind::Azure
+            && r.repo.eq_ignore_ascii_case(repo_name)
+            && r.azure_project.eq_ignore_ascii_case(project_name)
+    }) {
+        Some(r) => AzureRoute::Refresh {
+            project_id: r.id.clone(),
+            repo: r.repo.clone(),
+        },
+        None => AzureRoute::WrongRepo {
+            repo: Some(repo_name.to_string()),
+        },
+    }
 }
 
 /// Probe whether `cloudflared` is runnable (`cloudflared --version`). Never errors;
@@ -1450,9 +1820,65 @@ mod tests {
     fn route(id: &str, repo: &str, review_label: &str, check_label: &str) -> ProjectRoute {
         ProjectRoute {
             id: id.to_string(),
+            source_kind: SourceKind::Github,
             repo: repo.to_string(),
+            azure_project: String::new(),
             review_label: review_label.to_string(),
             check_label: check_label.to_string(),
+        }
+    }
+
+    /// An Azure-source route (AB#822): bare `repo` name + Azure project (the routing guard).
+    /// The Azure analogue of [`route`].
+    fn azure_route(
+        id: &str,
+        project: &str,
+        repo: &str,
+        review_label: &str,
+        check_label: &str,
+    ) -> ProjectRoute {
+        ProjectRoute {
+            id: id.to_string(),
+            source_kind: SourceKind::Azure,
+            repo: repo.to_string(),
+            azure_project: project.to_string(),
+            review_label: review_label.to_string(),
+            check_label: check_label.to_string(),
+        }
+    }
+
+    /// A one-project Azure route list for `myproject/myrepo` (id `"az"`), the Azure analogue of
+    /// [`single_route`]. Project/repo match [`azure_pr_payload`]'s defaults.
+    fn single_azure_route() -> Vec<ProjectRoute> {
+        vec![azure_route("az", "myproject", "myrepo", "review", "check")]
+    }
+
+    /// Build a minimal Azure DevOps Service Hook PR payload (`{ eventType, resource }`). Only
+    /// the routing-relevant fields matter now (`route_azure_delivery` ignores labels/status —
+    /// they're read by the `az` re-discovery). `extra` is merged into the `resource` object so a
+    /// test can override / drop `repository` etc.
+    fn azure_pr_payload(extra: serde_json::Value) -> Value {
+        let mut resource = serde_json::json!({
+            "pullRequestId": 42,
+            "status": "active",
+            "repository": { "name": "myrepo", "project": { "name": "myproject" } },
+        });
+        if let (Value::Object(res_map), Value::Object(extra_map)) = (&mut resource, extra) {
+            for (k, v) in extra_map {
+                res_map.insert(k, v);
+            }
+        }
+        serde_json::json!({ "eventType": "git.pullrequest.updated", "resource": resource })
+    }
+
+    /// Test helper: assert `route_azure_delivery` returns `Refresh` and return its `project_id`.
+    fn azure_refresh_project(p: &Value, routes: &[ProjectRoute]) -> String {
+        match route_azure_delivery(p, routes) {
+            AzureRoute::Refresh { project_id, .. } => project_id,
+            AzureRoute::WrongRepo { repo } => {
+                panic!("expected Refresh, got WrongRepo {{ repo: {repo:?} }}")
+            }
+            AzureRoute::Malformed => panic!("expected Refresh, got Malformed"),
         }
     }
 
@@ -1909,6 +2335,7 @@ mod tests {
     async fn command_mode_start_reports_configured_public_url() {
         let mgr = WebhookManager::default();
         mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
         // port 0 → OS picks a free port; `{port}` substitutes into the (harmless) sleep
         // args. cloudflared_bin is bogus on purpose — command mode must NOT require it.
@@ -1953,6 +2380,7 @@ mod tests {
     async fn command_mode_self_heals_when_child_exits() {
         let mgr = WebhookManager::default();
         mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
         let s = mgr
             .start(
@@ -2007,6 +2435,7 @@ mod tests {
     async fn listener_mode_has_no_child_and_does_not_self_heal() {
         let mgr = WebhookManager::default();
         mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
         let s = mgr
             .start(
@@ -2064,6 +2493,7 @@ mod tests {
     async fn stop_kills_and_reaps_tunnel_child() {
         let mgr = WebhookManager::default();
         mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
         let s = mgr
             .start(
@@ -2129,6 +2559,7 @@ mod tests {
     async fn listener_mode_empty_public_url_reports_none() {
         let mgr = WebhookManager::default();
         mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
         let s = mgr
             .start(
@@ -2206,6 +2637,7 @@ mod tests {
     async fn command_mode_blank_command_errs() {
         let mgr = WebhookManager::default();
         mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
         let r = mgr
             .start(
@@ -2429,6 +2861,7 @@ mod tests {
         tauri::async_runtime::block_on(async move {
             let mgr = WebhookManager::default();
             mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+            mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
             for i in 0..3 {
                 let s = mgr
@@ -2531,6 +2964,7 @@ mod tests {
             (DeliveryStatus::Gated, "gated"),
             (DeliveryStatus::Dispatched, "dispatched"),
             (DeliveryStatus::ListUpdated, "listUpdated"),
+            (DeliveryStatus::Refreshed, "refreshed"),
         ];
         for (status, wire) in cases {
             assert_eq!(
@@ -2566,5 +3000,141 @@ mod tests {
             snap.last().unwrap().pr_number,
             Some(DELIVERY_RING_CAP as u64 + 9)
         );
+    }
+
+    // ───────────────────────── Azure DevOps webhook (AB#822) ─────────────────────────
+
+    #[test]
+    fn verify_azure_token_accepts_correct_bearer() {
+        assert!(verify_azure_token("topsecret", "Bearer topsecret"));
+    }
+
+    #[test]
+    fn verify_azure_token_rejects_wrong_missing_and_malformed() {
+        // Wrong token.
+        assert!(!verify_azure_token("topsecret", "Bearer other"));
+        // Missing `Bearer ` prefix (raw token / wrong scheme).
+        assert!(!verify_azure_token("topsecret", "topsecret"));
+        assert!(!verify_azure_token("topsecret", "Basic topsecret"));
+        // Empty header.
+        assert!(!verify_azure_token("topsecret", ""));
+        // A token that is a prefix of the secret must NOT pass (length-aware compare).
+        assert!(!verify_azure_token("topsecret", "Bearer top"));
+        // Empty secret fails closed even with a structurally valid header.
+        assert!(!verify_azure_token("", "Bearer "));
+    }
+
+    #[test]
+    fn verify_azure_token_accepts_bearer_case_insensitively() {
+        // RFC 7235 auth-scheme is case-insensitive; a proxy/SDK may send `bearer`/`BEARER`.
+        assert!(verify_azure_token("topsecret", "bearer topsecret"));
+        assert!(verify_azure_token("topsecret", "BEARER topsecret"));
+    }
+
+    #[test]
+    fn route_azure_delivery_refreshes_matching_project() {
+        let p = azure_pr_payload(serde_json::json!({}));
+        // Routes by repo + Azure project to the project id, regardless of labels/status in the
+        // payload (those are read by the subsequent az re-discovery).
+        assert_eq!(azure_refresh_project(&p, &single_azure_route()), "az");
+        match route_azure_delivery(&p, &single_azure_route()) {
+            AzureRoute::Refresh { project_id, repo } => {
+                assert_eq!(project_id, "az");
+                assert_eq!(repo, "myrepo");
+            }
+            other => panic!("expected Refresh, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_azure_delivery_is_label_agnostic() {
+        // The payload's labels (even if present) and status are IGNORED for routing — the whole
+        // point of the refresh-signal design (Azure hooks don't carry labels). A payload with
+        // NO labels and a non-active status still routes to Refresh.
+        let p = azure_pr_payload(serde_json::json!({ "status": "completed" }));
+        assert_eq!(azure_refresh_project(&p, &single_azure_route()), "az");
+    }
+
+    #[test]
+    fn route_azure_delivery_wrong_repo_or_project_mismatch() {
+        let routes = single_azure_route();
+        // Repo name mismatch → WrongRepo.
+        let mut p = azure_pr_payload(serde_json::json!({}));
+        p["resource"]["repository"]["name"] = serde_json::json!("otherrepo");
+        assert!(matches!(
+            route_azure_delivery(&p, &routes),
+            AzureRoute::WrongRepo { .. }
+        ));
+        // Same repo name but DIFFERENT Azure project → WrongRepo (the project guard).
+        let mut p2 = azure_pr_payload(serde_json::json!({}));
+        p2["resource"]["repository"]["project"]["name"] = serde_json::json!("otherproject");
+        assert!(matches!(
+            route_azure_delivery(&p2, &routes),
+            AzureRoute::WrongRepo { .. }
+        ));
+    }
+
+    #[test]
+    fn route_azure_delivery_malformed_without_resource_repo_or_project() {
+        let routes = single_azure_route();
+        // No `resource`.
+        assert!(matches!(
+            route_azure_delivery(
+                &serde_json::json!({ "eventType": "git.pullrequest.updated" }),
+                &routes
+            ),
+            AzureRoute::Malformed
+        ));
+        // `repository.name` absent → Malformed (a real Azure PR hook always carries it).
+        let mut p = azure_pr_payload(serde_json::json!({}));
+        p["resource"]["repository"]
+            .as_object_mut()
+            .unwrap()
+            .remove("name");
+        assert!(matches!(
+            route_azure_delivery(&p, &routes),
+            AzureRoute::Malformed
+        ));
+        // `project.name` null → Malformed.
+        let mut p2 = azure_pr_payload(serde_json::json!({}));
+        p2["resource"]["repository"]["project"]["name"] = serde_json::json!(null);
+        assert!(matches!(
+            route_azure_delivery(&p2, &routes),
+            AzureRoute::Malformed
+        ));
+        // `repository` object entirely absent → Malformed.
+        let mut p3 = azure_pr_payload(serde_json::json!({}));
+        p3["resource"].as_object_mut().unwrap().remove("repository");
+        assert!(matches!(
+            route_azure_delivery(&p3, &routes),
+            AzureRoute::Malformed
+        ));
+    }
+
+    #[test]
+    fn route_azure_delivery_matches_repo_and_project_case_insensitively() {
+        let routes = single_azure_route(); // repo "myrepo", project "myproject"
+        let mut p = azure_pr_payload(serde_json::json!({}));
+        p["resource"]["repository"]["name"] = serde_json::json!("MyRepo");
+        p["resource"]["repository"]["project"]["name"] = serde_json::json!("MyProject");
+        assert_eq!(azure_refresh_project(&p, &routes), "az");
+    }
+
+    #[test]
+    fn provider_isolation_azure_payload_does_not_match_github_route_and_vice_versa() {
+        // An Azure payload must NOT route to a GitHub-source route even if the bare repo name
+        // string would `eq_ignore_ascii_case`-match (the source_kind guard rejects it).
+        let gh_routes = vec![route("gh", "myrepo", "needs-review", "needs-check")];
+        let azure_p = azure_pr_payload(serde_json::json!({}));
+        assert!(matches!(
+            route_azure_delivery(&azure_p, &gh_routes),
+            AzureRoute::WrongRepo { .. }
+        ));
+        // Symmetrically, a GitHub payload must not route to an Azure-source route.
+        let gh_p = pr_payload(&["needs-review"], serde_json::json!({}));
+        assert!(matches!(
+            parse_delivery(&gh_p, &single_azure_route()),
+            ParseResult::WrongRepo { .. }
+        ));
     }
 }

@@ -224,7 +224,7 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
         label: "Webhook Secret",
         kind: "text",
         secret: true,
-        hint: "与 GitHub 仓库 webhook 的 Secret 一致；用于 HMAC 验签",
+        hint: "GitHub：与仓库 webhook 的 Secret 一致（HMAC 验签）。Azure DevOps：在 Service Hook 的「HTTP headers」加一行——名 Authorization，值 Bearer <此密钥>",
       },
       {
         key: "cloudflaredBin",
@@ -251,7 +251,7 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
         key: "webhookPublicUrl",
         label: "公网 URL",
         kind: "text",
-        hint: "command/listener 模式：你的固定公网根 URL，面板据此显示要粘进 GitHub 的 Payload URL",
+        hint: "command/listener 模式：你的固定公网根 URL，面板据此显示要粘进 GitHub Webhook / Azure Service Hook 的 Payload URL",
       },
     ],
   },
