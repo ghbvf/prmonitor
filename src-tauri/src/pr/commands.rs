@@ -639,6 +639,7 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
 ) {
     let WebhookEvent {
         project_id,
+        event,
         action,
         repo,
         number,
@@ -654,6 +655,7 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
     let record_failclosed = |app: &tauri::AppHandle<R>, msg: String| {
         record_webhook_delivery(
             app,
+            &event,
             &repo,
             &action,
             number,
@@ -786,6 +788,7 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
     // it, it does not override it.
     record_webhook_delivery(
         app,
+        &event,
         &repo,
         &action,
         number,
@@ -798,8 +801,13 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
 /// Record one webhook-delivery diagnostic into the manager's ring (#62) via `AppState`.
 /// Helper so `ingest_webhook`'s several record sites (fail-closed + terminal) stay one
 /// liners and never leak the secret/token into the diagnostic.
+// The args ARE the `WebhookDelivery` wire fields (minus `received_at_epoch`, stamped here):
+// this is a flat record-builder + the `AppState` lookup, so the count is intrinsic to the
+// type, not a design smell. Bundling them into a struct would just re-spell `WebhookDelivery`.
+#[allow(clippy::too_many_arguments)]
 fn record_webhook_delivery<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
+    event: &str,
     repo: &str,
     action: &Option<String>,
     number: u64,
@@ -812,7 +820,9 @@ fn record_webhook_delivery<R: tauri::Runtime>(
         .webhook
         .record_delivery(WebhookDelivery {
             received_at_epoch: now_epoch(),
-            event: "pull_request".to_string(),
+            // The real wire event (AB#822): `"pull_request"` for GitHub, the Azure
+            // `eventType` for Azure — carried on the `WebhookEvent`, no longer hardcoded.
+            event: event.to_string(),
             action: action.clone(),
             repo: Some(repo.to_string()),
             pr_number: Some(number),
@@ -875,7 +885,13 @@ pub async fn start_webhook<R: tauri::Runtime>(
         .filter(|p| p.enabled && webhook_route_eligible(p.update_mode))
         .map(|p| super::webhook::ProjectRoute {
             id: p.id.clone(),
+            // AB#822: the handler routes Azure events only to Azure routes and GitHub events
+            // only to GitHub routes; org/project carry the Azure web-URL inputs (empty for
+            // GitHub) and disambiguate same-named Azure repos across projects.
+            source_kind: p.source_kind,
             repo: p.repo.clone(),
+            azure_org: p.azure_org.clone(),
+            azure_project: p.azure_project.clone(),
             review_label: p.review_label.clone(),
             check_label: p.check_label.clone(),
         })

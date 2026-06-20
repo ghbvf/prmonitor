@@ -224,7 +224,7 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
         label: "Webhook Secret",
         kind: "text",
         secret: true,
-        hint: "与 GitHub 仓库 webhook 的 Secret 一致；用于 HMAC 验签",
+        hint: "GitHub：与仓库 webhook 的 Secret 一致（HMAC 验签）。Azure DevOps：在 Service Hook 加请求头 Authorization: Bearer <此密钥>",
       },
       {
         key: "cloudflaredBin",

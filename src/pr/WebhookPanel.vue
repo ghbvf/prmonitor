@@ -296,9 +296,15 @@ async function copyUrl() {
         </button>
       </div>
       <p class="hint">
-        把上面的完整 URL（已含 /webhook 路径）粘贴到 GitHub 仓库 Settings → Webhooks →
-        Add webhook：Payload URL 填此 URL，Content type 选 application/json，Secret
-        填与设置里相同的 Webhook Secret，events 选 Pull requests。
+        <strong>GitHub：</strong>把上面的完整 URL（已含 /webhook 路径）粘贴到仓库 Settings →
+        Webhooks → Add webhook：Payload URL 填此 URL，Content type 选 application/json，
+        Secret 填与设置里相同的 Webhook Secret，events 选 Pull requests。
+      </p>
+      <p class="hint">
+        <strong>Azure DevOps：</strong>Project Settings → Service Hooks → 新建 Web Hooks
+        订阅，事件选 Pull request created / updated，URL 填此地址；在 HTTP 头加
+        <code>Authorization: Bearer &lt;Webhook Secret&gt;</code>（与设置里相同的密钥，Azure 无
+        HMAC 签名，靠此请求头鉴权）。
       </p>
     </div>
 

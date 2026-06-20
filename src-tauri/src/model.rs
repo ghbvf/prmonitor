@@ -34,7 +34,9 @@ pub struct Candidate {
 pub enum SourceKind {
     #[default]
     Github,
-    /// Azure DevOps Repos, discovered via the `az repos pr list` CLI (#818).
+    /// Azure DevOps Repos: pulled via the `az repos pr list` CLI (#818) and pushed via
+    /// inbound Azure DevOps Service Hooks on `/webhook` (`git.pullrequest.created/updated`,
+    /// AB#822) — both feed the same PR list / dispatch path.
     Azure,
     // future #11: GitLab, Bitbucket
 }

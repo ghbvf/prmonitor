@@ -102,7 +102,11 @@ async fn read_bounded<R: AsyncRead + Unpin>(
 /// passes through iff it is RFC 3986 "unreserved" (`A-Za-z0-9-._~`), else it is emitted as
 /// `%XX` (uppercase hex). Encoding the byte stream covers multi-byte UTF-8 correctly. A
 /// path segment never contains `/`, so `/` is (correctly) encoded to `%2F` here.
-fn encode_path_segment(segment: &str) -> String {
+///
+/// `pub(super)` so the `pr` slice's webhook handler (`webhook.rs`) reuses the SAME encoder
+/// when it builds an Azure PR web URL from an inbound Service Hook payload (AB#822) — one
+/// encoder, no duplicate, so the polling-path and webhook-path URLs are byte-identical.
+pub(super) fn encode_path_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for &byte in segment.as_bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
