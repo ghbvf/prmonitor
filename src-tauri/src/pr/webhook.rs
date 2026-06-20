@@ -36,11 +36,13 @@
 //! Azure DevOps. [`handle_webhook`] detects the provider by header — GitHub sends
 //! `X-GitHub-Event`; an Azure Service Hook does not — and branches to
 //! [`handle_github_delivery`] (HMAC over the body → [`parse_delivery`]) or
-//! [`handle_azure_delivery`] (a `{ eventType, resource }` payload → [`parse_azure_delivery`]).
-//! Both parsers emit the SAME [`WebhookEvent`]/[`IngestIntent`], so the entire downstream
-//! (ingest → gate → dispatch → diagnostics) is provider-agnostic and shared verbatim.
-//! Routing is provider-isolated: a route carries its [`ProjectRoute::source_kind`], so an
-//! Azure event (bare repo name) can never match a GitHub `owner/name` route and vice-versa.
+//! [`handle_azure_delivery`] (a `{ eventType, resource }` payload). The GitHub path ingests
+//! the payload into a [`WebhookEvent`]; the Azure path is a REFRESH SIGNAL — Azure PR Service
+//! Hooks carry no labels and don't fire on label changes (only push/status/reviewer/vote), so
+//! [`route_azure_delivery`] only routes the event to a `project_id` and the injected
+//! [`WebhookRefresher`] re-runs `az` discovery to read the authoritative labels. Routing is
+//! provider-isolated: a route carries its [`ProjectRoute::source_kind`], so an Azure event
+//! (bare repo name) can never match a GitHub `owner/name` route and vice-versa.
 //!
 //! **Layering.** The axum handler is runtime-agnostic — it never names
 //! `AppHandle<R>`. The list upsert + `prs:updated` emit (#61) and the autoReview +
@@ -102,6 +104,17 @@ type HmacSha256 = Hmac<Sha256>;
 pub type WebhookIngestor =
     Arc<dyn Fn(WebhookEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// The Azure refresh hook the composition root installs (AB#822). Called with one routed
+/// `project_id` when an Azure DevOps Service Hook PR event arrives. Azure PR Service Hooks
+/// carry NO labels and do NOT fire on label changes (only push/status/reviewer/vote — see
+/// [`route_azure_delivery`]), so the payload can't classify review-vs-check; the event is a
+/// REFRESH SIGNAL. The closure (the root wires it to `scheduler::SchedulerSet::discover_once`)
+/// re-runs `az repos pr list` discovery for that project — reading the AUTHORITATIVE current
+/// labels — and upserts + dispatches via the same poll path. Same `Arc<dyn Fn>` lifecycle as
+/// [`WebhookIngestor`]; keeps the axum handler runtime-agnostic.
+pub type WebhookRefresher =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// Cap on the retained webhook-delivery diagnostics ring (#62). Old deliveries are
 /// popped from the front once the buffer is full — the panel only ever needs a recent
 /// window for "did GitHub reach us, and what did we do with it".
@@ -136,6 +149,11 @@ pub enum DeliveryStatus {
     Dispatched,
     /// A clean candidate with autoReview OFF — list updated only (no dispatch by design).
     ListUpdated,
+    /// An Azure DevOps PR Service Hook (created/updated) was received and triggered a
+    /// re-discovery (AB#822). Azure hooks carry no labels and don't fire on label changes, so
+    /// the webhook is only a refresh signal — the actual list-update / dispatch outcome is
+    /// recorded by the poll path's `PollStatus` (via `discover_once`), not here.
+    Refreshed,
 }
 
 /// One recorded webhook delivery diagnostic (#62). MUST NOT carry the secret/token or
@@ -195,13 +213,12 @@ pub struct WebhookEvent {
     /// records (not the later record-time). The pure parsers leave this `0`; `handle_webhook`
     /// overwrites it on the `Routable` arm before handing the event to the ingestor.
     pub received_at: u64,
-    /// The wire event type for the delivery diagnostic: `"pull_request"` for GitHub, the
-    /// Azure `eventType` (e.g. `"git.pullrequest.updated"`) for Azure (AB#822). Carried on
-    /// the event so the terminal delivery record (`commands::ingest_webhook`) shows the real
-    /// provider event instead of a hardcoded string.
+    /// The wire event type for the delivery diagnostic — always `"pull_request"` (only the
+    /// GitHub path produces a `WebhookEvent`; the Azure path is a refresh signal that never
+    /// builds one, see [`route_azure_delivery`]). Carried on the event so
+    /// `commands::ingest_webhook` records it without a hardcoded literal.
     pub event: String,
-    /// The PR `action` (for the delivery diagnostic): GitHub's `action`
-    /// (`"labeled"`/…); `None` for Azure (no per-event action concept).
+    /// The PR `action` (for the delivery diagnostic): GitHub's `action` (`"labeled"`/…).
     pub action: Option<String>,
     /// The matched repo `owner/name` (for the delivery diagnostic).
     pub repo: String,
@@ -298,7 +315,7 @@ const WEBHOOK_PATH: &str = "/webhook";
 
 /// The two Azure DevOps Service Hook `eventType`s this receiver acts on (AB#822): a PR being
 /// opened and any subsequent update (label add/remove, push, status change). Single-sourced
-/// here so the handler's gate and the `parse_azure_delivery` doc reference one spelling.
+/// here so the handler's gate and the `route_azure_delivery` doc reference one spelling.
 const AZURE_PR_CREATED: &str = "git.pullrequest.created";
 const AZURE_PR_UPDATED: &str = "git.pullrequest.updated";
 
@@ -382,18 +399,17 @@ pub struct ProjectRoute {
     pub id: String,
     /// Which provider this project is — GitHub or Azure DevOps (AB#822). Routing is
     /// provider-isolated: [`parse_delivery`] only matches `Github` routes, and
-    /// [`parse_azure_delivery`] only `Azure` routes, so a bare Azure repo name can never
+    /// [`route_azure_delivery`] only `Azure` routes, so a bare Azure repo name can never
     /// collide with a GitHub `owner/name` (and vice-versa).
     pub source_kind: SourceKind,
     /// The monitored repo matched (case-insensitively) against the event's repository —
     /// `owner/name` for GitHub, the bare repository name for Azure.
     pub repo: String,
-    /// The Azure DevOps organization (AB#822) — used to build the inbound Azure PR's web
-    /// URL (the Service Hook payload carries no ready web URL). Empty for GitHub projects.
-    pub azure_org: String,
     /// The Azure DevOps project (AB#822) — matched against the event's
-    /// `resource.repository.project.name` to disambiguate same-named repos across Azure
-    /// projects, and used to build the PR web URL. Empty for GitHub projects.
+    /// `resource.repository.project.name` as a routing guard so an Azure event for a
+    /// coincidentally same-named repo in a DIFFERENT project doesn't refresh this one
+    /// (config already rejects duplicate bare repo names, so repo is globally unique; this
+    /// is the extra provider-scoped guard). Empty for GitHub projects.
     pub azure_project: String,
     /// Label that classifies an event as a `review` turn (this project's).
     pub review_label: String,
@@ -411,6 +427,10 @@ pub struct WebhookManager {
     /// emits `prs:updated`, and (when gated-clean) dispatches — keeping the axum handler
     /// runtime-agnostic (the closure holds the concrete `AppHandle<R>`).
     ingestor: StdMutex<Option<WebhookIngestor>>,
+    /// Installed once by the composition root alongside `ingestor` (AB#822). The Azure
+    /// refresh hook — called with a routed `project_id` to re-discover via `az` (see
+    /// [`WebhookRefresher`]). Keeps the handler runtime-agnostic, same as `ingestor`.
+    refresher: StdMutex<Option<WebhookRefresher>>,
     runtime: StdMutex<Option<WebhookRuntime>>,
     /// Serializes `start` (bind + spawn + tunnel-URL await) so concurrent starts
     /// can't double-bind the port.
@@ -523,6 +543,12 @@ impl WebhookManager {
         *self.ingestor.lock().unwrap() = Some(i);
     }
 
+    /// Install the Azure refresh hook (AB#822; composition root, before any start). Replaces
+    /// any prior hook (last writer wins). Mirror of [`Self::set_ingestor`].
+    pub fn set_refresher(&self, r: WebhookRefresher) {
+        *self.refresher.lock().unwrap() = Some(r);
+    }
+
     /// Record one webhook-delivery diagnostic (#62), popping the oldest when the ring is
     /// full ([`DELIVERY_RING_CAP`]). Called EXACTLY once per request — by the handler for
     /// the early-exit classifications, by `ingest_webhook` for the routable terminal
@@ -606,6 +632,12 @@ impl WebhookManager {
             .unwrap()
             .clone()
             .ok_or_else(|| AppError::new("webhook ingestor 未初始化".to_string()))?;
+        let refresher = self
+            .refresher
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| AppError::new("webhook refresher 未初始化".to_string()))?;
 
         // LOCAL bind only — the public path is the tunnel; the raw port is never
         // world-reachable. Shared by all three modes.
@@ -647,6 +679,7 @@ impl WebhookManager {
             secret,
             routes,
             ingestor,
+            refresher,
             deliveries: self.deliveries.clone(),
         });
         let router = Router::new()
@@ -875,8 +908,10 @@ struct WebhookCtx {
     /// the runtime's life — a project add/remove/enable requires a webhook restart (the
     /// composition root wires that on `set_config`).
     routes: Vec<ProjectRoute>,
-    /// The injected ingest hook (#61): handed each parsed, routed [`WebhookEvent`].
+    /// The injected ingest hook (#61): handed each parsed, routed [`WebhookEvent`] (GitHub).
     ingestor: WebhookIngestor,
+    /// The injected Azure refresh hook (AB#822): handed a routed `project_id` to re-discover.
+    refresher: WebhookRefresher,
     /// The manager's delivery-diagnostics ring (#62), shared so the handler can record
     /// the early-exit classifications directly (the routable terminal status is recorded
     /// by `ingest_webhook` via `AppState`).
@@ -1069,12 +1104,19 @@ fn handle_github_delivery(
 /// Azure DevOps provider branch (AB#822). An Azure Service Hook carries no `X-GitHub-Event`
 /// and no body HMAC; it authenticates via a user-configured `Authorization: Bearer <secret>`
 /// header (the same `webhookSecret`), constant-time compared by [`verify_azure_token`]. The
-/// PR event payload is `{ eventType, resource }` (vs GitHub's `{ action, pull_request }`);
-/// only `git.pullrequest.created` / `git.pullrequest.updated` drive the list (others are
-/// acknowledged, parity with GitHub's non-`pull_request` Ignored). Parses + routes via
-/// [`parse_azure_delivery`] into the SAME [`WebhookEvent`] the GitHub path produces, so the
-/// ingestor is shared verbatim. Records the early-exit diagnostics; a `Routable` is recorded
-/// by `ingest_webhook`.
+/// PR event payload is `{ eventType, resource }`; only `git.pullrequest.created` /
+/// `git.pullrequest.updated` drive a refresh (others acknowledged, parity with GitHub's
+/// non-`pull_request` Ignored).
+///
+/// **Refresh signal, not a payload ingest.** Azure PR Service Hooks carry NO `labels` and do
+/// NOT fire on label changes (the documented triggers are push / reviewers / status / vote),
+/// so the payload can't classify review-vs-check the way the GitHub path does. Instead this
+/// routes the event to a project (by repo + Azure project) and hands the `project_id` to the
+/// injected [`WebhookRefresher`], which re-runs `az repos pr list` discovery — reading the
+/// AUTHORITATIVE current labels — and upserts + dispatches via the poll path. The webhook is a
+/// low-latency "PR activity happened, re-check now" nudge; the poll path remains the backstop
+/// for a pure label-add (which fires no hook). The list/dispatch outcome is recorded by
+/// `PollStatus`; here we only record `Refreshed` (or the early-exit drops).
 fn handle_azure_delivery(
     ctx: &Arc<WebhookCtx>,
     received_at: u64,
@@ -1129,8 +1171,8 @@ fn handle_azure_delivery(
         .unwrap_or("")
         .to_string();
 
-    // Only PR created/updated update the list; other Azure events (push, comment, build, …)
-    // are acknowledged without acting (parity with GitHub's non-`pull_request` Ignored).
+    // Only PR created/updated trigger a refresh; other Azure events (push outside a PR,
+    // comment, build, …) are acknowledged without acting (parity with GitHub's Ignored).
     if event_type != AZURE_PR_CREATED && event_type != AZURE_PR_UPDATED {
         record_into(
             &ctx.deliveries,
@@ -1148,16 +1190,28 @@ fn handle_azure_delivery(
         return StatusCode::OK;
     }
 
-    match parse_azure_delivery(&payload, &ctx.routes) {
-        ParseResult::Routable(mut ev) => {
-            // Stamp the receipt time (the pure parser leaves it 0) so the terminal diagnostic
-            // matches the early-exit records.
-            ev.received_at = received_at;
-            let ingestor = ctx.ingestor.clone();
-            drop(spawn(ingestor(*ev)));
+    match route_azure_delivery(&payload, &ctx.routes) {
+        AzureRoute::Refresh { project_id, repo } => {
+            // Detached: re-discovery (the refresher) runs off the request path so Azure gets a
+            // fast 2xx; `discover_once` coalesces concurrent refreshes per project.
+            let refresher = ctx.refresher.clone();
+            drop(spawn(refresher(project_id)));
+            record_into(
+                &ctx.deliveries,
+                WebhookDelivery {
+                    received_at_epoch: received_at,
+                    event: event_type,
+                    action: None,
+                    repo: Some(repo),
+                    pr_number: None,
+                    kind: None,
+                    status: DeliveryStatus::Refreshed,
+                    message: Some("已触发 az 重新发现（读取当前标签）".to_string()),
+                },
+            );
             StatusCode::OK
         }
-        ParseResult::WrongRepo { repo } => {
+        AzureRoute::WrongRepo { repo } => {
             record_into(
                 &ctx.deliveries,
                 WebhookDelivery {
@@ -1173,7 +1227,7 @@ fn handle_azure_delivery(
             );
             StatusCode::OK
         }
-        ParseResult::Malformed => {
+        AzureRoute::Malformed => {
             record_into(
                 &ctx.deliveries,
                 WebhookDelivery {
@@ -1242,11 +1296,11 @@ fn verify_azure_token(secret: &str, header: &str) -> bool {
     token.as_bytes().ct_eq(secret.as_bytes()).into()
 }
 
-/// Classify an OPEN PR's trigger labels into an [`IngestIntent`] — the provider-agnostic
-/// label semantics shared by [`parse_delivery`] (GitHub) and [`parse_azure_delivery`] (Azure),
-/// so the (review/check/both/neither) → intent mapping lives in ONE place. `base` carries the
-/// candidate fields EXCEPT `kind`, which this stamps (`"review"`/`"check"`) for the single
-/// trigger-label cases; both labels → conflict Track (no candidate); neither → StatusOnly.
+/// Classify an OPEN GitHub PR's trigger labels into an [`IngestIntent`] for [`parse_delivery`]
+/// — the (review/check/both/neither) → intent mapping kept out of the main parser for clarity.
+/// `base` carries the candidate fields EXCEPT `kind`, which this stamps (`"review"`/`"check"`)
+/// for the single trigger-label cases; both labels → conflict Track (no candidate); neither →
+/// StatusOnly. (The Azure path doesn't classify from the payload — it re-discovers via `az`.)
 fn classify_intent(has_review: bool, has_check: bool, base: Candidate) -> IngestIntent {
     match (has_review, has_check) {
         // Both trigger labels → conflict: track as a skipped row, never dispatch (mirrors the
@@ -1466,184 +1520,65 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
     ParseResult::Routable(Box::new(event(intent)))
 }
 
-/// Parse + route + classify an Azure DevOps Service Hook PR payload (AB#822) into a
-/// [`ParseResult`] — the Azure analogue of [`parse_delivery`], producing the SAME
-/// [`WebhookEvent`] / [`IngestIntent`] so the entire downstream ingest is shared verbatim.
-/// PURE (no `AppHandle`) so the classification is unit-tested without a server.
-///
-/// The payload shape is `{ "eventType": "git.pullrequest.created"|"…updated", "resource":
-/// { … } }` (the handler has already gated `eventType`). Key differences from the GitHub
-/// path:
-///
-/// - **Routing** matches `resource.repository.name` (the BARE repo name) AND
-///   `resource.repository.project.name` against an `Azure`-source route (provider-isolated —
-///   a bare name can't collide with a GitHub `owner/name`). Both present but matching no route
-///   → [`ParseResult::WrongRepo`]; either ABSENT → [`ParseResult::Malformed`] (a real Azure PR
-///   Service Hook always carries them, so absence is a broken payload, not "not for us").
-/// - **Labels are optional** (the OPPOSITE of GitHub's strict array): the real Azure resource
-///   omits `labels` (or sends `null`) for a tag-less PR, so absent / null / non-array → "no
-///   labels", NOT `Malformed` — mirrors `azure.rs`'s `Option<Vec<RawLabel>>`. Only a missing
-///   `resource` or `pullRequestId` is `Malformed`.
-/// - **State** is `resource.status`: `"active"` → open; anything else (`"completed"` /
-///   `"abandoned"`) → [`IngestIntent::StatusOnly`] `ClosedOrMerged`.
-/// - Field mapping mirrors `azure.rs`'s polling parser: `lastMergeSourceCommit.commitId` →
-///   head_sha (null → ""), `sourceRefName` minus `refs/heads/` → head_ref,
-///   `createdBy.uniqueName` ‖ `displayName` → author, `isDraft` → is_draft, non-null
-///   `forkSource` → cross-repo. The PR web URL is built from the route's org/project/repo (the
-///   payload has no ready web URL), reusing `azure.rs`'s [`super::azure::encode_path_segment`].
-fn parse_azure_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
-    let Some(res) = payload.get("resource") else {
-        return ParseResult::Malformed;
-    };
+/// Outcome of routing an Azure DevOps Service Hook PR event to a project (AB#822). Unlike the
+/// GitHub [`parse_delivery`], this does NOT build a [`WebhookEvent`]: Azure PR Service Hooks
+/// carry no labels and don't fire on label changes, so the payload can't classify a candidate
+/// — the matched project is re-discovered via `az` instead (see [`handle_azure_delivery`]).
+#[derive(Debug)]
+enum AzureRoute {
+    /// Routed to this project — trigger a re-discovery. `repo` is carried for the diagnostic.
+    Refresh { project_id: String, repo: String },
+    /// Repo + project both present but matching no enabled `Azure` route (fail-closed drop).
+    WrongRepo { repo: Option<String> },
+    /// No `resource`, or `resource.repository.name` / `…project.name` absent — a real Azure PR
+    /// Service Hook always carries them, so absence is a broken payload (not "not for us").
+    Malformed,
+}
 
-    // Repo+project routing (provider-isolated): match the BARE repo name AND the Azure
-    // project against an `Azure`-source route, case-insensitively. `resource.repository.name`
-    // and `resource.repository.project.name` are ALWAYS present on a real Azure PR Service
-    // Hook, so an absent / null either → `Malformed` (a structurally-broken payload, same tier
-    // as a missing `pullRequestId`) rather than a misleading `WrongRepo`. A payload with BOTH
-    // present but matching no route → `WrongRepo` (fail-closed: an authenticated POST proves
-    // the secret is known, not that the event is for a repo this app monitors).
+/// Route an Azure DevOps Service Hook PR payload (AB#822) to a `project_id` to re-discover. PURE
+/// (no `AppHandle`) so routing is unit-tested without a server. The handler has already gated
+/// `eventType` to created/updated.
+///
+/// Matches `resource.repository.name` (BARE repo name) AND `resource.repository.project.name`
+/// against an `Azure`-source route (provider-isolated — a bare name can't collide with a GitHub
+/// `owner/name`; config rejects duplicate bare repos, so repo is globally unique and the project
+/// match is the extra provider-scoped guard). Both present but no match → [`AzureRoute::WrongRepo`];
+/// missing `resource` / repo name / project name → [`AzureRoute::Malformed`].
+///
+/// It deliberately does NOT read `resource.labels`: Azure Service Hooks omit labels and don't
+/// fire on label changes, so the current labels are read authoritatively by the subsequent `az`
+/// discovery the refresh triggers — not from this payload.
+fn route_azure_delivery(payload: &Value, routes: &[ProjectRoute]) -> AzureRoute {
+    let Some(res) = payload.get("resource") else {
+        return AzureRoute::Malformed;
+    };
     let repository = res.get("repository");
     let Some(repo_name) = repository
         .and_then(|r| r.get("name"))
         .and_then(Value::as_str)
     else {
-        return ParseResult::Malformed;
+        return AzureRoute::Malformed;
     };
     let Some(project_name) = repository
         .and_then(|r| r.get("project"))
         .and_then(|p| p.get("name"))
         .and_then(Value::as_str)
     else {
-        return ParseResult::Malformed;
+        return AzureRoute::Malformed;
     };
-    let route = match routes.iter().find(|r| {
+    match routes.iter().find(|r| {
         r.source_kind == SourceKind::Azure
             && r.repo.eq_ignore_ascii_case(repo_name)
             && r.azure_project.eq_ignore_ascii_case(project_name)
     }) {
-        Some(r) => r,
-        None => {
-            return ParseResult::WrongRepo {
-                repo: Some(repo_name.to_string()),
-            };
-        }
-    };
-
-    // The only strictly-required field: GitHub always sends number/head/labels, but Azure's
-    // resource reliably carries `pullRequestId` and the rest default like the poll path.
-    let Some(number) = res.get("pullRequestId").and_then(Value::as_u64) else {
-        return ParseResult::Malformed;
-    };
-
-    let head_sha = res
-        .get("lastMergeSourceCommit")
-        .and_then(|c| c.get("commitId"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let head_ref = res
-        .get("sourceRefName")
-        .and_then(Value::as_str)
-        .map(|s| s.strip_prefix("refs/heads/").unwrap_or(s).to_string())
-        .unwrap_or_default();
-    let author = res
-        .get("createdBy")
-        .map(|c| {
-            let unique = c.get("uniqueName").and_then(Value::as_str).unwrap_or("");
-            if unique.is_empty() {
-                c.get("displayName")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string()
-            } else {
-                unique.to_string()
-            }
-        })
-        .unwrap_or_default();
-    let is_draft = res.get("isDraft").and_then(Value::as_bool).unwrap_or(false);
-    // A non-null `forkSource` means the PR's source branch lives in a forked repo (the Azure
-    // analogue of gh's cross-repository), so `should_skip` drops it downstream.
-    let is_cross_repository = res.get("forkSource").map(|v| !v.is_null()).unwrap_or(false);
-    let title = res
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    // Labels are OPTIONAL on the Azure resource (absent / null for a tag-less PR) — unlike
-    // GitHub's strict array (F3). Absent / null / non-array → no labels, NOT Malformed.
-    let labels: Vec<String> = res
-        .get("labels")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
-                .filter(|n| !n.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let event_type = payload
-        .get("eventType")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    // The Service Hook payload carries no ready web URL, so build it from the route's
-    // org/project/repo (config truth — byte-identical to the poll path's URL), percent-encoding
-    // each segment via `azure.rs`'s shared encoder.
-    let url = format!(
-        "https://dev.azure.com/{}/{}/_git/{}/pullrequest/{}",
-        super::azure::encode_path_segment(&route.azure_org),
-        super::azure::encode_path_segment(&route.azure_project),
-        super::azure::encode_path_segment(&route.repo),
-        number
-    );
-
-    // Build the routed event with a given intent (the metadata is shared). Azure has no
-    // per-event "action"; the `eventType` goes in `event` for the diagnostic. `received_at` is
-    // left 0 here (pure parser) and stamped by `handle_webhook` on Routable.
-    let build = |intent: IngestIntent| WebhookEvent {
-        project_id: route.id.clone(),
-        received_at: 0,
-        event: event_type.clone(),
-        action: None,
-        repo: route.repo.clone(),
-        number,
-        title: title.clone(),
-        labels: labels.clone(),
-        url: url.clone(),
-        intent,
-    };
-
-    // Parity with the poll path's `--status active`: a non-active PR (completed / abandoned) is
-    // never a dispatch candidate but upserts a list row reflecting the closed state. A MISSING
-    // / null `status` is also treated as non-active (fail-safe: list-only, never dispatched) —
-    // the same spirit as the GitHub path's `state != "open"` handling of a null state.
-    if res.get("status").and_then(Value::as_str) != Some("active") {
-        return ParseResult::Routable(Box::new(build(IngestIntent::StatusOnly {
-            kind: StatusOnlyKind::ClosedOrMerged,
-        })));
-    }
-
-    // Classify with the MATCHED project's labels (per-project, same as the GitHub path), via
-    // the shared `classify_intent`.
-    let has_review = labels.iter().any(|l| l == &route.review_label);
-    let has_check = labels.iter().any(|l| l == &route.check_label);
-    let intent = classify_intent(
-        has_review,
-        has_check,
-        Candidate {
-            number,
-            head_sha,
-            head_ref,
-            author,
-            is_cross_repository,
-            is_draft,
-            kind: String::new(), // classify_intent stamps "review"/"check"
+        Some(r) => AzureRoute::Refresh {
+            project_id: r.id.clone(),
+            repo: r.repo.clone(),
         },
-    );
-    ParseResult::Routable(Box::new(build(intent)))
+        None => AzureRoute::WrongRepo {
+            repo: Some(repo_name.to_string()),
+        },
+    }
 }
 
 /// Probe whether `cloudflared` is runnable (`cloudflared --version`). Never errors;
@@ -1887,18 +1822,16 @@ mod tests {
             id: id.to_string(),
             source_kind: SourceKind::Github,
             repo: repo.to_string(),
-            azure_org: String::new(),
             azure_project: String::new(),
             review_label: review_label.to_string(),
             check_label: check_label.to_string(),
         }
     }
 
-    /// An Azure-source route (AB#822): bare `repo` name + org/project, classified by this
-    /// project's labels. The Azure analogue of [`route`].
+    /// An Azure-source route (AB#822): bare `repo` name + Azure project (the routing guard).
+    /// The Azure analogue of [`route`].
     fn azure_route(
         id: &str,
-        org: &str,
         project: &str,
         repo: &str,
         review_label: &str,
@@ -1908,44 +1841,26 @@ mod tests {
             id: id.to_string(),
             source_kind: SourceKind::Azure,
             repo: repo.to_string(),
-            azure_org: org.to_string(),
             azure_project: project.to_string(),
             review_label: review_label.to_string(),
             check_label: check_label.to_string(),
         }
     }
 
-    /// A one-project Azure route list for `myorg/myproject/myrepo` (id `"az"`), the Azure
-    /// analogue of [`single_route`]. Org/project/repo match [`azure_pr_payload`]'s defaults.
-    fn single_azure_route(review_label: &str, check_label: &str) -> Vec<ProjectRoute> {
-        vec![azure_route(
-            "az",
-            "myorg",
-            "myproject",
-            "myrepo",
-            review_label,
-            check_label,
-        )]
+    /// A one-project Azure route list for `myproject/myrepo` (id `"az"`), the Azure analogue of
+    /// [`single_route`]. Project/repo match [`azure_pr_payload`]'s defaults.
+    fn single_azure_route() -> Vec<ProjectRoute> {
+        vec![azure_route("az", "myproject", "myrepo", "review", "check")]
     }
 
-    /// Build a minimal Azure DevOps Service Hook PR payload (`{ eventType, resource }`) with
-    /// the given `status` ("active"/"completed"/…) and label names. `extra` is merged into the
-    /// `resource` object so a test can override / null a field (e.g. `labels: null`,
-    /// `lastMergeSourceCommit: null`, add `forkSource`). The Azure analogue of [`pr_payload`].
-    fn azure_pr_payload(status: &str, labels: &[&str], extra: serde_json::Value) -> Value {
-        let label_objs: Vec<Value> = labels
-            .iter()
-            .map(|n| serde_json::json!({ "name": n, "active": true }))
-            .collect();
+    /// Build a minimal Azure DevOps Service Hook PR payload (`{ eventType, resource }`). Only
+    /// the routing-relevant fields matter now (`route_azure_delivery` ignores labels/status —
+    /// they're read by the `az` re-discovery). `extra` is merged into the `resource` object so a
+    /// test can override / drop `repository` etc.
+    fn azure_pr_payload(extra: serde_json::Value) -> Value {
         let mut resource = serde_json::json!({
             "pullRequestId": 42,
-            "status": status,
-            "isDraft": false,
-            "title": "Add widget",
-            "sourceRefName": "refs/heads/feature/widget",
-            "lastMergeSourceCommit": { "commitId": "abc123" },
-            "createdBy": { "uniqueName": "dev@example.com", "displayName": "Dev Eloper" },
-            "labels": label_objs,
+            "status": "active",
             "repository": { "name": "myrepo", "project": { "name": "myproject" } },
         });
         if let (Value::Object(res_map), Value::Object(extra_map)) = (&mut resource, extra) {
@@ -1956,32 +1871,14 @@ mod tests {
         serde_json::json!({ "eventType": "git.pullrequest.updated", "resource": resource })
     }
 
-    /// Test helper: assert a `parse_azure_delivery` result is `Routable` and return its event.
-    fn azure_routable(p: &Value, routes: &[ProjectRoute]) -> WebhookEvent {
-        match parse_azure_delivery(p, routes) {
-            ParseResult::Routable(ev) => *ev,
-            ParseResult::WrongRepo { repo } => {
-                panic!("expected Routable, got WrongRepo {{ repo: {repo:?} }}")
+    /// Test helper: assert `route_azure_delivery` returns `Refresh` and return its `project_id`.
+    fn azure_refresh_project(p: &Value, routes: &[ProjectRoute]) -> String {
+        match route_azure_delivery(p, routes) {
+            AzureRoute::Refresh { project_id, .. } => project_id,
+            AzureRoute::WrongRepo { repo } => {
+                panic!("expected Refresh, got WrongRepo {{ repo: {repo:?} }}")
             }
-            ParseResult::Malformed => panic!("expected Routable, got Malformed"),
-        }
-    }
-
-    /// Test helper: assert an Azure `Routable` event tracks a dispatchable candidate.
-    fn azure_dispatch_candidate(p: &Value, routes: &[ProjectRoute]) -> Candidate {
-        match azure_routable(p, routes).intent {
-            IngestIntent::Track {
-                candidate: Some(c), ..
-            } => c,
-            IngestIntent::Track {
-                candidate: None, ..
-            } => panic!("expected a dispatch candidate, got a conflict Track"),
-            IngestIntent::StatusOnly { kind } => {
-                panic!(
-                    "expected a dispatch candidate, got StatusOnly: {}",
-                    kind.reason()
-                )
-            }
+            AzureRoute::Malformed => panic!("expected Refresh, got Malformed"),
         }
     }
 
@@ -2438,6 +2335,7 @@ mod tests {
     async fn command_mode_start_reports_configured_public_url() {
         let mgr = WebhookManager::default();
         mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
         // port 0 → OS picks a free port; `{port}` substitutes into the (harmless) sleep
         // args. cloudflared_bin is bogus on purpose — command mode must NOT require it.
@@ -2482,6 +2380,7 @@ mod tests {
     async fn command_mode_self_heals_when_child_exits() {
         let mgr = WebhookManager::default();
         mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
         let s = mgr
             .start(
@@ -2536,6 +2435,7 @@ mod tests {
     async fn listener_mode_has_no_child_and_does_not_self_heal() {
         let mgr = WebhookManager::default();
         mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
         let s = mgr
             .start(
@@ -2593,6 +2493,7 @@ mod tests {
     async fn stop_kills_and_reaps_tunnel_child() {
         let mgr = WebhookManager::default();
         mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
         let s = mgr
             .start(
@@ -2658,6 +2559,7 @@ mod tests {
     async fn listener_mode_empty_public_url_reports_none() {
         let mgr = WebhookManager::default();
         mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
         let s = mgr
             .start(
@@ -2735,6 +2637,7 @@ mod tests {
     async fn command_mode_blank_command_errs() {
         let mgr = WebhookManager::default();
         mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
         let r = mgr
             .start(
@@ -2958,6 +2861,7 @@ mod tests {
         tauri::async_runtime::block_on(async move {
             let mgr = WebhookManager::default();
             mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
+            mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
 
             for i in 0..3 {
                 let s = mgr
@@ -3060,6 +2964,7 @@ mod tests {
             (DeliveryStatus::Gated, "gated"),
             (DeliveryStatus::Dispatched, "dispatched"),
             (DeliveryStatus::ListUpdated, "listUpdated"),
+            (DeliveryStatus::Refreshed, "refreshed"),
         ];
         for (status, wire) in cases {
             assert_eq!(
@@ -3120,204 +3025,99 @@ mod tests {
     }
 
     #[test]
-    fn parse_azure_delivery_maps_review_label_with_metadata_and_url() {
-        let p = azure_pr_payload(
-            "active",
-            &["needs-review", "area/ui"],
-            serde_json::json!({}),
-        );
-        let routes = single_azure_route("needs-review", "needs-check");
-        let ev = azure_routable(&p, &routes);
-        assert_eq!(ev.project_id, "az");
-        assert_eq!(ev.number, 42);
-        assert_eq!(ev.event, "git.pullrequest.updated");
-        assert_eq!(ev.action, None, "Azure has no per-event action");
-        // Display metadata for the list row: real title, ALL labels, constructed web URL.
-        assert_eq!(ev.title, "Add widget");
-        assert_eq!(
-            ev.labels,
-            vec!["needs-review".to_string(), "area/ui".to_string()]
-        );
-        assert_eq!(
-            ev.url,
-            "https://dev.azure.com/myorg/myproject/_git/myrepo/pullrequest/42"
-        );
-        // Candidate field mapping (mirrors azure.rs's poll parser).
-        let c = azure_dispatch_candidate(&p, &routes);
-        assert_eq!(c.number, 42);
-        assert_eq!(c.kind, "review");
-        assert_eq!(c.head_sha, "abc123");
-        assert_eq!(c.head_ref, "feature/widget"); // refs/heads/ stripped
-        assert_eq!(c.author, "dev@example.com"); // uniqueName preferred
-        assert!(!c.is_draft);
-        assert!(!c.is_cross_repository);
+    fn verify_azure_token_accepts_bearer_case_insensitively() {
+        // RFC 7235 auth-scheme is case-insensitive; a proxy/SDK may send `bearer`/`BEARER`.
+        assert!(verify_azure_token("topsecret", "bearer topsecret"));
+        assert!(verify_azure_token("topsecret", "BEARER topsecret"));
     }
 
     #[test]
-    fn parse_azure_delivery_maps_check_label() {
-        let p = azure_pr_payload("active", &["needs-check"], serde_json::json!({}));
-        let c = azure_dispatch_candidate(&p, &single_azure_route("needs-review", "needs-check"));
-        assert_eq!(c.kind, "check");
-    }
-
-    #[test]
-    fn parse_azure_delivery_both_labels_is_conflict_track() {
-        let p = azure_pr_payload(
-            "active",
-            &["needs-review", "needs-check"],
-            serde_json::json!({}),
-        );
-        let ev = azure_routable(&p, &single_azure_route("needs-review", "needs-check"));
-        match ev.intent {
-            IngestIntent::Track {
-                candidate: None,
-                conflict: true,
-            } => {}
-            other => panic!("expected a conflict Track, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parse_azure_delivery_absent_or_null_labels_is_status_only_not_malformed() {
-        // THE key Azure-vs-GitHub difference: the real Azure resource omits `labels` (or sends
-        // `null`) for a tag-less PR. That is "no trigger label" → StatusOnly, NOT Malformed
-        // (GitHub's strict-array F3 rule does NOT apply to Azure).
-        let routes = single_azure_route("needs-review", "needs-check");
-        for labels in [serde_json::json!(null), serde_json::json!("nope")] {
-            let p = azure_pr_payload("active", &[], serde_json::json!({ "labels": labels }));
-            let ev = azure_routable(&p, &routes);
-            match ev.intent {
-                IngestIntent::StatusOnly {
-                    kind: StatusOnlyKind::TriggerLabelRemoved,
-                } => {}
-                other => panic!("expected StatusOnly TriggerLabelRemoved, got {other:?}"),
+    fn route_azure_delivery_refreshes_matching_project() {
+        let p = azure_pr_payload(serde_json::json!({}));
+        // Routes by repo + Azure project to the project id, regardless of labels/status in the
+        // payload (those are read by the subsequent az re-discovery).
+        assert_eq!(azure_refresh_project(&p, &single_azure_route()), "az");
+        match route_azure_delivery(&p, &single_azure_route()) {
+            AzureRoute::Refresh { project_id, repo } => {
+                assert_eq!(project_id, "az");
+                assert_eq!(repo, "myrepo");
             }
-        }
-        // An entirely absent `labels` key behaves the same way.
-        let mut p = azure_pr_payload("active", &[], serde_json::json!({}));
-        p["resource"].as_object_mut().unwrap().remove("labels");
-        match azure_routable(&p, &routes).intent {
-            IngestIntent::StatusOnly {
-                kind: StatusOnlyKind::TriggerLabelRemoved,
-            } => {}
-            other => panic!("expected StatusOnly TriggerLabelRemoved, got {other:?}"),
+            other => panic!("expected Refresh, got {other:?}"),
         }
     }
 
     #[test]
-    fn parse_azure_delivery_non_active_status_is_status_only() {
-        let routes = single_azure_route("needs-review", "needs-check");
-        // A completed/abandoned PR carrying the trigger label is list-only, never dispatched.
-        for status in ["completed", "abandoned"] {
-            let p = azure_pr_payload(status, &["needs-review"], serde_json::json!({}));
-            match azure_routable(&p, &routes).intent {
-                IngestIntent::StatusOnly {
-                    kind: StatusOnlyKind::ClosedOrMerged,
-                } => {}
-                other => panic!("expected StatusOnly ClosedOrMerged for {status}, got {other:?}"),
-            }
-        }
+    fn route_azure_delivery_is_label_agnostic() {
+        // The payload's labels (even if present) and status are IGNORED for routing — the whole
+        // point of the refresh-signal design (Azure hooks don't carry labels). A payload with
+        // NO labels and a non-active status still routes to Refresh.
+        let p = azure_pr_payload(serde_json::json!({ "status": "completed" }));
+        assert_eq!(azure_refresh_project(&p, &single_azure_route()), "az");
     }
 
     #[test]
-    fn parse_azure_delivery_marks_draft_and_fork() {
-        let p = azure_pr_payload(
-            "active",
-            &["needs-review"],
-            serde_json::json!({
-                "isDraft": true,
-                "forkSource": { "repository": { "id": "fork-id" } },
-            }),
-        );
-        let c = azure_dispatch_candidate(&p, &single_azure_route("needs-review", "needs-check"));
-        assert!(c.is_draft);
-        assert!(c.is_cross_repository, "non-null forkSource → cross-repo");
-    }
-
-    #[test]
-    fn parse_azure_delivery_author_falls_back_to_display_name() {
-        let p = azure_pr_payload(
-            "active",
-            &["needs-review"],
-            serde_json::json!({ "createdBy": { "uniqueName": "", "displayName": "Display Only" } }),
-        );
-        let c = azure_dispatch_candidate(&p, &single_azure_route("needs-review", "needs-check"));
-        assert_eq!(c.author, "Display Only");
-    }
-
-    #[test]
-    fn parse_azure_delivery_null_last_merge_commit_defaults_head_sha_empty() {
-        let p = azure_pr_payload(
-            "active",
-            &["needs-review"],
-            serde_json::json!({ "lastMergeSourceCommit": null }),
-        );
-        let c = azure_dispatch_candidate(&p, &single_azure_route("needs-review", "needs-check"));
-        assert_eq!(c.head_sha, "");
-        assert_eq!(c.kind, "review");
-    }
-
-    #[test]
-    fn parse_azure_delivery_wrong_repo_or_project_mismatch() {
-        let routes = single_azure_route("needs-review", "needs-check");
-        // Repo name mismatch.
-        let mut p = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
+    fn route_azure_delivery_wrong_repo_or_project_mismatch() {
+        let routes = single_azure_route();
+        // Repo name mismatch → WrongRepo.
+        let mut p = azure_pr_payload(serde_json::json!({}));
         p["resource"]["repository"]["name"] = serde_json::json!("otherrepo");
         assert!(matches!(
-            parse_azure_delivery(&p, &routes),
-            ParseResult::WrongRepo { .. }
+            route_azure_delivery(&p, &routes),
+            AzureRoute::WrongRepo { .. }
         ));
-        // Same repo name but DIFFERENT Azure project → must not match (disambiguation).
-        let mut p2 = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
+        // Same repo name but DIFFERENT Azure project → WrongRepo (the project guard).
+        let mut p2 = azure_pr_payload(serde_json::json!({}));
         p2["resource"]["repository"]["project"]["name"] = serde_json::json!("otherproject");
         assert!(matches!(
-            parse_azure_delivery(&p2, &routes),
-            ParseResult::WrongRepo { .. }
+            route_azure_delivery(&p2, &routes),
+            AzureRoute::WrongRepo { .. }
         ));
     }
 
     #[test]
-    fn parse_azure_delivery_malformed_without_resource_or_pr_id() {
-        let routes = single_azure_route("needs-review", "needs-check");
+    fn route_azure_delivery_malformed_without_resource_repo_or_project() {
+        let routes = single_azure_route();
         // No `resource`.
         assert!(matches!(
-            parse_azure_delivery(
+            route_azure_delivery(
                 &serde_json::json!({ "eventType": "git.pullrequest.updated" }),
                 &routes
             ),
-            ParseResult::Malformed
+            AzureRoute::Malformed
         ));
-        // `resource` present but no `pullRequestId`.
-        let mut p = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
-        p["resource"]
+        // `repository.name` absent → Malformed (a real Azure PR hook always carries it).
+        let mut p = azure_pr_payload(serde_json::json!({}));
+        p["resource"]["repository"]
             .as_object_mut()
             .unwrap()
-            .remove("pullRequestId");
+            .remove("name");
         assert!(matches!(
-            parse_azure_delivery(&p, &routes),
-            ParseResult::Malformed
+            route_azure_delivery(&p, &routes),
+            AzureRoute::Malformed
+        ));
+        // `project.name` null → Malformed.
+        let mut p2 = azure_pr_payload(serde_json::json!({}));
+        p2["resource"]["repository"]["project"]["name"] = serde_json::json!(null);
+        assert!(matches!(
+            route_azure_delivery(&p2, &routes),
+            AzureRoute::Malformed
+        ));
+        // `repository` object entirely absent → Malformed.
+        let mut p3 = azure_pr_payload(serde_json::json!({}));
+        p3["resource"].as_object_mut().unwrap().remove("repository");
+        assert!(matches!(
+            route_azure_delivery(&p3, &routes),
+            AzureRoute::Malformed
         ));
     }
 
     #[test]
-    fn parse_azure_delivery_url_percent_encodes_segments() {
-        // Org/project/repo carrying a space (allowed by config) yield a well-formed URL.
-        let routes = vec![azure_route(
-            "az",
-            "my org",
-            "my project",
-            "my repo",
-            "needs-review",
-            "needs-check",
-        )];
-        let mut p = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
-        p["resource"]["repository"]["name"] = serde_json::json!("my repo");
-        p["resource"]["repository"]["project"]["name"] = serde_json::json!("my project");
-        let ev = azure_routable(&p, &routes);
-        assert_eq!(
-            ev.url,
-            "https://dev.azure.com/my%20org/my%20project/_git/my%20repo/pullrequest/42"
-        );
+    fn route_azure_delivery_matches_repo_and_project_case_insensitively() {
+        let routes = single_azure_route(); // repo "myrepo", project "myproject"
+        let mut p = azure_pr_payload(serde_json::json!({}));
+        p["resource"]["repository"]["name"] = serde_json::json!("MyRepo");
+        p["resource"]["repository"]["project"]["name"] = serde_json::json!("MyProject");
+        assert_eq!(azure_refresh_project(&p, &routes), "az");
     }
 
     #[test]
@@ -3325,86 +3125,16 @@ mod tests {
         // An Azure payload must NOT route to a GitHub-source route even if the bare repo name
         // string would `eq_ignore_ascii_case`-match (the source_kind guard rejects it).
         let gh_routes = vec![route("gh", "myrepo", "needs-review", "needs-check")];
-        let azure_p = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
+        let azure_p = azure_pr_payload(serde_json::json!({}));
         assert!(matches!(
-            parse_azure_delivery(&azure_p, &gh_routes),
-            ParseResult::WrongRepo { .. }
+            route_azure_delivery(&azure_p, &gh_routes),
+            AzureRoute::WrongRepo { .. }
         ));
         // Symmetrically, a GitHub payload must not route to an Azure-source route.
-        let azure_routes = single_azure_route("needs-review", "needs-check");
         let gh_p = pr_payload(&["needs-review"], serde_json::json!({}));
         assert!(matches!(
-            parse_delivery(&gh_p, &azure_routes),
+            parse_delivery(&gh_p, &single_azure_route()),
             ParseResult::WrongRepo { .. }
         ));
-    }
-
-    #[test]
-    fn parse_azure_delivery_handles_created_event_type() {
-        // The handler accepts both created/updated; the parser must classify a `created`
-        // payload identically and carry its eventType through to the diagnostic.
-        let mut p = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
-        p["eventType"] = serde_json::json!("git.pullrequest.created");
-        let routes = single_azure_route("needs-review", "needs-check");
-        let ev = azure_routable(&p, &routes);
-        assert_eq!(ev.event, "git.pullrequest.created");
-        assert_eq!(azure_dispatch_candidate(&p, &routes).kind, "review");
-    }
-
-    #[test]
-    fn parse_azure_delivery_missing_repo_or_project_name_is_malformed() {
-        // A real Azure PR Service Hook ALWAYS carries repository.name + project.name, so an
-        // absent / null either is a broken payload (Malformed), NOT a "not for us" WrongRepo.
-        let routes = single_azure_route("needs-review", "needs-check");
-        // repository.name absent.
-        let mut p = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
-        p["resource"]["repository"]
-            .as_object_mut()
-            .unwrap()
-            .remove("name");
-        assert!(matches!(
-            parse_azure_delivery(&p, &routes),
-            ParseResult::Malformed
-        ));
-        // project.name null.
-        let mut p2 = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
-        p2["resource"]["repository"]["project"]["name"] = serde_json::json!(null);
-        assert!(matches!(
-            parse_azure_delivery(&p2, &routes),
-            ParseResult::Malformed
-        ));
-        // repository object entirely absent.
-        let mut p3 = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
-        p3["resource"].as_object_mut().unwrap().remove("repository");
-        assert!(matches!(
-            parse_azure_delivery(&p3, &routes),
-            ParseResult::Malformed
-        ));
-    }
-
-    #[test]
-    fn parse_azure_delivery_missing_or_null_status_is_status_only() {
-        // A missing / null `status` is treated as non-active (fail-safe: list-only, never
-        // dispatched), the same spirit as the GitHub path's null `state`.
-        let routes = single_azure_route("needs-review", "needs-check");
-        let mut p = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
-        p["resource"].as_object_mut().unwrap().remove("status");
-        match azure_routable(&p, &routes).intent {
-            IngestIntent::StatusOnly {
-                kind: StatusOnlyKind::ClosedOrMerged,
-            } => {}
-            other => panic!("expected StatusOnly ClosedOrMerged for missing status, got {other:?}"),
-        }
-        let p2 = azure_pr_payload(
-            "active",
-            &["needs-review"],
-            serde_json::json!({ "status": null }),
-        );
-        match azure_routable(&p2, &routes).intent {
-            IngestIntent::StatusOnly {
-                kind: StatusOnlyKind::ClosedOrMerged,
-            } => {}
-            other => panic!("expected StatusOnly ClosedOrMerged for null status, got {other:?}"),
-        }
     }
 }

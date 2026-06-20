@@ -371,6 +371,13 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
         // `eq_ignore_ascii_case` — so dedup must normalize too, or two case variants
         // would each register a project for the SAME repo (duplicate PR rows, double
         // dispatch). Normalize to lowercase before the uniqueness check.
+        //
+        // This bare-repo uniqueness is ALSO the "reject ambiguity" guarantee for Azure
+        // (AB#822 F2): the Azure webhook routes a Service Hook by bare repo name (+ project
+        // guard), so two Azure projects sharing a repo name across different org/project
+        // would make routing ambiguous. Rejecting duplicate bare repo names here forecloses
+        // that — the app intentionally does NOT support same-named repos across Azure
+        // orgs/projects (no org dimension in the route).
         if !seen_repos.insert(project.repo.to_ascii_lowercase()) {
             return Err(AppError::new(format!(
                 "项目 repo 重复: {}（同一仓库不能监控两次，大小写不敏感）",

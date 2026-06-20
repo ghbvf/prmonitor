@@ -251,7 +251,7 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
         key: "webhookPublicUrl",
         label: "公网 URL",
         kind: "text",
-        hint: "command/listener 模式：你的固定公网根 URL，面板据此显示要粘进 GitHub 的 Payload URL",
+        hint: "command/listener 模式：你的固定公网根 URL，面板据此显示要粘进 GitHub Webhook / Azure Service Hook 的 Payload URL",
       },
     ],
   },

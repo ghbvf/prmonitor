@@ -35,7 +35,8 @@ export type DeliveryStatus =
   | "notOpen"
   | "gated"
   | "dispatched"
-  | "listUpdated";
+  | "listUpdated"
+  | "refreshed";
 
 // WebhookDelivery mirrors `pr/webhook.rs::WebhookDelivery` (the `webhook_deliveries`
 // command's Rust return shape, serde camelCase). Slice-private diagnostics row, not

@@ -874,11 +874,10 @@ pub async fn start_webhook<R: tauri::Runtime>(
         .map(|p| super::webhook::ProjectRoute {
             id: p.id.clone(),
             // AB#822: the handler routes Azure events only to Azure routes and GitHub events
-            // only to GitHub routes; org/project carry the Azure web-URL inputs (empty for
-            // GitHub) and disambiguate same-named Azure repos across projects.
+            // only to GitHub routes; azure_project guards an Azure event to the matching
+            // project (config rejects duplicate bare repos, so repo is globally unique).
             source_kind: p.source_kind,
             repo: p.repo.clone(),
-            azure_org: p.azure_org.clone(),
             azure_project: p.azure_project.clone(),
             review_label: p.review_label.clone(),
             check_label: p.check_label.clone(),

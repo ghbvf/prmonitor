@@ -151,7 +151,9 @@ const recentDeliveries = computed(() => [...deliveries.value].reverse());
 // Short Chinese labels for each DeliveryStatus. Keyed by the full union so adding a
 // backend arm without a label fails type-checking here (Record over the union).
 const statusLabels: Record<DeliveryStatus, string> = {
-  unauthorized: "签名校验失败",
+  // Provider-neutral: GitHub fails HMAC, Azure fails Bearer — both surface here, so don't
+  // hardcode "签名校验" (the backend message carries the specific reason).
+  unauthorized: "鉴权失败",
   badPayload: "载荷无效",
   ignored: "已忽略",
   wrongRepo: "仓库不匹配",
@@ -160,6 +162,7 @@ const statusLabels: Record<DeliveryStatus, string> = {
   gated: "被拦截",
   dispatched: "已派发",
   listUpdated: "已更新列表",
+  refreshed: "已触发刷新",
 };
 
 // Tone class per status, so dispatched/listUpdated read as success, the skip/gate
@@ -168,6 +171,7 @@ function statusTone(s: DeliveryStatus): "ok" | "warn" | "danger" {
   switch (s) {
     case "dispatched":
     case "listUpdated":
+    case "refreshed":
       return "ok";
     case "unauthorized":
     case "badPayload":
@@ -307,6 +311,12 @@ async function copyUrl() {
         名（Header）填 <code>Authorization</code>，值填 <code>Bearer &lt;Webhook Secret&gt;</code>
         （与设置里相同的密钥；这是自定义 HTTP 头，不是 Basic authentication 区域。Azure 无 HMAC
         签名，靠此请求头鉴权）。
+      </p>
+      <p class="hint">
+        ⚠️ <strong>Azure 限制</strong>：Service Hook <strong>不会</strong>在「加/改 PR 标签」时触发
+        （只在 push / 状态 / 评审 / 投票时触发），载荷里也没有标签。所以 Azure webhook 只作
+        <strong>刷新信号</strong>——收到即重跑 az 拉取读当前标签。要让「加触发标签即派发 review」可靠，
+        Azure 项目请用 <strong>hybrid / pull</strong> 更新模式（由轮询兜底标签）。
       </p>
     </div>
 
