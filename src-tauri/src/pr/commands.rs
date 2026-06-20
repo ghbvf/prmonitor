@@ -4,8 +4,9 @@ use tauri::Emitter; // for app.emit
 
 use crate::config::service as config_service;
 use crate::error::AppResult;
-use crate::model::{Candidate, PullRequestView};
+use crate::model::{Candidate, PullRequestView, SourceKind, UpdateMode};
 
+use super::azure::AzureDevOpsCli;
 use super::discover::{self, MonitorParams};
 use super::gh::{gh_auth_status, GhRow, GhStatus, GithubCli};
 use super::ledger::{now_epoch, Ledger};
@@ -37,21 +38,56 @@ fn build_view(
     ledger: &Ledger,
     now: u64,
 ) -> (PullRequestView, Option<Candidate>) {
-    let skip_reason = if row.conflict {
+    build_view_parts(
+        row.candidate,
+        row.title,
+        row.labels,
+        row.url,
+        row.conflict,
+        params,
+        ledger,
+        now,
+    )
+}
+
+/// The source-agnostic core of the discovery view + dispatch decision (#818): given a
+/// gating [`Candidate`] plus its display fields (`title` / `labels` / `url`) and the
+/// both-trigger-label `conflict` flag, applies the SAME gate composition the poll path
+/// uses — conflict short-circuits to [`discover::BOTH_TRIGGER_LABELS_REASON`], otherwise
+/// static (`should_skip`) then cooldown (`cooldown_skip`) — and surfaces the dispatchable
+/// candidate only when nothing gates it (`skip_reason` None).
+///
+/// Both source arms feed this: the GitHub arm via [`build_view`] (`GhRow`) and the Azure
+/// arm directly from an [`super::azure::AzRow`]. Extracting it gives both sources FULL
+/// display + gating parity (title / url / all labels / kept-conflict), so the only
+/// difference between sources is how the rows are fetched, not how they are shown or
+/// gated. Pure (no `AppHandle`) so the gate composition is unit-tested.
+#[allow(clippy::too_many_arguments)]
+fn build_view_parts(
+    candidate: Candidate,
+    title: String,
+    labels: Vec<String>,
+    url: String,
+    conflict: bool,
+    params: &MonitorParams,
+    ledger: &Ledger,
+    now: u64,
+) -> (PullRequestView, Option<Candidate>) {
+    let skip_reason = if conflict {
         Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string())
     } else {
-        discover::should_skip(&row.candidate, params, ledger)
-            .or_else(|| discover::cooldown_skip(&row.candidate, params, ledger, now))
+        discover::should_skip(&candidate, params, ledger)
+            .or_else(|| discover::cooldown_skip(&candidate, params, ledger, now))
     };
     // Clone the candidate for dispatch only when it passes every static + cooldown
     // gate (skip_reason None); a skipped row contributes a view but no candidate.
-    let dispatchable = skip_reason.is_none().then(|| row.candidate.clone());
+    let dispatchable = skip_reason.is_none().then(|| candidate.clone());
     let view = PullRequestView {
-        number: row.candidate.number,
-        title: row.title,
-        labels: row.labels,
-        url: row.url,
-        kind: row.candidate.kind,
+        number: candidate.number,
+        title,
+        labels,
+        url,
+        kind: candidate.kind,
         skip_reason,
     };
     (view, dispatchable)
@@ -76,6 +112,10 @@ pub(crate) async fn discover<R: tauri::Runtime>(
     // a type contract — `AppConfig` stays config-private; we resolve THIS project by
     // id and snapshot the fields the pr slice needs into `MonitorParams`).
     let project = config_service::project(app, project_id)?;
+    // Capture the source-select fields before `project` is consumed into `params` (#818).
+    let source_kind = project.source_kind;
+    let azure_org = project.azure_org.clone();
+    let azure_project = project.azure_project.clone();
     let params = MonitorParams {
         repo: project.repo,
         review_label: project.review_label,
@@ -89,23 +129,73 @@ pub(crate) async fn discover<R: tauri::Runtime>(
     // `try_reserve_pair` test-and-set is the real double-dispatch backstop (see
     // `Ledger::load`). The write path (`record_dispatched`) is the half that locks.
     let ledger = Ledger::load(app, project_id)?;
-    let source = GithubCli::new(
-        params.repo.clone(),
-        params.review_label.clone(),
-        params.check_label.clone(),
-    );
-
-    let rows = source.discover_rows().await?;
     let now = now_epoch();
-    let mut views = Vec::with_capacity(rows.len());
-    let mut dispatchable = Vec::new();
-    for row in rows {
-        let (view, cand) = build_view(row, &params, &ledger, now);
-        if let Some(cand) = cand {
-            dispatchable.push(cand);
+
+    // Source selection (#818): branch on `source_kind` via an EXHAUSTIVE match (no
+    // wildcard, no `dyn`) so a new `SourceKind` variant fails to compile here until it is
+    // wired. Both sources expose a `discover_rows` returning display-ready rows (gating
+    // `Candidate` + title / url / all-labels + a both-label `conflict` flag), so the view
+    // path is IDENTICAL across sources — each arm just feeds its rows to `build_view_parts`.
+    let (views, dispatchable) = match source_kind {
+        SourceKind::Github => {
+            let source = GithubCli::new(
+                params.repo.clone(),
+                params.review_label.clone(),
+                params.check_label.clone(),
+            );
+            let rows = source.discover_rows().await?;
+            let mut views = Vec::with_capacity(rows.len());
+            let mut dispatchable = Vec::new();
+            for row in rows {
+                let (view, cand) = build_view(row, &params, &ledger, now);
+                if let Some(cand) = cand {
+                    dispatchable.push(cand);
+                }
+                views.push(view);
+            }
+            (views, dispatchable)
         }
-        views.push(view);
-    }
+        SourceKind::Azure => {
+            // Defense-in-depth (#818 F2): the reschedule/reconcile path reaches here via the
+            // NON-validated `config_service::load`, so a hand-edited / partially-migrated
+            // Azure project could carry empty org/project. Guard before building the URL —
+            // `az` would otherwise emit a confusing CLI error. (`validate_project` is the
+            // primary gate on the save path; this is the belt-and-braces backstop.)
+            if azure_org.trim().is_empty() || azure_project.trim().is_empty() {
+                return Err(crate::error::AppError::new(
+                    "Azure 源未配置 azureOrg / azureProject（请在设置中补全）",
+                ));
+            }
+            let source = AzureDevOpsCli::new(
+                azure_org,
+                azure_project,
+                params.repo.clone(),
+                params.review_label.clone(),
+                params.check_label.clone(),
+            );
+            let rows = source.discover_rows().await?;
+            let mut views = Vec::with_capacity(rows.len());
+            let mut dispatchable = Vec::new();
+            for row in rows {
+                // Structurally identical to the GitHub arm — full display + gating parity.
+                let (view, disp) = build_view_parts(
+                    row.candidate,
+                    row.title,
+                    row.labels,
+                    row.url,
+                    row.conflict,
+                    &params,
+                    &ledger,
+                    now,
+                );
+                if let Some(disp) = disp {
+                    dispatchable.push(disp);
+                }
+                views.push(view);
+            }
+            (views, dispatchable)
+        }
+    };
     Ok((views, dispatchable))
 }
 
@@ -164,21 +254,77 @@ pub async fn stop_polling(state: tauri::State<'_, crate::state::AppState>) -> Ap
     Ok(())
 }
 
-/// Triggers an immediate discovery cycle for `project_id` ("立即拉取", #35). Returns
-/// an error when that project's scheduler is paused/unknown (stopped): `wake` is a
-/// no-op on a missing loop and would emit no `prs:updated` event, leaving the
-/// frontend stuck in a loading state. Defense-in-depth alongside the
-/// disabled-while-paused button.
+/// The `poll_now` decision (#818 F6): what an immediate-pull request should DO, computed
+/// purely from `(loop_running, update_mode)` so every branch is unit-tested without a
+/// Tauri handle. [`poll_now`] is the thin IO shell that realizes the chosen action.
+#[derive(Debug, PartialEq, Eq)]
+enum PollNowAction {
+    /// A running loop (pull-only / hybrid) → wake it; its cycle emits `prs:updated`.
+    Wake,
+    /// No loop, manual mode → run ONE one-shot CLI discovery (manual's only pull path).
+    OneShot,
+    /// No loop, webhook-only → reject: there is no CLI source to pull from in this mode.
+    RejectWebhookOnly,
+    /// No loop, pull-only / hybrid → the loop is paused (e.g. after `stop_polling`);
+    /// reject so the frontend prompts to resume.
+    RejectPaused,
+}
+
+/// PURE `poll_now` decision over `(loop_running, mode)` (#818 F6). EXHAUSTIVE match on
+/// [`UpdateMode`] (no wildcard) so a new mode must be classified here. A running loop
+/// always [`Wake`](PollNowAction::Wake)s regardless of mode (it only runs for pull-only /
+/// hybrid anyway); with no loop the mode decides: `Manual` → one-shot, `WebhookOnly` →
+/// reject (no source), `PullOnly`/`Hybrid` → paused.
+fn poll_now_action(loop_running: bool, mode: UpdateMode) -> PollNowAction {
+    if loop_running {
+        return PollNowAction::Wake;
+    }
+    match mode {
+        UpdateMode::Manual => PollNowAction::OneShot,
+        UpdateMode::WebhookOnly => PollNowAction::RejectWebhookOnly,
+        UpdateMode::PullOnly | UpdateMode::Hybrid => PollNowAction::RejectPaused,
+    }
+}
+
+/// Triggers an immediate discovery cycle for `project_id` ("立即拉取", #35, #818). Thin IO
+/// shell over the pure [`poll_now_action`]: it realizes the chosen [`PollNowAction`].
+///
+/// `wake` both probes AND wakes atomically — when it returns `true` a running loop was
+/// woken (the `Wake` action; its cycle emits `prs:updated`). Only when no loop is running
+/// do we read the project's [`UpdateMode`] and dispatch the no-loop branch:
+/// - `Manual` → one-shot discovery ([`SchedulerSet::discover_once`]): manual has no
+///   periodic loop, so this explicit pull (or an inbound webhook) is its only refresh.
+/// - `WebhookOnly` → reject (no CLI source to pull from; the list updates on webhooks).
+/// - `PullOnly` / `Hybrid` → the loop is paused; reject so the frontend prompts to resume.
 #[tauri::command]
 pub async fn poll_now<R: tauri::Runtime>(
-    _app: tauri::AppHandle<R>,
+    app: tauri::AppHandle<R>,
     state: tauri::State<'_, crate::state::AppState>,
     project_id: &str,
 ) -> AppResult<()> {
+    // `wake` is atomic probe-and-wake. On success the loop is running → `Wake` realized.
     if state.scheduler.wake(project_id) {
-        Ok(())
-    } else {
-        Err(crate::error::AppError::new("轮询已暂停，请先恢复轮询"))
+        return Ok(());
+    }
+    // No running loop: read the mode and realize the no-loop action. The wake-check above
+    // and this config read are NOT one atomic step, but the window is a KNOWN ACCEPTABLE
+    // one (#818 F12): during a mode switch this could at most mis-respond ONCE (e.g. report
+    // "paused" for a loop that just started, or skip a wake for one that just stopped) — a
+    // user retry succeeds. It is not a correctness bug, so no lock spans the two reads.
+    let mode = config_service::project(&app, project_id)?.update_mode;
+    match poll_now_action(false, mode) {
+        // `false` here: we only reach this after `wake` returned false (no running loop).
+        PollNowAction::Wake => Ok(()), // unreachable with loop_running=false, but total.
+        PollNowAction::OneShot => {
+            // One-shot CLI discovery (manual has no periodic loop). Drives the same
+            // per-cycle body the loop would, so it discovers / persists / emits / dispatches.
+            state.scheduler.discover_once(&app, project_id).await;
+            Ok(())
+        }
+        PollNowAction::RejectWebhookOnly => Err(crate::error::AppError::new(
+            "webhook-only 模式不支持手动拉取",
+        )),
+        PollNowAction::RejectPaused => Err(crate::error::AppError::new("轮询已暂停，请先恢复轮询")),
     }
 }
 
@@ -676,6 +822,19 @@ fn record_webhook_delivery<R: tauri::Runtime>(
         });
 }
 
+/// Whether a project's [`UpdateMode`] accepts inbound webhook routes (#124 F1). The
+/// push-update counterpart to `scheduler::periodic_polling`: a wildcard-free EXHAUSTIVE
+/// match (so a new mode must be classified) — `WebhookOnly` / `Hybrid` / `Manual` accept
+/// webhooks (Manual lists webhooks as one of its refresh paths per the [`UpdateMode`] doc),
+/// while `PullOnly` is EXCLUDED: its periodic CLI poll is the SOLE update source, so a push
+/// must not enter / auto-dispatch it. Locked by `webhook_route_eligible_excludes_only_pull_only`.
+fn webhook_route_eligible(mode: UpdateMode) -> bool {
+    match mode {
+        UpdateMode::WebhookOnly | UpdateMode::Hybrid | UpdateMode::Manual => true,
+        UpdateMode::PullOnly => false,
+    }
+}
+
 /// Starts the webhook receiver + Cloudflare Quick Tunnel. Requires `webhook_enabled`
 /// in the persisted config; returns the resolved status (incl. the public
 /// `*.trycloudflare.com` URL to paste into GitHub). The local server binds
@@ -706,12 +865,14 @@ pub async fn start_webhook<R: tauri::Runtime>(
             "请先在设置中启用 Webhook 并保存配置",
         ));
     }
-    // One route per enabled project — the handler matches an event's repo against these
-    // and tags the dispatched candidate with the owning project's id (#35).
+    // One route per enabled, webhook-eligible project (#124 F1): a `pull-only` project's
+    // periodic CLI poll is its SOLE update source, so it gets NO route (a push must not
+    // update / auto-dispatch it). The handler matches an event's repo against these and
+    // tags the dispatched candidate with the owning project's id (#35).
     let routes: Vec<super::webhook::ProjectRoute> = cfg
         .projects
         .iter()
-        .filter(|p| p.enabled)
+        .filter(|p| p.enabled && webhook_route_eligible(p.update_mode))
         .map(|p| super::webhook::ProjectRoute {
             id: p.id.clone(),
             repo: p.repo.clone(),
@@ -818,6 +979,122 @@ mod tests {
             labels: vec!["review-label".to_string()],
             conflict,
         }
+    }
+
+    // #818: `build_view_parts` is the source-agnostic core both the GitHub (`GhRow`) and
+    // Azure (`AzRow`) arms feed. It applies the SAME gate composition as the old per-source
+    // builders — conflict short-circuits to the both-labels reason, otherwise static then
+    // cooldown — and carries the row's real title / url / labels through to the view, so an
+    // Azure row now has FULL display parity with GitHub. A clean row dispatches; a conflict
+    // / gated one is a skipped row with no dispatch.
+    #[test]
+    fn build_view_parts_clean_row_carries_display_fields_and_is_dispatchable() {
+        let cand = row(1, "review", false).candidate;
+        let (view, disp) = build_view_parts(
+            cand,
+            "Real title".to_string(),
+            vec!["review-label".to_string(), "area/ui".to_string()],
+            "https://dev.azure.com/o/p/_git/r/pullrequest/1".to_string(),
+            false,
+            &params(),
+            &Ledger::default(),
+            0,
+        );
+        assert_eq!(view.number, 1);
+        assert_eq!(view.kind, "review");
+        assert_eq!(view.title, "Real title");
+        assert_eq!(view.url, "https://dev.azure.com/o/p/_git/r/pullrequest/1");
+        assert_eq!(
+            view.labels,
+            vec!["review-label".to_string(), "area/ui".to_string()]
+        );
+        assert_eq!(view.skip_reason, None);
+        let disp = disp.expect("clean row is dispatchable");
+        assert_eq!(disp.number, 1);
+    }
+
+    #[test]
+    fn build_view_parts_conflict_row_is_skipped_with_both_labels_reason() {
+        let cand = row(2, "review", false).candidate;
+        let (view, disp) = build_view_parts(
+            cand,
+            "Both".to_string(),
+            vec!["review-label".to_string(), "check-label".to_string()],
+            "https://x/2".to_string(),
+            true, // conflict
+            &params(),
+            &Ledger::default(),
+            0,
+        );
+        assert_eq!(
+            view.skip_reason,
+            Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string())
+        );
+        assert!(disp.is_none(), "a conflict row is not dispatchable");
+    }
+
+    #[test]
+    fn build_view_parts_draft_is_skipped_and_not_dispatchable() {
+        let mut cand = row(3, "review", false).candidate;
+        cand.is_draft = true;
+        let (view, disp) = build_view_parts(
+            cand,
+            "Draft".to_string(),
+            vec!["review-label".to_string()],
+            "https://x/3".to_string(),
+            false,
+            &params(),
+            &Ledger::default(),
+            0,
+        );
+        assert_eq!(view.skip_reason, Some("draft PR".to_string()));
+        assert!(disp.is_none(), "a gated row is not dispatchable");
+    }
+
+    // #818 F6: the pure `poll_now_action` decision table — every (loop_running, mode) cell.
+    #[test]
+    fn poll_now_action_running_loop_always_wakes() {
+        // A running loop wakes regardless of mode (it only runs for pull-only/hybrid anyway).
+        for mode in [
+            UpdateMode::PullOnly,
+            UpdateMode::Hybrid,
+            UpdateMode::Manual,
+            UpdateMode::WebhookOnly,
+        ] {
+            assert_eq!(poll_now_action(true, mode), PollNowAction::Wake);
+        }
+    }
+
+    // #124 F1: a webhook route is built ONLY for a project whose mode accepts push updates.
+    // `PullOnly`'s contract makes the periodic CLI poll the SOLE update source, so it must NOT
+    // get a route (else a push could update + auto-dispatch it). WebhookOnly / Hybrid / Manual
+    // all accept webhooks (Manual per the UpdateMode doc — webhook is one of its refresh paths).
+    #[test]
+    fn webhook_route_eligible_excludes_only_pull_only() {
+        assert!(webhook_route_eligible(UpdateMode::WebhookOnly));
+        assert!(webhook_route_eligible(UpdateMode::Hybrid));
+        assert!(webhook_route_eligible(UpdateMode::Manual));
+        assert!(!webhook_route_eligible(UpdateMode::PullOnly));
+    }
+
+    #[test]
+    fn poll_now_action_no_loop_branches_by_mode() {
+        assert_eq!(
+            poll_now_action(false, UpdateMode::Manual),
+            PollNowAction::OneShot
+        );
+        assert_eq!(
+            poll_now_action(false, UpdateMode::WebhookOnly),
+            PollNowAction::RejectWebhookOnly
+        );
+        assert_eq!(
+            poll_now_action(false, UpdateMode::PullOnly),
+            PollNowAction::RejectPaused
+        );
+        assert_eq!(
+            poll_now_action(false, UpdateMode::Hybrid),
+            PollNowAction::RejectPaused
+        );
     }
 
     #[test]

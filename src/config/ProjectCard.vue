@@ -10,8 +10,9 @@
 // per `draft.projects[i]`, and each instance carries its own comma-joined string,
 // normalized back to string[] on every edit (mirrors SettingsView's old single
 // authors round-trip, now per-card).
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import type { Project } from "./types";
+import { pollingEnabledForMode } from "../types";
 import { PROJECT_GROUPS, type FieldDef, type ProjectFieldKey } from "./fields";
 import ConfigField from "./ConfigField.vue";
 
@@ -23,6 +24,12 @@ const emit = defineEmits<{
   delete: [];
   edit: [];
 }>();
+
+// Risk banner gate (818, F8): the CLI-polling risk warning applies only to the modes
+// that actually run the periodic poll loop (pull-only / hybrid) — exactly
+// `pollingEnabledForMode`. webhook-only AND manual don't run the loop, so neither
+// should show it (manual only does on-demand one-shot pulls, not periodic polling).
+const showRiskBanner = computed(() => pollingEnabledForMode(props.project.updateMode));
 
 // This card's own comma-joined authors buffer. Seeded from the project's authors and
 // re-seeded whenever the bound project identity changes (e.g. the list reorders or a
@@ -45,6 +52,14 @@ watch(
 function fieldValue(def: FieldDef): string | number | boolean | string[] {
   if (def.key === "authors") return authorsInput.value;
   return props.project[def.key as ProjectFieldKey];
+}
+
+// Conditional-visibility filter (818 F14): drop fields whose `visibleWhen` predicate is
+// false for THIS project draft (e.g. azureOrg/azureProject hidden for a github source).
+// A field without `visibleWhen` is always shown. Hidden fields keep their stored value —
+// we never clear them, so flipping sourceKind back to azure restores what was typed.
+function visibleFields(fields: FieldDef[]): FieldDef[] {
+  return fields.filter((f) => !f.visibleWhen || f.visibleWhen(props.project));
 }
 
 // Apply an edit. `authors` is held locally as a csv string and emitted normalized to
@@ -87,10 +102,17 @@ function onName(e: Event) {
       <button type="button" class="delete" @click="emit('delete')">删除</button>
     </header>
 
+    <!-- Risk banner (818, F8): only pull-only / hybrid run the periodic CLI poll loop,
+         which can trip account/API rate-limit risk control. Warn for those two only —
+         manual (on-demand one-shot) and webhook-only don't poll periodically. -->
+    <p v-if="showRiskBanner" class="risk-banner" role="alert">
+      ⚠️ CLI 轮询可能触发账号/API 风控，请谨慎开启
+    </p>
+
     <div v-for="g in PROJECT_GROUPS" :key="g.id" class="group">
       <h4 class="group-title">{{ g.title }}</h4>
       <ConfigField
-        v-for="def in g.fields"
+        v-for="def in visibleFields(g.fields)"
         :key="def.key"
         :def="def"
         :model-value="fieldValue(def)"
@@ -155,6 +177,15 @@ function onName(e: Event) {
 }
 .delete:hover {
   background: var(--color-surface-hover);
+}
+.risk-banner {
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--font-size-sm);
+  color: var(--color-warn);
+  background: var(--color-warn-bg);
+  border: 1px solid var(--color-warn-border);
+  border-radius: var(--radius-sm);
 }
 .group {
   display: flex;

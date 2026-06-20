@@ -33,9 +33,68 @@ export interface TrackedPrView extends PullRequestView {
 }
 
 // Discriminator unions mirroring the `SourceKind` / `EngineKind` Rust enums.
-// Single-arm today; widening tracked by #11.
-export type SourceKind = "github"; // 未来 #11: | "gitlab" | "bitbucket"
+// SourceKind widens to Azure DevOps (818), single-sourced as an `as const` array
+// (mirrors UPDATE_MODES / WEBHOOK_TUNNEL_MODES): the type is DERIVED from the array,
+// and fields.ts feeds the same array into the sourceKind select `options`, so the type
+// and the UI's option list can never drift. 未来 #11: add "gitlab" / "bitbucket" here.
+export const SOURCE_KINDS = ["github", "azure"] as const;
+export type SourceKind = (typeof SOURCE_KINDS)[number];
 export type EngineKind = "codex"; // 未来 #11: | "claude"
+
+// Per-project data-update mode (818) — mirrors the Rust `UpdateMode` enum's
+// camelCase wire values. webhook-only = default, no CLI polling (push-driven);
+// pull-only / hybrid = run the CLI poll loop (may trigger account/API risk control);
+// manual = no automatic updates, user pulls on demand.
+//
+// Single-sourced as an `as const` array (mirrors WEBHOOK_TUNNEL_MODES at
+// src/config/types.ts): the type is DERIVED from the array, and fields.ts feeds the
+// same array into the select `options`, so the type and the UI's option list can
+// never drift. Adding/renaming a mode = edit this one array. (The Rust↔TS mirror
+// remains a separate, golden-locked contract.)
+export const UPDATE_MODES = ["webhook-only", "pull-only", "hybrid", "manual"] as const;
+export type UpdateMode = (typeof UPDATE_MODES)[number];
+
+// Whether a data-update mode runs the CLI poll loop (818). webhook-only / manual =
+// push-driven / on-demand (no CLI polling); pull-only / hybrid = the loop runs. Lives
+// at the shared `src/` contract root (next to its `assertNever` carrier) because BOTH
+// the config slice (fields.ts) and the pr slice (PollControls.vue) gate on it — a
+// per-slice copy would violate the vertical-slice boundary (slice-boundary.test.ts).
+//
+// The `default` arm is `assertNever(mode)` (Medium — `assertNever`穷尽, same carrier as
+// above): adding a new UpdateMode without an arm here is a COMPILE error, so the mode
+// list and this gate can never silently fall out of sync.
+export function pollingEnabledForMode(mode: UpdateMode): boolean {
+  switch (mode) {
+    case "webhook-only":
+      return false;
+    case "pull-only":
+    case "hybrid":
+      return true;
+    case "manual":
+      return false;
+    default:
+      return assertNever(mode);
+  }
+}
+
+// Whether a mode supports the manual one-shot "立即拉取" (poll-now) trigger (818, F7).
+// This is a DIFFERENT capability from the periodic poll loop (pollingEnabledForMode):
+// the backend `poll_now` Manual branch runs a one-shot `discover_once`, so manual mode
+// DOES support an on-demand pull — only webhook-only (purely push-driven) does not.
+// Mirrors the backend `poll_now` gate. Exhaustive over UpdateMode via the `assertNever`
+// default (Medium — `assertNever`穷尽), so a new mode forces a decision here.
+export function manualPullAllowedForMode(mode: UpdateMode): boolean {
+  switch (mode) {
+    case "webhook-only":
+      return false;
+    case "pull-only":
+    case "hybrid":
+    case "manual":
+      return true;
+    default:
+      return assertNever(mode);
+  }
+}
 
 // Every arm carries `projectId` (#35): events fan out per monitored project, so the
 // frontend routes each payload to the project it belongs to. Discriminant stays `kind`.

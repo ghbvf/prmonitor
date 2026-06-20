@@ -36,7 +36,7 @@
 //! [`SchedulerSet::set_dispatcher`] is installed once and cloned into each scheduler
 //! on `reconcile`, so a project added later still inherits it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -51,7 +51,7 @@ use tokio::time::MissedTickBehavior;
 use crate::config::service::{self as config_service, Project};
 use crate::error::AppResult;
 use crate::events::{PrEvent, PRS_UPDATED_EVENT};
-use crate::model::{Candidate, TrackedPrView};
+use crate::model::{Candidate, TrackedPrView, UpdateMode};
 
 use super::registry;
 
@@ -309,6 +309,28 @@ impl Scheduler {
     }
 }
 
+/// Whether a project should get a periodic CLI poll loop (#818). The CORE safety gate
+/// of the data-source-modes work: app launch (and every reconcile) starts a [`Scheduler`]
+/// ONLY for a project that opted into periodic polling — an `enabled` project whose
+/// [`UpdateMode`] is `PullOnly` or `Hybrid`. A `WebhookOnly` (default) or `Manual`
+/// project, or a disabled one, gets NO loop, so no unsolicited `gh` / `az` poll fires at
+/// startup.
+///
+/// **Hard carrier** (#818 F5): the mode classification is a wildcard-free exhaustive
+/// `match` (every [`UpdateMode`] variant named explicitly), so adding a variant fails to
+/// compile here until it is classified as polling-or-not — the "new mode silently never
+/// polls" bug a `matches!`/`_` would allow is UNEXPRESSIBLE. Locked additionally by
+/// `periodic_polling_only_for_enabled_pull_or_hybrid`.
+fn periodic_polling(p: &Project) -> bool {
+    if !p.enabled {
+        return false;
+    }
+    match p.update_mode {
+        UpdateMode::PullOnly | UpdateMode::Hybrid => true,
+        UpdateMode::WebhookOnly | UpdateMode::Manual => false,
+    }
+}
+
 /// The composition-root handle for ALL projects' poll loops (#35). Lives in
 /// [`crate::state::AppState`]; all methods take `&self` and use interior mutability so
 /// a single shared `State<AppState>` can drive every project. Owns a
@@ -324,6 +346,41 @@ pub struct SchedulerSet {
     /// [`Self::set_dispatcher`] and cloned into each scheduler on `reconcile`. `None`
     /// (the `#[derive(Default)]` value) leaves every cycle discover-and-emit only.
     dispatcher: StdMutex<Option<ProjectDispatcher>>,
+    /// Retained per-project [`PollDiag`] for MANUAL projects (#818 F15), keyed by
+    /// `project_id`. A manual project has NO live [`Scheduler`] (so no `inner` entry and no
+    /// loop diag), yet its last "立即拉取" still needs to surface its time / discovered count /
+    /// error in `poll_status`. [`Self::discover_once`] records each one-shot cycle into this
+    /// sidecar (get-or-insert), and `poll_status`'s no-live-loop arm reads it. `reconcile`
+    /// prunes entries for projects that are gone (or no longer manual) to bound growth. The
+    /// inner `Arc<StdMutex<PollDiag>>` mirrors a `Scheduler`'s own diag handle so the same
+    /// "never hold the StdMutex across an await" discipline applies.
+    manual_diags: StdMutex<HashMap<String, Arc<StdMutex<PollDiag>>>>,
+    /// In-flight project ids for MANUAL one-shot discoveries (#124 F4). Rapid "立即拉取"
+    /// presses would otherwise spawn concurrent `az` discoveries for the same project (the
+    /// double-DISPATCH is already backstopped by the dispatcher's in-flight registry + the
+    /// ledger, so this guards mainly against redundant `az` calls). [`Self::try_begin_manual`]
+    /// inserts the id under this lock and returns a [`ManualInflightGuard`] that removes it on
+    /// drop (every exit path, incl. panic); a second concurrent pull for the same id is
+    /// coalesced (the in-flight one will emit). The lock is held ONLY for the insert/remove,
+    /// never across the discovery await. `Arc` so the [`ManualInflightGuard`] can own a handle
+    /// to remove the id on drop without borrowing `self` across the await.
+    manual_inflight: Arc<StdMutex<HashSet<String>>>,
+}
+
+/// RAII guard for a MANUAL in-flight one-shot discovery (#124 F4): holds the `SchedulerSet`'s
+/// `manual_inflight` set + the project id, and removes the id from the set on `Drop` — so the
+/// in-flight mark is cleared on EVERY exit path of `discover_once` (normal return, early
+/// return, or a panic unwinding through it), never leaking an entry that would wedge a
+/// project's manual pulls permanently. Created only by [`SchedulerSet::try_begin_manual`].
+struct ManualInflightGuard {
+    inflight: Arc<StdMutex<HashSet<String>>>,
+    project_id: String,
+}
+
+impl Drop for ManualInflightGuard {
+    fn drop(&mut self) {
+        self.inflight.lock().unwrap().remove(&self.project_id);
+    }
 }
 
 impl SchedulerSet {
@@ -336,31 +393,38 @@ impl SchedulerSet {
         *self.dispatcher.lock().unwrap() = Some(d);
     }
 
-    /// Reconciles the running schedulers to `projects` (#35). Idempotent — safe to call
-    /// on every config save:
-    /// - an `enabled` project NOT yet in the map → create a [`Scheduler`], install the
+    /// Reconciles the running schedulers to `projects` (#35, #818). Idempotent — safe to
+    /// call on every config save. A periodic poll loop runs ONLY for a project where
+    /// [`periodic_polling`] holds (enabled + `PullOnly`/`Hybrid`); a webhook-only / manual
+    /// / disabled project gets NO loop (the #818 safety change — app launch must not
+    /// auto-poll those):
+    /// - a poll-eligible project NOT yet in the map → create a [`Scheduler`], install the
     ///   shared dispatcher, and `start` it (captures the project's id);
-    /// - a mapped id that is no longer enabled (disabled, removed, or absent from
-    ///   `projects`) → `stop` it and drop it from the map;
-    /// - a surviving enabled project → `reconfigure` (re-read its period; the first
+    /// - a mapped id that is no longer poll-eligible (disabled, removed, mode flipped to
+    ///   webhook-only/manual, or absent from `projects`) → `stop` it and drop it;
+    /// - a surviving poll-eligible project → `reconfigure` (re-read its period; the first
     ///   tick fires immediately, so this also re-polls).
-    ///
-    /// A DISABLED project is treated identically to a removed one (stopped), so the
-    /// scheduler set always mirrors exactly the enabled projects.
     pub fn reconcile<R: tauri::Runtime>(&self, app: &tauri::AppHandle<R>, projects: &[Project]) {
         let dispatcher = self.dispatcher.lock().unwrap().clone();
         let mut map = self.inner.lock().unwrap();
 
-        // The set of ids that SHOULD be running (enabled projects).
-        let enabled_ids: std::collections::HashSet<&str> = projects
+        // The set of ids that SHOULD be running (poll-eligible projects: enabled +
+        // pull-only/hybrid). Webhook-only / manual / disabled are intentionally excluded
+        // (#818) so launch never auto-polls them.
+        let poll_ids: std::collections::HashSet<&str> = projects
             .iter()
-            .filter(|p| p.enabled)
+            .filter(|p| periodic_polling(p))
             .map(|p| p.id.as_str())
             .collect();
 
-        // Stop + drop schedulers whose project is no longer enabled (disabled / removed).
+        // Stop + drop schedulers whose project is no longer poll-eligible. `retain`
+        // dropping the entry releases this set's only `Arc<Scheduler>` for it, so the old
+        // loop is torn down; the create branch below builds a FRESH, independent
+        // `Arc<Scheduler>` for any re-eligible id — there is no shared handle and no
+        // double-start across a reconcile (a stopped scheduler is never restarted, a new
+        // one is a distinct Arc).
         map.retain(|id, scheduler| {
-            if enabled_ids.contains(id.as_str()) {
+            if poll_ids.contains(id.as_str()) {
                 true
             } else {
                 scheduler.stop();
@@ -368,8 +432,8 @@ impl SchedulerSet {
             }
         });
 
-        // Create-or-reconfigure each enabled project.
-        for project in projects.iter().filter(|p| p.enabled) {
+        // Create-or-reconfigure each poll-eligible project.
+        for project in projects.iter().filter(|p| periodic_polling(p)) {
             match map.get(&project.id) {
                 Some(scheduler) => scheduler.reconfigure(), // survivor: re-read period + re-poll.
                 None => {
@@ -382,6 +446,21 @@ impl SchedulerSet {
                 }
             }
         }
+
+        // Prune the manual-diag sidecar (#818 F15): keep a retained diag ONLY for a project
+        // that still EXISTS and is still `Manual`. A deleted project, or one whose mode
+        // flipped away from manual (a pull-only/hybrid project now surfaces its LIVE loop
+        // diag; a webhook-only one has no pull at all), drops its entry — bounding growth and
+        // never showing a stale "last manual pull" for a project that can no longer do one.
+        let manual_ids: std::collections::HashSet<&str> = projects
+            .iter()
+            .filter(|p| matches!(p.update_mode, UpdateMode::Manual))
+            .map(|p| p.id.as_str())
+            .collect();
+        self.manual_diags
+            .lock()
+            .unwrap()
+            .retain(|id, _| manual_ids.contains(id.as_str()));
     }
 
     /// Triggers an immediate discovery on `project_id`'s running loop ("立即拉取").
@@ -406,6 +485,68 @@ impl SchedulerSet {
         }
     }
 
+    /// Runs ONE one-shot discovery cycle for `project_id` WITHOUT a running poll loop
+    /// (#818). The `Manual` mode's "立即拉取" path: `poll_now` calls this when no scheduler
+    /// exists for the project (manual has no periodic loop). Drives the same per-cycle body
+    /// the loop runs — [`discover_emit_dispatch`] — so a manual pull discovers, persists,
+    /// emits `prs:updated`, and (when autoReview is on) dispatches exactly like a periodic
+    /// cycle. Uses the set's shared dispatcher (the same one `reconcile` clones into each
+    /// scheduler).
+    ///
+    /// Records the cycle into the RETAINED per-project [`PollDiag`] sidecar (#818 F15) so
+    /// `poll_status` can surface the last manual pull (time / discovered count / error) even
+    /// with no live loop. Get-or-insert the project's `Arc<StdMutex<PollDiag>>` while holding
+    /// ONLY the `manual_diags` map lock, then clone the `Arc` OUT and drop the map lock
+    /// BEFORE the await — so no `StdMutex` (neither the map's nor the diag's) is held across
+    /// `discover_emit_dispatch` (the same discipline the poll loop uses). `async` — awaited
+    /// by the caller.
+    pub async fn discover_once<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        project_id: &str,
+    ) {
+        // In-flight coalesce (#124 F4): admit ONE manual pull per project. If one is already
+        // running, return early — it will emit `prs:updated` for everyone. The `_guard`
+        // removes the id on EVERY exit path of this fn (drop at scope end), incl. a panic.
+        let Some(_guard) = self.try_begin_manual(project_id) else {
+            return;
+        };
+        let dispatcher = self.dispatcher.lock().unwrap().clone();
+        // Get-or-insert the retained diag, cloning the Arc out under ONLY the map lock; the
+        // map lock is released at the end of this block (before the await below).
+        let diag = {
+            let mut diags = self.manual_diags.lock().unwrap();
+            Arc::clone(
+                diags
+                    .entry(project_id.to_string())
+                    .or_insert_with(|| Arc::new(StdMutex::new(PollDiag::default()))),
+            )
+        };
+        // No StdMutex held here: `discover_emit_dispatch` locks the inner `PollDiag` only for
+        // the brief mark_* calls, never across its own awaits (same as the loop's cycle).
+        // `_guard` (the in-flight mark) is held across the await but it is a plain owned value,
+        // NOT a lock guard — no StdMutex spans the await.
+        discover_emit_dispatch(app, project_id, dispatcher.as_ref(), &diag).await;
+    }
+
+    /// Tries to mark `project_id` as having a MANUAL one-shot discovery in flight (#124 F4).
+    /// Inserts the id under the `manual_inflight` lock; returns `Some(guard)` when newly
+    /// inserted (the caller proceeds, and the [`ManualInflightGuard`] clears the mark on
+    /// drop) or `None` when a pull is already in flight for that project (coalesce — the
+    /// caller returns early). The lock is held ONLY for the test-and-insert, never across an
+    /// await.
+    fn try_begin_manual(&self, project_id: &str) -> Option<ManualInflightGuard> {
+        let newly_inserted = self
+            .manual_inflight
+            .lock()
+            .unwrap()
+            .insert(project_id.to_string());
+        newly_inserted.then(|| ManualInflightGuard {
+            inflight: Arc::clone(&self.manual_inflight),
+            project_id: project_id.to_string(),
+        })
+    }
+
     /// Stops + drops EVERY project's loop (the `stop_polling`-all path + app shutdown).
     /// After this the set is empty; a later [`Self::reconcile`] re-creates the enabled
     /// schedulers from scratch.
@@ -417,12 +558,16 @@ impl SchedulerSet {
         map.clear();
     }
 
-    /// Reports `project_id`'s poll-loop status (#62) for the settings panel, pulled via
-    /// the `poll_status` command. When that project's scheduler exists AND is running, the
-    /// diag fields are copied from its live [`PollDiag`]; otherwise `running: false` with
-    /// the default (all-`None`) diag. `interval_secs` is always the resolved period for
-    /// that project (so the panel shows the configured cadence even while stopped),
-    /// clamped through [`resolve_period`] from the persisted `poll_interval_secs`.
+    /// Reports `project_id`'s poll-loop status (#62, #818 F15) for the settings panel,
+    /// pulled via the `poll_status` command. Three cases:
+    /// - a LIVE running loop (pull-only / hybrid) → `running: true` with its [`PollDiag`];
+    /// - NO live loop but a RETAINED manual diag (a `Manual` project that has run a 立即拉取)
+    ///   → `running: false` with that retained diag's last-cycle fields (F15: the manual
+    ///   pull's time / result / error is now visible, not silently empty);
+    /// - neither → `running: false` with the default (all-`None`) diag.
+    ///
+    /// `interval_secs` is always the resolved period for that project (so the panel shows the
+    /// configured cadence even while stopped / manual), clamped through [`resolve_period`].
     pub fn poll_status<R: tauri::Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -432,30 +577,46 @@ impl SchedulerSet {
             resolve_period(config_service::project(app, project_id).map(|p| p.poll_interval_secs));
         // Snapshot the running scheduler's diag (if any) without holding the map lock
         // across the projection.
-        let diag = {
+        let live_diag = {
             let map = self.inner.lock().unwrap();
             match map.get(project_id) {
                 Some(s) if s.is_running() => Some(s.poll_diag()),
                 _ => None,
             }
         };
-        match diag {
-            Some(d) => PollStatus {
-                running: true,
-                interval_secs,
-                last_started_epoch: d.last_started_epoch,
-                last_success_epoch: d.last_success_epoch,
-                last_error_epoch: d.last_error_epoch,
-                last_error_message: d.last_error_message,
-                last_persist_epoch: d.last_persist_epoch,
-                last_discovered_count: d.last_discovered_count,
-            },
+        if let Some(d) = live_diag {
+            return poll_status_from_diag(true, interval_secs, d);
+        }
+        // No live loop: fall back to a retained MANUAL diag (#818 F15) if one exists. Clone
+        // it out under only the map lock (don't hold across the projection).
+        let manual_diag = {
+            let diags = self.manual_diags.lock().unwrap();
+            diags.get(project_id).map(|d| d.lock().unwrap().clone())
+        };
+        match manual_diag {
+            Some(d) => poll_status_from_diag(false, interval_secs, d),
             None => PollStatus {
                 running: false,
                 interval_secs,
                 ..PollStatus::default()
             },
         }
+    }
+}
+
+/// Projects a [`PollDiag`] snapshot + `running` flag + resolved `interval_secs` into the
+/// wire [`PollStatus`] (#62). Shared by `poll_status`'s live-loop and retained-manual-diag
+/// arms (#818 F15) so the last-cycle field copy lives in one place.
+fn poll_status_from_diag(running: bool, interval_secs: u64, d: PollDiag) -> PollStatus {
+    PollStatus {
+        running,
+        interval_secs,
+        last_started_epoch: d.last_started_epoch,
+        last_success_epoch: d.last_success_epoch,
+        last_error_epoch: d.last_error_epoch,
+        last_error_message: d.last_error_message,
+        last_persist_epoch: d.last_persist_epoch,
+        last_discovered_count: d.last_discovered_count,
     }
 }
 
@@ -712,6 +873,51 @@ mod tests {
         }
     }
 
+    // #818: `periodic_polling` is the core safety gate — app launch must NOT auto-poll
+    // webhook-only / manual / disabled projects, only enabled pull-only / hybrid ones.
+    #[test]
+    fn periodic_polling_only_for_enabled_pull_or_hybrid() {
+        use crate::model::UpdateMode;
+
+        let base = Project {
+            id: "p".to_string(),
+            enabled: true,
+            ..Project::default()
+        };
+
+        // Enabled pull-only / hybrid → polled.
+        assert!(periodic_polling(&Project {
+            update_mode: UpdateMode::PullOnly,
+            ..base.clone()
+        }));
+        assert!(periodic_polling(&Project {
+            update_mode: UpdateMode::Hybrid,
+            ..base.clone()
+        }));
+
+        // Enabled webhook-only / manual → NOT polled (no automatic CLI poll loop).
+        assert!(!periodic_polling(&Project {
+            update_mode: UpdateMode::WebhookOnly,
+            ..base.clone()
+        }));
+        assert!(!periodic_polling(&Project {
+            update_mode: UpdateMode::Manual,
+            ..base.clone()
+        }));
+
+        // Disabled is never polled regardless of mode.
+        assert!(!periodic_polling(&Project {
+            enabled: false,
+            update_mode: UpdateMode::PullOnly,
+            ..base.clone()
+        }));
+        assert!(!periodic_polling(&Project {
+            enabled: false,
+            update_mode: UpdateMode::Hybrid,
+            ..base
+        }));
+    }
+
     #[test]
     fn default_scheduler_is_not_running() {
         let scheduler = Scheduler::default();
@@ -831,6 +1037,117 @@ mod tests {
         assert_eq!(set.inner.lock().unwrap().len(), 1);
         set.stop_all();
         assert!(set.inner.lock().unwrap().is_empty());
+    }
+
+    // ── Manual poll diagnostics sidecar (#818 F15) ─────────────────────────
+    // `poll_status` itself needs an `AppHandle` (for the resolved interval), so it runs in
+    // the live app; these lock the testable seams: the shared `poll_status_from_diag`
+    // projection (what BOTH the live and the manual arms return) and the retained-diag
+    // mechanics (a default set has no manual diag; a seeded diag round-trips with
+    // `running: false` + populated fields; an unseeded project projects to the empty default).
+
+    #[test]
+    fn default_scheduler_set_has_no_manual_diags() {
+        let set = SchedulerSet::default();
+        assert!(set.manual_diags.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn poll_status_from_diag_projects_running_and_last_cycle_fields() {
+        // A populated diag with running=false (the F15 manual case): the status carries the
+        // last manual pull's started/success/persist epochs + discovered count, NOT empty.
+        let mut d = PollDiag::default();
+        d.mark_started(100);
+        d.mark_discovered(4, 110);
+        d.mark_persist(111);
+        let status = poll_status_from_diag(false, 120, d);
+        assert!(
+            !status.running,
+            "manual diag → running false (no live loop)"
+        );
+        assert_eq!(status.interval_secs, 120);
+        assert_eq!(status.last_started_epoch, Some(100));
+        assert_eq!(status.last_success_epoch, Some(110));
+        assert_eq!(status.last_persist_epoch, Some(111));
+        assert_eq!(status.last_discovered_count, Some(4));
+        assert!(status.last_error_epoch.is_none());
+
+        // An error-bearing diag surfaces the error fields too.
+        let mut e = PollDiag::default();
+        e.mark_error("az exploded".to_string(), 200);
+        let es = poll_status_from_diag(false, 120, e);
+        assert_eq!(es.last_error_epoch, Some(200));
+        assert_eq!(es.last_error_message.as_deref(), Some("az exploded"));
+    }
+
+    #[test]
+    fn manual_diag_sidecar_round_trips_and_empty_for_unknown() {
+        // Seed a retained manual diag directly (the shape `discover_once` get-or-inserts),
+        // then read it back as `poll_status`'s manual arm would: a clone projected with
+        // running=false carries the populated fields.
+        let set = SchedulerSet::default();
+        let diag = Arc::new(StdMutex::new({
+            let mut d = PollDiag::default();
+            d.mark_started(50);
+            d.mark_discovered(2, 55);
+            d
+        }));
+        set.manual_diags
+            .lock()
+            .unwrap()
+            .insert("p1".to_string(), diag);
+
+        // Present → the manual arm's clone projects the populated diag.
+        let snapshot = set
+            .manual_diags
+            .lock()
+            .unwrap()
+            .get("p1")
+            .map(|d| d.lock().unwrap().clone());
+        let status = poll_status_from_diag(false, 30, snapshot.expect("p1 has a manual diag"));
+        assert!(!status.running);
+        assert_eq!(status.last_started_epoch, Some(50));
+        assert_eq!(status.last_discovered_count, Some(2));
+
+        // Unknown project → no manual diag → the caller falls back to the empty default.
+        assert!(set.manual_diags.lock().unwrap().get("ghost").is_none());
+    }
+
+    // ── Manual in-flight coalescing (#124 F4) ──────────────────────────────
+    // `discover_once` itself needs an `AppHandle`; these lock the testable seam:
+    // `try_begin_manual` admits ONE concurrent manual pull per project (Some guard the
+    // first time, None while it is in flight) and the RAII guard removes the id on drop so
+    // a later pull can begin again.
+
+    #[test]
+    fn try_begin_manual_admits_one_and_coalesces_concurrent() {
+        let set = SchedulerSet::default();
+        // First pull → admitted (guard held).
+        let guard = set
+            .try_begin_manual("p1")
+            .expect("first manual pull is admitted");
+        // While p1 is in flight, a second p1 pull is coalesced (None — no guard).
+        assert!(
+            set.try_begin_manual("p1").is_none(),
+            "a concurrent p1 pull is coalesced"
+        );
+        // A DIFFERENT project is independent → admitted concurrently.
+        let g2 = set.try_begin_manual("p2").expect("p2 is independent");
+        assert!(set.manual_inflight.lock().unwrap().contains("p1"));
+        assert!(set.manual_inflight.lock().unwrap().contains("p2"));
+        drop(g2);
+        assert!(!set.manual_inflight.lock().unwrap().contains("p2"));
+
+        // Drop p1's guard → the id is removed → a later p1 pull is admitted again.
+        drop(guard);
+        assert!(
+            !set.manual_inflight.lock().unwrap().contains("p1"),
+            "the RAII guard removes the id on drop"
+        );
+        assert!(
+            set.try_begin_manual("p1").is_some(),
+            "after the in-flight pull ends, p1 can begin again"
+        );
     }
 
     fn candidate(number: u64, kind: &str) -> Candidate {

@@ -9,6 +9,7 @@
 // `keyof AppConfig`). `FieldGroup`/`FieldDef` are generic over the key type so each
 // set is precisely typed and its coverage test can assert exactly that key set.
 import { WEBHOOK_TUNNEL_MODES, type AppConfig, type Project } from "./types";
+import { SOURCE_KINDS, UPDATE_MODES, assertNever, type UpdateMode } from "../types";
 
 // A project field's key (per-project form/wizard) or a global AppConfig field's key
 // (the webhook group). Generic `FieldDef<K>` keeps each group set precisely typed.
@@ -22,14 +23,25 @@ export interface FieldDef<K extends FieldKey = FieldKey> {
   label: string;
   kind: FieldKind;
   hint?: string;
-  // Only meaningful for kind "select"; mirrors the SourceKind/EngineKind arms.
+  // Only meaningful for kind "select"; mirrors the SourceKind/EngineKind/UpdateMode arms.
+  // `options` carries the wire VALUES (single-sourced from the backing `as const` array
+  // so it can't drift from the type). `optionLabels` is an optional display map (wire
+  // value → human label); ConfigField falls back to the raw value when a label is absent.
   options?: readonly string[];
+  optionLabels?: Record<string, string>;
   // Reserved single-option enums (#11) are shown but not editable.
   readonly?: boolean;
   // text fields holding a credential (e.g. the webhook HMAC secret): rendered
   // masked (type=password) with a reveal toggle so it isn't exposed in screenshots
   // / screen-shares.
   secret?: boolean;
+  // Conditional visibility (818 F14): a project field that only applies under some
+  // sourceKind etc. (e.g. azureOrg/azureProject only for an Azure source). The Settings
+  // ProjectCard filters its render loop on this against the live project draft; a field
+  // without `visibleWhen` is always visible. Hidden fields keep their values (the
+  // backend ignores them when irrelevant), so toggling back restores them. Only used by
+  // per-project (Project-keyed) fields — the global webhook group never sets it.
+  visibleWhen?: (p: Project) => boolean;
 }
 
 interface FieldGroup<K extends FieldKey = FieldKey> {
@@ -37,6 +49,33 @@ interface FieldGroup<K extends FieldKey = FieldKey> {
   title: string;
   fields: FieldDef<K>[];
 }
+
+// Display labels for each UpdateMode (818). Exhaustive over `UpdateMode` via the
+// `assertNever` default (Medium穷尽 carrier, same as pollingEnabledForMode in
+// src/types.ts), so a new mode forces a label here. UPDATE_MODE_LABELS below derives
+// the select's display map from this, keeping the wire-value options single-sourced
+// while showing Chinese text.
+function updateModeLabel(mode: UpdateMode): string {
+  switch (mode) {
+    case "webhook-only":
+      return "Webhook（默认）";
+    case "pull-only":
+      return "仅 CLI 轮询";
+    case "hybrid":
+      return "混合";
+    case "manual":
+      return "手动拉取";
+    default:
+      return assertNever(mode);
+  }
+}
+
+// Wire value → display label map for the updateMode select, derived from the
+// single-sourced UPDATE_MODES array (no hand-copied list). ConfigField shows the label
+// but emits the raw wire value, so the camelCase contract stays intact.
+const UPDATE_MODE_LABELS: Record<UpdateMode, string> = Object.fromEntries(
+  UPDATE_MODES.map((m) => [m, updateModeLabel(m)]),
+) as Record<UpdateMode, string>;
 
 // Per-project field groups (#35). Every `Project` key appears exactly once across
 // these groups (asserted in fields.test.ts), so adding a project field forces a home
@@ -47,7 +86,12 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
     id: "project",
     title: "项目",
     fields: [
-      { key: "repo", label: "仓库", kind: "text", hint: "owner/name，如 ghbvf/prmonitor" },
+      {
+        key: "repo",
+        label: "仓库",
+        kind: "text",
+        hint: "GitHub 源: owner/name（如 ghbvf/prmonitor）；Azure 源: 裸仓库名（org/project 见下方）",
+      },
       { key: "repoRoot", label: "本地路径", kind: "text", hint: "本地 clone 的绝对路径" },
       {
         key: "skillRelPath",
@@ -61,6 +105,16 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
     id: "polling",
     title: "轮询",
     fields: [
+      {
+        key: "updateMode",
+        label: "数据更新模式",
+        kind: "select",
+        // Single-sourced from UPDATE_MODES (818) — type & options can't drift; Chinese
+        // labels via the optionLabels map (ConfigField emits the raw wire value).
+        options: UPDATE_MODES,
+        optionLabels: UPDATE_MODE_LABELS,
+        hint: "默认 Webhook；选 pull/hybrid 才启动 CLI 定时拉取（可能触发账号风控）",
+      },
       {
         key: "autoReview",
         label: "自动 review",
@@ -105,15 +159,33 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
     id: "engine",
     title: "引擎",
     fields: [
-      // Single-arm enums today; widening tracked by #11 — kept read-only so the UI
-      // never offers an option the backend can't honor.
+      // PR 来源 now selectable (818): github (gh) or Azure DevOps (az). engineKind stays
+      // single-arm read-only (widening tracked by #11).
       {
         key: "sourceKind",
         label: "PR 来源",
         kind: "select",
-        options: ["github"],
-        readonly: true,
-        hint: "暂仅支持 github（#11）",
+        // Single-sourced from SOURCE_KINDS (818, F11) — type & options can't drift;
+        // Chinese display via optionLabels (ConfigField emits the raw wire value).
+        options: SOURCE_KINDS,
+        optionLabels: { github: "GitHub (gh)", azure: "Azure DevOps (az)" },
+        hint: "github=gh CLI；azure=az CLI（需填下方 org/project）",
+      },
+      {
+        key: "azureOrg",
+        label: "Azure 组织",
+        kind: "text",
+        // 818 F14: only shown for an Azure source; hidden (but value preserved) for github.
+        visibleWhen: (p) => p.sourceKind === "azure",
+        hint: "(仅 Azure 源) Azure DevOps 组织名，如 shengming0923",
+      },
+      {
+        key: "azureProject",
+        label: "Azure 项目",
+        kind: "text",
+        // 818 F14: only shown for an Azure source; hidden (but value preserved) for github.
+        visibleWhen: (p) => p.sourceKind === "azure",
+        hint: "(仅 Azure 源) Azure DevOps 项目名，如 gocell",
       },
       {
         key: "engineKind",
@@ -185,9 +257,59 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
   },
 ];
 
-// Onboarding wizard step sequence. `source`/`done` are confirm-only steps.
+// Onboarding wizard step sequence. `done` is a confirm-only step; `source` is
+// confirm-only for github but gates the azure org/project for an azure source (F2).
 export type StepId = "repo" | "repoRoot" | "skill" | "source" | "autoReview" | "done";
 export const STEPS: StepId[] = ["repo", "repoRoot", "skill", "source", "autoReview", "done"];
+
+// Which per-project fields each onboarding step renders (818 F2/F3). Single-sourced here
+// (not in OnboardingWizard.vue) so the wizard and these unit tests agree. Keys are
+// `keyof Project`; the FieldDefs come from PROJECT_GROUPS. `source` lists the azure
+// fields too — they only render under an azure source via the FieldDef `visibleWhen`
+// predicate (see visibleStepFields). `autoReview` surfaces `updateMode` so the user
+// picks the data-update mode during onboarding instead of silently defaulting (F3).
+export const STEP_FIELDS: Record<StepId, ProjectFieldKey[]> = {
+  repo: ["repo"],
+  repoRoot: ["repoRoot"],
+  skill: ["skillRelPath"],
+  source: ["sourceKind", "azureOrg", "azureProject"],
+  autoReview: [
+    "updateMode",
+    "autoReview",
+    "pollIntervalSecs",
+    "prCooldownSeconds",
+    "reviewLabel",
+    "checkLabel",
+    "authors",
+  ],
+  done: [],
+};
+
+// All per-project FieldDefs addressable by key (PROJECT_GROUPS is the single source).
+const FIELD_BY_KEY = new Map<ProjectFieldKey, FieldDef<ProjectFieldKey>>(
+  PROJECT_GROUPS.flatMap((g) => g.fields).map((f) => [f.key, f]),
+);
+
+// The FieldDef for a per-project key. Throws if a STEP_FIELDS key isn't grouped (a
+// coverage invariant asserted in fields.test.ts), rather than render a half-broken step.
+export function fieldDefOf(key: ProjectFieldKey): FieldDef<ProjectFieldKey> {
+  const def = FIELD_BY_KEY.get(key);
+  if (!def) throw new Error(`missing field def: ${key}`);
+  return def;
+}
+
+// The FieldDefs a wizard step should render for a given draft (818 F2): STEP_FIELDS
+// filtered by each FieldDef's `visibleWhen` predicate (the same conditional-visibility
+// rule ProjectCard applies in Settings), so e.g. the source step shows azureOrg/
+// azureProject only for an azure source. A field without `visibleWhen` is always shown.
+export function visibleStepFields(
+  step: StepId,
+  draft: Project,
+): FieldDef<ProjectFieldKey>[] {
+  return STEP_FIELDS[step]
+    .map(fieldDefOf)
+    .filter((f) => !f.visibleWhen || f.visibleWhen(draft));
+}
 
 // owner/name with no whitespace and exactly one slash.
 const REPO_RE = /^[^/\s]+\/[^/\s]+$/;
@@ -201,6 +323,15 @@ const WIN_ABS_RE = /^[A-Za-z]:[\\/]/;
 export function validateStep(step: StepId, draft: Project): string | null {
   switch (step) {
     case "repo":
+      // Repo shape depends on the source (818, F4): a github repo is `owner/name`; an
+      // Azure repo is a BARE name (org/project come from the dedicated azureOrg/
+      // azureProject fields), so a slash there is wrong. Mirrors the backend validate().
+      if (draft.sourceKind === "azure") {
+        if (draft.repo.trim() === "") return "请填写 Azure 仓库名";
+        return draft.repo.includes("/")
+          ? "Azure 仓库为裸名称，不含 /（org/project 在下方单独填写）"
+          : null;
+      }
       return REPO_RE.test(draft.repo) ? null : "仓库需为 owner/name 格式";
     case "repoRoot":
       return draft.repoRoot.trim() !== "" ? null : "请填写本地 clone 的绝对路径";
@@ -211,7 +342,15 @@ export function validateStep(step: StepId, draft: Project): string | null {
       return null;
     }
     case "source":
-      // Single-option confirm step — nothing to validate.
+      // Azure source (818 F2): the backend `validate_project` requires a non-empty
+      // org + project, so gate them here too (errors start with the field token so
+      // errorToStep routes a backend rejection back to this step). github → nothing to
+      // validate (it's the single-option confirm path).
+      if (draft.sourceKind === "azure") {
+        if (draft.azureOrg.trim() === "") return "azureOrg 不能为空（azure 源需填组织名）";
+        if (draft.azureProject.trim() === "")
+          return "azureProject 不能为空（azure 源需填项目名）";
+      }
       return null;
     case "autoReview": {
       // `Number.isFinite` rejects NaN (a blank number input yields NaN, and
@@ -263,11 +402,18 @@ export function validateStep(step: StepId, draft: Project): string | null {
 // therefore fall through to `null` (→ done) by design; SettingsView surfaces those
 // backend errors directly without `errorToStep`. Locked by an explicit
 // "webhook messages → null" case in fields.test.ts so this stays intentional, not a gap.
+//
+// Azure fields (`azureOrg` / `azureProject`, 818 F2): the wizard `source` step NOW owns
+// them — it renders them (visibleWhen sourceKind==="azure") and `validateStep("source")`
+// gates them — so a backend rejection routes BACK to the source step (not null). Both
+// tokens are azure-prefixed and collide with no other field token, so order among them
+// is moot. Locked by an "azure messages → source" case in fields.test.ts.
 export function errorToStep(message: string): StepId | null {
   const m = message.trimStart();
   if (m.startsWith("skill")) return "skill";
   if (m.startsWith("repoRoot")) return "repoRoot";
   if (m.startsWith("repo")) return "repo";
+  if (m.startsWith("azureOrg") || m.startsWith("azureProject")) return "source";
   if (
     m.startsWith("pollIntervalSecs") ||
     m.startsWith("prCooldownSeconds") ||

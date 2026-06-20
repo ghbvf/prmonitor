@@ -99,7 +99,10 @@ const project = (id: string): Project => ({
   checkLabel: "check",
   skillRelPath: ".claude/skills/pr-review",
   prCooldownSeconds: 0,
+  updateMode: "webhook-only",
   sourceKind: "github",
+  azureOrg: "",
+  azureProject: "",
   engineKind: "codex",
   autoReview: false,
 });

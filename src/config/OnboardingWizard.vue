@@ -12,8 +12,8 @@ import { useConfigStore } from "./useConfigStore";
 import type { AppConfig, Project } from "./types";
 import { DEFAULT_PROJECT_ID, NEW_PROJECT_DEFAULTS } from "./defaults";
 import {
-  PROJECT_GROUPS,
   STEPS,
+  visibleStepFields,
   validateStep,
   errorToStep,
   type FieldDef,
@@ -78,33 +78,13 @@ const currentStep = computed<StepId>(() => STEPS[stepIndex.value]);
 // Inline validation / backend error for the current step.
 const stepError = ref<string | null>(null);
 
-// All per-project field defs flattened, addressable by key — the wizard cherry-picks
-// which FieldDefs each step shows (reusing the same definitions Settings groups use).
-// Every STEP_FIELDS key is a `keyof Project`, so PROJECT_GROUPS is the right source.
-const FIELD_BY_KEY = new Map<ProjectFieldKey, FieldDef>(
-  PROJECT_GROUPS.flatMap((g) => g.fields).map((f) => [f.key, f]),
-);
-
-function defOf(key: ProjectFieldKey): FieldDef {
-  const def = FIELD_BY_KEY.get(key);
-  // Every per-project key is grouped (asserted in fields.test.ts), so this never
-  // misses; throw rather than render a half-broken step if that invariant breaks.
-  if (!def) throw new Error(`missing field def: ${key}`);
-  return def;
-}
-
-// Which fields each step renders. Keys are `keyof Project` (#35).
-const STEP_FIELDS: Record<StepId, ProjectFieldKey[]> = {
-  repo: ["repo"],
-  repoRoot: ["repoRoot"],
-  skill: ["skillRelPath"],
-  source: ["sourceKind"],
-  autoReview: ["autoReview", "pollIntervalSecs", "prCooldownSeconds", "reviewLabel", "checkLabel", "authors"],
-  done: [],
-};
-
-const currentFields = computed<FieldDef[]>(() =>
-  STEP_FIELDS[currentStep.value].map(defOf),
+// The FieldDefs the current step renders, driven by the shared STEP_FIELDS wiring in
+// fields.ts and filtered by each FieldDef's `visibleWhen` predicate against the live
+// draft (818 F2): so the source step shows azureOrg/azureProject only for an azure
+// source, and the autoReview step now also surfaces updateMode (F3). Single-sourcing
+// STEP_FIELDS in fields.ts keeps this in lockstep with validateStep + the unit tests.
+const currentFields = computed<FieldDef<ProjectFieldKey>[]>(() =>
+  visibleStepFields(currentStep.value, draft),
 );
 
 function fieldValue(def: FieldDef): string | number | boolean | string[] {
@@ -218,7 +198,7 @@ async function finish() {
         </template>
         <template v-else-if="currentStep === 'source'">
           <h2>PR 来源</h2>
-          <p class="lead">确认 PR 来源与 review 引擎。</p>
+          <p class="lead">选择 PR 来源；Azure 源需填写组织 / 项目。</p>
         </template>
         <template v-else-if="currentStep === 'autoReview'">
           <h2>自动 review</h2>
@@ -244,6 +224,12 @@ async function finish() {
           <div><dt>仓库</dt><dd>{{ draft.repo }}</dd></div>
           <div><dt>本地路径</dt><dd>{{ draft.repoRoot }}</dd></div>
           <div><dt>Skill</dt><dd>{{ draft.skillRelPath }}</dd></div>
+          <div><dt>PR 来源</dt><dd>{{ draft.sourceKind }}</dd></div>
+          <template v-if="draft.sourceKind === 'azure'">
+            <div><dt>Azure 组织</dt><dd>{{ draft.azureOrg || "—" }}</dd></div>
+            <div><dt>Azure 项目</dt><dd>{{ draft.azureProject || "—" }}</dd></div>
+          </template>
+          <div><dt>数据更新模式</dt><dd>{{ draft.updateMode }}</dd></div>
           <div><dt>自动 review</dt><dd>{{ draft.autoReview ? "自动" : "手动" }}</dd></div>
           <div><dt>轮询间隔</dt><dd>{{ draft.pollIntervalSecs }} 秒</dd></div>
           <div><dt>PR 冷却</dt><dd>{{ draft.prCooldownSeconds }} 秒</dd></div>

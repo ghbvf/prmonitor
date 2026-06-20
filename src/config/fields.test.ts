@@ -7,13 +7,15 @@
 // keys) and GLOBAL_GROUPS (global webhook `AppConfig` keys).
 import { describe, expect, it } from "vitest";
 import type { AppConfig, Project } from "./types";
+import { UPDATE_MODES, pollingEnabledForMode, manualPullAllowedForMode } from "../types";
 import {
   PROJECT_GROUPS,
   GLOBAL_GROUPS,
   STEPS,
+  STEP_FIELDS,
+  visibleStepFields,
   validateStep,
   errorToStep,
-  type StepId,
 } from "./fields";
 
 // A fully-valid single project; each test perturbs one field to assert its step's gate.
@@ -30,7 +32,10 @@ function validProject(): Project {
     checkLabel: "pr-status/needs-check-fix",
     skillRelPath: ".codex/skills/pr-review/SKILL.md",
     prCooldownSeconds: 1800,
+    updateMode: "webhook-only",
     sourceKind: "github",
+    azureOrg: "",
+    azureProject: "",
     engineKind: "codex",
     autoReview: false,
   };
@@ -67,14 +72,73 @@ describe("PROJECT_GROUPS", () => {
     expect(f?.kind).toBe("checkbox");
   });
 
-  it("marks the engine group fields read-only (sourceKind/engineKind reserved #11)", () => {
+  it("engine group: sourceKind selectable (818), engineKind read-only (#11)", () => {
     const engine = PROJECT_GROUPS.find((g) => g.id === "engine");
     expect(engine).toBeDefined();
-    expect(engine!.fields.every((f) => f.readonly)).toBe(true);
-    expect(engine!.fields.map((f) => f.key).sort()).toEqual([
-      "engineKind",
-      "sourceKind",
-    ]);
+    const byKey = new Map(engine!.fields.map((f) => [f.key, f]));
+    // sourceKind is now an editable select offering github + azure (818).
+    const source = byKey.get("sourceKind");
+    expect(source?.kind).toBe("select");
+    expect(source?.readonly).toBeFalsy();
+    expect(source?.options).toEqual(["github", "azure"]);
+    // engineKind stays single-arm read-only (widening tracked by #11).
+    expect(byKey.get("engineKind")?.readonly).toBe(true);
+    // Azure org/project fields live in the engine group too (818).
+    expect(byKey.get("azureOrg")?.kind).toBe("text");
+    expect(byKey.get("azureProject")?.kind).toBe("text");
+  });
+
+  it("updateMode is a select single-sourced from UPDATE_MODES (818)", () => {
+    const f = PROJECT_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "updateMode");
+    expect(f?.kind).toBe("select");
+    expect(f?.options).toEqual(UPDATE_MODES);
+    // Every wire value has a display label (the Chinese mode names).
+    for (const m of UPDATE_MODES) {
+      expect(f?.optionLabels?.[m]).toBeTruthy();
+    }
+  });
+
+  it("azure fields are visibleWhen sourceKind === azure (818 F14)", () => {
+    const byKey = new Map(
+      PROJECT_GROUPS.flatMap((g) => g.fields).map((f) => [f.key, f]),
+    );
+    const azureP = { ...validProject(), sourceKind: "azure" as const };
+    const githubP = { ...validProject(), sourceKind: "github" as const };
+    for (const key of ["azureOrg", "azureProject"] as const) {
+      const f = byKey.get(key);
+      expect(f?.visibleWhen).toBeTypeOf("function");
+      expect(f!.visibleWhen!(azureP)).toBe(true);
+      expect(f!.visibleWhen!(githubP)).toBe(false);
+    }
+  });
+
+  it("non-azure project fields have no visibleWhen (always visible)", () => {
+    // sourceKind, repo, updateMode, etc. must NOT be conditionally hidden — only the
+    // azure-specific fields carry a predicate.
+    const conditional = PROJECT_GROUPS.flatMap((g) => g.fields)
+      .filter((f) => f.visibleWhen)
+      .map((f) => f.key)
+      .sort();
+    expect(conditional).toEqual(["azureOrg", "azureProject"]);
+  });
+});
+
+describe("pollingEnabledForMode (818)", () => {
+  it("enables polling only for pull-only / hybrid", () => {
+    expect(pollingEnabledForMode("webhook-only")).toBe(false);
+    expect(pollingEnabledForMode("pull-only")).toBe(true);
+    expect(pollingEnabledForMode("hybrid")).toBe(true);
+    expect(pollingEnabledForMode("manual")).toBe(false);
+  });
+});
+
+describe("manualPullAllowedForMode (818 F7)", () => {
+  it("allows the one-shot pull for everything except webhook-only", () => {
+    // Distinct from pollingEnabledForMode: manual supports a backend one-shot pull.
+    expect(manualPullAllowedForMode("webhook-only")).toBe(false);
+    expect(manualPullAllowedForMode("pull-only")).toBe(true);
+    expect(manualPullAllowedForMode("hybrid")).toBe(true);
+    expect(manualPullAllowedForMode("manual")).toBe(true);
   });
 });
 
@@ -91,13 +155,28 @@ describe("GLOBAL_GROUPS", () => {
 });
 
 describe("validateStep — repo", () => {
-  it("accepts owner/name", () => {
+  it("accepts owner/name (github source)", () => {
     expect(validateStep("repo", validProject())).toBeNull();
   });
   it.each(["ghbvf", "a/b/c", "", "owner /name", "owner/"])(
-    "rejects %j",
+    "rejects %j (github source)",
     (repo) => {
       expect(validateStep("repo", { ...validProject(), repo })).toBeTruthy();
+    },
+  );
+  // Azure source (818 F4): repo is a BARE name (no slash); org/project come from the
+  // azureOrg/azureProject fields, so a slash here is wrong and a bare name is valid.
+  it("accepts a bare name for an azure source", () => {
+    expect(
+      validateStep("repo", { ...validProject(), sourceKind: "azure", repo: "gocell" }),
+    ).toBeNull();
+  });
+  it.each(["org/repo", "shengming0923/gocell", "", "  "])(
+    "rejects %j for an azure source (slash or empty)",
+    (repo) => {
+      expect(
+        validateStep("repo", { ...validProject(), sourceKind: "azure", repo }),
+      ).toBeTruthy();
     },
   );
 });
@@ -151,9 +230,42 @@ describe("validateStep — autoReview (intervals)", () => {
   });
 });
 
-describe("validateStep — source/done are confirm-only", () => {
-  it.each(["source", "done"] as StepId[])("accepts %s", (step) => {
-    expect(validateStep(step, validProject())).toBeNull();
+describe("validateStep — done is confirm-only", () => {
+  it("accepts done", () => {
+    expect(validateStep("done", validProject())).toBeNull();
+  });
+});
+
+describe("validateStep — source (818 F2)", () => {
+  it("accepts a github source (no azure fields needed)", () => {
+    // validProject() is a github source with empty azure fields — must pass.
+    expect(validateStep("source", validProject())).toBeNull();
+  });
+  it("accepts an azure source with both org + project filled", () => {
+    expect(
+      validateStep("source", {
+        ...validProject(),
+        sourceKind: "azure",
+        azureOrg: "shengming0923",
+        azureProject: "gocell",
+      }),
+    ).toBeNull();
+  });
+  it.each([
+    { azureOrg: "", azureProject: "gocell" },
+    { azureOrg: "  ", azureProject: "gocell" },
+    { azureOrg: "shengming0923", azureProject: "" },
+    { azureOrg: "shengming0923", azureProject: "   " },
+    { azureOrg: "", azureProject: "" },
+  ])("rejects an azure source with a blank azure field %o", (patch) => {
+    const err = validateStep("source", {
+      ...validProject(),
+      sourceKind: "azure",
+      ...patch,
+    });
+    expect(err).toBeTruthy();
+    // Error must start with the offending field token so errorToStep can route it.
+    expect(err!.startsWith("azureOrg") || err!.startsWith("azureProject")).toBe(true);
   });
 });
 
@@ -167,6 +279,40 @@ describe("STEPS ordering", () => {
       "autoReview",
       "done",
     ]);
+  });
+});
+
+describe("STEP_FIELDS — onboarding wizard step → field wiring (818 F2/F3)", () => {
+  it("the source step owns sourceKind + the azure fields (818 F2)", () => {
+    expect(STEP_FIELDS.source).toContain("sourceKind");
+    expect(STEP_FIELDS.source).toContain("azureOrg");
+    expect(STEP_FIELDS.source).toContain("azureProject");
+  });
+
+  it("the autoReview step surfaces updateMode (818 F3)", () => {
+    expect(STEP_FIELDS.autoReview).toContain("updateMode");
+  });
+
+  it("every STEP_FIELDS key is a real PROJECT_GROUPS field", () => {
+    const grouped = new Set(PROJECT_GROUPS.flatMap((g) => g.fields).map((f) => f.key));
+    for (const keys of Object.values(STEP_FIELDS)) {
+      for (const k of keys) expect(grouped.has(k)).toBe(true);
+    }
+  });
+});
+
+describe("visibleStepFields — conditional fields per step (818 F2)", () => {
+  it("hides the azure fields on the source step for a github source", () => {
+    const keys = visibleStepFields("source", validProject()).map((f) => f.key);
+    expect(keys).toContain("sourceKind");
+    expect(keys).not.toContain("azureOrg");
+    expect(keys).not.toContain("azureProject");
+  });
+
+  it("shows the azure fields on the source step for an azure source", () => {
+    const draft = { ...validProject(), sourceKind: "azure" as const };
+    const keys = visibleStepFields("source", draft).map((f) => f.key);
+    expect(keys).toEqual(["sourceKind", "azureOrg", "azureProject"]);
   });
 });
 
@@ -221,5 +367,12 @@ describe("errorToStep — routes backend AppError messages", () => {
     expect(
       errorToStep("webhookTunnelCommand 不能为空（command 模式需填隧道命令，可用 {port} 占位）"),
     ).toBeNull();
+  });
+  // Azure fields (818 F2): the wizard `source` step NOW owns azureOrg/azureProject (it
+  // renders + validates them for an azure source), so a backend rejection routes back to
+  // the source step — not null. Both tokens map to "source".
+  it("azure messages → source step (818 F2, owned by the source step)", () => {
+    expect(errorToStep("azureOrg 不能为空（azure 源需填组织名）")).toBe("source");
+    expect(errorToStep("azureProject 不能为空（azure 源需填项目名）")).toBe("source");
   });
 });
