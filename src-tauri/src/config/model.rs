@@ -212,6 +212,23 @@ pub fn validate_project(project: &Project) -> AppResult<()> {
             if project.azure_org.trim().is_empty() {
                 return Err(AppError::new("azureOrg 不能为空（Azure 源必填）"));
             }
+            // `azure_org` ALONE is interpolated into the discovery URL
+            // (`https://dev.azure.com/{org}`), so it must be URL-safe (#818 F2): reject
+            // whitespace, path/query/userinfo delimiters (`/ # ? @`), and control chars —
+            // any would split the URL or smuggle a different host/path. Azure org names are
+            // restricted to URL-safe characters anyway, so this rejects nothing legitimate.
+            // `azure_project` / `repo` are NOT char-checked: they go as separate argv (no
+            // URL/shell parsing) and Azure project/repo names may contain spaces / unicode.
+            if project
+                .azure_org
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '#' | '?' | '@'))
+            {
+                return Err(AppError::new(format!(
+                    "azureOrg 含非法字符（不能有空白、控制字符或 / # ? @）: {}",
+                    project.azure_org
+                )));
+            }
             if project.azure_project.trim().is_empty() {
                 return Err(AppError::new("azureProject 不能为空（Azure 源必填）"));
             }
@@ -876,6 +893,39 @@ mod tests {
         .unwrap_err()
         .message;
         assert!(repo_err.starts_with("repo"), "{repo_err}");
+    }
+
+    #[test]
+    fn validate_azure_org_rejects_url_unsafe_chars() {
+        // #818 F2: azure_org is interpolated into the discovery URL, so URL-unsafe chars
+        // (whitespace, control, `/ # ? @`) are rejected — a `/` could smuggle a path. The
+        // message keeps the `azureOrg` routing prefix.
+        let azure_base = Project {
+            source_kind: SourceKind::Azure,
+            repo: "myrepo".to_string(),
+            azure_org: "myorg".to_string(),
+            azure_project: "myproject".to_string(),
+            ..valid_project()
+        };
+        for bad in ["my/org", "my org", "my#org", "my?org", "my@org", "my\torg"] {
+            let err = validate_project(&Project {
+                azure_org: bad.to_string(),
+                ..azure_base.clone()
+            })
+            .unwrap_err()
+            .message;
+            assert!(
+                err.starts_with("azureOrg"),
+                "org {bad:?} rejected with azureOrg prefix, got {err}"
+            );
+        }
+        // azure_project / repo may contain spaces (separate argv, no URL parsing) → accepted.
+        assert!(validate_project(&Project {
+            azure_project: "my project".to_string(),
+            repo: "my repo".to_string(),
+            ..azure_base
+        })
+        .is_ok());
     }
 
     #[test]

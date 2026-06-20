@@ -27,6 +27,33 @@ use super::source::PrSource;
 /// timed-out (or cancelled) future kills the child — mirrors `gh.rs`'s `GH_TIMEOUT`.
 const AZ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Max `az` stdout we will parse (#818 F9). A hostile / misconfigured `az` could emit an
+/// enormous body; cap it before `serde_json::from_str` so memory is bounded — past this
+/// we error instead of parsing. 10 MiB is far above any realistic active-PR JSON.
+const AZ_MAX_STDOUT_BYTES: usize = 10 * 1024 * 1024;
+
+/// Max `az` stderr chars surfaced in a non-zero-exit error (#818 F1). `az`'s user-facing
+/// error is at the END of stderr; the early lines are MSAL/ADAL auth debug where a token
+/// could appear. Surfacing only the tail bounds the message AND avoids leaking early
+/// auth-debug noise. The error keeps the `"az repos pr list 失败:"` prefix.
+const AZ_STDERR_TAIL_CHARS: usize = 512;
+
+/// The trailing `AZ_STDERR_TAIL_CHARS` chars of `stderr` (the user-facing tail), prefixed
+/// with `…` when truncated. Counts CHARS (not bytes) so the slice never splits a UTF-8
+/// boundary. Pure so the truncation is unit-tested.
+fn stderr_tail(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    let char_count = trimmed.chars().count();
+    if char_count <= AZ_STDERR_TAIL_CHARS {
+        return trimmed.to_string();
+    }
+    let tail: String = trimmed
+        .chars()
+        .skip(char_count - AZ_STDERR_TAIL_CHARS)
+        .collect();
+    format!("…{tail}")
+}
+
 /// `az repos pr list --createdBy` shape (`{ "uniqueName": "...", "displayName": "..." }`).
 /// `uniqueName` is the account email/upn; `displayName` is the human name fallback.
 #[derive(Debug, Deserialize)]
@@ -203,11 +230,25 @@ pub fn parse_rows(
     Ok(rows)
 }
 
-/// Gating-only view over [`parse_rows`]: the [`Candidate`]s, EXCLUDING conflict rows
-/// (mirrors gh.rs `PrSource::discover`, which filters `conflict` before dispatch). The
-/// trait [`PrSource::discover`] reuses this; the url args don't affect the candidate
-/// shape, so callers that only want candidates pass the project's org/project/repo.
-pub fn parse_pr_list(
+/// The gating projection of discovered rows (#818 F10): the [`Candidate`]s, EXCLUDING
+/// conflict rows (mirrors gh.rs `PrSource::discover`, which filters `conflict` before
+/// dispatch). The SINGLE canonical "rows → dispatch candidates" step shared by both the
+/// trait [`PrSource::discover`] (over live `discover_rows`) and [`parse_pr_list`] (over a
+/// parsed JSON string), so the conflict-drop logic lives in exactly one place.
+fn rows_into_candidates(rows: Vec<AzRow>) -> Vec<Candidate> {
+    rows.into_iter()
+        .filter(|row| !row.conflict)
+        .map(|row| row.candidate)
+        .collect()
+}
+
+/// Gating-only view over [`parse_rows`]: the [`Candidate`]s, EXCLUDING conflict rows (via
+/// [`rows_into_candidates`]). The url args don't affect the candidate shape, so callers
+/// that only want candidates pass the project's org/project/repo. `#[cfg(test)]`: the live
+/// path goes through `discover_rows` → trait `discover` → [`rows_into_candidates`], so this
+/// string-input convenience exists ONLY to exercise the gating projection in unit tests.
+#[cfg(test)]
+fn parse_pr_list(
     json: &str,
     org: &str,
     project: &str,
@@ -215,13 +256,14 @@ pub fn parse_pr_list(
     review_label: &str,
     check_label: &str,
 ) -> AppResult<Vec<Candidate>> {
-    Ok(
-        parse_rows(json, org, project, repo, review_label, check_label)?
-            .into_iter()
-            .filter(|row| !row.conflict)
-            .map(|row| row.candidate)
-            .collect(),
-    )
+    Ok(rows_into_candidates(parse_rows(
+        json,
+        org,
+        project,
+        repo,
+        review_label,
+        check_label,
+    )?))
 }
 
 /// The Azure DevOps PR source backed by the `az` CLI (#818).
@@ -288,11 +330,18 @@ impl AzureDevOpsCli {
         };
 
         if !output.status.success() {
+            // Surface only the trailing tail of stderr (F1): bounds the message and avoids
+            // leaking early MSAL/ADAL auth-debug (where a token could appear).
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(AppError::new(format!(
                 "az repos pr list 失败: {}",
-                stderr.trim()
+                stderr_tail(&stderr)
             )));
+        }
+        // Cap stdout before parsing (F9): a hostile / huge response is rejected rather than
+        // deserialized, bounding memory. Check the raw byte length first (cheap, no alloc).
+        if output.stdout.len() > AZ_MAX_STDOUT_BYTES {
+            return Err(AppError::new("az repos pr list 输出过大"));
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
@@ -320,13 +369,7 @@ impl PrSource for AzureDevOpsCli {
     /// `discover`, which drops both-label PRs before dispatch). The list UI uses
     /// [`Self::discover_rows`] for the full display fields.
     async fn discover(&self) -> AppResult<Vec<Candidate>> {
-        Ok(self
-            .discover_rows()
-            .await?
-            .into_iter()
-            .filter(|row| !row.conflict)
-            .map(|row| row.candidate)
-            .collect())
+        Ok(rows_into_candidates(self.discover_rows().await?))
     }
 }
 
@@ -659,5 +702,47 @@ mod tests {
         );
         let r = rows(&json).expect("parses");
         assert_eq!(r[0].candidate.author, "Display Only");
+    }
+
+    // F1: a short stderr passes through trimmed; a long one is truncated to the trailing
+    // `AZ_STDERR_TAIL_CHARS` chars with a leading `…`, so the EARLIEST stderr (the MSAL/ADAL
+    // auth-debug where a token could appear) is dropped and the message length is bounded.
+    #[test]
+    fn stderr_tail_passes_short_and_truncates_long_to_the_end() {
+        // Short → trimmed, no ellipsis.
+        assert_eq!(stderr_tail("  ERROR: not found  "), "ERROR: not found");
+
+        // Long: a unique earliest marker, then enough filler to push it WELL past the tail
+        // window, then the user-facing error at the very end.
+        let earliest = "EARLIEST-SECRET-MARKER";
+        let filler = "x".repeat(AZ_STDERR_TAIL_CHARS * 2); // ≫ the tail window
+        let tail_msg = "ERROR: az repos pr list failed: repository not found";
+        let full = format!("{earliest}{filler}{tail_msg}");
+        let out = stderr_tail(&full);
+        assert!(
+            out.starts_with('…'),
+            "truncated output is ellipsis-prefixed: {out}"
+        );
+        assert!(
+            out.ends_with(tail_msg),
+            "the user-facing tail is preserved: {out}"
+        );
+        // The earliest stderr (where a token would be) is beyond the window → dropped.
+        assert!(
+            !out.contains(earliest),
+            "the earliest auth-debug is dropped: {out}"
+        );
+        // Bounded: ellipsis + exactly AZ_STDERR_TAIL_CHARS tail chars.
+        assert_eq!(out.chars().count(), AZ_STDERR_TAIL_CHARS + 1);
+    }
+
+    // F1: char-counting (not byte) so a multibyte tail never splits a UTF-8 boundary
+    // (the truncation `.chars().skip(..)` would panic on a byte slice mid-codepoint).
+    #[test]
+    fn stderr_tail_is_utf8_safe_on_multibyte() {
+        let long = "中".repeat(AZ_STDERR_TAIL_CHARS + 50); // each char is 3 bytes
+        let out = stderr_tail(&long);
+        assert!(out.starts_with('…'));
+        assert_eq!(out.chars().count(), AZ_STDERR_TAIL_CHARS + 1);
     }
 }

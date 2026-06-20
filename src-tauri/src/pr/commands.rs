@@ -156,6 +156,16 @@ pub(crate) async fn discover<R: tauri::Runtime>(
             (views, dispatchable)
         }
         SourceKind::Azure => {
+            // Defense-in-depth (#818 F2): the reschedule/reconcile path reaches here via the
+            // NON-validated `config_service::load`, so a hand-edited / partially-migrated
+            // Azure project could carry empty org/project. Guard before building the URL —
+            // `az` would otherwise emit a confusing CLI error. (`validate_project` is the
+            // primary gate on the save path; this is the belt-and-braces backstop.)
+            if azure_org.trim().is_empty() || azure_project.trim().is_empty() {
+                return Err(crate::error::AppError::new(
+                    "Azure 源未配置 azureOrg / azureProject（请在设置中补全）",
+                ));
+            }
             let source = AzureDevOpsCli::new(
                 azure_org,
                 azure_project,
@@ -244,44 +254,77 @@ pub async fn stop_polling(state: tauri::State<'_, crate::state::AppState>) -> Ap
     Ok(())
 }
 
-/// Triggers an immediate discovery cycle for `project_id` ("立即拉取", #35, #818).
+/// The `poll_now` decision (#818 F6): what an immediate-pull request should DO, computed
+/// purely from `(loop_running, update_mode)` so every branch is unit-tested without a
+/// Tauri handle. [`poll_now`] is the thin IO shell that realizes the chosen action.
+#[derive(Debug, PartialEq, Eq)]
+enum PollNowAction {
+    /// A running loop (pull-only / hybrid) → wake it; its cycle emits `prs:updated`.
+    Wake,
+    /// No loop, manual mode → run ONE one-shot CLI discovery (manual's only pull path).
+    OneShot,
+    /// No loop, webhook-only → reject: there is no CLI source to pull from in this mode.
+    RejectWebhookOnly,
+    /// No loop, pull-only / hybrid → the loop is paused (e.g. after `stop_polling`);
+    /// reject so the frontend prompts to resume.
+    RejectPaused,
+}
+
+/// PURE `poll_now` decision over `(loop_running, mode)` (#818 F6). EXHAUSTIVE match on
+/// [`UpdateMode`] (no wildcard) so a new mode must be classified here. A running loop
+/// always [`Wake`](PollNowAction::Wake)s regardless of mode (it only runs for pull-only /
+/// hybrid anyway); with no loop the mode decides: `Manual` → one-shot, `WebhookOnly` →
+/// reject (no source), `PullOnly`/`Hybrid` → paused.
+fn poll_now_action(loop_running: bool, mode: UpdateMode) -> PollNowAction {
+    if loop_running {
+        return PollNowAction::Wake;
+    }
+    match mode {
+        UpdateMode::Manual => PollNowAction::OneShot,
+        UpdateMode::WebhookOnly => PollNowAction::RejectWebhookOnly,
+        UpdateMode::PullOnly | UpdateMode::Hybrid => PollNowAction::RejectPaused,
+    }
+}
+
+/// Triggers an immediate discovery cycle for `project_id` ("立即拉取", #35, #818). Thin IO
+/// shell over the pure [`poll_now_action`]: it realizes the chosen [`PollNowAction`].
 ///
-/// A project with a running poll loop (pull-only / hybrid) is simply `wake`d — the
-/// existing behavior. When no loop is running, the action depends on that project's
-/// [`UpdateMode`] (EXHAUSTIVE match, no wildcard, so a new mode must be classified):
-/// - `Manual` → run ONE one-shot discovery directly ([`SchedulerSet::discover_once`]):
-///   manual mode has no periodic loop, so the only way it refreshes is this explicit pull
-///   (or an inbound webhook). It discovers / persists / emits / dispatches like a cycle.
-/// - `WebhookOnly` → reject: there is no CLI source to pull from in webhook-only mode, so
-///   a manual pull is meaningless (the list updates only on inbound webhooks).
-/// - `PullOnly` / `Hybrid` with no running loop → the loop is paused (e.g. after
-///   `stop_polling`); error so the frontend prompts to resume, matching the pre-#818
-///   "轮询已暂停" defense (a no-op `wake` would leave the UI awaiting a `prs:updated`).
+/// `wake` both probes AND wakes atomically — when it returns `true` a running loop was
+/// woken (the `Wake` action; its cycle emits `prs:updated`). Only when no loop is running
+/// do we read the project's [`UpdateMode`] and dispatch the no-loop branch:
+/// - `Manual` → one-shot discovery ([`SchedulerSet::discover_once`]): manual has no
+///   periodic loop, so this explicit pull (or an inbound webhook) is its only refresh.
+/// - `WebhookOnly` → reject (no CLI source to pull from; the list updates on webhooks).
+/// - `PullOnly` / `Hybrid` → the loop is paused; reject so the frontend prompts to resume.
 #[tauri::command]
 pub async fn poll_now<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, crate::state::AppState>,
     project_id: &str,
 ) -> AppResult<()> {
-    // A running loop (pull-only / hybrid) → wake it; the cycle emits `prs:updated`.
+    // `wake` is atomic probe-and-wake. On success the loop is running → `Wake` realized.
     if state.scheduler.wake(project_id) {
         return Ok(());
     }
-    // No running loop: branch on the project's update mode.
-    let project = config_service::project(&app, project_id)?;
-    match project.update_mode {
-        UpdateMode::Manual => {
+    // No running loop: read the mode and realize the no-loop action. The wake-check above
+    // and this config read are NOT one atomic step, but the window is a KNOWN ACCEPTABLE
+    // one (#818 F12): during a mode switch this could at most mis-respond ONCE (e.g. report
+    // "paused" for a loop that just started, or skip a wake for one that just stopped) — a
+    // user retry succeeds. It is not a correctness bug, so no lock spans the two reads.
+    let mode = config_service::project(&app, project_id)?.update_mode;
+    match poll_now_action(false, mode) {
+        // `false` here: we only reach this after `wake` returned false (no running loop).
+        PollNowAction::Wake => Ok(()), // unreachable with loop_running=false, but total.
+        PollNowAction::OneShot => {
             // One-shot CLI discovery (manual has no periodic loop). Drives the same
             // per-cycle body the loop would, so it discovers / persists / emits / dispatches.
             state.scheduler.discover_once(&app, project_id).await;
             Ok(())
         }
-        UpdateMode::WebhookOnly => Err(crate::error::AppError::new(
+        PollNowAction::RejectWebhookOnly => Err(crate::error::AppError::new(
             "webhook-only 模式不支持手动拉取",
         )),
-        UpdateMode::PullOnly | UpdateMode::Hybrid => {
-            Err(crate::error::AppError::new("轮询已暂停，请先恢复轮询"))
-        }
+        PollNowAction::RejectPaused => Err(crate::error::AppError::new("轮询已暂停，请先恢复轮询")),
     }
 }
 
@@ -991,6 +1034,40 @@ mod tests {
         );
         assert_eq!(view.skip_reason, Some("draft PR".to_string()));
         assert!(disp.is_none(), "a gated row is not dispatchable");
+    }
+
+    // #818 F6: the pure `poll_now_action` decision table — every (loop_running, mode) cell.
+    #[test]
+    fn poll_now_action_running_loop_always_wakes() {
+        // A running loop wakes regardless of mode (it only runs for pull-only/hybrid anyway).
+        for mode in [
+            UpdateMode::PullOnly,
+            UpdateMode::Hybrid,
+            UpdateMode::Manual,
+            UpdateMode::WebhookOnly,
+        ] {
+            assert_eq!(poll_now_action(true, mode), PollNowAction::Wake);
+        }
+    }
+
+    #[test]
+    fn poll_now_action_no_loop_branches_by_mode() {
+        assert_eq!(
+            poll_now_action(false, UpdateMode::Manual),
+            PollNowAction::OneShot
+        );
+        assert_eq!(
+            poll_now_action(false, UpdateMode::WebhookOnly),
+            PollNowAction::RejectWebhookOnly
+        );
+        assert_eq!(
+            poll_now_action(false, UpdateMode::PullOnly),
+            PollNowAction::RejectPaused
+        );
+        assert_eq!(
+            poll_now_action(false, UpdateMode::Hybrid),
+            PollNowAction::RejectPaused
+        );
     }
 
     #[test]

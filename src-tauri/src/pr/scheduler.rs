@@ -314,10 +314,21 @@ impl Scheduler {
 /// ONLY for a project that opted into periodic polling — an `enabled` project whose
 /// [`UpdateMode`] is `PullOnly` or `Hybrid`. A `WebhookOnly` (default) or `Manual`
 /// project, or a disabled one, gets NO loop, so no unsolicited `gh` / `az` poll fires at
-/// startup. Exhaustive `matches!` over the polling modes so a new [`UpdateMode`] variant
-/// has to be classified here. Locked by `periodic_polling_only_for_enabled_pull_or_hybrid`.
+/// startup.
+///
+/// **Hard carrier** (#818 F5): the mode classification is a wildcard-free exhaustive
+/// `match` (every [`UpdateMode`] variant named explicitly), so adding a variant fails to
+/// compile here until it is classified as polling-or-not — the "new mode silently never
+/// polls" bug a `matches!`/`_` would allow is UNEXPRESSIBLE. Locked additionally by
+/// `periodic_polling_only_for_enabled_pull_or_hybrid`.
 fn periodic_polling(p: &Project) -> bool {
-    p.enabled && matches!(p.update_mode, UpdateMode::PullOnly | UpdateMode::Hybrid)
+    if !p.enabled {
+        return false;
+    }
+    match p.update_mode {
+        UpdateMode::PullOnly | UpdateMode::Hybrid => true,
+        UpdateMode::WebhookOnly | UpdateMode::Manual => false,
+    }
 }
 
 /// The composition-root handle for ALL projects' poll loops (#35). Lives in
@@ -371,7 +382,12 @@ impl SchedulerSet {
             .map(|p| p.id.as_str())
             .collect();
 
-        // Stop + drop schedulers whose project is no longer poll-eligible.
+        // Stop + drop schedulers whose project is no longer poll-eligible. `retain`
+        // dropping the entry releases this set's only `Arc<Scheduler>` for it, so the old
+        // loop is torn down; the create branch below builds a FRESH, independent
+        // `Arc<Scheduler>` for any re-eligible id — there is no shared handle and no
+        // double-start across a reconcile (a stopped scheduler is never restarted, a new
+        // one is a distinct Arc).
         map.retain(|id, scheduler| {
             if poll_ids.contains(id.as_str()) {
                 true
