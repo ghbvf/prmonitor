@@ -9,7 +9,7 @@
 // `keyof AppConfig`). `FieldGroup`/`FieldDef` are generic over the key type so each
 // set is precisely typed and its coverage test can assert exactly that key set.
 import { WEBHOOK_TUNNEL_MODES, type AppConfig, type Project } from "./types";
-import { UPDATE_MODES, assertNever, type UpdateMode } from "../types";
+import { SOURCE_KINDS, UPDATE_MODES, assertNever, type UpdateMode } from "../types";
 
 // A project field's key (per-project form/wizard) or a global AppConfig field's key
 // (the webhook group). Generic `FieldDef<K>` keeps each group set precisely typed.
@@ -153,7 +153,9 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         key: "sourceKind",
         label: "PR 来源",
         kind: "select",
-        options: ["github", "azure"],
+        // Single-sourced from SOURCE_KINDS (818, F11) — type & options can't drift;
+        // Chinese display via optionLabels (ConfigField emits the raw wire value).
+        options: SOURCE_KINDS,
         optionLabels: { github: "GitHub (gh)", azure: "Azure DevOps (az)" },
         hint: "github=gh CLI；azure=az CLI（需填下方 org/project）",
       },
@@ -255,6 +257,15 @@ const WIN_ABS_RE = /^[A-Za-z]:[\\/]/;
 export function validateStep(step: StepId, draft: Project): string | null {
   switch (step) {
     case "repo":
+      // Repo shape depends on the source (818, F4): a github repo is `owner/name`; an
+      // Azure repo is a BARE name (org/project come from the dedicated azureOrg/
+      // azureProject fields), so a slash there is wrong. Mirrors the backend validate().
+      if (draft.sourceKind === "azure") {
+        if (draft.repo.trim() === "") return "请填写 Azure 仓库名";
+        return draft.repo.includes("/")
+          ? "Azure 仓库为裸名称，不含 /（org/project 在下方单独填写）"
+          : null;
+      }
       return REPO_RE.test(draft.repo) ? null : "仓库需为 owner/name 格式";
     case "repoRoot":
       return draft.repoRoot.trim() !== "" ? null : "请填写本地 clone 的绝对路径";
@@ -317,6 +328,14 @@ export function validateStep(step: StepId, draft: Project): string | null {
 // therefore fall through to `null` (→ done) by design; SettingsView surfaces those
 // backend errors directly without `errorToStep`. Locked by an explicit
 // "webhook messages → null" case in fields.test.ts so this stays intentional, not a gap.
+//
+// Azure fields (`azureOrg` / `azureProject`, 818 F3) are likewise Settings-only: the
+// wizard's `source` step renders ONLY `sourceKind` (OnboardingWizard's STEP_FIELDS.source
+// = ["sourceKind"]) and validates nothing — azureOrg/azureProject live solely in the
+// Settings "engine" group, no STEPS entry owns them. So their backend `validate()`
+// messages (which start with the `azureOrg` / `azureProject` token) intentionally fall
+// through to `null` (→ done); SettingsView surfaces them directly. Locked by an explicit
+// "azure messages → null" case in fields.test.ts so the funnel stays closed, not a gap.
 export function errorToStep(message: string): StepId | null {
   const m = message.trimStart();
   if (m.startsWith("skill")) return "skill";

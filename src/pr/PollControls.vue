@@ -6,20 +6,28 @@
 import { computed, onMounted, onUnmounted } from "vue";
 import { usePrStore } from "./usePrStore";
 import { useProjects } from "../projects";
-import { pollingEnabledForMode } from "../types";
+import { manualPullAllowedForMode, pollingEnabledForMode } from "../types";
 
 const store = usePrStore();
 const { activeProjectId, projects } = useProjects();
 
-// Whether the active project's data-update mode runs the CLI poll loop (818). The poll
-// controls (立即拉取 / 暂停轮询) only make sense when polling is enabled; webhook-only /
-// manual projects are push-driven / on-demand, so the controls are disabled there.
-// `pollingEnabledForMode` is exhaustive over UpdateMode (assertNever), so a new mode
-// can't silently slip past this gate. Defaults to false when the project isn't found.
-const pollControlsEnabled = computed(() => {
-  const p = projects.value.find((x) => x.id === activeProjectId.value);
-  return p ? pollingEnabledForMode(p.updateMode) : false;
-});
+// The active project's update mode (818), or null when no project is resolved.
+const activeMode = computed(
+  () => projects.value.find((x) => x.id === activeProjectId.value)?.updateMode ?? null,
+);
+
+// Two DISTINCT capability gates (818, F7):
+// - manualPullEnabled gates "立即拉取" (one-shot poll-now): allowed for everything except
+//   webhook-only — manual mode runs a backend one-shot `discover_once` on demand.
+// - periodicPollEnabled gates "暂停/恢复轮询" (the periodic loop): only pull-only / hybrid.
+// Both helpers are exhaustive over UpdateMode (assertNever), so a new mode can't slip
+// past either gate. Default to false when no project is resolved.
+const manualPullEnabled = computed(() =>
+  activeMode.value ? manualPullAllowedForMode(activeMode.value) : false,
+);
+const periodicPollEnabled = computed(() =>
+  activeMode.value ? pollingEnabledForMode(activeMode.value) : false,
+);
 
 // Backstop poll-status refresh cadence: a fully-idle/failing loop emits no events, so
 // re-query the heartbeat/error line on this interval while mounted.
@@ -105,23 +113,32 @@ onUnmounted(() => {
 <template>
   <section class="poll-controls">
     <div class="actions">
+      <!-- 立即拉取: one-shot poll-now — allowed for all modes except webhook-only (manual
+           runs a backend one-shot discover_once). Gated on manualPullEnabled, NOT the
+           periodic gate. The pollingActive guard only applies once periodic polling is
+           on (manual has no running loop to pause), so don't block manual on it. -->
       <button
         type="button"
-        :disabled="!pollControlsEnabled || store.loadingActive || !store.pollingActive"
+        :disabled="
+          !manualPullEnabled ||
+          store.loadingActive ||
+          (periodicPollEnabled && !store.pollingActive)
+        "
         @click="store.pollNow(activeProjectId)"
       >
         {{ store.loadingActive ? "拉取中…" : "立即拉取" }}
       </button>
+      <!-- 暂停/恢复轮询: periodic loop control — only pull-only / hybrid have a loop. -->
       <button
         type="button"
-        :disabled="!pollControlsEnabled || store.loadingActive"
+        :disabled="!periodicPollEnabled || store.loadingActive"
         @click="store.toggle()"
       >
         {{ store.pollingActive ? "暂停轮询" : "恢复轮询" }}
       </button>
     </div>
-    <p v-if="!pollControlsEnabled" class="muted">
-      当前项目为 Webhook（默认）/ 手动模式，未启用 CLI 轮询。
+    <p v-if="!periodicPollEnabled" class="muted">
+      当前项目未启用 CLI 定时轮询（仅 pull/hybrid 模式有定时拉取）。
     </p>
     <p class="muted">上次拉取：{{ lastPulledText }}</p>
     <div v-if="poll" class="poll-status">

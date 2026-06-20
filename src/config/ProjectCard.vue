@@ -10,8 +10,9 @@
 // per `draft.projects[i]`, and each instance carries its own comma-joined string,
 // normalized back to string[] on every edit (mirrors SettingsView's old single
 // authors round-trip, now per-card).
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import type { Project } from "./types";
+import { pollingEnabledForMode } from "../types";
 import { PROJECT_GROUPS, type FieldDef, type ProjectFieldKey } from "./fields";
 import ConfigField from "./ConfigField.vue";
 
@@ -23,6 +24,12 @@ const emit = defineEmits<{
   delete: [];
   edit: [];
 }>();
+
+// Risk banner gate (818, F8): the CLI-polling risk warning applies only to the modes
+// that actually run the periodic poll loop (pull-only / hybrid) — exactly
+// `pollingEnabledForMode`. webhook-only AND manual don't run the loop, so neither
+// should show it (manual only does on-demand one-shot pulls, not periodic polling).
+const showRiskBanner = computed(() => pollingEnabledForMode(props.project.updateMode));
 
 // This card's own comma-joined authors buffer. Seeded from the project's authors and
 // re-seeded whenever the bound project identity changes (e.g. the list reorders or a
@@ -87,9 +94,10 @@ function onName(e: Event) {
       <button type="button" class="delete" @click="emit('delete')">删除</button>
     </header>
 
-    <!-- Risk banner (818): any mode other than webhook-only runs the CLI poll loop,
-         which can trip account/API rate-limit risk control. Warn before the user keeps it. -->
-    <p v-if="project.updateMode !== 'webhook-only'" class="risk-banner" role="alert">
+    <!-- Risk banner (818, F8): only pull-only / hybrid run the periodic CLI poll loop,
+         which can trip account/API rate-limit risk control. Warn for those two only —
+         manual (on-demand one-shot) and webhook-only don't poll periodically. -->
+    <p v-if="showRiskBanner" class="risk-banner" role="alert">
       ⚠️ CLI 轮询可能触发账号/API 风控，请谨慎开启
     </p>
 

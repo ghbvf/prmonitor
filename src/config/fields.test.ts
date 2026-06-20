@@ -7,7 +7,7 @@
 // keys) and GLOBAL_GROUPS (global webhook `AppConfig` keys).
 import { describe, expect, it } from "vitest";
 import type { AppConfig, Project } from "./types";
-import { UPDATE_MODES, pollingEnabledForMode } from "../types";
+import { UPDATE_MODES, pollingEnabledForMode, manualPullAllowedForMode } from "../types";
 import {
   PROJECT_GROUPS,
   GLOBAL_GROUPS,
@@ -107,6 +107,16 @@ describe("pollingEnabledForMode (818)", () => {
   });
 });
 
+describe("manualPullAllowedForMode (818 F7)", () => {
+  it("allows the one-shot pull for everything except webhook-only", () => {
+    // Distinct from pollingEnabledForMode: manual supports a backend one-shot pull.
+    expect(manualPullAllowedForMode("webhook-only")).toBe(false);
+    expect(manualPullAllowedForMode("pull-only")).toBe(true);
+    expect(manualPullAllowedForMode("hybrid")).toBe(true);
+    expect(manualPullAllowedForMode("manual")).toBe(true);
+  });
+});
+
 describe("GLOBAL_GROUPS", () => {
   it("covers all global (webhook) AppConfig keys exactly once across groups", () => {
     const keys = GLOBAL_GROUPS.flatMap((g) => g.fields.map((f) => f.key)).sort();
@@ -120,13 +130,28 @@ describe("GLOBAL_GROUPS", () => {
 });
 
 describe("validateStep — repo", () => {
-  it("accepts owner/name", () => {
+  it("accepts owner/name (github source)", () => {
     expect(validateStep("repo", validProject())).toBeNull();
   });
   it.each(["ghbvf", "a/b/c", "", "owner /name", "owner/"])(
-    "rejects %j",
+    "rejects %j (github source)",
     (repo) => {
       expect(validateStep("repo", { ...validProject(), repo })).toBeTruthy();
+    },
+  );
+  // Azure source (818 F4): repo is a BARE name (no slash); org/project come from the
+  // azureOrg/azureProject fields, so a slash here is wrong and a bare name is valid.
+  it("accepts a bare name for an azure source", () => {
+    expect(
+      validateStep("repo", { ...validProject(), sourceKind: "azure", repo: "gocell" }),
+    ).toBeNull();
+  });
+  it.each(["org/repo", "shengming0923/gocell", "", "  "])(
+    "rejects %j for an azure source (slash or empty)",
+    (repo) => {
+      expect(
+        validateStep("repo", { ...validProject(), sourceKind: "azure", repo }),
+      ).toBeTruthy();
     },
   );
 });
@@ -250,5 +275,13 @@ describe("errorToStep — routes backend AppError messages", () => {
     expect(
       errorToStep("webhookTunnelCommand 不能为空（command 模式需填隧道命令，可用 {port} 占位）"),
     ).toBeNull();
+  });
+  // Azure fields (818 F3) are Settings-only too: the wizard `source` step renders only
+  // `sourceKind`, so azureOrg/azureProject have no owning STEP. Their backend validate()
+  // messages intentionally fall through to null (→ done) — this case locks that the
+  // funnel is closed (intentional), not a routing gap.
+  it("azure messages → null (settings-only, not wizard-routed)", () => {
+    expect(errorToStep("azureOrg 不能为空（azure 源需填组织名）")).toBeNull();
+    expect(errorToStep("azureProject 不能为空（azure 源需填项目名）")).toBeNull();
   });
 });

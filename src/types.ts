@@ -33,8 +33,12 @@ export interface TrackedPrView extends PullRequestView {
 }
 
 // Discriminator unions mirroring the `SourceKind` / `EngineKind` Rust enums.
-// SourceKind widens to Azure DevOps (818); EngineKind single-arm, widening tracked by #11.
-export type SourceKind = "github" | "azure"; // 未来 #11: | "gitlab" | "bitbucket"
+// SourceKind widens to Azure DevOps (818), single-sourced as an `as const` array
+// (mirrors UPDATE_MODES / WEBHOOK_TUNNEL_MODES): the type is DERIVED from the array,
+// and fields.ts feeds the same array into the sourceKind select `options`, so the type
+// and the UI's option list can never drift. 未来 #11: add "gitlab" / "bitbucket" here.
+export const SOURCE_KINDS = ["github", "azure"] as const;
+export type SourceKind = (typeof SOURCE_KINDS)[number];
 export type EngineKind = "codex"; // 未来 #11: | "claude"
 
 // Per-project data-update mode (818) — mirrors the Rust `UpdateMode` enum's
@@ -68,6 +72,25 @@ export function pollingEnabledForMode(mode: UpdateMode): boolean {
       return true;
     case "manual":
       return false;
+    default:
+      return assertNever(mode);
+  }
+}
+
+// Whether a mode supports the manual one-shot "立即拉取" (poll-now) trigger (818, F7).
+// This is a DIFFERENT capability from the periodic poll loop (pollingEnabledForMode):
+// the backend `poll_now` Manual branch runs a one-shot `discover_once`, so manual mode
+// DOES support an on-demand pull — only webhook-only (purely push-driven) does not.
+// Mirrors the backend `poll_now` gate. Exhaustive over UpdateMode via the `assertNever`
+// default (Medium — `assertNever`穷尽), so a new mode forces a decision here.
+export function manualPullAllowedForMode(mode: UpdateMode): boolean {
+  switch (mode) {
+    case "webhook-only":
+      return false;
+    case "pull-only":
+    case "hybrid":
+    case "manual":
+      return true;
     default:
       return assertNever(mode);
   }
