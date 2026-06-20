@@ -6,9 +6,20 @@
 import { computed, onMounted, onUnmounted } from "vue";
 import { usePrStore } from "./usePrStore";
 import { useProjects } from "../projects";
+import { pollingEnabledForMode } from "../types";
 
 const store = usePrStore();
-const { activeProjectId } = useProjects();
+const { activeProjectId, projects } = useProjects();
+
+// Whether the active project's data-update mode runs the CLI poll loop (818). The poll
+// controls (立即拉取 / 暂停轮询) only make sense when polling is enabled; webhook-only /
+// manual projects are push-driven / on-demand, so the controls are disabled there.
+// `pollingEnabledForMode` is exhaustive over UpdateMode (assertNever), so a new mode
+// can't silently slip past this gate. Defaults to false when the project isn't found.
+const pollControlsEnabled = computed(() => {
+  const p = projects.value.find((x) => x.id === activeProjectId.value);
+  return p ? pollingEnabledForMode(p.updateMode) : false;
+});
 
 // Backstop poll-status refresh cadence: a fully-idle/failing loop emits no events, so
 // re-query the heartbeat/error line on this interval while mounted.
@@ -96,19 +107,22 @@ onUnmounted(() => {
     <div class="actions">
       <button
         type="button"
-        :disabled="store.loadingActive || !store.pollingActive"
+        :disabled="!pollControlsEnabled || store.loadingActive || !store.pollingActive"
         @click="store.pollNow(activeProjectId)"
       >
         {{ store.loadingActive ? "拉取中…" : "立即拉取" }}
       </button>
       <button
         type="button"
-        :disabled="store.loadingActive"
+        :disabled="!pollControlsEnabled || store.loadingActive"
         @click="store.toggle()"
       >
         {{ store.pollingActive ? "暂停轮询" : "恢复轮询" }}
       </button>
     </div>
+    <p v-if="!pollControlsEnabled" class="muted">
+      当前项目为 Webhook（默认）/ 手动模式，未启用 CLI 轮询。
+    </p>
     <p class="muted">上次拉取：{{ lastPulledText }}</p>
     <div v-if="poll" class="poll-status">
       <p class="muted status-line">

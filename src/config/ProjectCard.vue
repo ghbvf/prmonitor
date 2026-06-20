@@ -87,6 +87,12 @@ function onName(e: Event) {
       <button type="button" class="delete" @click="emit('delete')">删除</button>
     </header>
 
+    <!-- Risk banner (818): any mode other than webhook-only runs the CLI poll loop,
+         which can trip account/API rate-limit risk control. Warn before the user keeps it. -->
+    <p v-if="project.updateMode !== 'webhook-only'" class="risk-banner" role="alert">
+      ⚠️ CLI 轮询可能触发账号/API 风控，请谨慎开启
+    </p>
+
     <div v-for="g in PROJECT_GROUPS" :key="g.id" class="group">
       <h4 class="group-title">{{ g.title }}</h4>
       <ConfigField
@@ -155,6 +161,15 @@ function onName(e: Event) {
 }
 .delete:hover {
   background: var(--color-surface-hover);
+}
+.risk-banner {
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--font-size-sm);
+  color: var(--color-warn);
+  background: var(--color-warn-bg);
+  border: 1px solid var(--color-warn-border);
+  border-radius: var(--radius-sm);
 }
 .group {
   display: flex;

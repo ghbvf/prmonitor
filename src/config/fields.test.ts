@@ -7,6 +7,7 @@
 // keys) and GLOBAL_GROUPS (global webhook `AppConfig` keys).
 import { describe, expect, it } from "vitest";
 import type { AppConfig, Project } from "./types";
+import { UPDATE_MODES, pollingEnabledForMode } from "../types";
 import {
   PROJECT_GROUPS,
   GLOBAL_GROUPS,
@@ -30,7 +31,10 @@ function validProject(): Project {
     checkLabel: "pr-status/needs-check-fix",
     skillRelPath: ".codex/skills/pr-review/SKILL.md",
     prCooldownSeconds: 1800,
+    updateMode: "webhook-only",
     sourceKind: "github",
+    azureOrg: "",
+    azureProject: "",
     engineKind: "codex",
     autoReview: false,
   };
@@ -67,14 +71,39 @@ describe("PROJECT_GROUPS", () => {
     expect(f?.kind).toBe("checkbox");
   });
 
-  it("marks the engine group fields read-only (sourceKind/engineKind reserved #11)", () => {
+  it("engine group: sourceKind selectable (818), engineKind read-only (#11)", () => {
     const engine = PROJECT_GROUPS.find((g) => g.id === "engine");
     expect(engine).toBeDefined();
-    expect(engine!.fields.every((f) => f.readonly)).toBe(true);
-    expect(engine!.fields.map((f) => f.key).sort()).toEqual([
-      "engineKind",
-      "sourceKind",
-    ]);
+    const byKey = new Map(engine!.fields.map((f) => [f.key, f]));
+    // sourceKind is now an editable select offering github + azure (818).
+    const source = byKey.get("sourceKind");
+    expect(source?.kind).toBe("select");
+    expect(source?.readonly).toBeFalsy();
+    expect(source?.options).toEqual(["github", "azure"]);
+    // engineKind stays single-arm read-only (widening tracked by #11).
+    expect(byKey.get("engineKind")?.readonly).toBe(true);
+    // Azure org/project fields live in the engine group too (818).
+    expect(byKey.get("azureOrg")?.kind).toBe("text");
+    expect(byKey.get("azureProject")?.kind).toBe("text");
+  });
+
+  it("updateMode is a select single-sourced from UPDATE_MODES (818)", () => {
+    const f = PROJECT_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "updateMode");
+    expect(f?.kind).toBe("select");
+    expect(f?.options).toEqual(UPDATE_MODES);
+    // Every wire value has a display label (the Chinese mode names).
+    for (const m of UPDATE_MODES) {
+      expect(f?.optionLabels?.[m]).toBeTruthy();
+    }
+  });
+});
+
+describe("pollingEnabledForMode (818)", () => {
+  it("enables polling only for pull-only / hybrid", () => {
+    expect(pollingEnabledForMode("webhook-only")).toBe(false);
+    expect(pollingEnabledForMode("pull-only")).toBe(true);
+    expect(pollingEnabledForMode("hybrid")).toBe(true);
+    expect(pollingEnabledForMode("manual")).toBe(false);
   });
 });
 

@@ -24,7 +24,13 @@ export const NEW_PROJECT_DEFAULTS: Omit<Project, "id" | "name"> = {
   checkLabel: "pr-status/needs-check-fix",
   skillRelPath: ".codex/skills/pr-review/SKILL.md",
   prCooldownSeconds: 1800,
+  // Default webhook-only (818): push-driven, no CLI poll loop — avoids the account/API
+  // risk control that CLI polling can trigger. Source defaults to github with empty
+  // Azure fields (only used when sourceKind switches to "azure").
+  updateMode: "webhook-only",
   sourceKind: "github",
+  azureOrg: "",
+  azureProject: "",
   engineKind: "codex",
   autoReview: false,
 };

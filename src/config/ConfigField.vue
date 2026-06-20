@@ -105,7 +105,12 @@ function onCheckbox(e: Event) {
       :disabled="def.readonly"
       @change="onSelect"
     >
-      <option v-for="opt in def.options" :key="opt" :value="opt">{{ opt }}</option>
+      <!-- `opt` is the wire VALUE; the visible text is `optionLabels[opt]` when a label
+           map is provided (e.g. Chinese mode labels), else the raw value — so the
+           emitted value stays the camelCase wire contract regardless of display. -->
+      <option v-for="opt in def.options" :key="opt" :value="opt">
+        {{ def.optionLabels?.[opt] ?? opt }}
+      </option>
     </select>
 
     <input

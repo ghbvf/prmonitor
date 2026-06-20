@@ -9,6 +9,7 @@
 // `keyof AppConfig`). `FieldGroup`/`FieldDef` are generic over the key type so each
 // set is precisely typed and its coverage test can assert exactly that key set.
 import { WEBHOOK_TUNNEL_MODES, type AppConfig, type Project } from "./types";
+import { UPDATE_MODES, assertNever, type UpdateMode } from "../types";
 
 // A project field's key (per-project form/wizard) or a global AppConfig field's key
 // (the webhook group). Generic `FieldDef<K>` keeps each group set precisely typed.
@@ -22,8 +23,12 @@ export interface FieldDef<K extends FieldKey = FieldKey> {
   label: string;
   kind: FieldKind;
   hint?: string;
-  // Only meaningful for kind "select"; mirrors the SourceKind/EngineKind arms.
+  // Only meaningful for kind "select"; mirrors the SourceKind/EngineKind/UpdateMode arms.
+  // `options` carries the wire VALUES (single-sourced from the backing `as const` array
+  // so it can't drift from the type). `optionLabels` is an optional display map (wire
+  // value → human label); ConfigField falls back to the raw value when a label is absent.
   options?: readonly string[];
+  optionLabels?: Record<string, string>;
   // Reserved single-option enums (#11) are shown but not editable.
   readonly?: boolean;
   // text fields holding a credential (e.g. the webhook HMAC secret): rendered
@@ -37,6 +42,33 @@ interface FieldGroup<K extends FieldKey = FieldKey> {
   title: string;
   fields: FieldDef<K>[];
 }
+
+// Display labels for each UpdateMode (818). Exhaustive over `UpdateMode` via the
+// `assertNever` default (Medium穷尽 carrier, same as pollingEnabledForMode in
+// src/types.ts), so a new mode forces a label here. UPDATE_MODE_LABELS below derives
+// the select's display map from this, keeping the wire-value options single-sourced
+// while showing Chinese text.
+function updateModeLabel(mode: UpdateMode): string {
+  switch (mode) {
+    case "webhook-only":
+      return "Webhook（默认）";
+    case "pull-only":
+      return "仅 CLI 轮询";
+    case "hybrid":
+      return "混合";
+    case "manual":
+      return "手动拉取";
+    default:
+      return assertNever(mode);
+  }
+}
+
+// Wire value → display label map for the updateMode select, derived from the
+// single-sourced UPDATE_MODES array (no hand-copied list). ConfigField shows the label
+// but emits the raw wire value, so the camelCase contract stays intact.
+const UPDATE_MODE_LABELS: Record<UpdateMode, string> = Object.fromEntries(
+  UPDATE_MODES.map((m) => [m, updateModeLabel(m)]),
+) as Record<UpdateMode, string>;
 
 // Per-project field groups (#35). Every `Project` key appears exactly once across
 // these groups (asserted in fields.test.ts), so adding a project field forces a home
@@ -61,6 +93,16 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
     id: "polling",
     title: "轮询",
     fields: [
+      {
+        key: "updateMode",
+        label: "数据更新模式",
+        kind: "select",
+        // Single-sourced from UPDATE_MODES (818) — type & options can't drift; Chinese
+        // labels via the optionLabels map (ConfigField emits the raw wire value).
+        options: UPDATE_MODES,
+        optionLabels: UPDATE_MODE_LABELS,
+        hint: "默认 Webhook；选 pull/hybrid 才启动 CLI 定时拉取（可能触发账号风控）",
+      },
       {
         key: "autoReview",
         label: "自动 review",
@@ -105,15 +147,27 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
     id: "engine",
     title: "引擎",
     fields: [
-      // Single-arm enums today; widening tracked by #11 — kept read-only so the UI
-      // never offers an option the backend can't honor.
+      // PR 来源 now selectable (818): github (gh) or Azure DevOps (az). engineKind stays
+      // single-arm read-only (widening tracked by #11).
       {
         key: "sourceKind",
         label: "PR 来源",
         kind: "select",
-        options: ["github"],
-        readonly: true,
-        hint: "暂仅支持 github（#11）",
+        options: ["github", "azure"],
+        optionLabels: { github: "GitHub (gh)", azure: "Azure DevOps (az)" },
+        hint: "github=gh CLI；azure=az CLI（需填下方 org/project）",
+      },
+      {
+        key: "azureOrg",
+        label: "Azure 组织",
+        kind: "text",
+        hint: "(仅 Azure 源) Azure DevOps 组织名，如 shengming0923",
+      },
+      {
+        key: "azureProject",
+        label: "Azure 项目",
+        kind: "text",
+        hint: "(仅 Azure 源) Azure DevOps 项目名，如 gocell",
       },
       {
         key: "engineKind",

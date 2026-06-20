@@ -1,5 +1,5 @@
 // Config slice types. AppConfig is slice-private (mirrors src-tauri/src/config/model.rs).
-import type { SourceKind, EngineKind } from "../types";
+import type { SourceKind, EngineKind, UpdateMode } from "../types";
 
 // Webhook receiver tunnel mode (#9), config slice-private — mirrors the Rust
 // `WebhookTunnelMode` enum's camelCase wire values. quick = App starts a Cloudflare
@@ -30,7 +30,14 @@ export interface Project {
   checkLabel: string;
   skillRelPath: string;
   prCooldownSeconds: number;
+  // Data-update mode (818): webhook-only (default, push-driven) / pull-only / hybrid
+  // (both run the CLI poll loop) / manual. Mirrors the Rust `Project.updateMode` wire field.
+  updateMode: UpdateMode;
   sourceKind: SourceKind;
+  // Azure DevOps org/project (818) — only meaningful when sourceKind === "azure";
+  // empty strings for a github source. Mirrors the Rust `Project.azureOrg`/`azureProject`.
+  azureOrg: string;
+  azureProject: string;
   engineKind: EngineKind;
   autoReview: boolean;
 }
