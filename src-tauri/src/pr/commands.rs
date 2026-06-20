@@ -639,6 +639,7 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
 ) {
     let WebhookEvent {
         project_id,
+        received_at,
         event,
         action,
         repo,
@@ -651,17 +652,21 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
 
     // Resolve config + ledger, failing closed on either error (see the fn doc). On a
     // failure we record a `Gated` delivery with the error and return without touching the
-    // list — fail-closed parity with the deleted `gate_dispatchable`.
+    // list — fail-closed parity with the deleted `gate_dispatchable`. `received_at` is the
+    // handler-stamped receipt time, so this terminal record shares the early-exit time base.
     let record_failclosed = |app: &tauri::AppHandle<R>, msg: String| {
         record_webhook_delivery(
             app,
-            &event,
-            &repo,
-            &action,
-            number,
-            None,
-            DeliveryStatus::Gated,
-            Some(msg),
+            WebhookDelivery {
+                received_at_epoch: received_at,
+                event: event.clone(),
+                action: action.clone(),
+                repo: Some(repo.clone()),
+                pr_number: Some(number),
+                kind: None,
+                status: DeliveryStatus::Gated,
+                message: Some(msg),
+            },
         );
     };
     let project = match config_service::project(app, &project_id) {
@@ -788,48 +793,31 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
     // it, it does not override it.
     record_webhook_delivery(
         app,
-        &event,
-        &repo,
-        &action,
-        number,
-        Some(view.kind),
-        final_status,
-        message,
+        WebhookDelivery {
+            received_at_epoch: received_at,
+            event,
+            action,
+            repo: Some(repo),
+            pr_number: Some(number),
+            kind: Some(view.kind),
+            status: final_status,
+            message,
+        },
     );
 }
 
-/// Record one webhook-delivery diagnostic into the manager's ring (#62) via `AppState`.
-/// Helper so `ingest_webhook`'s several record sites (fail-closed + terminal) stay one
-/// liners and never leak the secret/token into the diagnostic.
-// The args ARE the `WebhookDelivery` wire fields (minus `received_at_epoch`, stamped here):
-// this is a flat record-builder + the `AppState` lookup, so the count is intrinsic to the
-// type, not a design smell. Bundling them into a struct would just re-spell `WebhookDelivery`.
-#[allow(clippy::too_many_arguments)]
+/// Record one webhook-delivery diagnostic into the manager's ring (#62) via `AppState`. A thin
+/// AppState-lookup wrapper: callers build the [`WebhookDelivery`] (so `received_at_epoch` is the
+/// handler-stamped receipt time, consistent with the early-exit records, and the secret/token
+/// is never put in the record by construction).
 fn record_webhook_delivery<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    event: &str,
-    repo: &str,
-    action: &Option<String>,
-    number: u64,
-    kind: Option<String>,
-    status: DeliveryStatus,
-    message: Option<String>,
+    delivery: WebhookDelivery,
 ) {
     use tauri::Manager;
     app.state::<crate::state::AppState>()
         .webhook
-        .record_delivery(WebhookDelivery {
-            received_at_epoch: now_epoch(),
-            // The real wire event (AB#822): `"pull_request"` for GitHub, the Azure
-            // `eventType` for Azure — carried on the `WebhookEvent`, no longer hardcoded.
-            event: event.to_string(),
-            action: action.clone(),
-            repo: Some(repo.to_string()),
-            pr_number: Some(number),
-            kind,
-            status,
-            message,
-        });
+        .record_delivery(delivery);
 }
 
 /// Whether a project's [`UpdateMode`] accepts inbound webhook routes (#124 F1). The

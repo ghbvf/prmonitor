@@ -302,16 +302,18 @@ async function copyUrl() {
       </p>
       <p class="hint">
         <strong>Azure DevOps：</strong>Project Settings → Service Hooks → 新建 Web Hooks
-        订阅，事件选 Pull request created / updated，URL 填此地址；在 HTTP 头加
-        <code>Authorization: Bearer &lt;Webhook Secret&gt;</code>（与设置里相同的密钥，Azure 无
-        HMAC 签名，靠此请求头鉴权）。
+        订阅，URL 填此地址。Azure 每个订阅只能选一种事件，需<strong>分别建两个</strong>：一个选
+        Pull request created、一个选 Pull request updated。在订阅的「HTTP headers」里加一行：
+        名（Header）填 <code>Authorization</code>，值填 <code>Bearer &lt;Webhook Secret&gt;</code>
+        （与设置里相同的密钥；这是自定义 HTTP 头，不是 Basic authentication 区域。Azure 无 HMAC
+        签名，靠此请求头鉴权）。
       </p>
     </div>
 
     <div v-else-if="status?.running && !status.payloadUrl" class="url-box">
       <p v-if="mode === 'quick'" class="hint">公网 URL 尚未解析（cloudflared 可能仍在建立隧道）。</p>
       <p v-else class="hint">
-        请在设置中填写「公网 URL」(webhookPublicUrl) 并重启，以显示要粘进 GitHub 的 Payload URL。
+        请在设置中填写「公网 URL」(webhookPublicUrl) 并重启，以显示要粘进 GitHub Webhook / Azure Service Hook 的 Payload URL。
       </p>
       <button type="button" class="copy" :disabled="busy" @click="onRefresh">
         重新查询状态

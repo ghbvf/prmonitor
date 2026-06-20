@@ -190,6 +190,11 @@ pub enum ParseResult {
 pub struct WebhookEvent {
     /// The routing key (the matched [`ProjectRoute::id`]).
     pub project_id: String,
+    /// When the request was received (epoch secs), stamped by the handler so the routable
+    /// path's terminal delivery diagnostic uses the SAME receipt time as the early-exit
+    /// records (not the later record-time). The pure parsers leave this `0`; `handle_webhook`
+    /// overwrites it on the `Routable` arm before handing the event to the ingestor.
+    pub received_at: u64,
     /// The wire event type for the delivery diagnostic: `"pull_request"` for GitHub, the
     /// Azure `eventType` (e.g. `"git.pullrequest.updated"`) for Azure (AB#822). Carried on
     /// the event so the terminal delivery record (`commands::ingest_webhook`) shows the real
@@ -290,6 +295,12 @@ type TunnelParts = (
 /// root to form the GitHub "Payload URL". ONE source for both the route registration
 /// and the URL the UI tells the user to paste; they must match or every delivery 404s.
 const WEBHOOK_PATH: &str = "/webhook";
+
+/// The two Azure DevOps Service Hook `eventType`s this receiver acts on (AB#822): a PR being
+/// opened and any subsequent update (label add/remove, push, status change). Single-sourced
+/// here so the handler's gate and the `parse_azure_delivery` doc reference one spelling.
+const AZURE_PR_CREATED: &str = "git.pullrequest.created";
+const AZURE_PR_UPDATED: &str = "git.pullrequest.updated";
 
 /// webhook receiver + tunnel status reported to the frontend (pr-slice-private wire
 /// type; not a cross-slice contract, so it is mirrored in `src/pr/types.ts`, not
@@ -640,9 +651,9 @@ impl WebhookManager {
         });
         let router = Router::new()
             .route(WEBHOOK_PATH, post(handle_webhook))
-            // Cap the public endpoint's request body. GitHub webhook payloads are well
-            // under this (typically < 25 KiB); the limit bounds the memory a forged POST
-            // can make us buffer before the HMAC check rejects it.
+            // Cap the public endpoint's request body. GitHub webhook and Azure Service Hook
+            // PR payloads are well under this (typically < 25 KiB); the limit bounds the memory
+            // a forged POST can make us buffer before the auth check (HMAC / Bearer) rejects it.
             .layer(DefaultBodyLimit::max(1024 * 1024))
             .with_state(ctx);
         // Graceful-shutdown signal: on teardown we fire `shutdown_tx` and AWAIT
@@ -901,17 +912,32 @@ async fn handle_webhook(
     body: Bytes,
 ) -> StatusCode {
     let received_at = ledger::now_epoch();
-    // Provider detection: a present (non-empty) `X-GitHub-Event` → GitHub branch; else →
-    // Azure branch. A missing/non-UTF-8 header collapses to "" → Azure path (which then
-    // fail-closes on its own Bearer check if the request isn't a real Azure delivery).
-    let gh_event = headers
-        .get("x-github-event")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if gh_event.is_empty() {
-        handle_azure_delivery(&ctx, received_at, &headers, &body)
-    } else {
-        handle_github_delivery(&ctx, received_at, gh_event.to_string(), &headers, &body)
+    // Provider detection by the `X-GitHub-Event` header (GitHub sends it; an Azure Service
+    // Hook does not). A non-UTF-8 value on a PRESENT header is a corrupt GitHub delivery — it
+    // must NOT silently fall to the Azure branch (whose `Bearer` 401 would misdirect
+    // diagnosis), so it's recorded as `BadPayload`. A present-but-empty or absent header → the
+    // Azure branch (which fail-closes on its own Bearer check if it isn't a real Azure POST).
+    match headers.get("x-github-event").map(|v| v.to_str()) {
+        Some(Ok(event)) if !event.is_empty() => {
+            handle_github_delivery(&ctx, received_at, event.to_string(), &headers, &body)
+        }
+        Some(Err(_)) => {
+            record_into(
+                &ctx.deliveries,
+                WebhookDelivery {
+                    received_at_epoch: received_at,
+                    event: String::new(),
+                    action: None,
+                    repo: None,
+                    pr_number: None,
+                    kind: None,
+                    status: DeliveryStatus::BadPayload,
+                    message: Some("X-GitHub-Event 头不是合法 UTF-8".to_string()),
+                },
+            );
+            StatusCode::BAD_REQUEST
+        }
+        _ => handle_azure_delivery(&ctx, received_at, &headers, &body),
     }
 }
 
@@ -993,10 +1019,12 @@ fn handle_github_delivery(
         .map(str::to_string);
 
     match parse_delivery(&payload, &ctx.routes) {
-        ParseResult::Routable(ev) => {
-            // Detached: the ingestor future is `Send + 'static`; the upsert / emit /
-            // dispatch run independently of this response. `ingest_webhook` records the
-            // terminal delivery status itself (it owns the gate/dispatch decision).
+        ParseResult::Routable(mut ev) => {
+            // Stamp the receipt time so the terminal diagnostic matches the early-exit records
+            // (the pure parser leaves it 0). Detached: the ingestor future is `Send + 'static`;
+            // the upsert / emit / dispatch run independently of this response. `ingest_webhook`
+            // records the terminal delivery status itself (it owns the gate/dispatch decision).
+            ev.received_at = received_at;
             let ingestor = ctx.ingestor.clone();
             drop(spawn(ingestor(*ev)));
             StatusCode::OK
@@ -1103,7 +1131,7 @@ fn handle_azure_delivery(
 
     // Only PR created/updated update the list; other Azure events (push, comment, build, …)
     // are acknowledged without acting (parity with GitHub's non-`pull_request` Ignored).
-    if event_type != "git.pullrequest.created" && event_type != "git.pullrequest.updated" {
+    if event_type != AZURE_PR_CREATED && event_type != AZURE_PR_UPDATED {
         record_into(
             &ctx.deliveries,
             WebhookDelivery {
@@ -1121,7 +1149,10 @@ fn handle_azure_delivery(
     }
 
     match parse_azure_delivery(&payload, &ctx.routes) {
-        ParseResult::Routable(ev) => {
+        ParseResult::Routable(mut ev) => {
+            // Stamp the receipt time (the pure parser leaves it 0) so the terminal diagnostic
+            // matches the early-exit records.
+            ev.received_at = received_at;
             let ingestor = ctx.ingestor.clone();
             drop(spawn(ingestor(*ev)));
             StatusCode::OK
@@ -1187,19 +1218,63 @@ fn verify_signature(secret: &str, body: &[u8], header: &str) -> bool {
 /// so the user configures this shared-secret header on the subscription (see the module
 /// **Security** note). An empty secret, an absent / non-`Bearer` header, or a token mismatch
 /// all fail closed — the public endpoint must never accept an unauthenticated Azure POST. The
-/// compare is constant-time via [`subtle::ConstantTimeEq`] (the Azure analogue of the GitHub
-/// path's `hmac::Mac::verify_slice`), so it can't leak the secret through timing. Pure —
+/// token compare is constant-time via [`subtle::ConstantTimeEq`] (the Azure analogue of the
+/// GitHub path's `hmac::Mac::verify_slice`): it leaks only the secret LENGTH (the `ct_eq`
+/// length short-circuit), never the secret CONTENT through timing. The `Bearer` scheme is
+/// matched case-INSENSITIVELY (RFC 7235 §2.1 auth-scheme is case-insensitive; a proxy / SDK
+/// may send `bearer`), so a correctly-configured delivery is never spuriously 401'd. Pure —
 /// unit-tested without a server.
 fn verify_azure_token(secret: &str, header: &str) -> bool {
     if secret.is_empty() {
         return false;
     }
-    let Some(token) = header.strip_prefix("Bearer ") else {
+    // Split "<scheme> <token>" and accept the token only when the scheme is `Bearer`
+    // (case-insensitive). A header with no space, or a non-Bearer scheme, fails closed.
+    let Some(token) = header
+        .split_once(' ')
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token)
+    else {
         return false;
     };
     // `ct_eq` on byte slices returns `Choice(0)` for differing lengths (leaking only length,
     // never content) and otherwise compares in constant time.
     token.as_bytes().ct_eq(secret.as_bytes()).into()
+}
+
+/// Classify an OPEN PR's trigger labels into an [`IngestIntent`] — the provider-agnostic
+/// label semantics shared by [`parse_delivery`] (GitHub) and [`parse_azure_delivery`] (Azure),
+/// so the (review/check/both/neither) → intent mapping lives in ONE place. `base` carries the
+/// candidate fields EXCEPT `kind`, which this stamps (`"review"`/`"check"`) for the single
+/// trigger-label cases; both labels → conflict Track (no candidate); neither → StatusOnly.
+fn classify_intent(has_review: bool, has_check: bool, base: Candidate) -> IngestIntent {
+    match (has_review, has_check) {
+        // Both trigger labels → conflict: track as a skipped row, never dispatch (mirrors the
+        // poll path's discovery-stage conflict drop).
+        (true, true) => IngestIntent::Track {
+            candidate: None,
+            conflict: true,
+        },
+        (true, false) => IngestIntent::Track {
+            candidate: Some(Candidate {
+                kind: "review".to_string(),
+                ..base
+            }),
+            conflict: false,
+        },
+        (false, true) => IngestIntent::Track {
+            candidate: Some(Candidate {
+                kind: "check".to_string(),
+                ..base
+            }),
+            conflict: false,
+        },
+        // Neither trigger label (e.g. an `unlabeled` delivery removing the trigger): the PR
+        // should still appear in the list with a skip reason, but never dispatch.
+        (false, false) => IngestIntent::StatusOnly {
+            kind: StatusOnlyKind::TriggerLabelRemoved,
+        },
+    }
 }
 
 /// Parse + route + classify a GitHub `pull_request` webhook payload (#61) into a
@@ -1347,8 +1422,10 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
     };
 
     // Helper to build the routed event with a given intent (the metadata is shared).
+    // `received_at` is left 0 here (pure parser) and stamped by `handle_webhook` on Routable.
     let event = |intent: IngestIntent| WebhookEvent {
         project_id: route.id.clone(),
+        received_at: 0,
         event: "pull_request".to_string(),
         action: action.clone(),
         repo: route.repo.clone(),
@@ -1368,47 +1445,24 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
         })));
     }
 
-    // Classify with the MATCHED project's labels (#35) — review/check labels are
-    // per-project, so a payload routed to project B is classified by B's labels.
+    // Classify with the MATCHED project's labels (#35) — review/check labels are per-project,
+    // so a payload routed to project B is classified by B's labels. The (review/check) → intent
+    // mapping is shared with the Azure path via `classify_intent`.
     let has_review = labels.iter().any(|l| l == &route.review_label);
     let has_check = labels.iter().any(|l| l == &route.check_label);
-    let intent = match (has_review, has_check) {
-        // Both trigger labels → conflict: track as a skipped row, never dispatch (mirrors
-        // the poll path's discovery-stage conflict drop). Kind "review" for the view.
-        (true, true) => IngestIntent::Track {
-            candidate: None,
-            conflict: true,
+    let intent = classify_intent(
+        has_review,
+        has_check,
+        Candidate {
+            number,
+            head_sha,
+            head_ref,
+            author,
+            is_cross_repository,
+            is_draft,
+            kind: String::new(), // classify_intent stamps "review"/"check"
         },
-        (true, false) => IngestIntent::Track {
-            candidate: Some(Candidate {
-                number,
-                head_sha,
-                head_ref,
-                author,
-                is_cross_repository,
-                is_draft,
-                kind: "review".to_string(),
-            }),
-            conflict: false,
-        },
-        (false, true) => IngestIntent::Track {
-            candidate: Some(Candidate {
-                number,
-                head_sha,
-                head_ref,
-                author,
-                is_cross_repository,
-                is_draft,
-                kind: "check".to_string(),
-            }),
-            conflict: false,
-        },
-        // Neither trigger label (e.g. an `unlabeled` delivery removing the trigger):
-        // the PR should still appear in the list with a skip reason, but never dispatch.
-        (false, false) => IngestIntent::StatusOnly {
-            kind: StatusOnlyKind::TriggerLabelRemoved,
-        },
-    };
+    );
     ParseResult::Routable(Box::new(event(intent)))
 }
 
@@ -1423,7 +1477,9 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
 ///
 /// - **Routing** matches `resource.repository.name` (the BARE repo name) AND
 ///   `resource.repository.project.name` against an `Azure`-source route (provider-isolated —
-///   a bare name can't collide with a GitHub `owner/name`). No match → [`ParseResult::WrongRepo`].
+///   a bare name can't collide with a GitHub `owner/name`). Both present but matching no route
+///   → [`ParseResult::WrongRepo`]; either ABSENT → [`ParseResult::Malformed`] (a real Azure PR
+///   Service Hook always carries them, so absence is a broken payload, not "not for us").
 /// - **Labels are optional** (the OPPOSITE of GitHub's strict array): the real Azure resource
 ///   omits `labels` (or sends `null`) for a tag-less PR, so absent / null / non-array → "no
 ///   labels", NOT `Malformed` — mirrors `azure.rs`'s `Option<Vec<RawLabel>>`. Only a missing
@@ -1441,30 +1497,35 @@ fn parse_azure_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult
     };
 
     // Repo+project routing (provider-isolated): match the BARE repo name AND the Azure
-    // project against an `Azure`-source route, case-insensitively. A payload matching none is
-    // dropped fail-closed (an authenticated POST proves the secret is known, not that the
-    // event is for a repo this app monitors).
+    // project against an `Azure`-source route, case-insensitively. `resource.repository.name`
+    // and `resource.repository.project.name` are ALWAYS present on a real Azure PR Service
+    // Hook, so an absent / null either → `Malformed` (a structurally-broken payload, same tier
+    // as a missing `pullRequestId`) rather than a misleading `WrongRepo`. A payload with BOTH
+    // present but matching no route → `WrongRepo` (fail-closed: an authenticated POST proves
+    // the secret is known, not that the event is for a repo this app monitors).
     let repository = res.get("repository");
-    let repo_name = repository
+    let Some(repo_name) = repository
         .and_then(|r| r.get("name"))
-        .and_then(Value::as_str);
-    let project_name = repository
+        .and_then(Value::as_str)
+    else {
+        return ParseResult::Malformed;
+    };
+    let Some(project_name) = repository
         .and_then(|r| r.get("project"))
         .and_then(|p| p.get("name"))
-        .and_then(Value::as_str);
-    let route = match repo_name.and_then(|repo| {
-        routes.iter().find(|r| {
-            r.source_kind == SourceKind::Azure
-                && r.repo.eq_ignore_ascii_case(repo)
-                && project_name
-                    .map(|proj| r.azure_project.eq_ignore_ascii_case(proj))
-                    .unwrap_or(false)
-        })
+        .and_then(Value::as_str)
+    else {
+        return ParseResult::Malformed;
+    };
+    let route = match routes.iter().find(|r| {
+        r.source_kind == SourceKind::Azure
+            && r.repo.eq_ignore_ascii_case(repo_name)
+            && r.azure_project.eq_ignore_ascii_case(project_name)
     }) {
         Some(r) => r,
         None => {
             return ParseResult::WrongRepo {
-                repo: repo_name.map(str::to_string),
+                repo: Some(repo_name.to_string()),
             };
         }
     };
@@ -1540,9 +1601,11 @@ fn parse_azure_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult
     );
 
     // Build the routed event with a given intent (the metadata is shared). Azure has no
-    // per-event "action"; the `eventType` goes in `event` for the diagnostic.
+    // per-event "action"; the `eventType` goes in `event` for the diagnostic. `received_at` is
+    // left 0 here (pure parser) and stamped by `handle_webhook` on Routable.
     let build = |intent: IngestIntent| WebhookEvent {
         project_id: route.id.clone(),
+        received_at: 0,
         event: event_type.clone(),
         action: None,
         repo: route.repo.clone(),
@@ -1553,50 +1616,33 @@ fn parse_azure_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult
         intent,
     };
 
-    // Parity with the poll path's `--status active`: a non-active PR (completed / abandoned)
-    // is never a dispatch candidate but upserts a list row reflecting the closed state.
+    // Parity with the poll path's `--status active`: a non-active PR (completed / abandoned) is
+    // never a dispatch candidate but upserts a list row reflecting the closed state. A MISSING
+    // / null `status` is also treated as non-active (fail-safe: list-only, never dispatched) —
+    // the same spirit as the GitHub path's `state != "open"` handling of a null state.
     if res.get("status").and_then(Value::as_str) != Some("active") {
         return ParseResult::Routable(Box::new(build(IngestIntent::StatusOnly {
             kind: StatusOnlyKind::ClosedOrMerged,
         })));
     }
 
-    // Classify with the MATCHED project's labels (per-project, same as the GitHub path).
+    // Classify with the MATCHED project's labels (per-project, same as the GitHub path), via
+    // the shared `classify_intent`.
     let has_review = labels.iter().any(|l| l == &route.review_label);
     let has_check = labels.iter().any(|l| l == &route.check_label);
-    let intent = match (has_review, has_check) {
-        (true, true) => IngestIntent::Track {
-            candidate: None,
-            conflict: true,
+    let intent = classify_intent(
+        has_review,
+        has_check,
+        Candidate {
+            number,
+            head_sha,
+            head_ref,
+            author,
+            is_cross_repository,
+            is_draft,
+            kind: String::new(), // classify_intent stamps "review"/"check"
         },
-        (true, false) => IngestIntent::Track {
-            candidate: Some(Candidate {
-                number,
-                head_sha,
-                head_ref,
-                author,
-                is_cross_repository,
-                is_draft,
-                kind: "review".to_string(),
-            }),
-            conflict: false,
-        },
-        (false, true) => IngestIntent::Track {
-            candidate: Some(Candidate {
-                number,
-                head_sha,
-                head_ref,
-                author,
-                is_cross_repository,
-                is_draft,
-                kind: "check".to_string(),
-            }),
-            conflict: false,
-        },
-        (false, false) => IngestIntent::StatusOnly {
-            kind: StatusOnlyKind::TriggerLabelRemoved,
-        },
-    };
+    );
     ParseResult::Routable(Box::new(build(intent)))
 }
 
@@ -3291,5 +3337,74 @@ mod tests {
             parse_delivery(&gh_p, &azure_routes),
             ParseResult::WrongRepo { .. }
         ));
+    }
+
+    #[test]
+    fn parse_azure_delivery_handles_created_event_type() {
+        // The handler accepts both created/updated; the parser must classify a `created`
+        // payload identically and carry its eventType through to the diagnostic.
+        let mut p = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
+        p["eventType"] = serde_json::json!("git.pullrequest.created");
+        let routes = single_azure_route("needs-review", "needs-check");
+        let ev = azure_routable(&p, &routes);
+        assert_eq!(ev.event, "git.pullrequest.created");
+        assert_eq!(azure_dispatch_candidate(&p, &routes).kind, "review");
+    }
+
+    #[test]
+    fn parse_azure_delivery_missing_repo_or_project_name_is_malformed() {
+        // A real Azure PR Service Hook ALWAYS carries repository.name + project.name, so an
+        // absent / null either is a broken payload (Malformed), NOT a "not for us" WrongRepo.
+        let routes = single_azure_route("needs-review", "needs-check");
+        // repository.name absent.
+        let mut p = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
+        p["resource"]["repository"]
+            .as_object_mut()
+            .unwrap()
+            .remove("name");
+        assert!(matches!(
+            parse_azure_delivery(&p, &routes),
+            ParseResult::Malformed
+        ));
+        // project.name null.
+        let mut p2 = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
+        p2["resource"]["repository"]["project"]["name"] = serde_json::json!(null);
+        assert!(matches!(
+            parse_azure_delivery(&p2, &routes),
+            ParseResult::Malformed
+        ));
+        // repository object entirely absent.
+        let mut p3 = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
+        p3["resource"].as_object_mut().unwrap().remove("repository");
+        assert!(matches!(
+            parse_azure_delivery(&p3, &routes),
+            ParseResult::Malformed
+        ));
+    }
+
+    #[test]
+    fn parse_azure_delivery_missing_or_null_status_is_status_only() {
+        // A missing / null `status` is treated as non-active (fail-safe: list-only, never
+        // dispatched), the same spirit as the GitHub path's null `state`.
+        let routes = single_azure_route("needs-review", "needs-check");
+        let mut p = azure_pr_payload("active", &["needs-review"], serde_json::json!({}));
+        p["resource"].as_object_mut().unwrap().remove("status");
+        match azure_routable(&p, &routes).intent {
+            IngestIntent::StatusOnly {
+                kind: StatusOnlyKind::ClosedOrMerged,
+            } => {}
+            other => panic!("expected StatusOnly ClosedOrMerged for missing status, got {other:?}"),
+        }
+        let p2 = azure_pr_payload(
+            "active",
+            &["needs-review"],
+            serde_json::json!({ "status": null }),
+        );
+        match azure_routable(&p2, &routes).intent {
+            IngestIntent::StatusOnly {
+                kind: StatusOnlyKind::ClosedOrMerged,
+            } => {}
+            other => panic!("expected StatusOnly ClosedOrMerged for null status, got {other:?}"),
+        }
     }
 }
