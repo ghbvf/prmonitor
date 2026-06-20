@@ -16,24 +16,39 @@ const { sessions, activeThreadId, focus } = useReviewStore();
 // Durable sessions for the selected PR (#70): persisted, so a PR's session list is
 // restored after a restart (the in-memory `sessions` is empty then).
 const durable = ref<ReviewSession[]>([]);
+const loading = ref(false);
+const loadError = ref<string | null>(null);
 
-async function loadDurable() {
+// `clear` = a PR/project SWITCH: blank the old PR's list synchronously (no stale flash,
+// review F4) and show a loading state. A background reload (live `sessions` changed) keeps
+// the current list visible and swaps it in on resolve — no flicker mid-stream.
+async function loadDurable(clear: boolean) {
+  loadError.value = null;
   if (props.prNumber == null) {
     durable.value = [];
     return;
+  }
+  if (clear) {
+    durable.value = [];
+    loading.value = true;
   }
   try {
     durable.value = await getPrSessions(props.projectId, props.prNumber);
   } catch (err) {
     console.error("加载 PR 会话列表失败", err);
-    durable.value = [];
+    loadError.value = (err as { message?: string })?.message ?? String(err);
+    if (clear) durable.value = [];
+  } finally {
+    loading.value = false;
   }
 }
 
-// Reload when the selected PR changes, and when the live session set changes (a new
-// session started / a status transitioned → re-read the durable list to match).
-watch(() => [props.projectId, props.prNumber], loadDurable, { immediate: true });
-watch(sessions, loadDurable);
+// PR/project switch → clear + load. Live session set changed (a session started /
+// transitioned) → background reload, no clear.
+watch(() => [props.projectId, props.prNumber], () => loadDurable(true), {
+  immediate: true,
+});
+watch(sessions, () => loadDurable(false));
 
 // Merge durable + live for the selected PR: a matching live session overrides the
 // durable row (its status is real-time), and a brand-new live session not yet in the
@@ -83,6 +98,12 @@ function statusLabel(status: SessionStatus): string {
       选择一个 PR 查看其会话 / Select a PR to see its sessions
     </p>
 
+    <p v-else-if="loadError" class="error">加载会话失败 / {{ loadError }}</p>
+
+    <p v-else-if="loading && visibleSessions.length === 0" class="muted">
+      加载中… / loading
+    </p>
+
     <p v-else-if="visibleSessions.length === 0" class="muted">
       该 PR 暂无会话 / No sessions for this PR
     </p>
@@ -121,6 +142,10 @@ function statusLabel(status: SessionStatus): string {
 }
 .muted {
   color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+.error {
+  color: var(--color-danger);
   font-size: var(--font-size-sm);
 }
 .rows {

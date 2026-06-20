@@ -40,12 +40,16 @@ fn now_epoch() -> u64 {
 }
 
 /// [`SessionStatus`] → its pinned camelCase wire string (the form stored in the `status`
-/// column), via the same serde contract `list_review_sessions` uses.
+/// column), via the same serde contract `list_review_sessions` uses. `SessionStatus` is a
+/// unit enum with `#[serde(rename_all = "camelCase")]`, so serialization to a JSON string
+/// CANNOT fail — `expect` fail-fast surfaces a serde regression loudly rather than
+/// silently writing an empty status that `status_from_wire` would then read as `Failed`
+/// (review F3).
 fn status_wire(status: SessionStatus) -> String {
     serde_json::to_value(status)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default()
+        .expect("SessionStatus serializes to a JSON string (unit enum, known variants)")
 }
 
 /// Wire string → [`SessionStatus`] (reverse of [`status_wire`]), for projecting stored
@@ -243,5 +247,70 @@ mod tests {
         assert!(v.get("kind").is_some());
         assert!(v.get("text").is_some());
         assert!(v.get("item_id").is_none());
+    }
+
+    // `get_pr_sessions` orders newest-first (`created_at DESC`) — the user-facing order
+    // (review F5). Insert two rows with explicit timestamps (upsert stamps `now`, which a
+    // fast test can't distinguish) and assert the newer thread comes first.
+    #[test]
+    fn get_pr_sessions_orders_newest_first() {
+        let db = Database::open_in_memory().expect("open db");
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO review_session \
+                 (thread_id, project_id, pr_number, turn_id, kind, status, created_at, updated_at) \
+                 VALUES ('old', 'alpha', 12, '', 'review', 'done', 100, 100), \
+                        ('new', 'alpha', 12, '', 'review', 'running', 200, 200)",
+                [],
+            )?;
+            Ok(())
+        })
+        .expect("seed");
+
+        let order: Vec<String> = get_pr_sessions(&db, "alpha", 12)
+            .expect("list")
+            .into_iter()
+            .map(|s| s.thread_id)
+            .collect();
+        assert_eq!(order, vec!["new".to_string(), "old".to_string()]);
+    }
+
+    // Every `SessionStatus` survives the store → wire-string → enum round-trip (review
+    // F5): closes the `status_from_wire` Deserialize funnel (the existing pinned-wire test
+    // only locks Serialize). A drift in either direction fails here.
+    #[test]
+    fn session_status_round_trips_through_storage() {
+        let db = Database::open_in_memory().expect("open db");
+        let cases = [
+            ("th-a", SessionStatus::Starting),
+            ("th-b", SessionStatus::Running),
+            ("th-c", SessionStatus::Interrupting),
+            ("th-d", SessionStatus::Done),
+            ("th-e", SessionStatus::Failed),
+        ];
+        for (thread, status) in cases {
+            upsert_session(&db, &info(thread, 12, status)).expect("upsert");
+        }
+        let by_thread: std::collections::HashMap<String, SessionStatus> =
+            get_pr_sessions(&db, "alpha", 12)
+                .expect("list")
+                .into_iter()
+                .map(|s| (s.thread_id, s.status))
+                .collect();
+        for (thread, status) in cases {
+            assert_eq!(by_thread.get(thread), Some(&status), "status for {thread}");
+        }
+    }
+
+    // FK to `review_session` was dropped (review F2): a best-effort `append_item` must
+    // succeed (orphan row) even if the session row is missing — losing the FK-violation
+    // would have silently dropped the whole session's history.
+    #[test]
+    fn append_item_without_session_row_is_orphan_not_error() {
+        let db = Database::open_in_memory().expect("open db");
+        append_item(&db, "orphan", "i1", "message", "hi").expect("append");
+        let items = get_history(&db, "orphan").expect("history");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "hi");
     }
 }

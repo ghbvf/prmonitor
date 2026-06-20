@@ -322,19 +322,26 @@ async function focus(threadId: string, prNumber: number, status: SessionStatus) 
   // interrupted — that distinction isn't kept in SessionInfo). An active session
   // keeps `finalStatus` null (it shows "运行中").
   finalStatus.value = active ? null : status === "failed" ? "failed" : "completed";
-  // Hydrate from the durable history. Live deltas for a still-running session keep
-  // appending via `applyEvent` (coalesced by `itemId`), so seeding the stored prefix
-  // and streaming the tail compose without duplication.
+  // Hydrate from the durable history. A still-running session keeps streaming during
+  // the await, and `applyEvent` appends those live deltas onto `items` — so MERGE rather
+  // than overwrite: seed the stored prefix, then keep any live item NOT already in the
+  // history (a new item that began mid-load). Overwriting would drop those live deltas
+  // for the user (review F1). For an item id present in both, the persisted history wins
+  // (it holds the full accumulated text; the live tail re-appends on the next delta).
   try {
     const history = await getSessionHistory(threadId);
     // Guard against a focus switch during the await: only apply if still focused here.
-    if (activeThreadId.value === threadId) {
-      items.value = history.map((h) => ({
-        itemId: h.itemId,
-        kind: h.kind,
-        text: h.text,
-      }));
+    if (activeThreadId.value !== threadId) return;
+    const merged: StreamItem[] = history.map((h) => ({
+      itemId: h.itemId,
+      kind: h.kind,
+      text: h.text,
+    }));
+    const seen = new Set(merged.map((i) => i.itemId));
+    for (const live of items.value) {
+      if (!seen.has(live.itemId)) merged.push(live);
     }
+    items.value = merged;
   } catch (err) {
     console.error("加载历史会话内容失败", err);
   }

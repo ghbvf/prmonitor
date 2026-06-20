@@ -14,7 +14,7 @@
 //! `gh` child it owns dies via `kill_on_drop`. No orphaned subprocess.
 //!
 //! **Snapshot (F3 → #38).** The poll-cycle snapshot is now the persisted
-//! `prs.json` tracked set: each successful discovery upserts the round's PRs into
+//! `tracked_pr` table (SQLite, #70): each successful discovery upserts the round's PRs into
 //! it and emits the *retained* list (read on mount via the `get_prs` command).
 //! Because the set is persisted it survives restarts, and a failed cycle leaves it
 //! intact (the last good list stays readable). A transient one-round `gh` miss no

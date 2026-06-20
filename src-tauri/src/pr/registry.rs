@@ -73,8 +73,8 @@ impl TrackedPrs {
     /// Loads `project_id`'s persisted set (#35), defaulting to empty when nothing is
     /// stored or the value is corrupt (a corrupt registry must never block discovery —
     /// the worst case is the list rebuilds from the next round's discovery). Reads only
-    /// this project's key (`tracked:{project_id}`), so one project's retained list never
-    /// shows another's PRs.
+    /// this project's rows (`WHERE project_id = ?1` on `tracked_pr`), so one project's
+    /// retained list never shows another's PRs.
     pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>, project_id: &str) -> AppResult<Self> {
         Self::load_db(app.state::<Database>().inner(), project_id)
     }
@@ -126,8 +126,8 @@ impl TrackedPrs {
     }
 
     /// SQLite-level save (no Tauri app) — replaces this project's partition with the
-    /// full in-memory `self` (delete-all + insert-all, the SQLite analogue of the old
-    /// whole-key `Store::set`). `pub(crate)` only so round-trip tests can drive it
+    /// full in-memory `self` (delete-all + insert-all, replacing the old whole-key
+    /// tauri-plugin-store write). `pub(crate)` only so round-trip tests can drive it
     /// against an in-memory [`Database`]; the F1 funnel still holds because production
     /// writers reach persistence only through the module-private [`Self::save`] →
     /// [`mutate_tracked`].
@@ -271,11 +271,11 @@ impl TrackedPrs {
 /// **This is the ONLY persist path** ([`TrackedPrs::save`] is module-private), so a
 /// lock-free write is not expressible outside this module — the closed funnel that
 /// fixes F1 (upstream: `save` private; downstream: one fixed static [`WRITE_LOCK`]).
-/// Reads (`get_prs`, the projection below) need no lock: a load is a single whole-value
-/// store read, so a torn read can't happen and a stale-by-one-round snapshot self-heals.
+/// Reads (`get_prs`, the projection below) need no lock: a load is a single SQL query,
+/// so a torn read can't happen and a stale-by-one-round snapshot self-heals.
 ///
 /// `project_id` (#35) scopes the load + save to that project's key; the GLOBAL
-/// [`WRITE_LOCK`] still guards the whole-file `prs.json` rewrite across projects.
+/// [`WRITE_LOCK`] still guards the whole-partition `tracked_pr` write across projects.
 pub fn mutate_tracked<R, T>(
     app: &tauri::AppHandle<R>,
     project_id: &str,
@@ -501,6 +501,30 @@ mod tests {
         assert_eq!(pr7.labels, vec!["needs-review".to_string()]);
         assert_eq!(pr7.first_seen_epoch, 0);
         assert_eq!(pr7.last_seen_epoch, 1_700_000_000);
+    }
+
+    // A corrupt `labels_json` column degrades to an empty list rather than panicking the
+    // whole load (the doc'd `unwrap_or_default` leniency, review F5): one bad row must not
+    // wipe / crash the retained set on read.
+    #[test]
+    fn load_db_degrades_corrupt_labels_json_to_empty() {
+        let db = Database::open_in_memory().expect("open db");
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tracked_pr \
+                 (project_id, number, title, labels_json, url, kind, skip_reason, \
+                  first_seen_epoch, last_seen_epoch, archived) \
+                 VALUES ('alpha', 7, 'PR 7', 'not-json', 'https://x/7', 'review', NULL, 1, 2, 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .expect("seed corrupt row");
+
+        let back = TrackedPrs::load_db(&db, "alpha").expect("load must not panic");
+        assert_eq!(back.prs.len(), 1);
+        assert_eq!(back.prs[0].labels, Vec::<String>::new());
+        assert_eq!(back.prs[0].title, "PR 7");
     }
 
     // Wire-shape lock for the persisted `prs.json` records (Medium carrier per

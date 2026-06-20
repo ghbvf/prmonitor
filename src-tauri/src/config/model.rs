@@ -278,12 +278,15 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
     let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut seen_repos: std::collections::HashSet<String> = std::collections::HashSet::new();
     for project in &config.projects {
-        // id-format lock (Medium carrier): the id becomes a store-key PREFIX
-        // (`dispatched:{id}` / `events:{id}` in ledger.rs, `tracked:{id}` in
-        // registry.rs). An id containing `:` would split the partition wrong and an
-        // empty / whitespace id would alias or corrupt a key — either silently merges
-        // two projects' dedup/retention partitions → dedup failure → re-review storm.
-        // Checked for EVERY project (not just enabled): a disabled project's stores
+        // id-format lock (Medium carrier): the id is stored as a `project_id` column
+        // value that scopes every dedup/retention partition (`WHERE project_id = ?1` on
+        // `dispatch_key` / `dispatch_event` / `tracked_pr`). It is still validated
+        // (reject empty / whitespace / colon) so ids stay unambiguous, and so the
+        // one-time legacy import — which parses the old JSON store keys (`tracked:{id}` /
+        // `dispatched:{id}` / `events:{id}`) by splitting on `:` — can recover each
+        // project's id unambiguously; an empty / whitespace / colon-bearing id would
+        // alias two projects' partitions → dedup failure → re-review storm.
+        // Checked for EVERY project (not just enabled): a disabled project's rows
         // persist and its id re-enters the key space the moment it is re-enabled. The
         // Hard path (future) is a `ProjectId` newtype whose typed constructor rejects
         // these at the type level, making the bad shape unexpressible.
@@ -613,10 +616,13 @@ mod tests {
 
     #[test]
     fn validate_rejects_project_id_with_colon_or_whitespace() {
-        // The id becomes a store-key prefix (`dispatched:{id}` / `events:{id}` /
-        // `tracked:{id}`); a `:`, whitespace, or empty id corrupts that partition →
-        // dedup failure → re-review storm. Rejected for EVERY project (even disabled),
-        // since a disabled project's id re-enters the key space when re-enabled.
+        // The id is stored as a `project_id` column value scoping every partition
+        // (`WHERE project_id = ?1` on `dispatch_key` / `dispatch_event` / `tracked_pr`),
+        // and the one-time legacy import recovers it by splitting the old JSON store keys
+        // (`dispatched:{id}` / `events:{id}` / `tracked:{id}`) on `:`; a `:`, whitespace,
+        // or empty id aliases two projects' partitions → dedup failure → re-review storm.
+        // Rejected for EVERY project (even disabled), since a disabled project's id
+        // re-enters the key space when re-enabled.
         for bad in ["", "a:b", "has space", "tab\tid", "\n"] {
             assert!(
                 validate(&with_project(Project {
@@ -627,7 +633,7 @@ mod tests {
                 "expected id {bad:?} to be rejected"
             );
         }
-        // A disabled project with a bad id is STILL rejected (its store key persists).
+        // A disabled project with a bad id is STILL rejected (its partition rows persist).
         assert!(validate(&with_project(Project {
             id: "a:b".to_string(),
             enabled: false,

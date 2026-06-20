@@ -116,12 +116,13 @@ impl Ledger {
     /// empty when nothing is stored or a value is corrupt (a corrupt ledger must
     /// never block discovery — the worst case is a duplicate dispatch, which the
     /// in-process registry guard then drops for any still-active session). Reads only
-    /// this project's keys (`dispatched:{project_id}` / `events:{project_id}`), so a
-    /// `has_dispatched` / cooldown check for one project never sees another's records.
+    /// this project's rows (`WHERE project_id = ?1` on `dispatch_key` / `dispatch_event`),
+    /// so a `has_dispatched` / cooldown check for one project never sees another's records.
     ///
     /// **Lock-free read (intentional).** The discovery path (`commands::discover`) and
     /// the webhook ingest (`commands::ingest_webhook` → `webhook_view`) call this OUTSIDE
-    /// [`LEDGER_WRITE_LOCK`]; a load is a single whole-value store read (no torn read)
+    /// [`LEDGER_WRITE_LOCK`]; a load runs two SELECTs inside one `with_conn` closure (the
+    /// connection mutex held across both — no torn read)
     /// and a stale-by-one-round snapshot is acceptable because it only gates an
     /// OPTIMIZATION — the real double-dispatch backstop is the session registry's
     /// `try_reserve_pair` atomic test-and-set at start time. A read racing a concurrent
@@ -213,8 +214,8 @@ impl Ledger {
     }
 
     /// SQLite-level save (no Tauri app) — replaces this project's partition with the
-    /// full in-memory `self` (delete-all + insert-all, the SQLite analogue of the old
-    /// whole-partition `Store::set`). Split from [`Self::record_many`] so the round-trip
+    /// full in-memory `self` (delete-all + insert-all, replacing the old tauri-plugin-store
+    /// `Store::set`). Split from [`Self::record_many`] so the round-trip
     /// is testable against an in-memory [`Database`].
     pub(crate) fn save_db(&self, db: &Database, project_id: &str) -> AppResult<()> {
         db.with_tx(|tx| {
@@ -263,8 +264,8 @@ impl Ledger {
 
     /// Stages a batch into the in-memory ledger (the dedup key set + cooldown event
     /// log) without persisting. Split out so the staging — what `record_many`
-    /// actually writes to the store — is unit-testable without a Tauri app /
-    /// `tauri-plugin-store` (the persistence itself is a thin `Store::save`).
+    /// actually writes to the store — is unit-testable without a Tauri app
+    /// (the persistence itself goes through `save_db` → `db.with_tx`).
     fn stage_all(&mut self, cands: &[Candidate], epoch: u64) {
         for cand in cands {
             let key = dispatch_key(cand.number, &cand.head_sha, &cand.kind);
@@ -356,7 +357,8 @@ mod tests {
         }
     }
 
-    // `record_many` persists via `Store::save`, which needs a Tauri app; the
+    // `record_many` persists via `save_db` → `db.with_tx`, which needs a `tauri::AppHandle`
+    // to resolve the `Database` state; the
     // batch's data effect is `stage_all`, which is what gets serialized. This
     // round-trip asserts staging a batch records every candidate's dedup key and
     // a cooldown event per candidate at the shared epoch (the persisted shape).
@@ -413,7 +415,7 @@ mod tests {
     // `load_db` against an in-memory DB must round-trip the dedup set + cooldown log
     // intact (a column/SQL drift surfaces here), and a different project's partition
     // must read empty (the `project_id` column is the partitioning seam that replaced
-    // the old `tracked:{pid}` store keys).
+    // the old `dispatched:{pid}` / `events:{pid}` store keys).
     #[test]
     fn sqlite_round_trip_and_per_project_isolation() {
         let db = Database::open_in_memory().expect("open db");
@@ -483,8 +485,9 @@ mod tests {
     // Ledger isolation (#35): two projects whose dedup sets are loaded from distinct
     // store-key partitions do NOT collide even when an identical (number, head, kind)
     // candidate was dispatched in one. `Ledger::load` is the partitioning seam (it
-    // reads `dispatched:{pid}`); here we simulate the two loaded partitions directly
-    // (the live `load` needs a Tauri store) and assert `has_dispatched` is true for
+    // queries `WHERE project_id = ?1` on `dispatch_key`); here we simulate the two loaded
+    // partitions directly (the live `load` needs a `tauri::AppHandle` to resolve the
+    // `Database` state) and assert `has_dispatched` is true for
     // the project that recorded it and false for the other — the dedup gate is
     // per-project, so PR #1@sha:review reviewed under project A is still dispatchable
     // under project B.

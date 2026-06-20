@@ -210,14 +210,18 @@ CREATE TABLE IF NOT EXISTS review_session (
 );
 CREATE INDEX IF NOT EXISTS idx_review_session_pr ON review_session(project_id, pr_number, created_at);
 
+-- No FK to review_session: history capture is BEST-EFFORT (the pump logs+swallows
+-- persistence errors so a DB hiccup never breaks the live stream). A rigid FK would,
+-- if the session-row upsert lost a race/failed, make every `append_item` FK-violate and
+-- silently drop that session's whole history. An orphan history row (recoverable, still
+-- readable by thread_id) is strictly better than losing the content (review F2).
 CREATE TABLE IF NOT EXISTS review_history_item (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     thread_id TEXT    NOT NULL,
     item_id   TEXT    NOT NULL,
     kind      TEXT    NOT NULL,
     text      TEXT    NOT NULL,
-    UNIQUE (thread_id, item_id),
-    FOREIGN KEY (thread_id) REFERENCES review_session(thread_id)
+    UNIQUE (thread_id, item_id)
 );
 CREATE INDEX IF NOT EXISTS idx_history_thread ON review_history_item(thread_id, id);
 "#;
