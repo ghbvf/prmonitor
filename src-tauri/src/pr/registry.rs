@@ -1,13 +1,14 @@
 //! Persisted PR-retention registry — the "ghost flicker" fix.
 //!
-//! Each poll round upserts the discovered PRs into a persisted set (`prs.json`
-//! via `tauri-plugin-store`'s `StoreExt`, the same backend-owned store pattern as
-//! [`super::ledger`] / the config slice). The emitted list is the *retained* set,
-//! not the raw per-round discovery: a transient one-round `gh` miss no longer
-//! drops a row — it just flips that row's [`crate::model::PrPresence`] from
-//! `Current` to `Stale` once it ages past the presence grace window. PRs are never
-//! auto-evicted (users archive inactive ones); [`TrackedPrs::prune`] is only the
-//! unbounded-growth backstop.
+//! Each poll round upserts the discovered PRs into a persisted set (the unified SQLite
+//! store's `tracked_pr` table, #70 — replacing the old `prs.json`; partitioned by a real
+//! `project_id` column). The emitted list is the *retained* set, not the raw per-round
+//! discovery: a transient one-round `gh` miss no longer drops a row — it just flips that
+//! row's [`crate::model::PrPresence`] from `Current` to `Stale` once it ages past the
+//! presence grace window. PRs are never auto-evicted (users archive inactive ones);
+//! [`TrackedPrs::prune`] is only the unbounded-growth backstop. This table is ALSO the
+//! durable store for webhook-received PRs (#70): the webhook ingest upserts here without
+//! calling `gh`, so a webhook PR survives a `gh` outage and a restart.
 //!
 //! Slice boundary: presence is computed purely from `last_seen_epoch` vs the grace
 //! window — the `pr` slice stays review-agnostic and never reads `state.sessions`.
@@ -15,47 +16,34 @@
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use tauri_plugin_store::StoreExt;
+use tauri::Manager;
 
 use crate::config::service as config_service;
-use crate::error::{AppError, AppResult};
+use crate::db::{map_err, Database};
+use crate::error::AppResult;
 use crate::model::{PrPresence, PullRequestView, TrackedPrView};
 
-/// Store file holding the persisted tracked-PR set.
-const STORE_FILE: &str = "prs.json";
-/// Key PREFIX holding the per-project list of tracked PRs (#35). The effective key
-/// is `tracked:{project_id}` (see [`tracked_key`]); a single `prs.json` holds every
-/// project's tracked set under its own key, so two projects' PRs never mingle in one
-/// list.
-const TRACKED_KEY_PREFIX: &str = "tracked";
 /// Unbounded-growth cap, applied PER PROJECT (#35). Beyond this, [`TrackedPrs::prune`]
 /// drops the least recently seen records (never the recent working set) — see its doc.
 const MAX_TRACKED: usize = 500;
 
-/// Store key for a project's tracked-PR set: `tracked:{project_id}` (#35).
-/// Partitions the shared `prs.json` so each project's retained list is isolated.
-fn tracked_key(project_id: &str) -> String {
-    format!("{TRACKED_KEY_PREFIX}:{project_id}")
-}
-
 /// Serializes every read-modify-write of the persisted set (F1, PR #43). The two
 /// writers — the poll cycle's upsert and the `set_pr_archived` command — each do a
-/// load→mutate→save of the whole `prs.json`; without a shared critical section they
-/// interleave and silently lose each other's write (an archive overwritten by a poll
-/// that loaded the pre-archive snapshot, or vice versa). A process-global `Mutex<()>`
-/// (the data lives in the store, not behind the lock) is the gate, and
+/// load→mutate→save of a project's `tracked_pr` partition; without a shared critical
+/// section they interleave and silently lose each other's write (an archive overwritten
+/// by a poll that loaded the pre-archive snapshot, or vice versa). A process-global
+/// `Mutex<()>` (the data lives in SQLite, not behind the lock) is the gate, and
 /// [`mutate_tracked`] is its only acquirer. A module static — not an injected
 /// `AppState` field — so the lock *identity* is fixed: a caller cannot accidentally
 /// serialize on the wrong mutex, which closes the funnel downstream as well as up.
 /// `std` (not `tokio`) `Mutex`: the guarded section is fully synchronous, so no
 /// `.await` is ever held across the guard.
 ///
-/// **Multi-project (#35):** the lock stays GLOBAL (not per-project) on purpose. Each
-/// project's set lives under its own store key (`tracked:{project_id}`), but
-/// `Store::save` rewrites the WHOLE `prs.json` — so two projects' parallel poll cycles
-/// each doing a load→mutate→save would still clobber each other's just-written key. A
-/// single global gate over the shared file is the correct granularity; a per-project
-/// lock would reopen that cross-project lost-update race.
+/// **Multi-project (#35):** the lock stays GLOBAL (not per-project) on purpose. `save`
+/// replaces a project's whole partition (delete + re-insert) — the SQLite connection's
+/// own mutex serializes individual statements, but only THIS lock makes a project's
+/// load→mutate→save one atomic critical section. Keeping it global (rather than
+/// per-project) matches the prior reasoning and keeps the lost-update analysis intact.
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// One persisted PR. `first_seen_epoch` is set once on insert and preserved across
@@ -85,23 +73,45 @@ impl TrackedPrs {
     /// Loads `project_id`'s persisted set (#35), defaulting to empty when nothing is
     /// stored or the value is corrupt (a corrupt registry must never block discovery —
     /// the worst case is the list rebuilds from the next round's discovery). Reads only
-    /// this project's key (`tracked:{project_id}`), so one project's retained list never
-    /// shows another's PRs.
+    /// this project's rows (`WHERE project_id = ?1` on `tracked_pr`), so one project's
+    /// retained list never shows another's PRs.
     pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>, project_id: &str) -> AppResult<Self> {
-        let store = app
-            .store(STORE_FILE)
-            .map_err(|e| AppError::new(format!("打开 PR 存储失败: {e}")))?;
+        Self::load_db(app.state::<Database>().inner(), project_id)
+    }
 
-        let prs = store
-            .get(tracked_key(project_id))
-            .and_then(|v| serde_json::from_value::<Vec<TrackedPr>>(v).ok())
-            .unwrap_or_default();
-
-        Ok(Self { prs })
+    /// SQLite-level load (no Tauri app) — reads this project's `tracked_pr` rows. Split
+    /// from [`Self::load`] so the store round-trip is testable against an in-memory
+    /// [`Database`]. `labels` is stored as a JSON-text column (`labels_json`); a corrupt
+    /// value degrades to an empty list (parity with the old `unwrap_or_default` leniency).
+    /// Epochs are stored as `i64` and read back as `u64`.
+    pub(crate) fn load_db(db: &Database, project_id: &str) -> AppResult<Self> {
+        db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT number, title, labels_json, url, kind, skip_reason, \
+                 first_seen_epoch, last_seen_epoch, archived \
+                 FROM tracked_pr WHERE project_id = ?1 ORDER BY number DESC",
+            )?;
+            let rows = stmt.query_map([project_id], |r| {
+                let labels_json: String = r.get(2)?;
+                Ok(TrackedPr {
+                    number: r.get::<_, i64>(0)? as u64,
+                    title: r.get(1)?,
+                    labels: serde_json::from_str(&labels_json).unwrap_or_default(),
+                    url: r.get(3)?,
+                    kind: r.get(4)?,
+                    skip_reason: r.get(5)?,
+                    first_seen_epoch: r.get::<_, i64>(6)? as u64,
+                    last_seen_epoch: r.get::<_, i64>(7)? as u64,
+                    archived: r.get::<_, i64>(8)? != 0,
+                })
+            })?;
+            let prs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(Self { prs })
+        })
     }
 
     /// Persists the tracked set. **Module-private — the F1 funnel's upstream gate.**
-    /// This is the only write path to `prs.json`, and it is reachable solely from
+    /// This is the only write path to the `tracked_pr` table, reachable solely from
     /// [`mutate_tracked`] (same module), which holds [`WRITE_LOCK`] across the whole
     /// load→mutate→save. Keeping `save` private makes a lock-free read-modify-write
     /// *not expressible* outside this module: a new writer has no way to call `save`,
@@ -112,18 +122,45 @@ impl TrackedPrs {
         app: &tauri::AppHandle<R>,
         project_id: &str,
     ) -> AppResult<()> {
-        let store = app
-            .store(STORE_FILE)
-            .map_err(|e| AppError::new(format!("打开 PR 存储失败: {e}")))?;
-        // tauri-plugin-store 2.x: `Store::set` is infallible and returns `()`.
-        store.set(
-            tracked_key(project_id),
-            serde_json::to_value(&self.prs).map_err(|e| AppError::new(e.to_string()))?,
-        );
-        store
-            .save()
-            .map_err(|e| AppError::new(format!("写入 PR 存储失败: {e}")))?;
-        Ok(())
+        self.save_db(app.state::<Database>().inner(), project_id)
+    }
+
+    /// SQLite-level save (no Tauri app) — replaces this project's partition with the
+    /// full in-memory `self` (delete-all + insert-all, replacing the old whole-key
+    /// tauri-plugin-store write). `pub(crate)` only so round-trip tests can drive it
+    /// against an in-memory [`Database`]; the F1 funnel still holds because production
+    /// writers reach persistence only through the module-private [`Self::save`] →
+    /// [`mutate_tracked`].
+    pub(crate) fn save_db(&self, db: &Database, project_id: &str) -> AppResult<()> {
+        db.with_tx(|tx| {
+            tx.execute("DELETE FROM tracked_pr WHERE project_id = ?1", [project_id])
+                .map_err(map_err)?;
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO tracked_pr \
+                     (project_id, number, title, labels_json, url, kind, skip_reason, \
+                      first_seen_epoch, last_seen_epoch, archived) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                )
+                .map_err(map_err)?;
+            for pr in &self.prs {
+                let labels_json = serde_json::to_string(&pr.labels).unwrap_or_else(|_| "[]".into());
+                stmt.execute(rusqlite::params![
+                    project_id,
+                    pr.number as i64,
+                    pr.title,
+                    labels_json,
+                    pr.url,
+                    pr.kind,
+                    pr.skip_reason,
+                    pr.first_seen_epoch as i64,
+                    pr.last_seen_epoch as i64,
+                    pr.archived as i64,
+                ])
+                .map_err(map_err)?;
+            }
+            Ok(())
+        })
     }
 
     /// Upserts this round's discovered views into the tracked set. An existing PR
@@ -234,11 +271,11 @@ impl TrackedPrs {
 /// **This is the ONLY persist path** ([`TrackedPrs::save`] is module-private), so a
 /// lock-free write is not expressible outside this module — the closed funnel that
 /// fixes F1 (upstream: `save` private; downstream: one fixed static [`WRITE_LOCK`]).
-/// Reads (`get_prs`, the projection below) need no lock: a load is a single whole-value
-/// store read, so a torn read can't happen and a stale-by-one-round snapshot self-heals.
+/// Reads (`get_prs`, the projection below) need no lock: a load is a single SQL query,
+/// so a torn read can't happen and a stale-by-one-round snapshot self-heals.
 ///
 /// `project_id` (#35) scopes the load + save to that project's key; the GLOBAL
-/// [`WRITE_LOCK`] still guards the whole-file `prs.json` rewrite across projects.
+/// [`WRITE_LOCK`] still guards the whole-partition `tracked_pr` write across projects.
 pub fn mutate_tracked<R, T>(
     app: &tauri::AppHandle<R>,
     project_id: &str,
@@ -259,6 +296,49 @@ where
         tracked.save(app, project_id)?;
     }
     Ok(out)
+}
+
+/// One-time legacy import (#70) of a project's `tracked:{pid}` list from the old
+/// `prs.json`. Parses the JSON array of [`TrackedPr`] and inserts `tracked_pr` rows via
+/// the same [`TrackedPrs::save_db`] used by production (so the column mapping has one
+/// source). Lenient: a corrupt value imports an empty set (parity with `load`).
+/// Runs inside the composition root's import transaction — but `save_db` opens its own
+/// transaction on the shared connection, which the import's outer `with_tx` would
+/// deadlock against; so it is called with a freshly-built `TrackedPrs` and inserts
+/// directly here rather than nesting `save_db`. See the inline note.
+pub fn import_legacy_tracked(
+    tx: &rusqlite::Transaction,
+    project_id: &str,
+    value: &serde_json::Value,
+) -> AppResult<()> {
+    let prs: Vec<TrackedPr> = serde_json::from_value(value.clone()).unwrap_or_default();
+    // Insert directly on the import transaction (do NOT call `save_db`, which would open
+    // a NESTED transaction on the same connection and fail). Mirrors `save_db`'s columns.
+    let mut stmt = tx
+        .prepare(
+            "INSERT OR REPLACE INTO tracked_pr \
+             (project_id, number, title, labels_json, url, kind, skip_reason, \
+              first_seen_epoch, last_seen_epoch, archived) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )
+        .map_err(map_err)?;
+    for pr in &prs {
+        let labels_json = serde_json::to_string(&pr.labels).unwrap_or_else(|_| "[]".into());
+        stmt.execute(rusqlite::params![
+            project_id,
+            pr.number as i64,
+            pr.title,
+            labels_json,
+            pr.url,
+            pr.kind,
+            pr.skip_reason,
+            pr.first_seen_epoch as i64,
+            pr.last_seen_epoch as i64,
+            pr.archived as i64,
+        ])
+        .map_err(map_err)?;
+    }
+    Ok(())
 }
 
 /// Projects the tracked set into the frontend wire rows. Each record's presence is
@@ -350,6 +430,101 @@ mod tests {
             last_seen_epoch: last_seen,
             archived: false,
         }
+    }
+
+    // SQLite store round-trip (#70, Medium carrier): an upserted set saved + loaded
+    // against an in-memory DB must preserve every field — including `labels` (stored as
+    // the `labels_json` text column), the nullable `skip_reason`, the presence clocks,
+    // and the `archived` flag. A column/SQL drift surfaces here.
+    #[test]
+    fn sqlite_round_trip_preserves_all_fields() {
+        let db = Database::open_in_memory().expect("open db");
+        let mut t = TrackedPrs::default();
+        t.upsert(&[view(12, "Add feature")], 1_700_000_000);
+        t.set_archived(12, true);
+        t.save_db(&db, "alpha").expect("save");
+
+        let back = TrackedPrs::load_db(&db, "alpha").expect("load");
+        assert_eq!(back.prs.len(), 1);
+        let pr = &back.prs[0];
+        assert_eq!(pr.number, 12);
+        assert_eq!(pr.title, "Add feature");
+        assert_eq!(pr.labels, vec!["review-label".to_string()]);
+        assert_eq!(pr.url, "https://x/12");
+        assert_eq!(pr.first_seen_epoch, 1_700_000_000);
+        assert!(pr.archived);
+
+        // A different project's partition is empty (the `project_id` column is the seam).
+        assert!(TrackedPrs::load_db(&db, "beta")
+            .expect("load other")
+            .prs
+            .is_empty());
+    }
+
+    // `save_db` replaces the whole partition: a row dropped from `self` (e.g. by a future
+    // prune) disappears from storage rather than lingering as an orphan.
+    #[test]
+    fn save_db_replaces_partition() {
+        let db = Database::open_in_memory().expect("open db");
+        let mut two = TrackedPrs::default();
+        two.upsert(&[view(1, "one"), view(2, "two")], 1_000);
+        two.save_db(&db, "p").expect("save two");
+
+        let mut one = TrackedPrs::default();
+        one.upsert(&[view(1, "one")], 1_000);
+        one.save_db(&db, "p").expect("save one");
+
+        let back = TrackedPrs::load_db(&db, "p").expect("load");
+        assert_eq!(back.prs.len(), 1);
+        assert_eq!(back.prs[0].number, 1);
+    }
+
+    // One-time legacy import (#70): the old `prs.json` shape (a JSON array of `TrackedPr`)
+    // imports into the SQLite partition and reads back through `load_db`, preserving the
+    // archived flag + presence clock existing users rely on across the migration.
+    #[test]
+    fn legacy_import_round_trips_through_load() {
+        let db = Database::open_in_memory().expect("open db");
+        let mut archived = tracked(7, 1_700_000_000);
+        archived.archived = true;
+        archived.labels = vec!["needs-review".to_string()];
+        let value = serde_json::to_value(vec![tracked(9, 1_700_000_500), archived])
+            .expect("legacy list serializes");
+
+        db.with_tx(|tx| import_legacy_tracked(tx, "alpha", &value))
+            .expect("import");
+
+        let back = TrackedPrs::load_db(&db, "alpha").expect("load");
+        assert_eq!(back.prs.len(), 2);
+        let pr7 = back.prs.iter().find(|p| p.number == 7).expect("pr 7");
+        assert!(pr7.archived, "archived flag survives import");
+        assert_eq!(pr7.labels, vec!["needs-review".to_string()]);
+        assert_eq!(pr7.first_seen_epoch, 0);
+        assert_eq!(pr7.last_seen_epoch, 1_700_000_000);
+    }
+
+    // A corrupt `labels_json` column degrades to an empty list rather than panicking the
+    // whole load (the doc'd `unwrap_or_default` leniency, review F5): one bad row must not
+    // wipe / crash the retained set on read.
+    #[test]
+    fn load_db_degrades_corrupt_labels_json_to_empty() {
+        let db = Database::open_in_memory().expect("open db");
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tracked_pr \
+                 (project_id, number, title, labels_json, url, kind, skip_reason, \
+                  first_seen_epoch, last_seen_epoch, archived) \
+                 VALUES ('alpha', 7, 'PR 7', 'not-json', 'https://x/7', 'review', NULL, 1, 2, 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .expect("seed corrupt row");
+
+        let back = TrackedPrs::load_db(&db, "alpha").expect("load must not panic");
+        assert_eq!(back.prs.len(), 1);
+        assert_eq!(back.prs[0].labels, Vec::<String>::new());
+        assert_eq!(back.prs[0].title, "PR 7");
     }
 
     // Wire-shape lock for the persisted `prs.json` records (Medium carrier per

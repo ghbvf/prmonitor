@@ -78,9 +78,11 @@ pub enum ReviewEvent {
         thread_id: String,
         message: String,
     },
-    /// An auto-trigger dispatch-level notice NOT tied to any one session — config
+    /// An app-level background-write notice NOT tied to any one session — config
     /// invalid, one/more `start_review` failures, or a ledger-write failure during
-    /// `crate::dispatch::auto_dispatch`. Carries no `threadId` (session-less), but
+    /// `crate::dispatch::auto_dispatch`; ALSO the one-time review-session persistence
+    /// failure notice (review F9), the same class of silent background-write failure the
+    /// user should see. Carries no `threadId` (session-less), but
     /// DOES carry `project_id` (#35) so the frontend can scope the app-level "auto
     /// review" notice to the offending project. Now that it has >1 field, it needs
     /// its own `#[serde(rename_all = "camelCase")]` so `projectId` serializes

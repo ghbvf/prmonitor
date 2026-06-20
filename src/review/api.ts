@@ -2,7 +2,7 @@
 // commands, and the streamed `review:event` Tauri event.
 import { invoke, listen } from "../api";
 import type { ReviewEvent } from "../types";
-import type { CodexStatus, ReviewSession } from "./types";
+import type { CodexStatus, ReviewSession, StreamItem } from "./types";
 
 // Mirrors `src-tauri/src/events.rs::REVIEW_EVENT` (pinned by a Rust test).
 const REVIEW_EVENT = "review:event" as const;
@@ -38,6 +38,31 @@ export function stopReview(sessionId: string): Promise<void> {
 
 export function listReviewSessions(): Promise<ReviewSession[]> {
   return invoke<ReviewSession[]>("list_review_sessions");
+}
+
+// A PR's persisted sessions, newest first, from the DURABLE store (#70) — survives an
+// app restart (unlike `listReviewSessions`, the in-memory snapshot), so the session
+// panel can list a PR's prior sessions and re-open their history.
+export function getPrSessions(
+  projectId: string,
+  prNumber: number,
+): Promise<ReviewSession[]> {
+  return invoke<ReviewSession[]>("get_pr_sessions", { projectId, prNumber });
+}
+
+// A session's persisted history items in stream order (#70) — message/reasoning blocks
+// produced before the session was opened. Same shape as the live `StreamItem`, so the
+// panel can render stored + live content uniformly.
+export function getSessionHistory(
+  projectId: string,
+  prNumber: number,
+  threadId: string,
+): Promise<StreamItem[]> {
+  return invoke<StreamItem[]>("get_session_history", {
+    projectId,
+    prNumber,
+    threadId,
+  });
 }
 
 // Subscribe to streamed review events. Returns a Promise<UnlistenFn> for cleanup.

@@ -10,10 +10,11 @@
 //! `list_review_sessions`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde::Serialize;
-use tauri::Emitter;
+use serde::{Deserialize, Serialize};
+use tauri::{Emitter, Manager};
 use tokio::sync::broadcast;
 
 use super::engines::codex::process;
@@ -22,6 +23,7 @@ use super::engines::codex::protocol::{
     UserInput,
 };
 use super::engines::codex::CodexManager;
+use super::history_store::HistoryItemKind;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, REVIEW_EVENT};
 use crate::review::engine::StartReviewOutcome;
@@ -34,8 +36,9 @@ pub type ThreadId = String;
 const PR_REVIEW_SKILL: &str = "pr-review";
 
 /// Lifecycle of one review session (the state machine). Serialized camelCase for
-/// `list_review_sessions`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// `list_review_sessions`; `Deserialize` so the persisted `review_session.status` wire
+/// string (#70) projects back into this enum in `history_store::get_pr_sessions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionStatus {
     /// `thread/start` / `turn/start` in flight (not yet observed on the stream).
@@ -66,6 +69,12 @@ pub struct SessionInfo {
     /// `"review"` or `"check"` — the trigger-label mode the review was started in.
     pub kind: String,
     pub status: SessionStatus,
+    /// Wall-clock epoch seconds when the session was created (#70, review F10): the
+    /// newest-first sort key the UI orders sessions by. Stamped at construction for a
+    /// live session; the persisted `created_at` for a durable row. `threadId` is a UUID
+    /// (no time), so the frontend sorting on it scrambled the list — this carries the
+    /// real order (mirrors `ReviewSession.createdAtEpoch` in `src/review/types.ts`).
+    pub created_at_epoch: u64,
 }
 
 /// In-memory registry of review sessions keyed by `threadId`. Lives in
@@ -370,14 +379,19 @@ pub async fn start_review<R: tauri::Runtime>(
     // dispatch never slips between `thread/start` success and this insert. A later
     // `turn/start` failure flips it to `Failed` (visible to `list_review_sessions`,
     // not vanished); `turn_id` is filled once the turn starts.
-    registry.promote_reservation(SessionInfo {
+    let starting = SessionInfo {
         project_id: project_id.to_string(),
         thread_id: thread_id.clone(),
         turn_id: String::new(),
         pr_number,
         kind: kind.to_string(),
         status: SessionStatus::Starting,
-    });
+        created_at_epoch: super::history_store::now_epoch(),
+    };
+    registry.promote_reservation(starting.clone());
+    // Mirror the in-memory session into the durable `review_session` table (#70) so this
+    // PR's session list survives a restart and its history can be reopened. Best-effort.
+    persist_session(app, &starting);
     reservation.disarm();
 
     let prompt = review_prompt(repo, &skill_command(pr_number, kind));
@@ -409,11 +423,28 @@ pub async fn start_review<R: tauri::Runtime>(
         Ok(turn_id) => turn_id,
         Err(e) => {
             registry.set_status(&thread_id, SessionStatus::Failed);
+            persist_status(app, &thread_id, SessionStatus::Failed);
             return Err(e);
         }
     };
 
-    registry.set_running(&thread_id, turn_id);
+    registry.set_running(&thread_id, turn_id.clone());
+    // Mirror the Running transition (+ the now-known turn id) into `review_session` (#70).
+    persist_session(
+        app,
+        &SessionInfo {
+            project_id: project_id.to_string(),
+            thread_id: thread_id.clone(),
+            turn_id,
+            pr_number,
+            kind: kind.to_string(),
+            status: SessionStatus::Running,
+            // Same creation instant as the `Starting` row above — `upsert_session` keys
+            // `created_at` on first insert (ON CONFLICT preserves it), so this only needs
+            // to stay consistent with `starting`, not re-stamp `now`.
+            created_at_epoch: starting.created_at_epoch,
+        },
+    );
 
     // Capture `project_id` as an owned String at spawn time so the pump stamps every
     // emitted `ReviewEvent` with it WITHOUT re-looking-up the session per event (#35):
@@ -497,6 +528,98 @@ pub async fn stop_review(
     Ok(())
 }
 
+/// Process-global guard for the one-time persistence-failure notice (review F9): a broken
+/// DB would otherwise fire a banner on EVERY swallowed persist error (one per delta). The
+/// first failure flips this and emits a single app-level notice; later failures only log.
+/// Static (not per-instance) because the app runs once per process and the notice is
+/// informational — there is no reset point to model.
+static PERSIST_FAILURE_NOTIFIED: AtomicBool = AtomicBool::new(false);
+
+/// Surface the FIRST review-persistence failure to the user once (review F9). The `persist_*`
+/// helpers are best-effort (log + swallow), so a failing DB silently stops saving session
+/// history — invisible on a desktop where nobody reads the console. This emits one app-level
+/// [`ReviewEvent::DispatchError`] (the existing availability-banner channel, which already
+/// covers background write failures) so the user learns their history may not survive a
+/// restart. Subsequent failures only log, so a broken DB never spams a notice per delta.
+fn notify_persist_failure_once<R: tauri::Runtime>(app: &tauri::AppHandle<R>, project_id: &str) {
+    if PERSIST_FAILURE_NOTIFIED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let _ = app.emit(
+        REVIEW_EVENT,
+        &ReviewEvent::DispatchError {
+            project_id: project_id.to_string(),
+            message: "review 会话持久化失败——重启后历史可能丢失（请检查磁盘空间 / 数据库文件权限）。后续失败仅记录日志。"
+                .to_string(),
+        },
+    );
+}
+
+/// Best-effort mirror of an in-memory [`SessionInfo`] into the durable `review_session`
+/// table (#70). Logs + swallows errors: a persistence hiccup must never break the live
+/// session (the in-memory registry stays the authority for dedup / status). The first
+/// failure also raises a one-time user-facing notice (review F9).
+fn persist_session<R: tauri::Runtime>(app: &tauri::AppHandle<R>, info: &SessionInfo) {
+    let db = app.state::<crate::db::Database>();
+    if let Err(e) = super::history_store::upsert_session(db.inner(), info) {
+        eprintln!(
+            "review session 持久化失败（{}）：{}",
+            info.thread_id, e.message
+        );
+        notify_persist_failure_once(app, &info.project_id);
+    }
+}
+
+/// Best-effort mirror of a session status transition into `review_session` (#70). Used at
+/// terminal transitions in the pump where only the thread id is at hand.
+fn persist_status<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    thread_id: &str,
+    status: SessionStatus,
+) {
+    let db = app.state::<crate::db::Database>();
+    if let Err(e) = super::history_store::set_status(db.inner(), thread_id, status) {
+        eprintln!(
+            "review session 状态持久化失败（{thread_id}）：{}",
+            e.message
+        );
+    }
+}
+
+/// Best-effort capture of a streamed delta into the persisted session history (#70).
+/// Called AFTER `app.emit` so the live stream never waits on the DB; a non-delta event is
+/// a no-op, and a persist error is logged + swallowed (the rendered stream is unaffected
+/// — at worst the last delta before a crash is missing from the reopened history).
+fn persist_delta<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    thread_id: &str,
+    event: &ReviewEvent,
+) {
+    let (project_id, item_id, kind, text) = match event {
+        ReviewEvent::MessageDelta {
+            project_id,
+            item_id,
+            text,
+            ..
+        } => (project_id, item_id, HistoryItemKind::Message, text),
+        ReviewEvent::ReasoningDelta {
+            project_id,
+            item_id,
+            text,
+            ..
+        } => (project_id, item_id, HistoryItemKind::Reasoning, text),
+        _ => return,
+    };
+    let db = app.state::<crate::db::Database>();
+    if let Err(e) = super::history_store::append_item(db.inner(), thread_id, item_id, kind, text) {
+        eprintln!(
+            "review history 持久化失败（{thread_id}/{item_id}）：{}",
+            e.message
+        );
+        notify_persist_failure_once(app, project_id);
+    }
+}
+
 /// Pump task: forward this session's notifications to the frontend as
 /// [`ReviewEvent`]s until the turn completes (or the connection drops). Filters by
 /// `thread_id` since the broadcast carries every session's stream; stamps every
@@ -526,11 +649,17 @@ async fn pump<R: tauri::Runtime>(
                     continue;
                 };
                 if let ReviewEvent::TurnCompleted { status, .. } = &event {
-                    registry.set_status(&thread_id, terminal_status(status));
+                    let terminal = terminal_status(status);
+                    registry.set_status(&thread_id, terminal);
                     let _ = app.emit(REVIEW_EVENT, &event);
+                    persist_status(&app, &thread_id, terminal); // mirror terminal to DB (#70)
                     break; // terminal — the turn is over.
                 }
+                // Emit FIRST (streaming latency must not wait on the DB), THEN persist the
+                // delta to the session history (#70) best-effort — a persist error is
+                // logged, never breaks the live stream.
                 let _ = app.emit(REVIEW_EVENT, &event);
+                persist_delta(&app, &thread_id, &event);
             }
             // The pump fell behind the shared ring and `n` notifications were
             // evicted. The terminal `turn/completed` may have been among them
@@ -541,6 +670,7 @@ async fn pump<R: tauri::Runtime>(
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 eprintln!("review pump（{thread_id}）滞后，丢弃 {n} 条通知");
                 registry.set_status(&thread_id, SessionStatus::Failed);
+                persist_status(&app, &thread_id, SessionStatus::Failed); // mirror to DB (#70)
                 let _ = app.emit(
                     REVIEW_EVENT,
                     &ReviewEvent::Error {
@@ -573,6 +703,7 @@ fn fail_connection_closed<R: tauri::Runtime>(
     thread_id: &str,
 ) {
     registry.set_status(thread_id, SessionStatus::Failed);
+    persist_status(app, thread_id, SessionStatus::Failed); // mirror to DB (#70)
     let _ = app.emit(
         REVIEW_EVENT,
         &ReviewEvent::Error {
@@ -783,6 +914,7 @@ mod tests {
             pr_number: 7,
             kind: "review".to_string(),
             status: SessionStatus::Running,
+            created_at_epoch: 0,
         });
         assert_eq!(reg.list()[0].turn_id, "tn1");
         reg.set_status("t1", SessionStatus::Done);
@@ -806,6 +938,7 @@ mod tests {
                 pr_number: pr,
                 kind: kind.to_string(),
                 status,
+                created_at_epoch: 0,
             });
         };
         info("a", 1, "review", SessionStatus::Starting);
@@ -861,6 +994,7 @@ mod tests {
             pr_number: 7,
             kind: "review".to_string(),
             status: SessionStatus::Running,
+            created_at_epoch: 0,
         });
         assert!(!reg.try_reserve_pair("p1", 7, "review"));
         // A different kind is still reservable; a terminal session would not block
@@ -903,6 +1037,7 @@ mod tests {
             pr_number: 9,
             kind: "review".to_string(),
             status: SessionStatus::Running,
+            created_at_epoch: 0,
         });
         assert!(
             reg.active_pairs("A").contains(&(9, "review".to_string())),
@@ -940,6 +1075,7 @@ mod tests {
             pr_number: 7,
             kind: "review".to_string(),
             status: SessionStatus::Starting,
+            created_at_epoch: 0,
         });
         // After promotion the pair is covered by the Starting session, not the reserved
         // set — and a concurrent reserve still loses (continuous coverage, no gap).
@@ -993,6 +1129,7 @@ mod tests {
             pr_number: 7,
             kind: "review".to_string(),
             status: SessionStatus::Running,
+            created_at_epoch: 0,
         });
         // Running → Proceed(turn_id), status flips to Interrupting.
         match reg.begin_interrupt("t1") {
@@ -1022,6 +1159,7 @@ mod tests {
             pr_number: 7,
             kind: "review".to_string(),
             status: SessionStatus::Running,
+            created_at_epoch: 0,
         });
         reg.begin_interrupt("t1"); // → Interrupting
         reg.rollback_interrupt("t1"); // failed interrupt → back to Running (retry-able)
@@ -1046,12 +1184,16 @@ mod tests {
             pr_number: 7,
             kind: "review".to_string(),
             status: SessionStatus::Running,
+            created_at_epoch: 1_700_000_000,
         })
         .expect("SessionInfo serializes");
         assert_eq!(v["projectId"], "p1");
         assert_eq!(v["threadId"], "t1");
         assert_eq!(v["turnId"], "tn1");
         assert_eq!(v["prNumber"], 7);
+        // `createdAtEpoch` (review F10) is the frontend sort key — pin its camelCase wire
+        // key so a rename / drop surfaces here in lockstep with `ReviewSession` in TS.
+        assert_eq!(v["createdAtEpoch"], 1_700_000_000_u64);
         // `kind` ("review"/"check") is a frontend contract field (mirrored by
         // `ReviewSession.kind` in `src/review/types.ts`); pin it so a rename / drop
         // surfaces here in lockstep with the camelCase keys.
@@ -1059,6 +1201,7 @@ mod tests {
         assert_eq!(v["status"], "running");
         assert!(v.get("project_id").is_none());
         assert!(v.get("thread_id").is_none());
+        assert!(v.get("created_at_epoch").is_none());
     }
 
     #[test]
@@ -1088,6 +1231,7 @@ mod tests {
             pr_number: 7,
             kind: "review".to_string(),
             status: SessionStatus::Starting,
+            created_at_epoch: 0,
         });
         reg.set_status("t1", SessionStatus::Failed);
         assert_eq!(reg.list()[0].status, SessionStatus::Failed);

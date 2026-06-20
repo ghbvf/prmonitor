@@ -22,6 +22,8 @@ vi.mock("./api", () => ({
   startReview: vi.fn(() => Promise.resolve("th_1")),
   stopReview: vi.fn(() => Promise.resolve()),
   listReviewSessions: vi.fn(() => Promise.resolve([])),
+  getPrSessions: vi.fn(() => Promise.resolve([])),
+  getSessionHistory: vi.fn(() => Promise.resolve([])),
   onReviewEvent: vi.fn(() => Promise.resolve(() => {})),
 }));
 
@@ -40,6 +42,8 @@ beforeEach(() => {
   vi.mocked(api.startReview).mockResolvedValue("th_1");
   vi.mocked(api.stopReview).mockResolvedValue();
   vi.mocked(api.listReviewSessions).mockResolvedValue([]);
+  vi.mocked(api.getPrSessions).mockResolvedValue([]);
+  vi.mocked(api.getSessionHistory).mockResolvedValue([]);
   // Module-level singleton state: reset between tests so each starts clean.
   const s = useReviewStore();
   s.codex.value = null;
@@ -67,6 +71,7 @@ function session(over: Partial<ReviewSession> = {}): ReviewSession {
     prNumber: 7,
     kind: "review",
     status: "running",
+    createdAtEpoch: 0,
     ...over,
   };
 }
@@ -379,6 +384,7 @@ describe("useReviewStore init()", () => {
         prNumber: 42,
         kind: "review",
         status: "running",
+        createdAtEpoch: 0,
       },
     ]);
     const store = useReviewStore();
@@ -404,6 +410,7 @@ describe("useReviewStore init()", () => {
         prNumber: 1,
         kind: "review",
         status: "done",
+        createdAtEpoch: 0,
       },
     ]);
     const store = useReviewStore();
@@ -573,7 +580,7 @@ describe("useReviewStore focus()", () => {
     store.error.value = "old error";
     store.finalStatus.value = "completed";
 
-    store.focus("th_pick", 42, "running");
+    store.focus("p1", "th_pick", 42, "running");
 
     expect(store.activeThreadId.value).toBe("th_pick");
     expect(store.activePr.value).toBe(42);
@@ -586,15 +593,61 @@ describe("useReviewStore focus()", () => {
   it("marks a terminal session as not running", () => {
     const store = useReviewStore();
 
-    store.focus("th_done", 7, "done");
+    store.focus("p1", "th_done", 7, "done");
 
     expect(store.running.value).toBe(false);
+  });
+
+  it("hydrates the panel with the session's persisted history (#70)", async () => {
+    const store = useReviewStore();
+    vi.mocked(api.getSessionHistory).mockResolvedValueOnce([
+      { itemId: "i1", kind: "reasoning", text: "planned" },
+      { itemId: "i2", kind: "message", text: "done" },
+    ]);
+
+    await store.focus("p1", "th_hist", 7, "done");
+
+    expect(api.getSessionHistory).toHaveBeenCalledWith("p1", 7, "th_hist");
+    expect(store.items.value).toEqual([
+      { itemId: "i1", kind: "reasoning", text: "planned" },
+      { itemId: "i2", kind: "message", text: "done" },
+    ]);
+  });
+
+  it("surfaces a history load failure to the user (pr-review F4)", async () => {
+    const store = useReviewStore();
+    vi.mocked(api.getSessionHistory).mockRejectedValueOnce(new Error("disk gone"));
+
+    await store.focus("p1", "th_err", 7, "done");
+
+    // A rejected getSessionHistory used to only console.error → blank panel, no signal.
+    expect(store.error.value).toBe("disk gone");
+  });
+
+  it("does not apply stale history after focus switched away mid-load", async () => {
+    const store = useReviewStore();
+    // First focus's history load is slow; a second focus lands before it resolves.
+    let resolveFirst!: (v: { itemId: string; kind: "message"; text: string }[]) => void;
+    vi.mocked(api.getSessionHistory)
+      .mockImplementationOnce(
+        () => new Promise((res) => (resolveFirst = res)),
+      )
+      .mockResolvedValueOnce([]);
+
+    const first = store.focus("p1", "th_a", 1, "done");
+    await store.focus("p1", "th_b", 2, "done"); // switches focus to th_b
+    resolveFirst([{ itemId: "x", kind: "message", text: "late" }]);
+    await first;
+
+    // th_a's late history must NOT clobber th_b's (now-focused) empty panel.
+    expect(store.activeThreadId.value).toBe("th_b");
+    expect(store.items.value).toEqual([]);
   });
 
   it("treats a starting session as running", () => {
     const store = useReviewStore();
 
-    store.focus("th_starting", 7, "starting");
+    store.focus("p1", "th_starting", 7, "starting");
 
     expect(store.running.value).toBe(true);
   });
@@ -602,7 +655,7 @@ describe("useReviewStore focus()", () => {
   it("treats an interrupting session as running", () => {
     const store = useReviewStore();
 
-    store.focus("th_interrupting", 7, "interrupting");
+    store.focus("p1", "th_interrupting", 7, "interrupting");
 
     expect(store.running.value).toBe(true);
   });
@@ -610,7 +663,7 @@ describe("useReviewStore focus()", () => {
   it("renders a focused done session as ended, not 未开始", () => {
     const store = useReviewStore();
 
-    store.focus("th_done", 7, "done");
+    store.focus("p1", "th_done", 7, "done");
 
     // A terminal status must surface so ReviewPanel shows "已结束", not "未开始".
     expect(store.running.value).toBe(false);
@@ -620,7 +673,7 @@ describe("useReviewStore focus()", () => {
   it("renders a focused failed session with a failed terminal status", () => {
     const store = useReviewStore();
 
-    store.focus("th_failed", 7, "failed");
+    store.focus("p1", "th_failed", 7, "failed");
 
     expect(store.running.value).toBe(false);
     expect(store.finalStatus.value).toBe("failed");
@@ -629,7 +682,7 @@ describe("useReviewStore focus()", () => {
   it("clearFocus() drops the focused session (#35 F5: project switch)", () => {
     const store = useReviewStore();
     // A focused, running session from the project the user is about to leave.
-    store.focus("th_other_project", 7, "running");
+    store.focus("p1", "th_other_project", 7, "running");
     store.items.value = [{ itemId: "i1", kind: "message", text: "hi" }];
 
     store.clearFocus();

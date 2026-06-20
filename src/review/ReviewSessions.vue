@@ -1,23 +1,84 @@
 <script setup lang="ts">
-// Review-sessions list: the concurrent-aware companion to ReviewPanel's single
-// focused stream. #8 can auto-trigger several review sessions at once; this lists
-// them all — running AND finished (the backend's `list_review_sessions` returns
-// both) — from the shared store's `sessions` ref, and lets the user point the
-// focused panel at any one. Reads the module-level singleton store — no second
-// instance, no props. Mirrors PrList/PrRow's badge + muted conventions.
-import { computed } from "vue";
-import { useProjects } from "../projects";
+// Review-sessions list for the SELECTED PR (#67): the independent session panel
+// (sessions stay OUT of the PR box per the chosen layout). Lists that PR's sessions —
+// running AND finished — sourced from the DURABLE store (`getPrSessions`, #70) so they
+// survive a restart, overlaid with the live in-memory `sessions` for real-time status.
+// Clicking one points the focused panel at it (and hydrates its persisted history). The
+// composition root (App.vue) passes the selected PR down, keeping pr/review decoupled.
+import { computed, ref, watch } from "vue";
+import { getPrSessions } from "./api";
 import { useReviewStore } from "./useReviewStore";
-import type { SessionStatus } from "./types";
+import type { ReviewSession, SessionStatus } from "./types";
 
+const props = defineProps<{ projectId: string; prNumber: number | null }>();
 const { sessions, activeThreadId, focus } = useReviewStore();
-const { activeProjectId } = useProjects();
 
-// Scope the list to the active project (#35): the store tracks every project's
-// sessions, but the panel only ever focuses one project's at a time.
-const visibleSessions = computed(() =>
-  sessions.value.filter((s) => s.projectId === activeProjectId.value),
-);
+// Durable sessions for the selected PR (#70): persisted, so a PR's session list is
+// restored after a restart (the in-memory `sessions` is empty then).
+const durable = ref<ReviewSession[]>([]);
+const loading = ref(false);
+const loadError = ref<string | null>(null);
+
+// `clear` = a PR/project SWITCH: blank the old PR's list synchronously (no stale flash,
+// review F4) and show a loading state. A background reload (live `sessions` changed) keeps
+// the current list visible and swaps it in on resolve — no flicker mid-stream.
+async function loadDurable(clear: boolean) {
+  loadError.value = null;
+  // Capture this request's target (pr-review F2): a slow `getPrSessions` that resolves
+  // AFTER the user switched PR/project must be discarded, not written onto the now-current
+  // PR's list. Mirrors `useReviewStore.focus()`'s stale-response guard.
+  const reqProjectId = props.projectId;
+  const reqPrNumber = props.prNumber;
+  if (reqPrNumber == null) {
+    durable.value = [];
+    return;
+  }
+  if (clear) {
+    durable.value = [];
+    loading.value = true;
+  }
+  const isStale = () =>
+    props.projectId !== reqProjectId || props.prNumber !== reqPrNumber;
+  try {
+    const result = await getPrSessions(reqProjectId, reqPrNumber);
+    if (isStale()) return;
+    durable.value = result;
+  } catch (err) {
+    if (isStale()) return;
+    console.error("加载 PR 会话列表失败", err);
+    loadError.value = (err as { message?: string })?.message ?? String(err);
+    if (clear) durable.value = [];
+  } finally {
+    if (!isStale()) loading.value = false;
+  }
+}
+
+// PR/project switch → clear + load. Live session set changed (a session started /
+// transitioned) → background reload, no clear.
+watch(() => [props.projectId, props.prNumber], () => loadDurable(true), {
+  immediate: true,
+});
+watch(sessions, () => loadDurable(false));
+
+// Merge durable + live for the selected PR: a matching live session overrides the
+// durable row (its status is real-time), and a brand-new live session not yet in the
+// durable snapshot still appears. Newest-first by `createdAtEpoch` (#70, review F10):
+// `threadId` is a UUID with no time, so sorting on it scrambled the list — the epoch is
+// the real creation order, with `threadId` as a stable tiebreaker for equal stamps.
+const visibleSessions = computed<ReviewSession[]>(() => {
+  if (props.prNumber == null) return [];
+  const byThread = new Map<string, ReviewSession>();
+  for (const s of durable.value) byThread.set(s.threadId, s);
+  for (const s of sessions.value) {
+    if (s.projectId === props.projectId && s.prNumber === props.prNumber) {
+      byThread.set(s.threadId, s);
+    }
+  }
+  return [...byThread.values()].sort(
+    (a, b) =>
+      b.createdAtEpoch - a.createdAtEpoch || a.threadId.localeCompare(b.threadId),
+  );
+});
 
 // Bilingual label for each session lifecycle status (mirrors ReviewPanel's
 // finalLabel style). Default keeps the raw value so a new SessionStatus still
@@ -46,8 +107,18 @@ function statusLabel(status: SessionStatus): string {
       <h2>Review 会话 / Review sessions</h2>
     </header>
 
-    <p v-if="visibleSessions.length === 0" class="muted">
-      暂无会话 / No review sessions
+    <p v-if="prNumber == null" class="muted">
+      选择一个 PR 查看其会话 / Select a PR to see its sessions
+    </p>
+
+    <p v-else-if="loadError" class="error">加载会话失败 / {{ loadError }}</p>
+
+    <p v-else-if="loading && visibleSessions.length === 0" class="muted">
+      加载中… / loading
+    </p>
+
+    <p v-else-if="visibleSessions.length === 0" class="muted">
+      该 PR 暂无会话 / No sessions for this PR
     </p>
 
     <ul v-else class="rows">
@@ -56,7 +127,7 @@ function statusLabel(status: SessionStatus): string {
         :key="s.threadId"
         class="session-row"
         :class="{ focused: s.threadId === activeThreadId }"
-        @click="focus(s.threadId, s.prNumber, s.status)"
+        @click="focus(s.projectId, s.threadId, s.prNumber, s.status)"
       >
         <span class="pr">PR #{{ s.prNumber }}</span>
         <span class="badge kind">{{ s.kind }}</span>
@@ -84,6 +155,10 @@ function statusLabel(status: SessionStatus): string {
 }
 .muted {
   color: var(--color-text-muted);
+  font-size: var(--font-size-sm);
+}
+.error {
+  color: var(--color-danger);
   font-size: var(--font-size-sm);
 }
 .rows {

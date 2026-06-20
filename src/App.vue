@@ -8,8 +8,7 @@ import { useConfigStore } from "./config/useConfigStore";
 import SettingsView from "./config/SettingsView.vue";
 import OnboardingWizard from "./config/OnboardingWizard.vue";
 import PollControls from "./pr/PollControls.vue";
-import PrList from "./pr/PrList.vue";
-import ProjectSwitcher from "./pr/ProjectSwitcher.vue";
+import ProjectNav from "./pr/ProjectNav.vue";
 import WebhookPanel from "./pr/WebhookPanel.vue";
 import { usePrStore } from "./pr/usePrStore";
 import StatusBar from "./StatusBar.vue";
@@ -218,10 +217,13 @@ watch(activeProjectId, () => {
     </SettingsView>
 
     <div v-else class="layout">
-      <ProjectSwitcher />
-      <aside class="sidebar">
+      <!-- Unified project → PR navigation (#67): one column (ProjectNav merges the old
+           ProjectSwitcher rail + PrList sidebar) — projects as H2, the active project's
+           PRs nested beneath. Sessions stay OUT of this column (the independent session
+           panel lives in the content area), per the chosen layout. -->
+      <aside class="nav-column">
         <PollControls />
-        <PrList
+        <ProjectNav
           :selected-number="selectedNumber"
           @select="(pr) => (selectedNumber = pr.number)"
         />
@@ -260,7 +262,10 @@ watch(activeProjectId, () => {
             </button>
           </p>
         </div>
-        <ReviewSessions />
+        <ReviewSessions
+          :project-id="activeProjectId"
+          :pr-number="selectedPr?.number ?? null"
+        />
         <ReviewPanel :selected-pr="selectedPr" />
       </main>
     </div>
@@ -331,7 +336,7 @@ body {
   min-height: 0;
 }
 
-.sidebar {
+.nav-column {
   width: var(--sidebar-width);
   border-right: 1px solid var(--color-border-strong);
   overflow-y: auto;

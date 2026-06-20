@@ -9,4 +9,5 @@
 pub mod commands;
 pub mod engine;
 pub mod engines;
+pub mod history_store;
 pub mod session;

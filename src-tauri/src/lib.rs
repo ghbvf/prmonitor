@@ -19,6 +19,7 @@
 // `pr::source::PrSource`, `review::engine::ReviewEngine`) count as reachable API
 // in this skeleton rather than tripping `dead_code` before their first use.
 pub mod config;
+pub mod db;
 pub mod dispatch;
 pub mod error;
 pub mod events;
@@ -40,6 +41,23 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(AppState::default())
         .setup(|app| {
+            // Open + migrate the unified SQLite store and manage it as a `tauri::State`
+            // BEFORE anything that reads persistence (config load / poll start). It is a
+            // `State` rather than an `AppState` field because `app_data_dir()` only
+            // resolves here in `setup`, while `AppState` is `.manage()`d at builder time.
+            // Then run the one-time legacy JSON → SQLite import (#70) so existing users'
+            // config / tracked PRs / ledger carry over before the first read.
+            app.manage(db::Database::open(app.handle())?);
+            import_legacy_stores(app.handle())?;
+            // Reconcile sessions left non-terminal by a dead previous process (pr-review F1):
+            // a persisted starting/running/interrupting status has no live pump, so mark it
+            // failed rather than letting the UI restore it as still running.
+            let stale =
+                review::history_store::fail_orphaned_sessions(app.state::<db::Database>().inner())?;
+            if stale > 0 {
+                eprintln!("启动：{stale} 个遗留未完成 review 会话已标记 failed");
+            }
+
             let state = app.state::<AppState>();
             // Install the auto-trigger dispatcher BEFORE starting the loop, so the
             // immediate first tick already auto-starts dispatchable reviews. The
@@ -105,6 +123,8 @@ pub fn run() {
             review::commands::start_review,
             review::commands::stop_review,
             review::commands::list_review_sessions,
+            review::commands::get_session_history,
+            review::commands::get_pr_sessions,
             config::commands::set_active_project,
         ])
         .build(tauri::generate_context!())
@@ -121,6 +141,98 @@ pub fn run() {
                 state.webhook.shutdown();
             }
         });
+}
+
+/// One-time legacy JSON → SQLite import (#70). Reads the pre-SQLite `tauri-plugin-store`
+/// files (`config.json` / `prs.json` / `ledger.json`) and hands each value to the OWNING
+/// slice's `import_legacy_*` helper (column knowledge stays in the slice), inserting all
+/// rows + the done-guard in ONE transaction so a crash mid-import rolls back and re-runs
+/// cleanly. A no-op once [`db::Database::legacy_imported`] is set, and on fresh installs
+/// (the legacy stores are empty, so nothing imports). The old JSON files are LEFT in
+/// place (recoverable / downgradeable); the guard makes them inert.
+///
+/// This is composition (it spans `config` + `pr` slices), so it lives at the root, not
+/// in `db` (which stays a pure horizontal owning only schema + connection).
+fn import_legacy_stores<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> error::AppResult<()> {
+    use tauri_plugin_store::StoreExt;
+
+    let db = app.state::<db::Database>();
+    if db.legacy_imported()? {
+        return Ok(());
+    }
+
+    // Gather the legacy values up front (reads, outside the write transaction). A
+    // missing store file just yields an empty store → nothing to import.
+    let config_value = app
+        .store("config.json")
+        .ok()
+        .and_then(|s| s.get("appConfig"));
+
+    let mut tracked: Vec<(String, serde_json::Value)> = Vec::new();
+    if let Ok(store) = app.store("prs.json") {
+        for key in store.keys() {
+            if let Some(pid) = key.strip_prefix("tracked:") {
+                if let Some(v) = store.get(&key) {
+                    tracked.push((pid.to_string(), v));
+                }
+            }
+        }
+    }
+
+    let mut dispatched: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut events: Vec<(String, serde_json::Value)> = Vec::new();
+    if let Ok(store) = app.store("ledger.json") {
+        for key in store.keys() {
+            if let Some(pid) = key.strip_prefix("dispatched:") {
+                if let Some(v) = store.get(&key) {
+                    dispatched.push((pid.to_string(), v));
+                }
+            } else if let Some(pid) = key.strip_prefix("events:") {
+                if let Some(v) = store.get(&key) {
+                    events.push((pid.to_string(), v));
+                }
+            }
+        }
+    }
+
+    import_legacy_into_db(&db, config_value.as_ref(), &tracked, &dispatched, &events)
+}
+
+/// The cross-slice import ASSEMBLY (review F11) — split out from [`import_legacy_stores`]
+/// (which is the tauri-store GATHER) so the part with NO per-slice owner is testable
+/// without a tauri app: guard-check, then in ONE transaction hand each gathered legacy
+/// value to its owning slice's `import_legacy_*` and stamp the done-guard, so a crash
+/// mid-import rolls back and re-runs cleanly. The per-slice `import_legacy_*` have their
+/// own round-trip tests; this layer's contract (all four categories in one tx + guard) is
+/// covered by `import_legacy_into_db_imports_all_slices_then_guards`.
+fn import_legacy_into_db(
+    db: &db::Database,
+    config_value: Option<&serde_json::Value>,
+    tracked: &[(String, serde_json::Value)],
+    dispatched: &[(String, serde_json::Value)],
+    events: &[(String, serde_json::Value)],
+) -> error::AppResult<()> {
+    // Authoritative guard (also pre-checked in `import_legacy_stores` to skip the gather):
+    // keeping it here makes this unit self-guarding, so a re-run is a proven no-op.
+    if db.legacy_imported()? {
+        return Ok(());
+    }
+    db.with_tx(|tx| {
+        if let Some(v) = config_value {
+            config::service::import_legacy_config(tx, v)?;
+        }
+        for (pid, v) in tracked {
+            pr::registry::import_legacy_tracked(tx, pid, v)?;
+        }
+        for (pid, v) in dispatched {
+            pr::ledger::import_legacy_dispatched(tx, pid, v)?;
+        }
+        for (pid, v) in events {
+            pr::ledger::import_legacy_events(tx, pid, v)?;
+        }
+        db::mark_legacy_imported(tx)?;
+        Ok(())
+    })
 }
 
 /// Build the per-cycle [`pr::scheduler::ProjectDispatcher`] both auto-trigger sources
@@ -222,4 +334,73 @@ fn skill_abs_path(repo_root: &str, skill_rel_path: &str) -> String {
         .join(skill_rel_path)
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    // Cross-slice legacy-import ASSEMBLY + guard (review F11). The per-slice
+    // `import_legacy_*` have their own round-trip tests; this covers what ONLY the
+    // composition root owns: all four categories imported in ONE transaction, the
+    // done-guard stamped, and a second call short-circuiting with NO duplicate rows —
+    // proven via `dispatch_event` (a plain INSERT, so a dropped guard would double it).
+    #[test]
+    fn import_legacy_into_db_imports_all_slices_then_guards() {
+        let db = Database::open_in_memory().expect("open db");
+
+        let config_value = serde_json::json!({ "activeProjectId": "imported", "projects": [] });
+        let tracked = vec![(
+            "default".to_string(),
+            serde_json::json!([{
+                "number": 7, "title": "PR 7", "labels": ["needs-review"],
+                "url": "https://x/7", "kind": "review", "skipReason": null,
+                "firstSeenEpoch": 1, "lastSeenEpoch": 2, "archived": false
+            }]),
+        )];
+        let dispatched = vec![("default".to_string(), serde_json::json!(["7@sha:review"]))];
+        let events = vec![(
+            "default".to_string(),
+            serde_json::json!([{
+                "pr": 7, "kind": "review", "headSha": "sha",
+                "key": "7@sha:review", "dispatchedAtEpoch": 100
+            }]),
+        )];
+
+        import_legacy_into_db(&db, Some(&config_value), &tracked, &dispatched, &events)
+            .expect("first import");
+
+        // Guard stamped.
+        assert!(db.legacy_imported().expect("guard read"));
+
+        // Config blob imported (one row at the fixed id).
+        let config_rows = db
+            .with_conn(|c| {
+                c.query_row("SELECT COUNT(*) FROM config_blob WHERE id = 1", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+            })
+            .expect("count config");
+        assert_eq!(config_rows, 1, "config blob imported");
+
+        // pr-slice tracked + ledger round-trip through their db-loads.
+        let prs = pr::registry::TrackedPrs::load_db(&db, "default").expect("tracked load");
+        assert_eq!(prs.prs.len(), 1);
+        assert_eq!(prs.prs[0].number, 7);
+
+        let ledger = pr::ledger::Ledger::load_db(&db, "default").expect("ledger load");
+        assert!(ledger.has_dispatched("7@sha:review"));
+        assert_eq!(ledger.events.len(), 1);
+
+        // Second call short-circuits on the guard → NO duplicate dispatch_event rows.
+        import_legacy_into_db(&db, Some(&config_value), &tracked, &dispatched, &events)
+            .expect("second import is a no-op");
+        let ledger_again = pr::ledger::Ledger::load_db(&db, "default").expect("ledger reload");
+        assert_eq!(
+            ledger_again.events.len(),
+            1,
+            "guard prevents re-import duplicating events"
+        );
+    }
 }

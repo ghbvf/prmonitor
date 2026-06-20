@@ -206,7 +206,7 @@ pub async fn gh_status() -> AppResult<GhStatus> {
 }
 
 /// Returns `project_id`'s retained tracked-PR list (#35) — that project's persisted
-/// `prs.json` partition projected at the current epoch — so the frontend can render
+/// `tracked_pr` rows projected at the current epoch — so the frontend can render
 /// the active project's state on mount without waiting for the next `prs:updated`
 /// event (closes the startup lost-event race). Reads only `app` (+ the project id):
 /// the persisted set survives restarts, so this no longer depends on the scheduler

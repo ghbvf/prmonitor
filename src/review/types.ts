@@ -24,6 +24,10 @@ export interface ReviewSession {
   prNumber: number;
   kind: string;
   status: SessionStatus;
+  // Wall-clock epoch seconds the session was created (#70, review F10): the newest-first
+  // sort key for the session list. Mirrors `SessionInfo.created_at_epoch` (Rust) — a UUID
+  // `threadId` has no time, so the list is ordered by this instead.
+  createdAtEpoch: number;
 }
 
 // A view-only aggregate of streamed deltas, keyed by codex `itemId`. Message and
