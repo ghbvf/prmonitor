@@ -51,7 +51,7 @@ use tokio::time::MissedTickBehavior;
 use crate::config::service::{self as config_service, Project};
 use crate::error::AppResult;
 use crate::events::{PrEvent, PRS_UPDATED_EVENT};
-use crate::model::{Candidate, TrackedPrView};
+use crate::model::{Candidate, TrackedPrView, UpdateMode};
 
 use super::registry;
 
@@ -309,6 +309,17 @@ impl Scheduler {
     }
 }
 
+/// Whether a project should get a periodic CLI poll loop (#818). The CORE safety gate
+/// of the data-source-modes work: app launch (and every reconcile) starts a [`Scheduler`]
+/// ONLY for a project that opted into periodic polling — an `enabled` project whose
+/// [`UpdateMode`] is `PullOnly` or `Hybrid`. A `WebhookOnly` (default) or `Manual`
+/// project, or a disabled one, gets NO loop, so no unsolicited `gh` / `az` poll fires at
+/// startup. Exhaustive `matches!` over the polling modes so a new [`UpdateMode`] variant
+/// has to be classified here. Locked by `periodic_polling_only_for_enabled_pull_or_hybrid`.
+fn periodic_polling(p: &Project) -> bool {
+    p.enabled && matches!(p.update_mode, UpdateMode::PullOnly | UpdateMode::Hybrid)
+}
+
 /// The composition-root handle for ALL projects' poll loops (#35). Lives in
 /// [`crate::state::AppState`]; all methods take `&self` and use interior mutability so
 /// a single shared `State<AppState>` can drive every project. Owns a
@@ -336,31 +347,33 @@ impl SchedulerSet {
         *self.dispatcher.lock().unwrap() = Some(d);
     }
 
-    /// Reconciles the running schedulers to `projects` (#35). Idempotent — safe to call
-    /// on every config save:
-    /// - an `enabled` project NOT yet in the map → create a [`Scheduler`], install the
+    /// Reconciles the running schedulers to `projects` (#35, #818). Idempotent — safe to
+    /// call on every config save. A periodic poll loop runs ONLY for a project where
+    /// [`periodic_polling`] holds (enabled + `PullOnly`/`Hybrid`); a webhook-only / manual
+    /// / disabled project gets NO loop (the #818 safety change — app launch must not
+    /// auto-poll those):
+    /// - a poll-eligible project NOT yet in the map → create a [`Scheduler`], install the
     ///   shared dispatcher, and `start` it (captures the project's id);
-    /// - a mapped id that is no longer enabled (disabled, removed, or absent from
-    ///   `projects`) → `stop` it and drop it from the map;
-    /// - a surviving enabled project → `reconfigure` (re-read its period; the first
+    /// - a mapped id that is no longer poll-eligible (disabled, removed, mode flipped to
+    ///   webhook-only/manual, or absent from `projects`) → `stop` it and drop it;
+    /// - a surviving poll-eligible project → `reconfigure` (re-read its period; the first
     ///   tick fires immediately, so this also re-polls).
-    ///
-    /// A DISABLED project is treated identically to a removed one (stopped), so the
-    /// scheduler set always mirrors exactly the enabled projects.
     pub fn reconcile<R: tauri::Runtime>(&self, app: &tauri::AppHandle<R>, projects: &[Project]) {
         let dispatcher = self.dispatcher.lock().unwrap().clone();
         let mut map = self.inner.lock().unwrap();
 
-        // The set of ids that SHOULD be running (enabled projects).
-        let enabled_ids: std::collections::HashSet<&str> = projects
+        // The set of ids that SHOULD be running (poll-eligible projects: enabled +
+        // pull-only/hybrid). Webhook-only / manual / disabled are intentionally excluded
+        // (#818) so launch never auto-polls them.
+        let poll_ids: std::collections::HashSet<&str> = projects
             .iter()
-            .filter(|p| p.enabled)
+            .filter(|p| periodic_polling(p))
             .map(|p| p.id.as_str())
             .collect();
 
-        // Stop + drop schedulers whose project is no longer enabled (disabled / removed).
+        // Stop + drop schedulers whose project is no longer poll-eligible.
         map.retain(|id, scheduler| {
-            if enabled_ids.contains(id.as_str()) {
+            if poll_ids.contains(id.as_str()) {
                 true
             } else {
                 scheduler.stop();
@@ -368,8 +381,8 @@ impl SchedulerSet {
             }
         });
 
-        // Create-or-reconfigure each enabled project.
-        for project in projects.iter().filter(|p| p.enabled) {
+        // Create-or-reconfigure each poll-eligible project.
+        for project in projects.iter().filter(|p| periodic_polling(p)) {
             match map.get(&project.id) {
                 Some(scheduler) => scheduler.reconfigure(), // survivor: re-read period + re-poll.
                 None => {
@@ -404,6 +417,24 @@ impl SchedulerSet {
         if let Some(s) = self.inner.lock().unwrap().get(project_id) {
             s.reconfigure();
         }
+    }
+
+    /// Runs ONE one-shot discovery cycle for `project_id` WITHOUT a running poll loop
+    /// (#818). The `Manual` mode's "立即拉取" path: `poll_now` calls this when no scheduler
+    /// exists for the project (manual has no periodic loop). Drives the same per-cycle body
+    /// the loop runs — [`discover_emit_dispatch`] — so a manual pull discovers, persists,
+    /// emits `prs:updated`, and (when autoReview is on) dispatches exactly like a periodic
+    /// cycle. Uses the set's shared dispatcher (the same one `reconcile` clones into each
+    /// scheduler) and a TRANSIENT [`PollDiag`] (no persistent loop to surface diagnostics
+    /// through, so the cycle's timestamps are discarded). `async` — awaited by the caller.
+    pub async fn discover_once<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        project_id: &str,
+    ) {
+        let dispatcher = self.dispatcher.lock().unwrap().clone();
+        let diag = Arc::new(StdMutex::new(PollDiag::default()));
+        discover_emit_dispatch(app, project_id, dispatcher.as_ref(), &diag).await;
     }
 
     /// Stops + drops EVERY project's loop (the `stop_polling`-all path + app shutdown).
@@ -710,6 +741,51 @@ mod tests {
             }
             other => panic!("a store failure must emit Error, not {other:?}"),
         }
+    }
+
+    // #818: `periodic_polling` is the core safety gate — app launch must NOT auto-poll
+    // webhook-only / manual / disabled projects, only enabled pull-only / hybrid ones.
+    #[test]
+    fn periodic_polling_only_for_enabled_pull_or_hybrid() {
+        use crate::model::UpdateMode;
+
+        let base = Project {
+            id: "p".to_string(),
+            enabled: true,
+            ..Project::default()
+        };
+
+        // Enabled pull-only / hybrid → polled.
+        assert!(periodic_polling(&Project {
+            update_mode: UpdateMode::PullOnly,
+            ..base.clone()
+        }));
+        assert!(periodic_polling(&Project {
+            update_mode: UpdateMode::Hybrid,
+            ..base.clone()
+        }));
+
+        // Enabled webhook-only / manual → NOT polled (no automatic CLI poll loop).
+        assert!(!periodic_polling(&Project {
+            update_mode: UpdateMode::WebhookOnly,
+            ..base.clone()
+        }));
+        assert!(!periodic_polling(&Project {
+            update_mode: UpdateMode::Manual,
+            ..base.clone()
+        }));
+
+        // Disabled is never polled regardless of mode.
+        assert!(!periodic_polling(&Project {
+            enabled: false,
+            update_mode: UpdateMode::PullOnly,
+            ..base.clone()
+        }));
+        assert!(!periodic_polling(&Project {
+            enabled: false,
+            update_mode: UpdateMode::Hybrid,
+            ..base
+        }));
     }
 
     #[test]

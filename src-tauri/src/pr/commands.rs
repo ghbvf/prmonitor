@@ -4,8 +4,9 @@ use tauri::Emitter; // for app.emit
 
 use crate::config::service as config_service;
 use crate::error::AppResult;
-use crate::model::{Candidate, PullRequestView};
+use crate::model::{Candidate, PullRequestView, SourceKind, UpdateMode};
 
+use super::azure::AzureDevOpsCli;
 use super::discover::{self, MonitorParams};
 use super::gh::{gh_auth_status, GhRow, GhStatus, GithubCli};
 use super::ledger::{now_epoch, Ledger};
@@ -37,21 +38,56 @@ fn build_view(
     ledger: &Ledger,
     now: u64,
 ) -> (PullRequestView, Option<Candidate>) {
-    let skip_reason = if row.conflict {
+    build_view_parts(
+        row.candidate,
+        row.title,
+        row.labels,
+        row.url,
+        row.conflict,
+        params,
+        ledger,
+        now,
+    )
+}
+
+/// The source-agnostic core of the discovery view + dispatch decision (#818): given a
+/// gating [`Candidate`] plus its display fields (`title` / `labels` / `url`) and the
+/// both-trigger-label `conflict` flag, applies the SAME gate composition the poll path
+/// uses — conflict short-circuits to [`discover::BOTH_TRIGGER_LABELS_REASON`], otherwise
+/// static (`should_skip`) then cooldown (`cooldown_skip`) — and surfaces the dispatchable
+/// candidate only when nothing gates it (`skip_reason` None).
+///
+/// Both source arms feed this: the GitHub arm via [`build_view`] (`GhRow`) and the Azure
+/// arm directly from an [`super::azure::AzRow`]. Extracting it gives both sources FULL
+/// display + gating parity (title / url / all labels / kept-conflict), so the only
+/// difference between sources is how the rows are fetched, not how they are shown or
+/// gated. Pure (no `AppHandle`) so the gate composition is unit-tested.
+#[allow(clippy::too_many_arguments)]
+fn build_view_parts(
+    candidate: Candidate,
+    title: String,
+    labels: Vec<String>,
+    url: String,
+    conflict: bool,
+    params: &MonitorParams,
+    ledger: &Ledger,
+    now: u64,
+) -> (PullRequestView, Option<Candidate>) {
+    let skip_reason = if conflict {
         Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string())
     } else {
-        discover::should_skip(&row.candidate, params, ledger)
-            .or_else(|| discover::cooldown_skip(&row.candidate, params, ledger, now))
+        discover::should_skip(&candidate, params, ledger)
+            .or_else(|| discover::cooldown_skip(&candidate, params, ledger, now))
     };
     // Clone the candidate for dispatch only when it passes every static + cooldown
     // gate (skip_reason None); a skipped row contributes a view but no candidate.
-    let dispatchable = skip_reason.is_none().then(|| row.candidate.clone());
+    let dispatchable = skip_reason.is_none().then(|| candidate.clone());
     let view = PullRequestView {
-        number: row.candidate.number,
-        title: row.title,
-        labels: row.labels,
-        url: row.url,
-        kind: row.candidate.kind,
+        number: candidate.number,
+        title,
+        labels,
+        url,
+        kind: candidate.kind,
         skip_reason,
     };
     (view, dispatchable)
@@ -76,6 +112,10 @@ pub(crate) async fn discover<R: tauri::Runtime>(
     // a type contract — `AppConfig` stays config-private; we resolve THIS project by
     // id and snapshot the fields the pr slice needs into `MonitorParams`).
     let project = config_service::project(app, project_id)?;
+    // Capture the source-select fields before `project` is consumed into `params` (#818).
+    let source_kind = project.source_kind;
+    let azure_org = project.azure_org.clone();
+    let azure_project = project.azure_project.clone();
     let params = MonitorParams {
         repo: project.repo,
         review_label: project.review_label,
@@ -89,23 +129,63 @@ pub(crate) async fn discover<R: tauri::Runtime>(
     // `try_reserve_pair` test-and-set is the real double-dispatch backstop (see
     // `Ledger::load`). The write path (`record_dispatched`) is the half that locks.
     let ledger = Ledger::load(app, project_id)?;
-    let source = GithubCli::new(
-        params.repo.clone(),
-        params.review_label.clone(),
-        params.check_label.clone(),
-    );
-
-    let rows = source.discover_rows().await?;
     let now = now_epoch();
-    let mut views = Vec::with_capacity(rows.len());
-    let mut dispatchable = Vec::new();
-    for row in rows {
-        let (view, cand) = build_view(row, &params, &ledger, now);
-        if let Some(cand) = cand {
-            dispatchable.push(cand);
+
+    // Source selection (#818): branch on `source_kind` via an EXHAUSTIVE match (no
+    // wildcard, no `dyn`) so a new `SourceKind` variant fails to compile here until it is
+    // wired. Both sources expose a `discover_rows` returning display-ready rows (gating
+    // `Candidate` + title / url / all-labels + a both-label `conflict` flag), so the view
+    // path is IDENTICAL across sources — each arm just feeds its rows to `build_view_parts`.
+    let (views, dispatchable) = match source_kind {
+        SourceKind::Github => {
+            let source = GithubCli::new(
+                params.repo.clone(),
+                params.review_label.clone(),
+                params.check_label.clone(),
+            );
+            let rows = source.discover_rows().await?;
+            let mut views = Vec::with_capacity(rows.len());
+            let mut dispatchable = Vec::new();
+            for row in rows {
+                let (view, cand) = build_view(row, &params, &ledger, now);
+                if let Some(cand) = cand {
+                    dispatchable.push(cand);
+                }
+                views.push(view);
+            }
+            (views, dispatchable)
         }
-        views.push(view);
-    }
+        SourceKind::Azure => {
+            let source = AzureDevOpsCli::new(
+                azure_org,
+                azure_project,
+                params.repo.clone(),
+                params.review_label.clone(),
+                params.check_label.clone(),
+            );
+            let rows = source.discover_rows().await?;
+            let mut views = Vec::with_capacity(rows.len());
+            let mut dispatchable = Vec::new();
+            for row in rows {
+                // Structurally identical to the GitHub arm — full display + gating parity.
+                let (view, disp) = build_view_parts(
+                    row.candidate,
+                    row.title,
+                    row.labels,
+                    row.url,
+                    row.conflict,
+                    &params,
+                    &ledger,
+                    now,
+                );
+                if let Some(disp) = disp {
+                    dispatchable.push(disp);
+                }
+                views.push(view);
+            }
+            (views, dispatchable)
+        }
+    };
     Ok((views, dispatchable))
 }
 
@@ -164,21 +244,44 @@ pub async fn stop_polling(state: tauri::State<'_, crate::state::AppState>) -> Ap
     Ok(())
 }
 
-/// Triggers an immediate discovery cycle for `project_id` ("立即拉取", #35). Returns
-/// an error when that project's scheduler is paused/unknown (stopped): `wake` is a
-/// no-op on a missing loop and would emit no `prs:updated` event, leaving the
-/// frontend stuck in a loading state. Defense-in-depth alongside the
-/// disabled-while-paused button.
+/// Triggers an immediate discovery cycle for `project_id` ("立即拉取", #35, #818).
+///
+/// A project with a running poll loop (pull-only / hybrid) is simply `wake`d — the
+/// existing behavior. When no loop is running, the action depends on that project's
+/// [`UpdateMode`] (EXHAUSTIVE match, no wildcard, so a new mode must be classified):
+/// - `Manual` → run ONE one-shot discovery directly ([`SchedulerSet::discover_once`]):
+///   manual mode has no periodic loop, so the only way it refreshes is this explicit pull
+///   (or an inbound webhook). It discovers / persists / emits / dispatches like a cycle.
+/// - `WebhookOnly` → reject: there is no CLI source to pull from in webhook-only mode, so
+///   a manual pull is meaningless (the list updates only on inbound webhooks).
+/// - `PullOnly` / `Hybrid` with no running loop → the loop is paused (e.g. after
+///   `stop_polling`); error so the frontend prompts to resume, matching the pre-#818
+///   "轮询已暂停" defense (a no-op `wake` would leave the UI awaiting a `prs:updated`).
 #[tauri::command]
 pub async fn poll_now<R: tauri::Runtime>(
-    _app: tauri::AppHandle<R>,
+    app: tauri::AppHandle<R>,
     state: tauri::State<'_, crate::state::AppState>,
     project_id: &str,
 ) -> AppResult<()> {
+    // A running loop (pull-only / hybrid) → wake it; the cycle emits `prs:updated`.
     if state.scheduler.wake(project_id) {
-        Ok(())
-    } else {
-        Err(crate::error::AppError::new("轮询已暂停，请先恢复轮询"))
+        return Ok(());
+    }
+    // No running loop: branch on the project's update mode.
+    let project = config_service::project(&app, project_id)?;
+    match project.update_mode {
+        UpdateMode::Manual => {
+            // One-shot CLI discovery (manual has no periodic loop). Drives the same
+            // per-cycle body the loop would, so it discovers / persists / emits / dispatches.
+            state.scheduler.discover_once(&app, project_id).await;
+            Ok(())
+        }
+        UpdateMode::WebhookOnly => Err(crate::error::AppError::new(
+            "webhook-only 模式不支持手动拉取",
+        )),
+        UpdateMode::PullOnly | UpdateMode::Hybrid => {
+            Err(crate::error::AppError::new("轮询已暂停，请先恢复轮询"))
+        }
     }
 }
 
@@ -818,6 +921,76 @@ mod tests {
             labels: vec!["review-label".to_string()],
             conflict,
         }
+    }
+
+    // #818: `build_view_parts` is the source-agnostic core both the GitHub (`GhRow`) and
+    // Azure (`AzRow`) arms feed. It applies the SAME gate composition as the old per-source
+    // builders — conflict short-circuits to the both-labels reason, otherwise static then
+    // cooldown — and carries the row's real title / url / labels through to the view, so an
+    // Azure row now has FULL display parity with GitHub. A clean row dispatches; a conflict
+    // / gated one is a skipped row with no dispatch.
+    #[test]
+    fn build_view_parts_clean_row_carries_display_fields_and_is_dispatchable() {
+        let cand = row(1, "review", false).candidate;
+        let (view, disp) = build_view_parts(
+            cand,
+            "Real title".to_string(),
+            vec!["review-label".to_string(), "area/ui".to_string()],
+            "https://dev.azure.com/o/p/_git/r/pullrequest/1".to_string(),
+            false,
+            &params(),
+            &Ledger::default(),
+            0,
+        );
+        assert_eq!(view.number, 1);
+        assert_eq!(view.kind, "review");
+        assert_eq!(view.title, "Real title");
+        assert_eq!(view.url, "https://dev.azure.com/o/p/_git/r/pullrequest/1");
+        assert_eq!(
+            view.labels,
+            vec!["review-label".to_string(), "area/ui".to_string()]
+        );
+        assert_eq!(view.skip_reason, None);
+        let disp = disp.expect("clean row is dispatchable");
+        assert_eq!(disp.number, 1);
+    }
+
+    #[test]
+    fn build_view_parts_conflict_row_is_skipped_with_both_labels_reason() {
+        let cand = row(2, "review", false).candidate;
+        let (view, disp) = build_view_parts(
+            cand,
+            "Both".to_string(),
+            vec!["review-label".to_string(), "check-label".to_string()],
+            "https://x/2".to_string(),
+            true, // conflict
+            &params(),
+            &Ledger::default(),
+            0,
+        );
+        assert_eq!(
+            view.skip_reason,
+            Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string())
+        );
+        assert!(disp.is_none(), "a conflict row is not dispatchable");
+    }
+
+    #[test]
+    fn build_view_parts_draft_is_skipped_and_not_dispatchable() {
+        let mut cand = row(3, "review", false).candidate;
+        cand.is_draft = true;
+        let (view, disp) = build_view_parts(
+            cand,
+            "Draft".to_string(),
+            vec!["review-label".to_string()],
+            "https://x/3".to_string(),
+            false,
+            &params(),
+            &Ledger::default(),
+            0,
+        );
+        assert_eq!(view.skip_reason, Some("draft PR".to_string()));
+        assert!(disp.is_none(), "a gated row is not dispatchable");
     }
 
     #[test]

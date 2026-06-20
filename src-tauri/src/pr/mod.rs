@@ -7,6 +7,7 @@
 //! `commands` exposes the `poll_now` / `start_polling` / `stop_polling` /
 //! `reschedule` / `gh_status` Tauri commands.
 
+pub mod azure;
 pub mod commands;
 pub mod discover;
 pub mod gh;

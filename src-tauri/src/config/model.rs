@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
-use crate::model::{EngineKind, SourceKind, WebhookTunnelMode};
+use crate::model::{EngineKind, SourceKind, UpdateMode, WebhookTunnelMode};
 
 /// One monitored project (#35). What was previously the flat per-repo subset of
 /// [`AppConfig`] is now a list element: each project carries its own repo, paths,
@@ -53,6 +53,16 @@ pub struct Project {
     pub engine_kind: EngineKind,
     /// 是否在发现 dispatchable PR 时自动派发 review（false=仅手动「开始 review」触发）。
     pub auto_review: bool,
+    /// 本项目 PR 列表的更新模式（#818）。默认 [`UpdateMode::WebhookOnly`]：**启动不自动
+    /// 轮询 CLI**，列表仅由 webhook 推送更新。`pull-only`/`hybrid` 才起周期轮询；`manual`
+    /// 只在「立即拉取」时跑一次性发现。调度器据此 gate 是否为本项目起轮询 loop。
+    pub update_mode: UpdateMode,
+    /// Azure DevOps 组织名（#818，仅 [`SourceKind::Azure`] 用）。`az repos pr list
+    /// --organization https://dev.azure.com/<org>` 的 `<org>`。GitHub 源留空。
+    pub azure_org: String,
+    /// Azure DevOps 项目名（#818，仅 [`SourceKind::Azure`] 用）。`az repos pr list
+    /// --project <project>` 的 `<project>`。GitHub 源留空。
+    pub azure_project: String,
 }
 
 impl Default for Project {
@@ -75,6 +85,12 @@ impl Default for Project {
             // auto-dispatch codex at startup (avoids clashing with other review
             // processes). Flip-back guarded by `default_auto_review_is_off`.
             auto_review: false,
+            // #818: boot defaults to webhook-only — NO automatic CLI polling at startup
+            // (the scheduler does not start a loop for this mode). Flip-back guarded by
+            // `default_update_mode_is_webhook_only`.
+            update_mode: UpdateMode::WebhookOnly,
+            azure_org: String::new(),
+            azure_project: String::new(),
         }
     }
 }
@@ -143,38 +159,66 @@ const WEBHOOK_SECRET_MIN_LEN: usize = 16;
 
 /// Validates one [`Project`]'s fields (hard-reject on failure).
 ///
-/// Checks: `repo` is `owner/name` (one slash, both sides non-empty, no
-/// whitespace — the backend boundary `gh pr list --repo` consumes, mirroring the
-/// frontend `REPO_RE`); `repo_root` is a non-empty, **absolute** path to an
-/// existing directory (absolute so resolution never depends on the process CWD,
-/// matching the field's doc contract); `skill_rel_path` resolves to an existing
-/// file that stays **inside** `repo_root` (the skill check defends two
+/// The `repo` (and, for Azure, `azureOrg` / `azureProject`) check branches on
+/// `source_kind` (#818) via an EXHAUSTIVE `match` (no wildcard), so a new
+/// [`SourceKind`] variant fails to compile until its repo-shape rule is added:
+/// - [`SourceKind::Github`]: `repo` is `owner/name` (one slash, both sides
+///   non-empty, no whitespace — the backend boundary `gh pr list --repo` consumes,
+///   mirroring the frontend `REPO_RE`).
+/// - [`SourceKind::Azure`]: `repo` is a bare non-empty repository name, and
+///   `azure_org` / `azure_project` are non-empty (`az repos pr list --organization
+///   <org> --project <project> --repository <repo>` consumes all three).
+///
+/// The source-agnostic checks then run: `repo_root` is a non-empty, **absolute**
+/// path to an existing directory (absolute so resolution never depends on the
+/// process CWD, matching the field's doc contract); `skill_rel_path` resolves to an
+/// existing file that stays **inside** `repo_root` (the skill check defends two
 /// `Path::join` pitfalls: an absolute `skill_rel_path` would discard `repo_root`,
 /// and `..` traversal could escape the clone — both would let a later engine read
 /// arbitrary files); positive poll/cooldown intervals; and non-empty
-/// `review_label` / `check_label` (each is fed to `gh pr list --label`, so a blank
-/// one makes every poll match nothing / fail).
+/// `review_label` / `check_label` (each is fed to the source's label filter, so a
+/// blank one makes every poll match nothing / fail).
 ///
 /// Errors funnel through [`AppError`], and each message **starts with** the
-/// offending field's wire name (`repo` / `repoRoot` / `skillRelPath` / `skill` /
-/// `pollIntervalSecs` / `prCooldownSeconds` / `reviewLabel` / `checkLabel`). That
-/// prefix is the cross-end routing contract the onboarding wizard's `errorToStep`
-/// (src/config/fields.ts) keys on — locked at this end by the `validate_error_*`
-/// test below (PR #41 F4, Medium). Checks run in wizard-step order so the first
-/// failure routes to the earliest offending step.
+/// offending field's wire name (`repo` / `azureOrg` / `azureProject` / `repoRoot` /
+/// `skillRelPath` / `skill` / `pollIntervalSecs` / `prCooldownSeconds` /
+/// `reviewLabel` / `checkLabel`). That prefix is the cross-end routing contract the
+/// onboarding wizard's `errorToStep` (src/config/fields.ts) keys on — locked at
+/// this end by the `validate_error_*` test below (PR #41 F4, Medium). Checks run in
+/// wizard-step order so the first failure routes to the earliest offending step.
 pub fn validate_project(project: &Project) -> AppResult<()> {
-    // owner/name: exactly one slash, both sides non-empty, no whitespace anywhere
-    // (mirrors the frontend REPO_RE `^[^/\s]+\/[^/\s]+$`).
-    let repo_parts: Vec<&str> = project.repo.split('/').collect();
-    let repo_ok = repo_parts.len() == 2
-        && !repo_parts[0].is_empty()
-        && !repo_parts[1].is_empty()
-        && !project.repo.chars().any(char::is_whitespace);
-    if !repo_ok {
-        return Err(AppError::new(format!(
-            "repo 必须是 owner/name 格式: {}",
-            project.repo
-        )));
+    // Repo-shape check branches on the source (#818). EXHAUSTIVE match (no wildcard):
+    // a new `SourceKind` variant fails to compile here until its repo rule is added.
+    match project.source_kind {
+        SourceKind::Github => {
+            // owner/name: exactly one slash, both sides non-empty, no whitespace anywhere
+            // (mirrors the frontend REPO_RE `^[^/\s]+\/[^/\s]+$`).
+            let repo_parts: Vec<&str> = project.repo.split('/').collect();
+            let repo_ok = repo_parts.len() == 2
+                && !repo_parts[0].is_empty()
+                && !repo_parts[1].is_empty()
+                && !project.repo.chars().any(char::is_whitespace);
+            if !repo_ok {
+                return Err(AppError::new(format!(
+                    "repo 必须是 owner/name 格式: {}",
+                    project.repo
+                )));
+            }
+        }
+        SourceKind::Azure => {
+            // Azure: org/project/repo are three separate `az repos pr list` args, so the
+            // repo is a bare non-empty name (NOT owner/name). All three must be non-empty;
+            // messages keep the camelCase field prefix the wizard routes on.
+            if project.azure_org.trim().is_empty() {
+                return Err(AppError::new("azureOrg 不能为空（Azure 源必填）"));
+            }
+            if project.azure_project.trim().is_empty() {
+                return Err(AppError::new("azureProject 不能为空（Azure 源必填）"));
+            }
+            if project.repo.trim().is_empty() {
+                return Err(AppError::new("repo 不能为空（Azure 源必填仓库名）"));
+            }
+        }
     }
 
     let repo_root = project.repo_root.trim();
@@ -451,6 +495,9 @@ mod tests {
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
             auto_review: false,
+            update_mode: UpdateMode::WebhookOnly,
+            azure_org: "myorg".to_string(),
+            azure_project: "myproject".to_string(),
         };
 
         let v = serde_json::to_value(&project).expect("Project serializes");
@@ -472,6 +519,11 @@ mod tests {
         assert!(v.get("engineKind").is_some());
         assert_eq!(v["engineKind"], "codex");
         assert!(v.get("autoReview").is_some());
+        // #818: the new data-source-mode fields.
+        assert!(v.get("updateMode").is_some());
+        assert_eq!(v["updateMode"], "webhook-only");
+        assert!(v.get("azureOrg").is_some());
+        assert!(v.get("azureProject").is_some());
 
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("repo_root").is_none());
@@ -483,6 +535,10 @@ mod tests {
         assert!(v.get("source_kind").is_none());
         assert!(v.get("engine_kind").is_none());
         assert!(v.get("auto_review").is_none());
+        // #818: snake_case forms of the new fields absent.
+        assert!(v.get("update_mode").is_none());
+        assert!(v.get("azure_org").is_none());
+        assert!(v.get("azure_project").is_none());
     }
 
     /// First-launch marker lock (Medium). The frontend routes a fresh install into
@@ -506,6 +562,16 @@ mod tests {
     #[test]
     fn default_auto_review_is_off() {
         assert!(!Project::default().auto_review);
+    }
+
+    /// Default-update-mode lock (#818, Medium). A fresh project must default to
+    /// `WebhookOnly` — the safe boot behavior that runs NO automatic CLI polling at
+    /// startup (the core safety change of #818). A silent flip to a polling mode would
+    /// re-introduce unsolicited CLI polls at launch; locking the default here makes that
+    /// intent machine-checked.
+    #[test]
+    fn default_update_mode_is_webhook_only() {
+        assert_eq!(Project::default().update_mode, UpdateMode::WebhookOnly);
     }
 
     #[test]
@@ -766,6 +832,70 @@ mod tests {
             }))
             .is_err());
         }
+    }
+
+    #[test]
+    fn validate_azure_source_requires_org_and_project() {
+        // #818: an Azure-source project must supply azureOrg, azureProject, and repo. An
+        // empty org or project is rejected, with the message starting with the camelCase
+        // wire field token so the wizard's `errorToStep` routes it.
+        let azure_base = Project {
+            source_kind: SourceKind::Azure,
+            repo: "myrepo".to_string(),
+            azure_org: "myorg".to_string(),
+            azure_project: "myproject".to_string(),
+            ..valid_project()
+        };
+        // A complete Azure project validates.
+        assert!(validate_project(&azure_base).is_ok());
+
+        // Empty org → rejected, message starts with `azureOrg`.
+        let org_err = validate_project(&Project {
+            azure_org: "   ".to_string(),
+            ..azure_base.clone()
+        })
+        .unwrap_err()
+        .message;
+        assert!(org_err.starts_with("azureOrg"), "{org_err}");
+
+        // Empty project → rejected, message starts with `azureProject`.
+        let proj_err = validate_project(&Project {
+            azure_project: String::new(),
+            ..azure_base.clone()
+        })
+        .unwrap_err()
+        .message;
+        assert!(proj_err.starts_with("azureProject"), "{proj_err}");
+
+        // Empty repo → rejected, message starts with `repo` (Azure repo is a bare name,
+        // so it does NOT go through the GitHub owner/name check).
+        let repo_err = validate_project(&Project {
+            repo: "   ".to_string(),
+            ..azure_base.clone()
+        })
+        .unwrap_err()
+        .message;
+        assert!(repo_err.starts_with("repo"), "{repo_err}");
+    }
+
+    #[test]
+    fn validate_github_source_unaffected_by_azure_fields() {
+        // #818: a GitHub-source project keeps the owner/name repo validation and ignores
+        // the (empty) Azure fields — the new branch must not change GitHub behavior.
+        assert!(validate_project(&Project {
+            source_kind: SourceKind::Github,
+            azure_org: String::new(),
+            azure_project: String::new(),
+            ..valid_project()
+        })
+        .is_ok());
+        // A bad owner/name repo is still rejected for GitHub.
+        assert!(validate_project(&Project {
+            source_kind: SourceKind::Github,
+            repo: "not-a-repo".to_string(),
+            ..valid_project()
+        })
+        .is_err());
     }
 
     #[test]

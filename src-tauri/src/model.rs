@@ -26,15 +26,45 @@ pub struct Candidate {
 /// is a compile error — the missing arm cannot be expressed. Today it has one
 /// variant, so the seam is reserved but not yet load-bearing.
 ///
-/// #11 design reservation: future variants `GitLab` / `Bitbucket`. Wire string
-/// for `Github` is pinned to `"github"` (cross-agent contract; the frontend
-/// mirrors it and a serde golden test locks it).
+/// #11 design reservation: future variants `GitLab` / `Bitbucket`. Wire strings
+/// for `Github` / `Azure` are pinned to `"github"` / `"azure"` (cross-agent
+/// contract; the frontend mirrors them and a serde golden test locks them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SourceKind {
     #[default]
     Github,
+    /// Azure DevOps Repos, discovered via the `az repos pr list` CLI (#818).
+    Azure,
     // future #11: GitLab, Bitbucket
+}
+
+/// Per-project data-update mode (#818): how a project's PR list is kept fresh.
+///
+/// **Hard carrier** (sealed enum): source/poll selection branches on an exhaustive
+/// `match UpdateMode { ... }` (the scheduler's `periodic_polling` and `poll_now`),
+/// so adding a variant without handling it is a compile error.
+///
+/// Wire strings are pinned kebab-case (`"webhook-only" | "pull-only" | "hybrid" |
+/// "manual"`) — a cross-agent contract the frontend's TS union must mirror exactly;
+/// a serde golden test below locks it.
+///
+/// Modes:
+/// - [`WebhookOnly`](Self::WebhookOnly) (default, the safe boot behavior): the list
+///   is updated ONLY by inbound webhook deliveries — NO automatic CLI polling. A
+///   manual pull is rejected (there is no source to pull from in this mode).
+/// - [`PullOnly`](Self::PullOnly): a periodic CLI poll loop is the sole update source.
+/// - [`Hybrid`](Self::Hybrid): both a periodic CLI poll loop AND inbound webhooks.
+/// - [`Manual`](Self::Manual): no periodic loop; the list updates only on an explicit
+///   "立即拉取" (one-shot CLI discovery) or inbound webhook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum UpdateMode {
+    #[default]
+    WebhookOnly,
+    PullOnly,
+    Hybrid,
+    Manual,
 }
 
 /// Which review engine runs against a PR.
@@ -193,9 +223,37 @@ mod tests {
             serde_json::to_value(SourceKind::Github).expect("SourceKind serializes"),
             "github"
         );
+        // #818: the Azure source variant pins to "azure" (the frontend mirrors it).
+        assert_eq!(
+            serde_json::to_value(SourceKind::Azure).expect("SourceKind serializes"),
+            "azure"
+        );
         assert_eq!(
             serde_json::to_value(EngineKind::Codex).expect("EngineKind serializes"),
             "codex"
+        );
+        // #818: per-project data-update modes. kebab-case wire strings the frontend
+        // mirrors; a variant rename or `rename_all` change surfaces here. Default is
+        // `WebhookOnly` (the safe boot default: NO automatic CLI polling).
+        assert_eq!(
+            serde_json::to_value(UpdateMode::WebhookOnly).expect("UpdateMode serializes"),
+            "webhook-only"
+        );
+        assert_eq!(
+            serde_json::to_value(UpdateMode::PullOnly).expect("UpdateMode serializes"),
+            "pull-only"
+        );
+        assert_eq!(
+            serde_json::to_value(UpdateMode::Hybrid).expect("UpdateMode serializes"),
+            "hybrid"
+        );
+        assert_eq!(
+            serde_json::to_value(UpdateMode::Manual).expect("UpdateMode serializes"),
+            "manual"
+        );
+        assert_eq!(
+            serde_json::to_value(UpdateMode::default()).expect("UpdateMode serializes"),
+            "webhook-only"
         );
     }
 
