@@ -89,9 +89,19 @@ pub struct SessionInfo {
 /// pr-review comment URL (if any) so a future transport can both "wait for this review"
 /// AND read back the comment link without re-querying. `Clone` so the watch channel hands
 /// each subscriber its own copy.
+///
+/// `status` is the terminal KIND ([`SessionStatus::Done`] / [`SessionStatus::Failed`]) —
+/// but `Done` covers BOTH a successful `completed` and a user `interrupted` turn (see
+/// [`terminal_status`]). `wire_status` carries the raw codex `turn.status` string
+/// (`"completed"` / `"interrupted"` / `"failed"`, mirroring
+/// [`crate::events::ReviewEvent::TurnCompleted`]'s `status`) so a subscriber CAN tell a
+/// finished review from an interrupted one — which `status` alone cannot express.
 #[derive(Debug, Clone)]
 pub struct CompletionOutcome {
     pub status: SessionStatus,
+    /// Raw codex `turn.status` — distinguishes `completed` vs `interrupted` (both map to
+    /// `SessionStatus::Done`). See the struct doc.
+    pub wire_status: String,
     pub comment_url: Option<String>,
 }
 
@@ -879,7 +889,7 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
     error: Option<String>,
 ) {
     // 1. Resolve the comment URL only on a successful completion. Any failure → None.
-    let comment_url = if wire_status == "completed" {
+    let comment_url = if should_resolve_url(wire_status) {
         match crate::config::service::project(app, project_id) {
             Ok(project) => {
                 super::comment_url::resolve_comment_url(
@@ -942,6 +952,9 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
         thread_id,
         CompletionOutcome {
             status: terminal,
+            // The raw codex status so a subscriber distinguishes completed vs interrupted
+            // (both terminal-map to `Done`) — `wire_status` is in scope here as `&str`.
+            wire_status: wire_status.to_string(),
             comment_url,
         },
     );
@@ -997,6 +1010,14 @@ fn terminal_status(status: &str) -> SessionStatus {
         "completed" | "interrupted" => SessionStatus::Done,
         _ => SessionStatus::Failed,
     }
+}
+
+/// Whether [`finalize_turn`] resolves a comment URL for this terminal — TRUE only for a
+/// `completed` turn (AB#1042). An `interrupted` turn maps to [`SessionStatus::Done`] (same
+/// as `completed`) yet posted no comment, so the gate is on the raw `wire_status`, NOT on
+/// the terminal [`SessionStatus`] — pinning that an interrupted/failed turn resolves NO URL.
+fn should_resolve_url(wire_status: &str) -> bool {
+    wire_status == "completed"
 }
 
 /// The skill command the review turn instructs codex to run: `/pr-review <N>` for
@@ -1124,6 +1145,17 @@ mod tests {
         assert_eq!(terminal_status("interrupted"), SessionStatus::Done);
         assert_eq!(terminal_status("failed"), SessionStatus::Failed);
         assert_eq!(terminal_status("anythingElse"), SessionStatus::Failed);
+    }
+
+    #[test]
+    fn should_resolve_url_only_for_completed() {
+        // Only a `completed` turn posted a comment to resolve. `interrupted` maps to the
+        // SAME terminal `Done` as `completed`, so the gate must key on the raw wire status,
+        // not the terminal kind — an interrupted/failed/empty turn resolves NO url.
+        assert!(should_resolve_url("completed"));
+        assert!(!should_resolve_url("interrupted"));
+        assert!(!should_resolve_url("failed"));
+        assert!(!should_resolve_url(""));
     }
 
     #[test]
@@ -1526,11 +1558,14 @@ mod tests {
             "t1",
             CompletionOutcome {
                 status: SessionStatus::Done,
+                wire_status: "completed".to_string(),
                 comment_url: Some("https://x/c".to_string()),
             },
         );
         let got = rx.borrow_and_update().clone().expect("outcome delivered");
         assert_eq!(got.status, SessionStatus::Done);
+        // `wire_status` distinguishes a completed turn from an interrupted one (both Done).
+        assert_eq!(got.wire_status, "completed");
         assert_eq!(got.comment_url.as_deref(), Some("https://x/c"));
     }
 
@@ -1543,6 +1578,7 @@ mod tests {
             "t1",
             CompletionOutcome {
                 status: SessionStatus::Failed,
+                wire_status: "failed".to_string(),
                 comment_url: None,
             },
         );
@@ -1560,13 +1596,17 @@ mod tests {
         // Done / Failed / Interrupted-as-Done each deliver a single Some with the right
         // status (the funnel maps interrupted → Done via `terminal_status`, so a completion
         // subscriber sees Done for a user stop too).
-        for status in [SessionStatus::Done, SessionStatus::Failed] {
+        for (status, wire) in [
+            (SessionStatus::Done, "completed"),
+            (SessionStatus::Failed, "failed"),
+        ] {
             let reg = SessionRegistry::default();
             let rx = reg.subscribe_completion("t");
             reg.signal_completion(
                 "t",
                 CompletionOutcome {
                     status,
+                    wire_status: wire.to_string(),
                     comment_url: None,
                 },
             );

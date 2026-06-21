@@ -73,12 +73,16 @@ pub fn stop_codex(state: tauri::State<'_, AppState>) -> AppResult<CodexStatus> {
     Ok(state.codex.stop())
 }
 
-/// The ONE place that names a concrete review engine (AB#1042): the shared dispatch body
-/// behind BOTH [`start_review`] (project resolved by id) and [`trigger_review`] (project
-/// resolved by id-or-repo `reference`). Exhaustive `match project.engine_kind` over the
-/// sealed [`EngineKind`] (model.rs) = **Hard** single-source carrier: a new variant without
-/// an arm here is a compile error, and no other callsite may re-state the match (a second
-/// `match EngineKind` would split engine selection).
+/// The single source for engine selection on the MANUAL / explicit path (AB#1042): the
+/// shared dispatch body behind BOTH [`start_review`] (project resolved by id) and
+/// [`trigger_review`] (project resolved by id-or-repo `reference`). The AUTO-dispatch path
+/// has its own engine selection in `lib.rs::run_auto_dispatch` (intentionally separate — it
+/// monomorphizes `dispatch::auto_dispatch` per concrete engine and applies the codex
+/// stop-flag gate that doesn't exist on the manual path). Both are INDEPENDENTLY exhaustive
+/// `match project.engine_kind` over the sealed [`EngineKind`] (model.rs) — that exhaustiveness
+/// is the **Hard** carrier: a new variant without an arm in EITHER match is a compile error,
+/// so neither path can silently miss a new engine. Don't add a THIRD manual-path `match`:
+/// this one folds in the dedup + outcome mapping, so every explicit entry routes through it.
 ///
 /// Folds the `outcome → Result` mapping in (both callers handle a [`StartReviewOutcome`]
 /// identically): `Started` → the session id; `Deduped` (the registry already has an

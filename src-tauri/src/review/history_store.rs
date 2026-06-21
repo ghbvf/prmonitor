@@ -369,6 +369,14 @@ mod tests {
         assert_eq!(sessions[0].status, SessionStatus::Done);
         assert_eq!(sessions[0].comment_url.as_deref(), Some("https://x/c"));
 
+        // A later Some terminal write OVERWRITES the earlier URL (Some→Some): the dedicated
+        // terminal write is an explicit set, NOT a COALESCE — a re-review's new comment URL
+        // replaces the prior one rather than being preserved.
+        set_status_and_comment_url(&db, "th-1", SessionStatus::Done, Some("https://x/c2"))
+            .expect("overwrite write");
+        let after_some = get_pr_sessions(&db, "alpha", 12).expect("list");
+        assert_eq!(after_some[0].comment_url.as_deref(), Some("https://x/c2"));
+
         // A later None terminal (e.g. a re-run that interrupted) overwrites with NULL — the
         // dedicated terminal write is explicit, not a COALESCE (only the start upsert preserves).
         set_status_and_comment_url(&db, "th-1", SessionStatus::Failed, None).expect("none write");

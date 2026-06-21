@@ -540,6 +540,9 @@ mod tests {
         // Miss (neither id nor known repo) → error.
         assert!(match_project_ref(&projects, "nope/missing").is_err());
         assert!(match_project_ref(&[], "alpha").is_err());
+        // An empty reference matches no id and no repo → error (a blank trigger arg can't
+        // accidentally resolve to a project).
+        assert!(match_project_ref(&projects, "").is_err());
 
         // id takes precedence over a repo that equals another project's id: a project
         // whose REPO is literally "alpha" must not shadow the id hit on "alpha".

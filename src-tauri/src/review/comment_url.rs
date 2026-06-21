@@ -159,7 +159,14 @@ async fn run_gh_pr_view(repo: &str, pr: u64) -> Option<String> {
         // Timeout or a bounded-read error → no URL (best-effort).
         _ => return None,
     };
-    let status = child.wait().await.ok()?;
+    // Bound the teardown wait too: if `gh` wrote stdout then hangs in teardown, an unbounded
+    // `wait()` would block forever (and `kill_on_drop` can't fire while `child` is borrowed by
+    // the awaited future). On timeout/err return None — dropping `child` triggers `kill_on_drop`
+    // to reap. Best-effort, like every other failure here.
+    let status = match tokio::time::timeout(GH_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => status,
+        _ => return None,
+    };
     if !status.success() {
         return None;
     }
@@ -168,8 +175,9 @@ async fn run_gh_pr_view(repo: &str, pr: u64) -> Option<String> {
 
 /// Reads `reader` to EOF but stops once more than `limit` bytes have arrived, returning
 /// `None` rather than allocating unboundedly (mirrors `pr::azure`'s `read_bounded`). The
-/// bound is applied at READ time, so memory never grows past ~`limit`. Generic over
-/// [`AsyncRead`] so it is unit-tested with an in-memory `&[u8]`.
+/// over-bound check runs AFTER each `extend_from_slice`, so the buffer peaks at most
+/// `limit + chunk_size` bytes (one final chunk past the limit) before giving up. Generic
+/// over [`AsyncRead`] so it is unit-tested with an in-memory `&[u8]`.
 async fn read_bounded<R: AsyncRead + Unpin>(mut reader: R, limit: usize) -> Result<Vec<u8>, ()> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8 * 1024];
@@ -180,7 +188,7 @@ async fn read_bounded<R: AsyncRead + Unpin>(mut reader: R, limit: usize) -> Resu
         }
         buf.extend_from_slice(&chunk[..n]);
         if buf.len() > limit {
-            return Err(()); // over the bound → give up (memory stays ~limit).
+            return Err(()); // over the bound → give up (peak ≤ limit + chunk_size).
         }
     }
 }
@@ -203,6 +211,21 @@ mod tests {
         assert_eq!(
             pick_last_pm_comment_url(json),
             Some("https://gh/c/3".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_last_pm_comment_url_picks_leading_whitespace_body() {
+        // The picker `trim_start()`s before the `pm:` check, so a body with leading
+        // whitespace still matches and its (non-empty) url is picked.
+        let json = r#"{
+            "comments": [
+                { "body": "   pm:pr-review done", "url": "https://gh/c/9" }
+            ]
+        }"#;
+        assert_eq!(
+            pick_last_pm_comment_url(json),
+            Some("https://gh/c/9".to_string())
         );
     }
 

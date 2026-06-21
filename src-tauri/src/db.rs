@@ -328,6 +328,30 @@ mod tests {
         );
     }
 
+    /// Fresh v0 → v2 migration lock (AB#1042, Medium): opening a brand-new DB replays ALL
+    /// migrations from `user_version = 0` (v1 then v2). Assert the runner lands on
+    /// `SCHEMA_VERSION` AND that the v2 `comment_url` column is present — so a fresh install
+    /// (the common case, distinct from the upgrade path in `migrate_v1_to_v2_*`) gets the
+    /// terminal-URL column, not just an upgraded one.
+    #[test]
+    fn fresh_open_migrates_to_v2_with_comment_url_column() {
+        let db = Database::open_in_memory().expect("open");
+        db.with_conn(|conn| {
+            let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+            assert_eq!(
+                version, SCHEMA_VERSION,
+                "fresh open stamps the current schema"
+            );
+            assert_eq!(SCHEMA_VERSION, 2, "current schema is v2");
+            assert!(
+                review_session_has_comment_url(conn),
+                "fresh v0 → v2 has the comment_url column"
+            );
+            Ok(())
+        })
+        .expect("query");
+    }
+
     /// Whether `review_session` has a `comment_url` column (via `PRAGMA table_info`).
     fn review_session_has_comment_url(conn: &Connection) -> bool {
         let mut stmt = conn
