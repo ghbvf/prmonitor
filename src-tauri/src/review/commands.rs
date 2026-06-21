@@ -5,7 +5,10 @@ use tauri::Manager;
 use crate::config::service as config_service;
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
+use crate::model::EngineKind;
 use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
+use crate::review::engines::claude::process::CLAUDE_BIN;
+use crate::review::engines::claude::ClaudeEngine;
 use crate::review::engines::codex::{CodexEngine, CodexStatus};
 use crate::review::history_store::{self, HistoryItem};
 use crate::review::session::SessionInfo;
@@ -92,26 +95,45 @@ pub async fn start_review<R: tauri::Runtime>(
     // `project_validated` is the per-project analogue of the old `load_validated`; the
     // review slice still depends only on `config::service`, never `config::model`.
     let project = config_service::project_validated(&app, &project_id)?;
-    let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
-    // MANUAL force-start: a user asking to review overrides a prior `stop_codex`.
-    // `resume()` clears the user-stop flag BEFORE `engine.start()` reaches the
-    // `connection()` funnel (which refuses when stopped). Auto-dispatch does NOT
-    // resume, so a stopped server is never auto-revived (PR #47 F1).
-    state.codex.resume();
-    let engine = CodexEngine {
-        app: &app,
-        codex: &state.codex,
-        registry: &state.sessions,
-        codex_bin: CODEX_BIN,
-        project_id: &project.id,
-        repo: &project.repo,
-        repo_root: &project.repo_root,
-        skill_abs_path: &skill_abs,
+    // The ONE place that names a concrete engine for the manual path. Exhaustive `match`
+    // over the sealed `EngineKind` (model.rs) = Hard carrier: a new variant without an arm
+    // here is a compile error. `Deduped` = the registry already has an in-flight review for
+    // this `(project_id, pr, kind)`: a manual re-start is a benign no-op surfaced as an
+    // error (the UI shows it; nothing double-starts). Stop the running one first to re-review.
+    let outcome = match project.engine_kind {
+        EngineKind::Codex => {
+            let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
+            // MANUAL force-start: a user asking to review overrides a prior `stop_codex`.
+            // `resume()` clears the user-stop flag BEFORE `engine.start()` reaches the
+            // `connection()` funnel (which refuses when stopped). Auto-dispatch does NOT
+            // resume, so a stopped server is never auto-revived (PR #47 F1).
+            state.codex.resume();
+            let engine = CodexEngine {
+                app: &app,
+                codex: &state.codex,
+                registry: &state.sessions,
+                codex_bin: CODEX_BIN,
+                project_id: &project.id,
+                repo: &project.repo,
+                repo_root: &project.repo_root,
+                skill_abs_path: &skill_abs,
+            };
+            engine.start(pr_number, &kind).await?
+        }
+        EngineKind::Claude => {
+            let engine = ClaudeEngine {
+                app: &app,
+                claude: &state.claude,
+                registry: &state.sessions,
+                claude_bin: CLAUDE_BIN,
+                project_id: &project.id,
+                repo: &project.repo,
+                repo_root: &project.repo_root,
+            };
+            engine.start(pr_number, &kind).await?
+        }
     };
-    // `Deduped` = the registry already has an in-flight review for this
-    // `(project_id, pr, kind)`: a manual re-start is a benign no-op surfaced as an error
-    // (the UI shows it; nothing double-starts). Stop the running one first to re-review.
-    match engine.start(pr_number, &kind).await? {
+    match outcome {
         StartReviewOutcome::Started(session_id) => Ok(session_id),
         StartReviewOutcome::Deduped => Err(AppError::new(format!(
             "PR {pr_number} 的 {kind} review 已在进行中"
@@ -127,6 +149,16 @@ pub async fn stop_review<R: tauri::Runtime>(
     state: tauri::State<'_, AppState>,
     session_id: String,
 ) -> AppResult<()> {
+    // Stop-engine resolution WITHOUT an engine field on the persisted `SessionInfo`
+    // (#718): a session id is globally unique, so whichever manager holds its kill handle
+    // definitively OWNS the session. Try claude first — `stop` returns true iff the
+    // ClaudeManager owned this session (and just aborted its pump → killed `claude -p`).
+    // This is deterministic, not a guess, and avoids changing `SessionInfo`'s
+    // persisted/mirrored wire shape and all its constructors. If false, the session is
+    // codex's (or already gone) → fall through to the unchanged codex interrupt path.
+    if state.claude.stop(&session_id) {
+        return Ok(());
+    }
     // `stop` interrupts an already-live turn purely by its session id (codex
     // `threadId`); it needs neither the project, the repo, nor the skill path (see
     // `session::stop_review`, where `codex_bin`/`repo_root` are bound to `_`). So we
@@ -185,7 +217,12 @@ pub fn get_pr_sessions<R: tauri::Runtime>(
 /// Resolve the absolute path to the pr-review skill file codex attaches to the
 /// turn. `repo_root` is an absolute dir and `skill_rel_path` a relative path under
 /// it (both config-validated), so the join is absolute and infallible.
-fn skill_abs_path(repo_root: &str, skill_rel_path: &str) -> String {
+///
+/// Single source for both codex callsites — the manual `start_review` here and the
+/// auto path's `run_auto_dispatch` in the composition root (`lib.rs`), which calls
+/// `review::commands::skill_abs_path` rather than keeping its own copy. The review
+/// slice owns the codex skill-path concept, so it lives here (`pub(crate)`).
+pub(crate) fn skill_abs_path(repo_root: &str, skill_rel_path: &str) -> String {
     std::path::Path::new(repo_root)
         .join(skill_rel_path)
         .to_string_lossy()

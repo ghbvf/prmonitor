@@ -30,7 +30,7 @@ pub mod state;
 
 use std::sync::Arc;
 
-use model::Candidate;
+use model::{Candidate, EngineKind};
 use state::AppState;
 use tauri::{Emitter, Manager};
 
@@ -156,6 +156,10 @@ pub fn run() {
             if matches!(event, tauri::RunEvent::Exit) {
                 let state = app_handle.state::<AppState>();
                 state.codex.shutdown();
+                // Abort every in-flight `claude -p` review's pump task (each drops its
+                // `kill_on_drop` child → SIGKILL), so no review subprocess outlives the
+                // app — same "软件关闭时一起关闭" contract as codex (#718).
+                state.claude.shutdown();
                 // Kill the cloudflared tunnel + abort the receiver so neither outlives
                 // the app (same "软件关闭时一起关闭" contract as codex).
                 state.webhook.shutdown();
@@ -300,32 +304,55 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
             return;
         }
     };
-    let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
+    let skill_abs = review::commands::skill_abs_path(&project.repo_root, &project.skill_rel_path);
     let state = app.state::<AppState>();
-    // Respect an explicit user `stop_codex`: a stopped codex is NOT auto-revived by a
-    // dispatchable PR. Skip this batch silently (same as the autoReview-off skip — no
-    // emit, no spawn). Only MANUAL review (`start_review`) and manual `start_codex`
-    // force a restart; auto-dispatch defers to the user's stop (PR #47 F1).
-    if state.codex.is_stopped() {
-        return;
-    }
-    let engine = review::engines::codex::CodexEngine {
-        app: &app,
-        codex: &state.codex,
-        registry: &state.sessions,
-        codex_bin: review::commands::CODEX_BIN,
-        project_id: &project_id,
-        repo: &project.repo,
-        repo_root: &project.repo_root,
-        skill_abs_path: &skill_abs,
-    };
     // The review slice owns "what counts as active"; the pr slice owns the ledger.
     // Both are scoped to this project (#35) so a PR number active in one project does
     // not gate the same number in another, and dedup writes land in the right partition.
     let active = state.sessions.active_pairs(&project_id);
     let record = |cands: &[Candidate]| pr::ledger::record_dispatched(&app, &project_id, cands);
     let report = |msg: String| emit_dispatch_error(&app, &project_id, msg);
-    dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
+    // The ONE place that names a concrete engine for the auto-trigger path. The
+    // exhaustive `match` over the sealed `EngineKind` (model.rs) is the Hard carrier:
+    // adding a variant without an arm here is a compile error. Each arm monomorphizes
+    // `dispatch::auto_dispatch` with its concrete engine (the trait uses bare `async fn`,
+    // not dyn-safe, so we pick a concrete type per arm rather than box).
+    match project.engine_kind {
+        EngineKind::Codex => {
+            // Respect an explicit user `stop_codex`: a stopped codex is NOT auto-revived
+            // by a dispatchable PR. Skip this batch silently (same as the autoReview-off
+            // skip — no emit, no spawn). Only MANUAL review (`start_review`) and manual
+            // `start_codex` force a restart; auto-dispatch defers to the user's stop (PR
+            // #47 F1). Codex-specific: claude has no resident server / stop flag, so this
+            // gate lives in the codex arm — a `stop_codex` must not swallow claude reviews.
+            if state.codex.is_stopped() {
+                return;
+            }
+            let engine = review::engines::codex::CodexEngine {
+                app: &app,
+                codex: &state.codex,
+                registry: &state.sessions,
+                codex_bin: review::commands::CODEX_BIN,
+                project_id: &project_id,
+                repo: &project.repo,
+                repo_root: &project.repo_root,
+                skill_abs_path: &skill_abs,
+            };
+            dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
+        }
+        EngineKind::Claude => {
+            let engine = review::engines::claude::ClaudeEngine {
+                app: &app,
+                claude: &state.claude,
+                registry: &state.sessions,
+                claude_bin: review::engines::claude::process::CLAUDE_BIN,
+                project_id: &project_id,
+                repo: &project.repo,
+                repo_root: &project.repo_root,
+            };
+            dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
+        }
+    }
 }
 
 /// Emit a session-less [`events::ReviewEvent::DispatchError`] to the review area
@@ -344,16 +371,6 @@ fn emit_dispatch_error<R: tauri::Runtime>(
             message,
         },
     );
-}
-
-/// Absolute path to the pr-review skill file codex attaches to a turn. `repo_root`
-/// is an absolute dir and `skill_rel_path` a relative path under it (both
-/// config-validated), so the join is absolute and infallible.
-fn skill_abs_path(repo_root: &str, skill_rel_path: &str) -> String {
-    std::path::Path::new(repo_root)
-        .join(skill_rel_path)
-        .to_string_lossy()
-        .into_owned()
 }
 
 #[cfg(test)]

@@ -129,15 +129,20 @@ impl SessionRegistry {
             .insert(info.thread_id.clone(), info);
     }
 
-    fn set_status(&self, thread_id: &str, status: SessionStatus) {
+    /// `pub(super)` so the claude orchestration (`engines::claude`) can drive the
+    /// same lifecycle transitions as the codex `start_review`/`pump` — the dedup
+    /// registry is engine-agnostic and reused, NOT duplicated (#718). Kept
+    /// `pub(super)` (not `pub`) to respect the review slice boundary.
+    pub(super) fn set_status(&self, thread_id: &str, status: SessionStatus) {
         if let Some(info) = self.inner.lock().unwrap().sessions.get_mut(thread_id) {
             info.status = status;
         }
     }
 
-    /// Record the turn id and flip to [`SessionStatus::Running`] once `turn/start`
-    /// has returned (the session was inserted as `Starting` before the turn began).
-    fn set_running(&self, thread_id: &str, turn_id: String) {
+    /// Record the turn id and flip to [`SessionStatus::Running`] once the engine has
+    /// confirmed the session is live (the session was inserted as `Starting` first).
+    /// `pub(super)` for the reused claude orchestration (#718).
+    pub(super) fn set_running(&self, thread_id: &str, turn_id: String) {
         if let Some(info) = self.inner.lock().unwrap().sessions.get_mut(thread_id) {
             info.turn_id = turn_id;
             info.status = SessionStatus::Running;
@@ -184,7 +189,9 @@ impl SessionRegistry {
     /// session via [`Self::promote_reservation`], so the happy path never calls this.
     /// Idempotent (a missing triple is a no-op). Keyed by the full
     /// `(project_id, pr, kind)` so it frees exactly the triple `try_reserve_pair` took.
-    fn release_pair(&self, project_id: &str, pr_number: u64, kind: &str) {
+    /// `pub(super)` so the claude orchestration's [`ReservationGuard`] analogue can
+    /// release on an early failure (#718).
+    pub(super) fn release_pair(&self, project_id: &str, pr_number: u64, kind: &str) {
         self.inner.lock().unwrap().reserved.remove(&(
             project_id.to_string(),
             pr_number,
@@ -197,7 +204,9 @@ impl SessionRegistry {
     /// unreserved-and-not-yet-a-session (the gap between `thread/start` success and the
     /// insert). The pair stays continuously covered: reserved → (this swap) →
     /// in-flight session.
-    fn promote_reservation(&self, info: SessionInfo) {
+    /// `pub(super)` so the claude orchestration hands its reservation to a `Starting`
+    /// session through the same gap-free swap the codex path uses (#718).
+    pub(super) fn promote_reservation(&self, info: SessionInfo) {
         let mut st = self.inner.lock().unwrap();
         st.reserved
             .remove(&(info.project_id.clone(), info.pr_number, info.kind.clone()));
@@ -541,7 +550,15 @@ static PERSIST_FAILURE_NOTIFIED: AtomicBool = AtomicBool::new(false);
 /// [`ReviewEvent::DispatchError`] (the existing availability-banner channel, which already
 /// covers background write failures) so the user learns their history may not survive a
 /// restart. Subsequent failures only log, so a broken DB never spams a notice per delta.
-fn notify_persist_failure_once<R: tauri::Runtime>(app: &tauri::AppHandle<R>, project_id: &str) {
+///
+/// `pub(super)` so the claude engine (`engines::claude`) reuses the SAME one-time notice
+/// on its own persist failures (#718) — a single process-global notice across BOTH engines
+/// is correct (the static `PERSIST_FAILURE_NOTIFIED` is shared, not per-engine), so a
+/// broken DB still raises exactly one banner regardless of which engine hit it first.
+pub(super) fn notify_persist_failure_once<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_id: &str,
+) {
     if PERSIST_FAILURE_NOTIFIED.swap(true, Ordering::Relaxed) {
         return;
     }

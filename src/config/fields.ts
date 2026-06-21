@@ -9,7 +9,14 @@
 // `keyof AppConfig`). `FieldGroup`/`FieldDef` are generic over the key type so each
 // set is precisely typed and its coverage test can assert exactly that key set.
 import { WEBHOOK_TUNNEL_MODES, type AppConfig, type Project } from "./types";
-import { SOURCE_KINDS, LABEL_SOURCES, UPDATE_MODES, assertNever, type UpdateMode } from "../types";
+import {
+  SOURCE_KINDS,
+  ENGINE_KINDS,
+  LABEL_SOURCES,
+  UPDATE_MODES,
+  assertNever,
+  type UpdateMode,
+} from "../types";
 
 // A project field's key (per-project form/wizard) or a global AppConfig field's key
 // (the webhook group). Generic `FieldDef<K>` keeps each group set precisely typed.
@@ -97,7 +104,12 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         key: "skillRelPath",
         label: "Skill 路径",
         kind: "text",
-        hint: "相对仓库根的 skill 路径，如 .codex/skills/pr-review/SKILL.md",
+        hint: "相对仓库根的 skill 路径，如 .codex/skills/pr-review/SKILL.md（仅 codex 引擎）",
+        // codex-only (#718): the claude engine discovers `.claude/skills/` from the
+        // repo cwd, so it needs no configured skill path. Hidden for a claude project,
+        // mirroring the source-conditional azure/bitbucket fields below; the backend
+        // `validate_project` likewise skips skillRelPath unless engineKind === codex.
+        visibleWhen: (p) => p.engineKind === "codex",
       },
     ],
   },
@@ -170,7 +182,7 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
     title: "引擎",
     fields: [
       // PR 来源 now selectable (818, 717): github (gh) / Azure DevOps (az) / Bitbucket
-      // Server (REST). engineKind stays single-arm read-only (widening tracked by #11).
+      // Server (REST). engineKind is now a real select too (#718): codex / claude.
       {
         key: "sourceKind",
         label: "PR 来源",
@@ -230,9 +242,11 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         key: "engineKind",
         label: "Review 引擎",
         kind: "select",
-        options: ["codex"],
-        readonly: true,
-        hint: "暂仅支持 codex（#11）",
+        // Single-sourced from ENGINE_KINDS (#718) — type & options can't drift; Chinese
+        // display via optionLabels (ConfigField emits the raw camelCase wire value).
+        options: ENGINE_KINDS,
+        optionLabels: { codex: "Codex", claude: "Claude (claude -p)" },
+        hint: "codex=codex app-server；claude=claude -p（Claude Code headless，复用 claude CLI 登录）",
       },
     ],
   },
@@ -404,6 +418,10 @@ export function validateStep(step: StepId, draft: Project): string | null {
     case "repoRoot":
       return draft.repoRoot.trim() !== "" ? null : "请填写本地 clone 的绝对路径";
     case "skill": {
+      // codex-only (#718): the claude engine discovers `.claude/skills/` from cwd, so
+      // skillRelPath is unused — skip the gate (the field is hidden via visibleWhen and
+      // the backend `validate_project` skips it for a non-codex engine).
+      if (draft.engineKind !== "codex") return null;
       const p = draft.skillRelPath;
       if (p.trim() === "") return "请填写 skill 相对路径";
       if (p.startsWith("/") || WIN_ABS_RE.test(p)) return "skill 必须是相对路径";

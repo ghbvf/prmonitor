@@ -99,20 +99,23 @@ pub enum UpdateMode {
 
 /// Which review engine runs against a PR.
 ///
-/// **Hard carrier** (sealed enum): once PR3+ wires engine selection through an
-/// exhaustive `match EngineKind { ... }`, adding a variant without handling it
-/// is a compile error — the missing arm cannot be expressed. Today it has one
-/// variant, so the seam is reserved but not yet load-bearing.
+/// **Hard carrier** (sealed enum): engine selection is wired through exhaustive
+/// `match EngineKind { ... }` at the composition root (`lib.rs::run_auto_dispatch`)
+/// and the review commands (`commands.rs::start_review`), so adding a variant
+/// without handling it is a compile error — the missing arm cannot be expressed.
+/// Now load-bearing (#718): `Claude` is dispatched alongside `Codex`.
 ///
-/// #11 design reservation: future variant `Claude`. Wire string for `Codex` is
-/// pinned to `"codex"` (cross-agent contract; the frontend mirrors it and a
-/// serde golden test locks it).
+/// Wire strings are a cross-agent contract the frontend mirrors (`ENGINE_KINDS`
+/// in `src/types.ts`): `Codex → "codex"`, `Claude → "claude"`. The serde golden
+/// test below (`discriminator_enums_serialize_to_pinned_wire_strings`) is the
+/// **Medium** carrier locking those strings against a `rename_all` / variant drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum EngineKind {
     #[default]
     Codex,
-    // future #11: Claude
+    /// `claude -p` headless (Claude Code) review engine (#718).
+    Claude,
 }
 
 /// How the webhook receiver's local port is exposed to the public internet (#9).
@@ -266,6 +269,13 @@ mod tests {
         assert_eq!(
             serde_json::to_value(EngineKind::Codex).expect("EngineKind serializes"),
             "codex"
+        );
+        // #718: the Claude review engine variant pins to "claude" (the frontend
+        // mirrors it in `ENGINE_KINDS`); a variant rename or `rename_all` change
+        // surfaces here (Medium carrier; the exhaustive `match` wiring is the Hard one).
+        assert_eq!(
+            serde_json::to_value(EngineKind::Claude).expect("EngineKind serializes"),
+            "claude"
         );
         // AB#717: per-project label source. camelCase wire strings the frontend mirrors;
         // a variant rename or `rename_all` change surfaces here. Default is `Native`
