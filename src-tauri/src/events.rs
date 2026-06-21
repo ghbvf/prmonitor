@@ -70,6 +70,13 @@ pub enum ReviewEvent {
         project_id: String,
         thread_id: String,
         status: String,
+        /// The resolved pr-review comment URL (AB#1042), present on a `completed` turn
+        /// when the source kind resolves one (GitHub: exact comment URL; Azure: PR URL;
+        /// Bitbucket / a failed resolve: `None`). `skip_serializing_if` OMITS the key
+        /// when `None`, so the wire matches the optional `commentUrl?: string` on
+        /// `src/types.ts`'s `turnCompleted` (an absent key, not a JSON `null`).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        comment_url: Option<String>,
     },
     /// A session-level error.
     #[serde(rename_all = "camelCase")]
@@ -269,6 +276,8 @@ mod tests {
             project_id: "p1".to_string(),
             thread_id: "t1".to_string(),
             status: "completed".to_string(),
+            // AB#1042: a resolved comment URL must surface as the camelCase `commentUrl`.
+            comment_url: Some("https://example.com/pr/1#c".to_string()),
         };
 
         let v = serde_json::to_value(&event).expect("ReviewEvent serializes");
@@ -280,9 +289,25 @@ mod tests {
         assert!(v.get("projectId").is_some());
         assert!(v.get("threadId").is_some());
         assert!(v.get("status").is_some());
+        // AB#1042: the new `commentUrl` field serializes camelCase; the snake_case form
+        // must stay absent (mirrored by the optional `commentUrl` on `src/types.ts`).
+        assert!(v.get("commentUrl").is_some());
+        assert_eq!(v["commentUrl"], "https://example.com/pr/1#c");
+        assert!(v.get("comment_url").is_none());
 
         // snake_case form absent — a rename would surface here.
         assert!(v.get("project_id").is_none());
         assert!(v.get("thread_id").is_none());
+
+        // `comment_url: None` OMITS the key (skip_serializing_if), matching the optional
+        // `commentUrl?: string` TS mirror — an absent key, not a JSON `null`.
+        let no_url = serde_json::to_value(&ReviewEvent::TurnCompleted {
+            project_id: "p1".to_string(),
+            thread_id: "t1".to_string(),
+            status: "interrupted".to_string(),
+            comment_url: None,
+        })
+        .expect("ReviewEvent serializes");
+        assert!(no_url.get("commentUrl").is_none(), "None omits commentUrl");
     }
 }

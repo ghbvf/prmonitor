@@ -140,15 +140,16 @@ pub fn upsert_session(db: &Database, info: &SessionInfo) -> AppResult<()> {
     db.with_tx(|tx| {
         tx.execute(
             "INSERT INTO review_session \
-             (thread_id, project_id, pr_number, turn_id, kind, status, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) \
+             (thread_id, project_id, pr_number, turn_id, kind, status, created_at, updated_at, comment_url) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8) \
              ON CONFLICT(thread_id) DO UPDATE SET \
                project_id = excluded.project_id, \
                pr_number  = excluded.pr_number, \
                turn_id    = excluded.turn_id, \
                kind       = excluded.kind, \
                status     = excluded.status, \
-               updated_at = excluded.updated_at",
+               updated_at = excluded.updated_at, \
+               comment_url = COALESCE(excluded.comment_url, comment_url)",
             rusqlite::params![
                 info.thread_id,
                 info.project_id,
@@ -157,6 +158,10 @@ pub fn upsert_session(db: &Database, info: &SessionInfo) -> AppResult<()> {
                 info.kind,
                 status,
                 now,
+                // AB#1042: `comment_url` is None during start (Starting/Running upserts); the
+                // terminal URL is written by `set_status_and_comment_url`. COALESCE on conflict
+                // means a None upsert never clobbers an already-resolved URL.
+                info.comment_url,
             ],
         )
         .map_err(crate::db::map_err)?;
@@ -178,6 +183,30 @@ pub fn set_status(db: &Database, thread_id: &str, status: SessionStatus) -> AppR
         conn.execute(
             "UPDATE review_session SET status = ?2, updated_at = ?3 WHERE thread_id = ?1",
             rusqlite::params![thread_id, status, now],
+        )
+        .map(|_| ())
+    })
+}
+
+/// Atomically writes the TERMINAL status AND the resolved `comment_url` for a session
+/// (AB#1042) — the durable half of [`super::session::finalize_turn`]'s terminal write, so a
+/// woken completion subscriber reading the DB sees the status and URL land together. A
+/// `None` `comment_url` writes SQL NULL (the terminal had no comment — interrupted / failed
+/// / Bitbucket). A no-op if the row doesn't exist (the session insert always precedes a
+/// terminal in practice). Best-effort, like [`set_status`].
+pub fn set_status_and_comment_url(
+    db: &Database,
+    thread_id: &str,
+    status: SessionStatus,
+    comment_url: Option<&str>,
+) -> AppResult<()> {
+    let now = now_epoch() as i64;
+    let status = status_wire(status);
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE review_session SET status = ?2, comment_url = ?3, updated_at = ?4 \
+             WHERE thread_id = ?1",
+            rusqlite::params![thread_id, status, comment_url, now],
         )
         .map(|_| ())
     })
@@ -249,7 +278,7 @@ pub fn get_pr_sessions(
 ) -> AppResult<Vec<SessionInfo>> {
     db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT thread_id, project_id, pr_number, turn_id, kind, status, created_at \
+            "SELECT thread_id, project_id, pr_number, turn_id, kind, status, created_at, comment_url \
              FROM review_session \
              WHERE project_id = ?1 AND pr_number = ?2 ORDER BY created_at DESC, thread_id",
         )?;
@@ -263,6 +292,8 @@ pub fn get_pr_sessions(
                 kind: r.get(4)?,
                 status: status_from_wire(&status),
                 created_at_epoch: r.get::<_, i64>(6)? as u64,
+                // AB#1042: NULL (no comment) → None; a resolved terminal URL → Some.
+                comment_url: r.get::<_, Option<String>>(7)?,
             })
         })?;
         rows.collect()
@@ -296,6 +327,7 @@ mod tests {
             kind: "review".to_string(),
             status,
             created_at_epoch: 0,
+            comment_url: None,
         }
     }
 
@@ -315,6 +347,44 @@ mod tests {
 
         // Scoped per (project, PR): a different PR sees nothing.
         assert!(get_pr_sessions(&db, "alpha", 99).expect("list").is_empty());
+    }
+
+    // AB#1042: the terminal write (`set_status_and_comment_url`) persists status + URL
+    // together, and `get_pr_sessions` reads the URL back into `SessionInfo.comment_url`. A
+    // None terminal leaves it NULL (read back as None). The Starting/Running upserts carry
+    // None and must NOT clobber a later-written URL (the COALESCE on conflict).
+    #[test]
+    fn terminal_comment_url_persists_and_reads_back() {
+        let db = Database::open_in_memory().expect("open db");
+        // Starting then Running upserts (both None comment_url).
+        upsert_session(&db, &info("th-1", 12, SessionStatus::Starting)).expect("starting");
+        upsert_session(&db, &info("th-1", 12, SessionStatus::Running)).expect("running");
+
+        // Terminal: write Done + the resolved URL atomically.
+        set_status_and_comment_url(&db, "th-1", SessionStatus::Done, Some("https://x/c"))
+            .expect("terminal write");
+
+        let sessions = get_pr_sessions(&db, "alpha", 12).expect("list");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, SessionStatus::Done);
+        assert_eq!(sessions[0].comment_url.as_deref(), Some("https://x/c"));
+
+        // A later Some terminal write OVERWRITES the earlier URL (Some→Some): the dedicated
+        // terminal write is an explicit set, NOT a COALESCE — a re-review's new comment URL
+        // replaces the prior one rather than being preserved.
+        set_status_and_comment_url(&db, "th-1", SessionStatus::Done, Some("https://x/c2"))
+            .expect("overwrite write");
+        let after_some = get_pr_sessions(&db, "alpha", 12).expect("list");
+        assert_eq!(after_some[0].comment_url.as_deref(), Some("https://x/c2"));
+
+        // A later None terminal (e.g. a re-run that interrupted) overwrites with NULL — the
+        // dedicated terminal write is explicit, not a COALESCE (only the start upsert preserves).
+        set_status_and_comment_url(&db, "th-1", SessionStatus::Failed, None).expect("none write");
+        let after = get_pr_sessions(&db, "alpha", 12).expect("list");
+        assert!(
+            after[0].comment_url.is_none(),
+            "explicit None terminal clears the URL"
+        );
     }
 
     // History capture (#70): deltas for one item id COALESCE into a single concatenated

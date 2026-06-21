@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use super::engines::codex::process;
 use super::engines::codex::protocol::{
@@ -75,6 +75,55 @@ pub struct SessionInfo {
     /// (no time), so the frontend sorting on it scrambled the list — this carries the
     /// real order (mirrors `ReviewSession.createdAtEpoch` in `src/review/types.ts`).
     pub created_at_epoch: u64,
+    /// The resolved pr-review comment URL (AB#1042), filled by [`finalize_turn`] at a
+    /// `completed` terminal (GitHub: exact comment URL; Azure: PR URL; else `None`).
+    /// `None` for a non-terminal / non-completed session. Serializes camelCase
+    /// `commentUrl`; `skip_serializing_if` omits the key when `None` so the wire matches
+    /// an optional TS field rather than emitting a JSON `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment_url: Option<String>,
+}
+
+/// The terminal outcome of one review turn, delivered to a programmatic completion
+/// subscriber (AB#1042). Carries the terminal [`SessionStatus`] plus the resolved
+/// pr-review comment URL (if any) so a future transport can both "wait for this review"
+/// AND read back the comment link without re-querying. `Clone` so the watch channel hands
+/// each subscriber its own copy.
+///
+/// `status` is the terminal KIND ([`SessionStatus::Done`] / [`SessionStatus::Failed`]) —
+/// but `Done` covers BOTH a successful `completed` and a user `interrupted` turn (see
+/// [`terminal_status`]). `wire_status` carries the raw codex `turn.status` string
+/// (`"completed"` / `"interrupted"` / `"failed"`, mirroring
+/// [`crate::events::ReviewEvent::TurnCompleted`]'s `status`) so a subscriber CAN tell a
+/// finished review from an interrupted one — which `status` alone cannot express.
+#[derive(Debug, Clone)]
+pub struct CompletionOutcome {
+    pub status: SessionStatus,
+    /// Raw codex `turn.status` — distinguishes `completed` vs `interrupted` (both map to
+    /// `SessionStatus::Done`). See the struct doc.
+    pub wire_status: String,
+    pub comment_url: Option<String>,
+}
+
+/// The source context [`finalize_turn`] needs to resolve the pr-review comment URL (AB#1042),
+/// captured IMMUTABLY at session creation. The funnel runs at the terminal — possibly minutes
+/// after the review started — so it must NOT re-read the (mutable) project config there: a
+/// config edit mid-review would otherwise yield a wrong/None URL (this bites the Azure path
+/// especially, whose URL is built from `azure_org`/`azure_project`/`repo`). Snapshotting these
+/// fields at start pins the answer to the project the review actually ran against.
+///
+/// Review-slice-internal: NOT serialized, NOT a DB column, NOT a wire type — it lives only in
+/// the in-memory [`RegistryState::url_contexts`] map, so it touches no wire/DB contract.
+/// `pub(crate)` (not `pub(super)`) ONLY because the auto-dispatch composition root
+/// (`crate::lib::run_auto_dispatch`) builds the engines directly and sits OUTSIDE the `review`
+/// module, so it must be able to name the type to set the engine's `url_ctx` field. It is
+/// still crate-internal — never crosses the Tauri command boundary nor the DB.
+#[derive(Debug, Clone)]
+pub(crate) struct CommentUrlContext {
+    pub source_kind: crate::model::SourceKind,
+    pub repo: String,
+    pub azure_org: String,
+    pub azure_project: String,
 }
 
 /// In-memory registry of review sessions keyed by `threadId`. Lives in
@@ -103,6 +152,23 @@ pub struct SessionRegistry {
 struct RegistryState {
     sessions: HashMap<ThreadId, SessionInfo>,
     reserved: HashSet<(String, u64, String)>,
+    /// Per-`thread_id` completion broadcast (AB#1042): a `watch::Sender` whose value goes
+    /// `None` → `Some(CompletionOutcome)` exactly once, when the turn reaches a terminal
+    /// state via [`finalize_turn`]. Get-or-create on BOTH ends ([`SessionRegistry::subscribe_completion`]
+    /// / [`SessionRegistry::signal_completion`]) so a subscriber that arrives before the
+    /// signal still observes the retained terminal value (watch keeps the last value), and
+    /// a signal that fires before anyone subscribes is not lost. Lives under the SAME mutex
+    /// as `sessions` — `watch` send/subscribe are synchronous, so no `.await` is held under
+    /// the lock (the registry's invariant). Entries are intentionally retained for the
+    /// process lifetime (a session count is bounded by usage; no churn that warrants GC).
+    completions: HashMap<ThreadId, watch::Sender<Option<CompletionOutcome>>>,
+    /// Per-`thread_id` source context for the comment-URL resolve (AB#1042), captured
+    /// IMMUTABLY at session creation in the SAME critical section as the `sessions` insert
+    /// ([`SessionRegistry::promote_reservation`]) — so it is present before any pump can
+    /// finalize. [`finalize_turn`] reads it via [`SessionRegistry::take_url_context`] (remove +
+    /// return), which bounds the map and pins that the URL is resolved against the project the
+    /// review STARTED against, never a config that changed mid-review. In-memory only.
+    url_contexts: HashMap<ThreadId, CommentUrlContext>,
 }
 
 /// Outcome of [`SessionRegistry::begin_interrupt`] — the atomic guard that makes
@@ -136,6 +202,22 @@ impl SessionRegistry {
     pub(super) fn set_status(&self, thread_id: &str, status: SessionStatus) {
         if let Some(info) = self.inner.lock().unwrap().sessions.get_mut(thread_id) {
             info.status = status;
+        }
+    }
+
+    /// Terminal mutator for [`finalize_turn`] (AB#1042): set the status AND the resolved
+    /// `comment_url` in one critical section, so a `list_review_sessions` snapshot taken
+    /// after finalize sees both. Kept a dumb mutator (no signal — the funnel signals LAST,
+    /// after the durable write); `set_status` stays for the non-terminal callers.
+    pub(super) fn set_status_and_comment_url(
+        &self,
+        thread_id: &str,
+        status: SessionStatus,
+        comment_url: Option<String>,
+    ) {
+        if let Some(info) = self.inner.lock().unwrap().sessions.get_mut(thread_id) {
+            info.status = status;
+            info.comment_url = comment_url;
         }
     }
 
@@ -206,11 +288,26 @@ impl SessionRegistry {
     /// in-flight session.
     /// `pub(super)` so the claude orchestration hands its reservation to a `Starting`
     /// session through the same gap-free swap the codex path uses (#718).
-    pub(super) fn promote_reservation(&self, info: SessionInfo) {
+    ///
+    /// `url_ctx` is the IMMUTABLE comment-URL source context (AB#1042), inserted into
+    /// `url_contexts` keyed by the session's `thread_id` IN THIS SAME critical section as the
+    /// session insert — so the snapshot is atomic with session creation and present before the
+    /// pump can finalize. [`finalize_turn`] reads it once via [`Self::take_url_context`].
+    pub(super) fn promote_reservation(&self, info: SessionInfo, url_ctx: CommentUrlContext) {
         let mut st = self.inner.lock().unwrap();
         st.reserved
             .remove(&(info.project_id.clone(), info.pr_number, info.kind.clone()));
+        st.url_contexts.insert(info.thread_id.clone(), url_ctx);
         st.sessions.insert(info.thread_id.clone(), info);
+    }
+
+    /// Remove and return this `thread_id`'s captured [`CommentUrlContext`] (AB#1042). Called
+    /// EXACTLY ONCE by [`finalize_turn`] at the terminal — remove-on-read bounds the map (a
+    /// finalized session needs the context no more) and pins that the URL is resolved against
+    /// the start-time snapshot, independent of any later config change. A second take (or a
+    /// session that never captured one) yields `None`. Synchronous (no `.await` under the lock).
+    pub(super) fn take_url_context(&self, thread_id: &str) -> Option<CommentUrlContext> {
+        self.inner.lock().unwrap().url_contexts.remove(thread_id)
     }
 
     /// Atomically begin an interrupt. Only a [`SessionStatus::Running`] session
@@ -295,6 +392,41 @@ impl SessionRegistry {
         );
         pairs
     }
+
+    /// Subscribe to this `thread_id`'s terminal completion (AB#1042). Returns a
+    /// `watch::Receiver` whose value is `None` until the turn finalizes, then the retained
+    /// `Some(CompletionOutcome)`. GET-OR-CREATE (a fresh sender starts at `None`): a
+    /// subscriber that arrives AFTER the signal still reads the last value the watch keeps,
+    /// so there is no "subscribed too late" race. Synchronous (no `.await` under the lock).
+    pub fn subscribe_completion(
+        &self,
+        thread_id: &str,
+    ) -> watch::Receiver<Option<CompletionOutcome>> {
+        let mut st = self.inner.lock().unwrap();
+        st.completions
+            .entry(thread_id.to_string())
+            .or_insert_with(|| watch::channel(None).0)
+            .subscribe()
+    }
+
+    /// Signal this `thread_id`'s terminal completion (AB#1042) by setting the watch value to
+    /// `Some(outcome)`. GET-OR-CREATE so a signal that fires before anyone subscribed is not
+    /// lost (a later `subscribe_completion` reads the retained value). Called LAST by
+    /// [`finalize_turn`], after the registry/DB terminal writes have landed, so any woken
+    /// subscriber sees a fully-settled session. `pub(super)` — only the funnel signals.
+    /// Synchronous (no `.await` under the lock).
+    pub(super) fn signal_completion(&self, thread_id: &str, outcome: CompletionOutcome) {
+        let mut st = self.inner.lock().unwrap();
+        let sender = st
+            .completions
+            .entry(thread_id.to_string())
+            .or_insert_with(|| watch::channel(None).0);
+        // `send_replace` (NOT `send`) sets the value UNCONDITIONALLY — `send` would fail and
+        // DISCARD the value when there are no receivers yet (signal-before-subscribe), losing
+        // the outcome. `send_replace` retains it (and notifies any existing receivers), so a
+        // later `subscribe_completion` reads the retained terminal value.
+        let _ = sender.send_replace(Some(outcome));
+    }
 }
 
 /// RAII release of a `(pr, kind)` reservation taken by
@@ -336,8 +468,12 @@ impl Drop for ReservationGuard<'_> {
 ///
 /// Subscribes to the notification stream BEFORE `turn/start` so no early delta is
 /// missed, then spawns a pump task that forwards events until the turn completes.
+///
+/// `pub(crate)` (not `pub`): only the in-crate codex engine adapter calls it, and its
+/// `url_ctx: CommentUrlContext` param is a crate-internal type — keeping both at crate
+/// visibility makes the interface consistent (no `private_interfaces` leak).
 #[allow(clippy::too_many_arguments)]
-pub async fn start_review<R: tauri::Runtime>(
+pub(crate) async fn start_review<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     codex: &CodexManager,
     registry: &SessionRegistry,
@@ -349,6 +485,10 @@ pub async fn start_review<R: tauri::Runtime>(
     project_id: &str,
     pr_number: u64,
     kind: &str,
+    // The IMMUTABLE comment-URL source context (AB#1042), captured by the caller from the
+    // project at start. Handed to the `Starting` session in `promote_reservation` so the
+    // terminal `finalize_turn` resolves the URL against the project the review ran against.
+    url_ctx: CommentUrlContext,
 ) -> AppResult<StartReviewOutcome> {
     // Atomic test-and-set BEFORE any `.await`: if this `(project_id, pr, kind)` is
     // already reserved or covered by an in-flight session, do NOT start a second review.
@@ -397,8 +537,10 @@ pub async fn start_review<R: tauri::Runtime>(
         kind: kind.to_string(),
         status: SessionStatus::Starting,
         created_at_epoch: super::history_store::now_epoch(),
+        // No comment yet — filled by `finalize_turn` at a `completed` terminal (AB#1042).
+        comment_url: None,
     };
-    registry.promote_reservation(starting.clone());
+    registry.promote_reservation(starting.clone(), url_ctx);
     // Mirror the in-memory session into the durable `review_session` table (#70) so this
     // PR's session list survives a restart and its history can be reopened. Best-effort.
     persist_session(app, &starting);
@@ -457,6 +599,8 @@ pub async fn start_review<R: tauri::Runtime>(
             // `created_at` on first insert (ON CONFLICT preserves it), so this only needs
             // to stay consistent with `starting`, not re-stamp `now`.
             created_at_epoch: starting.created_at_epoch,
+            // Still no comment at the Running transition (AB#1042).
+            comment_url: None,
         },
     );
 
@@ -468,6 +612,7 @@ pub async fn start_review<R: tauri::Runtime>(
     tauri::async_runtime::spawn(pump(
         rx,
         project_id.to_string(),
+        pr_number,
         thread_id.clone(),
         app.clone(),
         registry.clone(),
@@ -650,6 +795,7 @@ fn persist_delta<R: tauri::Runtime>(
 async fn pump<R: tauri::Runtime>(
     mut rx: broadcast::Receiver<Arc<ServerNotification>>,
     project_id: String,
+    pr_number: u64,
     thread_id: String,
     app: tauri::AppHandle<R>,
     registry: SessionRegistry,
@@ -663,20 +809,37 @@ async fn pump<R: tauri::Runtime>(
             // `Sender` alive across a dead reader, so `RecvError::Closed` below never
             // fires for a process-death; this is what catches that case).
             Ok(note) if matches!(note.as_ref(), ServerNotification::ConnectionClosed) => {
-                fail_connection_closed(&registry, &app, &project_id, &thread_id);
+                fail_connection_closed(&registry, &app, &project_id, pr_number, &thread_id).await;
                 break;
             }
             Ok(note) => {
+                // PEEK the raw terminal notification BEFORE mapping (AB#1042): the terminal
+                // path must run the async `finalize_turn` (resolve URL, signal completion),
+                // which the pure `map_notification` cannot do. Only THIS session's
+                // `turn/completed` is terminal; another thread's is not ours.
+                if let ServerNotification::TurnCompleted(d) = note.as_ref() {
+                    if d.thread_id == thread_id {
+                        let wire_status = d.turn.status.clone();
+                        let terminal = terminal_status(&wire_status);
+                        finalize_turn(
+                            &app,
+                            &registry,
+                            &project_id,
+                            pr_number,
+                            &thread_id,
+                            terminal,
+                            &wire_status,
+                            None,
+                        )
+                        .await;
+                        break; // terminal — the turn is over.
+                    }
+                    // Another session's completion → not ours; keep pumping.
+                    continue;
+                }
                 let Some(event) = map_notification(&note, &project_id, &thread_id) else {
                     continue;
                 };
-                if let ReviewEvent::TurnCompleted { status, .. } = &event {
-                    let terminal = terminal_status(status);
-                    registry.set_status(&thread_id, terminal);
-                    let _ = app.emit(REVIEW_EVENT, &event);
-                    persist_status(&app, &thread_id, terminal); // mirror terminal to DB (#70)
-                    break; // terminal — the turn is over.
-                }
                 // Emit FIRST (streaming latency must not wait on the DB), THEN persist the
                 // delta to the session history (#70) best-effort — a persist error is
                 // logged, never breaks the live stream.
@@ -688,50 +851,162 @@ async fn pump<R: tauri::Runtime>(
             // (another session can flood the ring after ours), which would hang
             // this pump on `recv()` forever — and the dropped deltas already make
             // the rendered stream incomplete. So end the session honestly with a
-            // Failed terminal + error rather than risk a stuck `Running`.
+            // Failed terminal + error rather than risk a stuck `Running`. Routed
+            // through `finalize_turn` (AB#1042) so a completion subscriber is signalled
+            // (no URL on a lag-failure — the turn never reported `completed`).
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 eprintln!("review pump（{thread_id}）滞后，丢弃 {n} 条通知");
-                registry.set_status(&thread_id, SessionStatus::Failed);
-                persist_status(&app, &thread_id, SessionStatus::Failed); // mirror to DB (#70)
-                let _ = app.emit(
-                    REVIEW_EVENT,
-                    &ReviewEvent::Error {
-                        project_id: project_id.clone(),
-                        thread_id: thread_id.clone(),
-                        message: format!("codex 输出流滞后，丢弃 {n} 条消息（review 中断）"),
-                    },
-                );
+                finalize_turn(
+                    &app,
+                    &registry,
+                    &project_id,
+                    pr_number,
+                    &thread_id,
+                    SessionStatus::Failed,
+                    "failed",
+                    Some(format!("codex 输出流滞后，丢弃 {n} 条消息（review 中断）")),
+                )
+                .await;
                 break;
             }
             // The broadcast itself closed (every `Sender` dropped — i.e. the whole
             // `RpcClient` was torn down, e.g. manager shutdown). Same terminal
             // outcome as the synthetic `ConnectionClosed` above.
             Err(broadcast::error::RecvError::Closed) => {
-                fail_connection_closed(&registry, &app, &project_id, &thread_id);
+                fail_connection_closed(&registry, &app, &project_id, pr_number, &thread_id).await;
                 break;
             }
         }
     }
 }
 
-/// End a session as `Failed` with a "connection closed" error event. Shared by the
-/// pump's two transport-teardown paths: the synthetic `ConnectionClosed` (reader
-/// exited but the `RpcClient` lives on) and `RecvError::Closed` (the whole client
-/// dropped).
-fn fail_connection_closed<R: tauri::Runtime>(
+/// End a session as `Failed` with a "connection closed" error event, through the terminal
+/// funnel (AB#1042). Shared by the pump's two transport-teardown paths: the synthetic
+/// `ConnectionClosed` (reader exited but the `RpcClient` lives on) and `RecvError::Closed`
+/// (the whole client dropped). `async` (it routes through `finalize_turn`); safe — no lock
+/// is held across the await (`AppHandle: Send+Sync`, `SessionRegistry: Clone(Arc)`). No URL
+/// is resolved (the connection died — the turn never reported `completed`).
+async fn fail_connection_closed<R: tauri::Runtime>(
     registry: &SessionRegistry,
     app: &tauri::AppHandle<R>,
     project_id: &str,
+    pr_number: u64,
     thread_id: &str,
 ) {
-    registry.set_status(thread_id, SessionStatus::Failed);
-    persist_status(app, thread_id, SessionStatus::Failed); // mirror to DB (#70)
+    finalize_turn(
+        app,
+        registry,
+        project_id,
+        pr_number,
+        thread_id,
+        SessionStatus::Failed,
+        "failed",
+        Some("codex 连接已关闭".to_string()),
+    )
+    .await;
+}
+
+/// The single terminal funnel for a review turn (AB#1042) — every terminal path (both
+/// engines' pump exit points) converges here so the completion writes, the wire
+/// `TurnCompleted`, and the programmatic completion signal happen in ONE fixed order.
+/// Engine-agnostic (no `CodexManager`/`ClaudeManager` param): the codex pump's
+/// `TurnCompleted` / lag / connection-closed exits and the claude `finish`'s exits all
+/// call it; per-engine cleanup (claude's `deregister`) stays at the callsite, OUTSIDE the
+/// funnel.
+///
+/// Steps (ORDER IS LOAD-BEARING — `signal_completion` MUST be last):
+/// 1. Resolve the comment URL ONLY for a `completed` turn: read the IMMUTABLE
+///    [`CommentUrlContext`] captured at session start (`registry.take_url_context`) for
+///    repo/source_kind/azure org+project, then [`super::comment_url::resolve_comment_url`].
+///    Reading the start-time snapshot (NOT the live, mutable config) is what makes the URL
+///    correct even when the config was edited during a long review. ANY miss (no captured
+///    context, gh error) degrades to `None` — the funnel NEVER fails (mirrors the best-effort
+///    persist contract). interrupted / failed → `None` (no comment was posted).
+/// 2. Set the in-memory terminal status AND write the resolved `comment_url` onto the
+///    session (`set_status` stays a dumb mutator; the URL write is folded in here).
+/// 3. Persist the terminal status + URL atomically (best-effort, the one-time notice on
+///    failure), so a woken subscriber that reads the DB sees the settled row.
+/// 4. Emit the optional `Error` event, then the terminal `TurnCompleted { comment_url }`.
+/// 5. Signal the completion watch LAST — a subscriber woken by it then reads the registry
+///    / DB and is guaranteed to see the already-landed terminal state + URL.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn finalize_turn<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    registry: &SessionRegistry,
+    project_id: &str,
+    pr_number: u64,
+    thread_id: &str,
+    terminal: SessionStatus,
+    wire_status: &str,
+    error: Option<String>,
+) {
+    // 1. Resolve the comment URL only on a successful completion, against the IMMUTABLE
+    // context captured at session start (NOT the live config) so a mid-review config edit
+    // can't yield a wrong/None URL. Take it unconditionally (remove-on-read bounds the map);
+    // a missing context or a non-`completed` terminal both yield None. Any resolve failure
+    // also degrades to None — the funnel never fails.
+    let comment_url = match registry.take_url_context(thread_id) {
+        Some(ctx) if should_resolve_url(wire_status) => {
+            super::comment_url::resolve_comment_url(
+                ctx.source_kind,
+                &ctx.repo,
+                &ctx.azure_org,
+                &ctx.azure_project,
+                pr_number,
+            )
+            .await
+        }
+        _ => None,
+    };
+
+    // 2. In-memory terminal status + the resolved URL.
+    registry.set_status_and_comment_url(thread_id, terminal, comment_url.clone());
+
+    // 3. Durable terminal status + URL (best-effort; one-time notice on failure).
+    let db = app.state::<crate::db::Database>();
+    if let Err(e) = super::history_store::set_status_and_comment_url(
+        db.inner(),
+        thread_id,
+        terminal,
+        comment_url.as_deref(),
+    ) {
+        eprintln!(
+            "review session 终态持久化失败（{thread_id}）：{}",
+            e.message
+        );
+        notify_persist_failure_once(app, project_id);
+    }
+
+    // 4. Optional Error, then the terminal TurnCompleted carrying the URL.
+    if let Some(message) = error {
+        let _ = app.emit(
+            REVIEW_EVENT,
+            &ReviewEvent::Error {
+                project_id: project_id.to_string(),
+                thread_id: thread_id.to_string(),
+                message,
+            },
+        );
+    }
     let _ = app.emit(
         REVIEW_EVENT,
-        &ReviewEvent::Error {
+        &ReviewEvent::TurnCompleted {
             project_id: project_id.to_string(),
             thread_id: thread_id.to_string(),
-            message: "codex 连接已关闭".to_string(),
+            status: wire_status.to_string(),
+            comment_url: comment_url.clone(),
+        },
+    );
+
+    // 5. Signal LAST — subscribers wake to an already-settled registry/DB.
+    registry.signal_completion(
+        thread_id,
+        CompletionOutcome {
+            status: terminal,
+            // The raw codex status so a subscriber distinguishes completed vs interrupted
+            // (both terminal-map to `Done`) — `wire_status` is in scope here as `&str`.
+            wire_status: wire_status.to_string(),
+            comment_url,
         },
     );
 }
@@ -762,11 +1037,16 @@ fn map_notification(
                 text: d.delta.clone(),
             })
         }
+        // Retained for the pure-mapping unit test (AB#1042): the PRODUCTION pump peeks the
+        // raw `TurnCompleted` BEFORE calling `map_notification` and routes it through the
+        // async `finalize_turn` (which fills `comment_url`), so this arm is never hit live —
+        // the `comment_url: None` here only matters to the characterization test.
         ServerNotification::TurnCompleted(d) if d.thread_id == thread_id => {
             Some(ReviewEvent::TurnCompleted {
                 project_id: project_id.to_string(),
                 thread_id: d.thread_id.clone(),
                 status: d.turn.status.clone(),
+                comment_url: None,
             })
         }
         _ => None,
@@ -781,6 +1061,14 @@ fn terminal_status(status: &str) -> SessionStatus {
         "completed" | "interrupted" => SessionStatus::Done,
         _ => SessionStatus::Failed,
     }
+}
+
+/// Whether [`finalize_turn`] resolves a comment URL for this terminal — TRUE only for a
+/// `completed` turn (AB#1042). An `interrupted` turn maps to [`SessionStatus::Done`] (same
+/// as `completed`) yet posted no comment, so the gate is on the raw `wire_status`, NOT on
+/// the terminal [`SessionStatus`] — pinning that an interrupted/failed turn resolves NO URL.
+fn should_resolve_url(wire_status: &str) -> bool {
+    wire_status == "completed"
 }
 
 /// The skill command the review turn instructs codex to run: `/pr-review <N>` for
@@ -822,6 +1110,18 @@ mod tests {
             item_id: "it".to_string(),
             delta: "hello".to_string(),
         })
+    }
+
+    /// A throwaway [`CommentUrlContext`] for `promote_reservation` calls whose tests do not
+    /// assert on the captured value (AB#1042). The capture-roundtrip test below builds its
+    /// own distinguishable context instead.
+    fn test_url_ctx() -> CommentUrlContext {
+        CommentUrlContext {
+            source_kind: crate::model::SourceKind::Github,
+            repo: "owner/name".to_string(),
+            azure_org: String::new(),
+            azure_project: String::new(),
+        }
     }
 
     #[test]
@@ -911,6 +1211,17 @@ mod tests {
     }
 
     #[test]
+    fn should_resolve_url_only_for_completed() {
+        // Only a `completed` turn posted a comment to resolve. `interrupted` maps to the
+        // SAME terminal `Done` as `completed`, so the gate must key on the raw wire status,
+        // not the terminal kind — an interrupted/failed/empty turn resolves NO url.
+        assert!(should_resolve_url("completed"));
+        assert!(!should_resolve_url("interrupted"));
+        assert!(!should_resolve_url("failed"));
+        assert!(!should_resolve_url(""));
+    }
+
+    #[test]
     fn skill_command_matches_kind() {
         assert_eq!(skill_command(7, "review"), "/pr-review 7");
         assert_eq!(skill_command(7, "check"), "/pr-review 7 --check");
@@ -937,6 +1248,7 @@ mod tests {
             kind: "review".to_string(),
             status: SessionStatus::Running,
             created_at_epoch: 0,
+            comment_url: None,
         });
         assert_eq!(reg.list()[0].turn_id, "tn1");
         reg.set_status("t1", SessionStatus::Done);
@@ -961,6 +1273,7 @@ mod tests {
                 kind: kind.to_string(),
                 status,
                 created_at_epoch: 0,
+                comment_url: None,
             });
         };
         info("a", 1, "review", SessionStatus::Starting);
@@ -1017,6 +1330,7 @@ mod tests {
             kind: "review".to_string(),
             status: SessionStatus::Running,
             created_at_epoch: 0,
+            comment_url: None,
         });
         assert!(!reg.try_reserve_pair("p1", 7, "review"));
         // A different kind is still reservable; a terminal session would not block
@@ -1052,15 +1366,19 @@ mod tests {
 
         // An in-flight SESSION (not just a reservation) is likewise project-scoped:
         // A's promoted session does not appear in B's active_pairs and does not block B.
-        reg.promote_reservation(SessionInfo {
-            project_id: "A".to_string(),
-            thread_id: "tA".to_string(),
-            turn_id: String::new(),
-            pr_number: 9,
-            kind: "review".to_string(),
-            status: SessionStatus::Running,
-            created_at_epoch: 0,
-        });
+        reg.promote_reservation(
+            SessionInfo {
+                project_id: "A".to_string(),
+                thread_id: "tA".to_string(),
+                turn_id: String::new(),
+                pr_number: 9,
+                kind: "review".to_string(),
+                status: SessionStatus::Running,
+                created_at_epoch: 0,
+                comment_url: None,
+            },
+            test_url_ctx(),
+        );
         assert!(
             reg.active_pairs("A").contains(&(9, "review".to_string())),
             "A's session shows in A"
@@ -1090,15 +1408,19 @@ mod tests {
     fn promote_reservation_hands_off_without_a_gap() {
         let reg = SessionRegistry::default();
         assert!(reg.try_reserve_pair("p1", 7, "review"));
-        reg.promote_reservation(SessionInfo {
-            project_id: "p1".to_string(),
-            thread_id: "t1".to_string(),
-            turn_id: String::new(),
-            pr_number: 7,
-            kind: "review".to_string(),
-            status: SessionStatus::Starting,
-            created_at_epoch: 0,
-        });
+        reg.promote_reservation(
+            SessionInfo {
+                project_id: "p1".to_string(),
+                thread_id: "t1".to_string(),
+                turn_id: String::new(),
+                pr_number: 7,
+                kind: "review".to_string(),
+                status: SessionStatus::Starting,
+                created_at_epoch: 0,
+                comment_url: None,
+            },
+            test_url_ctx(),
+        );
         // After promotion the pair is covered by the Starting session, not the reserved
         // set — and a concurrent reserve still loses (continuous coverage, no gap).
         assert!(!reg.try_reserve_pair("p1", 7, "review"));
@@ -1110,6 +1432,51 @@ mod tests {
                 .filter(|p| **p == (7, "review".to_string()))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn promote_reservation_captures_url_context_at_start() {
+        // AB#1042 (F3): the comment-URL source context is the START-TIME snapshot, captured in
+        // the same critical section as the session insert and read back EXACTLY once at the
+        // terminal. This pins that `finalize_turn` resolves the URL against the project the
+        // review ran against, independent of any later config change (which would never touch
+        // this captured value).
+        let reg = SessionRegistry::default();
+        assert!(reg.try_reserve_pair("p1", 7, "review"));
+        let ctx = CommentUrlContext {
+            source_kind: crate::model::SourceKind::Azure,
+            repo: "the-repo".to_string(),
+            azure_org: "the-org".to_string(),
+            azure_project: "the-project".to_string(),
+        };
+        reg.promote_reservation(
+            SessionInfo {
+                project_id: "p1".to_string(),
+                thread_id: "t1".to_string(),
+                turn_id: String::new(),
+                pr_number: 7,
+                kind: "review".to_string(),
+                status: SessionStatus::Starting,
+                created_at_epoch: 0,
+                comment_url: None,
+            },
+            ctx,
+        );
+        // The terminal reads the captured snapshot — the exact values supplied at start.
+        let taken = reg
+            .take_url_context("t1")
+            .expect("context captured at start");
+        assert_eq!(taken.source_kind, crate::model::SourceKind::Azure);
+        assert_eq!(taken.repo, "the-repo");
+        assert_eq!(taken.azure_org, "the-org");
+        assert_eq!(taken.azure_project, "the-project");
+        // Remove-on-read: a second take (or a session that never captured one) yields None,
+        // so the map is bounded and the funnel reads it exactly once.
+        assert!(reg.take_url_context("t1").is_none(), "second take is None");
+        assert!(
+            reg.take_url_context("never-existed").is_none(),
+            "an unknown thread id yields None"
         );
     }
 
@@ -1152,6 +1519,7 @@ mod tests {
             kind: "review".to_string(),
             status: SessionStatus::Running,
             created_at_epoch: 0,
+            comment_url: None,
         });
         // Running → Proceed(turn_id), status flips to Interrupting.
         match reg.begin_interrupt("t1") {
@@ -1182,6 +1550,7 @@ mod tests {
             kind: "review".to_string(),
             status: SessionStatus::Running,
             created_at_epoch: 0,
+            comment_url: None,
         });
         reg.begin_interrupt("t1"); // → Interrupting
         reg.rollback_interrupt("t1"); // failed interrupt → back to Running (retry-able)
@@ -1207,6 +1576,8 @@ mod tests {
             kind: "review".to_string(),
             status: SessionStatus::Running,
             created_at_epoch: 1_700_000_000,
+            // AB#1042: a resolved comment URL must surface as camelCase `commentUrl`.
+            comment_url: Some("https://example.com/pr/7#c".to_string()),
         })
         .expect("SessionInfo serializes");
         assert_eq!(v["projectId"], "p1");
@@ -1221,9 +1592,31 @@ mod tests {
         // surfaces here in lockstep with the camelCase keys.
         assert_eq!(v["kind"], "review");
         assert_eq!(v["status"], "running");
+        // AB#1042: `commentUrl` serializes camelCase; the snake_case form stays absent and
+        // is mirrored by the optional `ReviewSession.commentUrl` on the TS side.
+        assert_eq!(v["commentUrl"], "https://example.com/pr/7#c");
+        assert!(v.get("comment_url").is_none());
         assert!(v.get("project_id").is_none());
         assert!(v.get("thread_id").is_none());
         assert!(v.get("created_at_epoch").is_none());
+
+        // `comment_url: None` OMITS the key (skip_serializing_if) so the wire matches the
+        // optional `commentUrl?` TS mirror — an absent key, not a JSON `null`.
+        let no_url = serde_json::to_value(SessionInfo {
+            comment_url: None,
+            ..SessionInfo {
+                project_id: "p1".to_string(),
+                thread_id: "t1".to_string(),
+                turn_id: "tn1".to_string(),
+                pr_number: 7,
+                kind: "review".to_string(),
+                status: SessionStatus::Running,
+                created_at_epoch: 1_700_000_000,
+                comment_url: None,
+            }
+        })
+        .expect("SessionInfo serializes");
+        assert!(no_url.get("commentUrl").is_none(), "None omits commentUrl");
     }
 
     #[test]
@@ -1254,6 +1647,7 @@ mod tests {
             kind: "review".to_string(),
             status: SessionStatus::Starting,
             created_at_epoch: 0,
+            comment_url: None,
         });
         reg.set_status("t1", SessionStatus::Failed);
         assert_eq!(reg.list()[0].status, SessionStatus::Failed);
@@ -1262,5 +1656,77 @@ mod tests {
         reg.set_running("t1", "tn9".to_string());
         assert_eq!(reg.list()[0].turn_id, "tn9");
         assert_eq!(reg.list()[0].status, SessionStatus::Running);
+    }
+
+    // ── AB#1042: completion-notification primitive ──────────────────────────────
+
+    #[test]
+    fn subscribe_then_signal_delivers_the_outcome() {
+        // Subscribe first, then signal: the receiver observes the `Some(outcome)` (status +
+        // comment_url) once the funnel signals.
+        let reg = SessionRegistry::default();
+        let mut rx = reg.subscribe_completion("t1");
+        assert!(rx.borrow().is_none(), "starts None (not yet terminal)");
+
+        reg.signal_completion(
+            "t1",
+            CompletionOutcome {
+                status: SessionStatus::Done,
+                wire_status: "completed".to_string(),
+                comment_url: Some("https://x/c".to_string()),
+            },
+        );
+        let got = rx.borrow_and_update().clone().expect("outcome delivered");
+        assert_eq!(got.status, SessionStatus::Done);
+        // `wire_status` distinguishes a completed turn from an interrupted one (both Done).
+        assert_eq!(got.wire_status, "completed");
+        assert_eq!(got.comment_url.as_deref(), Some("https://x/c"));
+    }
+
+    #[test]
+    fn signal_then_subscribe_still_sees_retained_outcome() {
+        // Signal BEFORE anyone subscribes (get-or-create on the signal side): a later
+        // subscriber still reads the retained terminal value — no "subscribed too late" race.
+        let reg = SessionRegistry::default();
+        reg.signal_completion(
+            "t1",
+            CompletionOutcome {
+                status: SessionStatus::Failed,
+                wire_status: "failed".to_string(),
+                comment_url: None,
+            },
+        );
+        let rx = reg.subscribe_completion("t1");
+        let got = rx
+            .borrow()
+            .clone()
+            .expect("retained value seen by late subscriber");
+        assert_eq!(got.status, SessionStatus::Failed);
+        assert!(got.comment_url.is_none());
+    }
+
+    #[test]
+    fn signal_completion_carries_each_terminal_status() {
+        // Done / Failed / Interrupted-as-Done each deliver a single Some with the right
+        // status (the funnel maps interrupted → Done via `terminal_status`, so a completion
+        // subscriber sees Done for a user stop too).
+        for (status, wire) in [
+            (SessionStatus::Done, "completed"),
+            (SessionStatus::Failed, "failed"),
+        ] {
+            let reg = SessionRegistry::default();
+            let rx = reg.subscribe_completion("t");
+            reg.signal_completion(
+                "t",
+                CompletionOutcome {
+                    status,
+                    wire_status: wire.to_string(),
+                    comment_url: None,
+                },
+            );
+            assert_eq!(rx.borrow().as_ref().expect("delivered").status, status);
+        }
+        // `terminal_status("interrupted")` is Done — a user stop signals Done, not Failed.
+        assert_eq!(terminal_status("interrupted"), SessionStatus::Done);
     }
 }

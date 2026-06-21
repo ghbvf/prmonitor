@@ -176,7 +176,11 @@ export function manualPullEligible(enabled: boolean, mode: UpdateMode): boolean 
 export type ReviewEvent =
   | { kind: "messageDelta"; projectId: string; threadId: string; itemId: string; text: string }
   | { kind: "reasoningDelta"; projectId: string; threadId: string; itemId: string; text: string }
-  | { kind: "turnCompleted"; projectId: string; threadId: string; status: string }
+  // `commentUrl` (AB#1042): the resolved pr-review comment URL, present on a `completed`
+  // turn when the source kind can resolve one (GitHub: exact comment URL; Azure: PR URL;
+  // Bitbucket: absent), else omitted/undefined. Mirrors `events.rs::TurnCompleted`'s
+  // optional `comment_url` (serde camelCase; locked by the events.rs golden test).
+  | { kind: "turnCompleted"; projectId: string; threadId: string; status: string; commentUrl?: string }
   | { kind: "error"; projectId: string; threadId: string; message: string }
   // Session-less auto-trigger (#8) notice — no threadId (mirrors
   // `events.rs::ReviewEvent::DispatchError`; locked by a serde golden test).

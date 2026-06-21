@@ -175,6 +175,54 @@ pub fn project_validated<R: tauri::Runtime>(
     Ok(p)
 }
 
+/// Resolves a project from a free-form `reference` (a project `id` OR a `repo`), then
+/// validates its filesystem-dependent fields — the [`project_validated`] analogue for the
+/// trigger funnel (AB#1042), where a third-party caller (CLI/deeplink, future) names a
+/// project by id or repo rather than its internal id. Matching is delegated to the pure
+/// [`match_project_ref`] (unit-tested without an app); validation stays inside the config
+/// slice so the review slice depends only on `config::service`, never `config::model`.
+pub fn project_by_ref_validated<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    reference: &str,
+) -> AppResult<Project> {
+    let config = load(app)?;
+    let p = match_project_ref(&config.projects, reference)?.clone();
+    crate::config::model::validate_project(&p)?;
+    Ok(p)
+}
+
+/// Pure project resolver for a `reference` that is either a project `id` or a `repo`
+/// (AB#1042). Returns a borrow of the matched project, or an [`AppError`] when the
+/// reference is ambiguous / unknown:
+/// - **id first** (exact, unique by [`crate::config::model::validate`]): an `id` hit
+///   returns immediately, so a repo that happens to equal some project's id can't shadow it.
+/// - else **repo** (case-insensitive, mirroring the webhook router's `eq_ignore_ascii_case`
+///   and config's case-insensitive duplicate-repo rejection): 0 matches → "找不到"; **>1
+///   matches → reject** "repo 不唯一，请用 projectId" (fail-closed — never silently trigger
+///   the wrong project); exactly 1 → that project.
+///
+/// `config::validate` already forbids duplicate repos (case-insensitive), so >1 is
+/// theoretically unreachable; rejecting it explicitly is a fail-closed backstop rather than
+/// resting on that "config can't duplicate" soft assumption. Pure (no IO) so the
+/// id-hit / repo-ci-hit / miss / ambiguity cases are unit-tested directly.
+fn match_project_ref<'a>(projects: &'a [Project], reference: &str) -> AppResult<&'a Project> {
+    if let Some(p) = projects.iter().find(|p| p.id == reference) {
+        return Ok(p);
+    }
+    let mut by_repo = projects
+        .iter()
+        .filter(|p| p.repo.eq_ignore_ascii_case(reference));
+    match (by_repo.next(), by_repo.next()) {
+        (None, _) => Err(AppError::new(format!(
+            "找不到项目（reference 既非 id 也非已知 repo）: {reference}"
+        ))),
+        (Some(p), None) => Ok(p),
+        (Some(_), Some(_)) => Err(AppError::new(format!(
+            "repo 不唯一，请用 projectId: {reference}"
+        ))),
+    }
+}
+
 /// Returns the `repo_root` of the active project, or an empty string when there is
 /// no active project (first launch, or `active_project_id` matches nothing).
 ///
@@ -451,5 +499,66 @@ mod tests {
         let once = migrate_value(raw);
         let twice = migrate_value(once.clone());
         assert_eq!(once, twice);
+    }
+
+    /// A bare project with the given `id` / `repo` for the `match_project_ref` cases
+    /// (other fields irrelevant — the resolver only reads `id` / `repo`).
+    fn proj(id: &str, repo: &str) -> Project {
+        Project {
+            id: id.to_string(),
+            repo: repo.to_string(),
+            ..Project::default()
+        }
+    }
+
+    /// `match_project_ref` (AB#1042) — the pure trigger-funnel resolver. Pins: id-first
+    /// (exact), repo case-insensitive, miss → err, repo ambiguity (>1) → err.
+    #[test]
+    fn match_project_ref_resolves_by_id_repo_ci_and_rejects_ambiguity() {
+        let projects = vec![proj("alpha", "Owner/Repo-A"), proj("beta", "owner/repo-b")];
+
+        // id hit (exact) → that project.
+        assert_eq!(
+            match_project_ref(&projects, "alpha").expect("id hit").id,
+            "alpha"
+        );
+
+        // repo hit, case-insensitive (mirrors the webhook router's eq_ignore_ascii_case).
+        assert_eq!(
+            match_project_ref(&projects, "owner/repo-a")
+                .expect("repo-ci hit")
+                .id,
+            "alpha"
+        );
+        assert_eq!(
+            match_project_ref(&projects, "OWNER/REPO-B")
+                .expect("repo-ci hit")
+                .id,
+            "beta"
+        );
+
+        // Miss (neither id nor known repo) → error.
+        assert!(match_project_ref(&projects, "nope/missing").is_err());
+        assert!(match_project_ref(&[], "alpha").is_err());
+        // An empty reference matches no id and no repo → error (a blank trigger arg can't
+        // accidentally resolve to a project).
+        assert!(match_project_ref(&projects, "").is_err());
+
+        // id takes precedence over a repo that equals another project's id: a project
+        // whose REPO is literally "alpha" must not shadow the id hit on "alpha".
+        let with_repo_named_like_id = vec![proj("alpha", "Owner/Repo-A"), proj("gamma", "alpha")];
+        assert_eq!(
+            match_project_ref(&with_repo_named_like_id, "alpha")
+                .expect("id wins over repo named like id")
+                .id,
+            "alpha"
+        );
+
+        // >1 repo match (case-insensitive) → fail-closed reject with the projectId hint.
+        // (config::validate forbids this, so it's a backstop, not an expected state.)
+        let dup_repos = vec![proj("one", "owner/dup"), proj("two", "Owner/Dup")];
+        let err =
+            match_project_ref(&dup_repos, "owner/dup").expect_err("ambiguous repo must reject");
+        assert!(err.message.contains("projectId"), "{}", err.message);
     }
 }
