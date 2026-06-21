@@ -105,6 +105,27 @@ pub struct CompletionOutcome {
     pub comment_url: Option<String>,
 }
 
+/// The source context [`finalize_turn`] needs to resolve the pr-review comment URL (AB#1042),
+/// captured IMMUTABLY at session creation. The funnel runs at the terminal — possibly minutes
+/// after the review started — so it must NOT re-read the (mutable) project config there: a
+/// config edit mid-review would otherwise yield a wrong/None URL (this bites the Azure path
+/// especially, whose URL is built from `azure_org`/`azure_project`/`repo`). Snapshotting these
+/// fields at start pins the answer to the project the review actually ran against.
+///
+/// Review-slice-internal: NOT serialized, NOT a DB column, NOT a wire type — it lives only in
+/// the in-memory [`RegistryState::url_contexts`] map, so it touches no wire/DB contract.
+/// `pub(crate)` (not `pub(super)`) ONLY because the auto-dispatch composition root
+/// (`crate::lib::run_auto_dispatch`) builds the engines directly and sits OUTSIDE the `review`
+/// module, so it must be able to name the type to set the engine's `url_ctx` field. It is
+/// still crate-internal — never crosses the Tauri command boundary nor the DB.
+#[derive(Debug, Clone)]
+pub(crate) struct CommentUrlContext {
+    pub source_kind: crate::model::SourceKind,
+    pub repo: String,
+    pub azure_org: String,
+    pub azure_project: String,
+}
+
 /// In-memory registry of review sessions keyed by `threadId`. Lives in
 /// `AppState`; `Clone` (shares one `Arc`) so the command path and each pump task
 /// see the same map. Every critical section is synchronous (no `.await` under the
@@ -141,6 +162,13 @@ struct RegistryState {
     /// the lock (the registry's invariant). Entries are intentionally retained for the
     /// process lifetime (a session count is bounded by usage; no churn that warrants GC).
     completions: HashMap<ThreadId, watch::Sender<Option<CompletionOutcome>>>,
+    /// Per-`thread_id` source context for the comment-URL resolve (AB#1042), captured
+    /// IMMUTABLY at session creation in the SAME critical section as the `sessions` insert
+    /// ([`SessionRegistry::promote_reservation`]) — so it is present before any pump can
+    /// finalize. [`finalize_turn`] reads it via [`SessionRegistry::take_url_context`] (remove +
+    /// return), which bounds the map and pins that the URL is resolved against the project the
+    /// review STARTED against, never a config that changed mid-review. In-memory only.
+    url_contexts: HashMap<ThreadId, CommentUrlContext>,
 }
 
 /// Outcome of [`SessionRegistry::begin_interrupt`] — the atomic guard that makes
@@ -260,11 +288,26 @@ impl SessionRegistry {
     /// in-flight session.
     /// `pub(super)` so the claude orchestration hands its reservation to a `Starting`
     /// session through the same gap-free swap the codex path uses (#718).
-    pub(super) fn promote_reservation(&self, info: SessionInfo) {
+    ///
+    /// `url_ctx` is the IMMUTABLE comment-URL source context (AB#1042), inserted into
+    /// `url_contexts` keyed by the session's `thread_id` IN THIS SAME critical section as the
+    /// session insert — so the snapshot is atomic with session creation and present before the
+    /// pump can finalize. [`finalize_turn`] reads it once via [`Self::take_url_context`].
+    pub(super) fn promote_reservation(&self, info: SessionInfo, url_ctx: CommentUrlContext) {
         let mut st = self.inner.lock().unwrap();
         st.reserved
             .remove(&(info.project_id.clone(), info.pr_number, info.kind.clone()));
+        st.url_contexts.insert(info.thread_id.clone(), url_ctx);
         st.sessions.insert(info.thread_id.clone(), info);
+    }
+
+    /// Remove and return this `thread_id`'s captured [`CommentUrlContext`] (AB#1042). Called
+    /// EXACTLY ONCE by [`finalize_turn`] at the terminal — remove-on-read bounds the map (a
+    /// finalized session needs the context no more) and pins that the URL is resolved against
+    /// the start-time snapshot, independent of any later config change. A second take (or a
+    /// session that never captured one) yields `None`. Synchronous (no `.await` under the lock).
+    pub(super) fn take_url_context(&self, thread_id: &str) -> Option<CommentUrlContext> {
+        self.inner.lock().unwrap().url_contexts.remove(thread_id)
     }
 
     /// Atomically begin an interrupt. Only a [`SessionStatus::Running`] session
@@ -425,8 +468,12 @@ impl Drop for ReservationGuard<'_> {
 ///
 /// Subscribes to the notification stream BEFORE `turn/start` so no early delta is
 /// missed, then spawns a pump task that forwards events until the turn completes.
+///
+/// `pub(crate)` (not `pub`): only the in-crate codex engine adapter calls it, and its
+/// `url_ctx: CommentUrlContext` param is a crate-internal type — keeping both at crate
+/// visibility makes the interface consistent (no `private_interfaces` leak).
 #[allow(clippy::too_many_arguments)]
-pub async fn start_review<R: tauri::Runtime>(
+pub(crate) async fn start_review<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     codex: &CodexManager,
     registry: &SessionRegistry,
@@ -438,6 +485,10 @@ pub async fn start_review<R: tauri::Runtime>(
     project_id: &str,
     pr_number: u64,
     kind: &str,
+    // The IMMUTABLE comment-URL source context (AB#1042), captured by the caller from the
+    // project at start. Handed to the `Starting` session in `promote_reservation` so the
+    // terminal `finalize_turn` resolves the URL against the project the review ran against.
+    url_ctx: CommentUrlContext,
 ) -> AppResult<StartReviewOutcome> {
     // Atomic test-and-set BEFORE any `.await`: if this `(project_id, pr, kind)` is
     // already reserved or covered by an in-flight session, do NOT start a second review.
@@ -489,7 +540,7 @@ pub async fn start_review<R: tauri::Runtime>(
         // No comment yet — filled by `finalize_turn` at a `completed` terminal (AB#1042).
         comment_url: None,
     };
-    registry.promote_reservation(starting.clone());
+    registry.promote_reservation(starting.clone(), url_ctx);
     // Mirror the in-memory session into the durable `review_session` table (#70) so this
     // PR's session list survives a restart and its history can be reopened. Best-effort.
     persist_session(app, &starting);
@@ -864,12 +915,13 @@ async fn fail_connection_closed<R: tauri::Runtime>(
 /// funnel.
 ///
 /// Steps (ORDER IS LOAD-BEARING — `signal_completion` MUST be last):
-/// 1. Resolve the comment URL ONLY for a `completed` turn: read the project UNVALIDATED
-///    (`config::service::project` — a finished review must not fail to finalize because a
-///    skill path went stale) for repo/source_kind/azure org+project, then
-///    [`super::comment_url::resolve_comment_url`]. ANY failure (gh error, project deleted)
-///    degrades to `None` — the funnel NEVER fails (mirrors the best-effort persist contract).
-///    interrupted / failed → `None` (no comment was posted).
+/// 1. Resolve the comment URL ONLY for a `completed` turn: read the IMMUTABLE
+///    [`CommentUrlContext`] captured at session start (`registry.take_url_context`) for
+///    repo/source_kind/azure org+project, then [`super::comment_url::resolve_comment_url`].
+///    Reading the start-time snapshot (NOT the live, mutable config) is what makes the URL
+///    correct even when the config was edited during a long review. ANY miss (no captured
+///    context, gh error) degrades to `None` — the funnel NEVER fails (mirrors the best-effort
+///    persist contract). interrupted / failed → `None` (no comment was posted).
 /// 2. Set the in-memory terminal status AND write the resolved `comment_url` onto the
 ///    session (`set_status` stays a dumb mutator; the URL write is folded in here).
 /// 3. Persist the terminal status + URL atomically (best-effort, the one-time notice on
@@ -888,24 +940,23 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
     wire_status: &str,
     error: Option<String>,
 ) {
-    // 1. Resolve the comment URL only on a successful completion. Any failure → None.
-    let comment_url = if should_resolve_url(wire_status) {
-        match crate::config::service::project(app, project_id) {
-            Ok(project) => {
-                super::comment_url::resolve_comment_url(
-                    project.source_kind,
-                    &project.repo,
-                    &project.azure_org,
-                    &project.azure_project,
-                    pr_number,
-                )
-                .await
-            }
-            // Project gone / config unreadable → no URL (best-effort; never fail the funnel).
-            Err(_) => None,
+    // 1. Resolve the comment URL only on a successful completion, against the IMMUTABLE
+    // context captured at session start (NOT the live config) so a mid-review config edit
+    // can't yield a wrong/None URL. Take it unconditionally (remove-on-read bounds the map);
+    // a missing context or a non-`completed` terminal both yield None. Any resolve failure
+    // also degrades to None — the funnel never fails.
+    let comment_url = match registry.take_url_context(thread_id) {
+        Some(ctx) if should_resolve_url(wire_status) => {
+            super::comment_url::resolve_comment_url(
+                ctx.source_kind,
+                &ctx.repo,
+                &ctx.azure_org,
+                &ctx.azure_project,
+                pr_number,
+            )
+            .await
         }
-    } else {
-        None
+        _ => None,
     };
 
     // 2. In-memory terminal status + the resolved URL.
@@ -1059,6 +1110,18 @@ mod tests {
             item_id: "it".to_string(),
             delta: "hello".to_string(),
         })
+    }
+
+    /// A throwaway [`CommentUrlContext`] for `promote_reservation` calls whose tests do not
+    /// assert on the captured value (AB#1042). The capture-roundtrip test below builds its
+    /// own distinguishable context instead.
+    fn test_url_ctx() -> CommentUrlContext {
+        CommentUrlContext {
+            source_kind: crate::model::SourceKind::Github,
+            repo: "owner/name".to_string(),
+            azure_org: String::new(),
+            azure_project: String::new(),
+        }
     }
 
     #[test]
@@ -1303,16 +1366,19 @@ mod tests {
 
         // An in-flight SESSION (not just a reservation) is likewise project-scoped:
         // A's promoted session does not appear in B's active_pairs and does not block B.
-        reg.promote_reservation(SessionInfo {
-            project_id: "A".to_string(),
-            thread_id: "tA".to_string(),
-            turn_id: String::new(),
-            pr_number: 9,
-            kind: "review".to_string(),
-            status: SessionStatus::Running,
-            created_at_epoch: 0,
-            comment_url: None,
-        });
+        reg.promote_reservation(
+            SessionInfo {
+                project_id: "A".to_string(),
+                thread_id: "tA".to_string(),
+                turn_id: String::new(),
+                pr_number: 9,
+                kind: "review".to_string(),
+                status: SessionStatus::Running,
+                created_at_epoch: 0,
+                comment_url: None,
+            },
+            test_url_ctx(),
+        );
         assert!(
             reg.active_pairs("A").contains(&(9, "review".to_string())),
             "A's session shows in A"
@@ -1342,16 +1408,19 @@ mod tests {
     fn promote_reservation_hands_off_without_a_gap() {
         let reg = SessionRegistry::default();
         assert!(reg.try_reserve_pair("p1", 7, "review"));
-        reg.promote_reservation(SessionInfo {
-            project_id: "p1".to_string(),
-            thread_id: "t1".to_string(),
-            turn_id: String::new(),
-            pr_number: 7,
-            kind: "review".to_string(),
-            status: SessionStatus::Starting,
-            created_at_epoch: 0,
-            comment_url: None,
-        });
+        reg.promote_reservation(
+            SessionInfo {
+                project_id: "p1".to_string(),
+                thread_id: "t1".to_string(),
+                turn_id: String::new(),
+                pr_number: 7,
+                kind: "review".to_string(),
+                status: SessionStatus::Starting,
+                created_at_epoch: 0,
+                comment_url: None,
+            },
+            test_url_ctx(),
+        );
         // After promotion the pair is covered by the Starting session, not the reserved
         // set — and a concurrent reserve still loses (continuous coverage, no gap).
         assert!(!reg.try_reserve_pair("p1", 7, "review"));
@@ -1363,6 +1432,51 @@ mod tests {
                 .filter(|p| **p == (7, "review".to_string()))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn promote_reservation_captures_url_context_at_start() {
+        // AB#1042 (F3): the comment-URL source context is the START-TIME snapshot, captured in
+        // the same critical section as the session insert and read back EXACTLY once at the
+        // terminal. This pins that `finalize_turn` resolves the URL against the project the
+        // review ran against, independent of any later config change (which would never touch
+        // this captured value).
+        let reg = SessionRegistry::default();
+        assert!(reg.try_reserve_pair("p1", 7, "review"));
+        let ctx = CommentUrlContext {
+            source_kind: crate::model::SourceKind::Azure,
+            repo: "the-repo".to_string(),
+            azure_org: "the-org".to_string(),
+            azure_project: "the-project".to_string(),
+        };
+        reg.promote_reservation(
+            SessionInfo {
+                project_id: "p1".to_string(),
+                thread_id: "t1".to_string(),
+                turn_id: String::new(),
+                pr_number: 7,
+                kind: "review".to_string(),
+                status: SessionStatus::Starting,
+                created_at_epoch: 0,
+                comment_url: None,
+            },
+            ctx,
+        );
+        // The terminal reads the captured snapshot — the exact values supplied at start.
+        let taken = reg
+            .take_url_context("t1")
+            .expect("context captured at start");
+        assert_eq!(taken.source_kind, crate::model::SourceKind::Azure);
+        assert_eq!(taken.repo, "the-repo");
+        assert_eq!(taken.azure_org, "the-org");
+        assert_eq!(taken.azure_project, "the-project");
+        // Remove-on-read: a second take (or a session that never captured one) yields None,
+        // so the map is bounded and the funnel reads it exactly once.
+        assert!(reg.take_url_context("t1").is_none(), "second take is None");
+        assert!(
+            reg.take_url_context("never-existed").is_none(),
+            "an unknown thread id yields None"
         );
     }
 

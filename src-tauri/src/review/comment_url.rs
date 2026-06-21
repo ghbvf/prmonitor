@@ -1,7 +1,7 @@
 //! Read-only pr-review comment URL resolver (AB#1042).
 //!
-//! The trigger funnel ([`super::session::finalize_turn`]) needs the URL of the `pm:`
-//! pr-review comment the review subprocess posted, to hand back to a third-party trigger
+//! The trigger funnel ([`super::session::finalize_turn`]) needs the URL of the pr-review
+//! comment the review subprocess posted, to hand back to a third-party trigger
 //! (CLI/deeplink, future). The app itself NEVER writes comments — the governance backstop
 //! (`crate::dispatch`'s `app_code_uses_no_gh_write_subcommands`) scans all of `src` for
 //! gh write subcommands. Reading is allowed, so this resolves the URL source-kind-aware:
@@ -9,7 +9,7 @@
 //! - [`SourceKind::Github`]: shell out to read-only `gh pr view <pr> --repo <repo> --json
 //!   comments` (mirroring `pr::gh`'s subprocess discipline — `Command::new` + a wall-clock
 //!   timeout + `kill_on_drop(true)` + a bounded read), then [`pick_last_pm_comment_url`]
-//!   picks the last `pm:` comment's URL from the JSON.
+//!   picks the last pr-review comment's URL from the JSON.
 //! - [`SourceKind::Azure`]: no API call — [`azure_pr_url`] purely constructs the PR-level
 //!   web URL (a comment thread URL would need a thread-id API round-trip we deliberately
 //!   skip; the PR URL is the agreed Azure answer).
@@ -36,10 +36,12 @@ const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// read) BEFORE `serde_json::from_str`. 10 MiB is far above any realistic comment body set.
 const GH_MAX_STDOUT_BYTES: usize = 10 * 1024 * 1024;
 
-/// The `pm:` comment prefix the pr-review skill posts (the turn prompt instructs it to post
-/// the `pm:pr-review` comment — see `super::session::review_prompt`). We match on the `pm:`
-/// prefix (trimmed) so a future `pm:`-prefixed variant still resolves.
-const PM_COMMENT_PREFIX: &str = "pm:";
+/// The hidden HTML marker the pr-review skill prepends to every comment body it posts (see
+/// `.claude/skills/pr-review/SKILL.md`). The body STARTS WITH this marker, so we match the
+/// trimmed prefix to pick out the review comment. NOTE this is the real marker, not a bare
+/// `pm:` prefix — a real comment body never starts with `pm:`, it starts with this `<!-- ... -->`
+/// HTML comment, so matching `pm:` alone would never hit a real review comment.
+const PM_REVIEW_MARKER: &str = "<!-- pm:pr-review -->";
 
 /// Resolve the URL of this review's pr-review comment, source-kind-aware (AB#1042). Returns
 /// `None` when the source has no resolver (Bitbucket) or the lookup yields nothing — the
@@ -85,18 +87,21 @@ struct RawPrView {
     comments: Vec<RawComment>,
 }
 
-/// Picks the URL of the LAST `pm:` pr-review comment in `gh pr view --json comments` output
+/// Picks the URL of the LAST pr-review comment in `gh pr view --json comments` output
 /// (AB#1042) — the most recent review leaves its comment last, and a check turn appends a
-/// new one. Pure (no `gh` call) so the multi-comment / no-pm / empty cases are unit-tested.
+/// new one. A review comment is recognized by its body starting (after trimming leading
+/// whitespace) with the hidden [`PM_REVIEW_MARKER`] HTML marker. Pure (no `gh` call) so the
+/// multi-comment / no-marker / empty cases are unit-tested.
 ///
-/// Returns `None` when the JSON doesn't parse, there are no comments, or none is a `pm:`
-/// comment (whitespace-trimmed prefix match) with a non-empty URL.
+/// Returns `None` when the JSON doesn't parse, there are no comments, or none carries the
+/// marker (whitespace-trimmed prefix match) with a non-empty URL.
 fn pick_last_pm_comment_url(json: &str) -> Option<String> {
     let view: RawPrView = serde_json::from_str(json).ok()?;
-    // `rfind` scans from the back for the LAST comment that is a non-empty `pm:` comment.
+    // `rfind` scans from the back for the LAST comment whose body starts with the marker and
+    // has a non-empty url.
     view.comments
         .into_iter()
-        .rfind(|c| c.body.trim_start().starts_with(PM_COMMENT_PREFIX) && !c.url.is_empty())
+        .rfind(|c| c.body.trim_start().starts_with(PM_REVIEW_MARKER) && !c.url.is_empty())
         .map(|c| c.url)
 }
 
@@ -199,13 +204,14 @@ mod tests {
 
     #[test]
     fn pick_last_pm_comment_url_takes_the_last_pm_comment() {
-        // Two pm: comments (an earlier review + a later check) → the LAST one's url wins;
-        // a non-pm comment is ignored regardless of position.
+        // Two marked review comments (an earlier review + a later check) → the LAST one's
+        // url wins; an unmarked comment is ignored regardless of position. The bodies start
+        // with the real `<!-- pm:pr-review -->` marker, as the skill actually posts them.
         let json = r#"{
             "comments": [
-                { "body": "pm:pr-review round 1", "url": "https://gh/c/1" },
-                { "body": "looks good 👍",        "url": "https://gh/c/2" },
-                { "body": "pm:pr-review round 2", "url": "https://gh/c/3" }
+                { "body": "<!-- pm:pr-review -->\nround 1", "url": "https://gh/c/1" },
+                { "body": "looks good 👍",                  "url": "https://gh/c/2" },
+                { "body": "<!-- pm:pr-review -->\nround 2", "url": "https://gh/c/3" }
             ]
         }"#;
         assert_eq!(
@@ -216,11 +222,11 @@ mod tests {
 
     #[test]
     fn pick_last_pm_comment_url_picks_leading_whitespace_body() {
-        // The picker `trim_start()`s before the `pm:` check, so a body with leading
-        // whitespace still matches and its (non-empty) url is picked.
+        // The picker `trim_start()`s before the marker check, so a body with leading
+        // whitespace before the marker still matches and its (non-empty) url is picked.
         let json = r#"{
             "comments": [
-                { "body": "   pm:pr-review done", "url": "https://gh/c/9" }
+                { "body": "   <!-- pm:pr-review -->\ndone", "url": "https://gh/c/9" }
             ]
         }"#;
         assert_eq!(
@@ -231,7 +237,7 @@ mod tests {
 
     #[test]
     fn pick_last_pm_comment_url_none_without_pm_comment() {
-        // No comment carries the `pm:` prefix → None.
+        // No comment carries the marker → None.
         let json = r#"{
             "comments": [
                 { "body": "first",  "url": "https://gh/c/1" },
@@ -249,9 +255,11 @@ mod tests {
         assert_eq!(pick_last_pm_comment_url(r#"{}"#), None);
         // Unparsable JSON → None (best-effort; never an error).
         assert_eq!(pick_last_pm_comment_url("not json"), None);
-        // A pm: comment with an empty url is skipped (no URL to return).
+        // A marked comment with an empty url is skipped (no URL to return).
         assert_eq!(
-            pick_last_pm_comment_url(r#"{ "comments": [ { "body": "pm:x", "url": "" } ] }"#),
+            pick_last_pm_comment_url(
+                r#"{ "comments": [ { "body": "<!-- pm:pr-review -->\nx", "url": "" } ] }"#
+            ),
             None
         );
     }

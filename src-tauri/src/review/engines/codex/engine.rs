@@ -7,7 +7,7 @@
 use super::CodexManager;
 use crate::error::AppResult;
 use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
-use crate::review::session::{self, SessionRegistry};
+use crate::review::session::{self, CommentUrlContext, SessionRegistry};
 
 /// Per-request engine handle. Borrows the long-lived state from `AppState` plus
 /// the request's `AppHandle`; constructed fresh by each command (cheap — all
@@ -33,6 +33,12 @@ pub struct CodexEngine<'a, R: tauri::Runtime> {
     /// per-turn `model` override on `turn/start` (the app-server is shared, so model
     /// selection can't be a spawn flag).
     pub codex_model: &'a str,
+    /// IMMUTABLE comment-URL source context (AB#1042), built from the project at dispatch.
+    /// Owned (not a borrow) so it can move into `start_review` → the `Starting` session,
+    /// pinning the terminal `finalize_turn`'s URL resolve to the project the review ran
+    /// against — never a config edited mid-review. `pub(crate)`: the field's type is a
+    /// crate-internal context, and the only constructors (commands.rs / lib.rs) are in-crate.
+    pub(crate) url_ctx: CommentUrlContext,
 }
 
 impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
@@ -49,6 +55,8 @@ impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
             self.project_id,
             pr_number,
             kind,
+            // `&self` start can't move the field; clone the owned context for this turn.
+            self.url_ctx.clone(),
         )
         .await
     }

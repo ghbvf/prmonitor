@@ -11,7 +11,7 @@ use crate::review::engines::claude::process::CLAUDE_BIN;
 use crate::review::engines::claude::ClaudeEngine;
 use crate::review::engines::codex::{CodexEngine, CodexStatus};
 use crate::review::history_store::{self, HistoryItem};
-use crate::review::session::SessionInfo;
+use crate::review::session::{CommentUrlContext, SessionInfo};
 use crate::state::AppState;
 
 /// The codex binary name (PATH-resolved). Single source for every review command
@@ -97,6 +97,16 @@ async fn dispatch_engine<R: tauri::Runtime>(
     pr_number: u64,
     kind: &str,
 ) -> AppResult<SessionId> {
+    // Snapshot the comment-URL source context from the project NOW (AB#1042), so the terminal
+    // `finalize_turn` resolves the pr-review comment URL against the project the review ran
+    // against — never a config edited mid-review. Both engines carry this owned context into
+    // their `Starting` session; built once here since the fields are identical for either.
+    let url_ctx = CommentUrlContext {
+        source_kind: project.source_kind,
+        repo: project.repo.clone(),
+        azure_org: project.azure_org.clone(),
+        azure_project: project.azure_project.clone(),
+    };
     let outcome = match project.engine_kind {
         EngineKind::Codex => {
             let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
@@ -117,6 +127,7 @@ async fn dispatch_engine<R: tauri::Runtime>(
                 repo_root: &project.repo_root,
                 skill_abs_path: &skill_abs,
                 codex_model: &project.codex_model,
+                url_ctx,
             };
             engine.start(pr_number, kind).await?
         }
@@ -130,6 +141,7 @@ async fn dispatch_engine<R: tauri::Runtime>(
                 repo: &project.repo,
                 repo_root: &project.repo_root,
                 claude_model: &project.claude_model,
+                url_ctx,
             };
             engine.start(pr_number, kind).await?
         }
@@ -224,6 +236,14 @@ pub async fn stop_review<R: tauri::Runtime>(
         skill_abs_path: "",
         // `stop` resolves purely by session id; model is irrelevant on the interrupt path.
         codex_model: "",
+        // `stop` never reaches `start_review`/`promote_reservation`, so the URL context is
+        // unused here — a default (empty) value satisfies the field without a config read.
+        url_ctx: CommentUrlContext {
+            source_kind: crate::model::SourceKind::default(),
+            repo: String::new(),
+            azure_org: String::new(),
+            azure_project: String::new(),
+        },
     };
     engine.stop(&session_id).await
 }

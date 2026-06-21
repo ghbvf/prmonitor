@@ -17,7 +17,7 @@ use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, REVIEW_EVENT};
 use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
 use crate::review::history_store::{self, HistoryItemKind};
-use crate::review::session::{SessionInfo, SessionRegistry, SessionStatus};
+use crate::review::session::{CommentUrlContext, SessionInfo, SessionRegistry, SessionStatus};
 
 /// Per-request engine handle. Borrows the long-lived state from `AppState` plus the
 /// request's `AppHandle`; constructed fresh by each command/dispatch (cheap — all
@@ -41,6 +41,11 @@ pub struct ClaudeEngine<'a, R: tauri::Runtime> {
     /// Hand-typed claude model name (empty = claude CLI default). Passed as `--model`
     /// to the `claude -p` subprocess when non-blank.
     pub claude_model: &'a str,
+    /// IMMUTABLE comment-URL source context (AB#1042), built from the project at dispatch.
+    /// Owned so it moves into `start_review` → the `Starting` session, pinning the terminal
+    /// `finalize_turn`'s URL resolve to the project the review ran against (not a mid-review
+    /// config edit). `pub(crate)`: crate-internal context type, in-crate constructors only.
+    pub(crate) url_ctx: CommentUrlContext,
 }
 
 impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
@@ -55,6 +60,8 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
             self.claude_model,
             pr_number,
             kind,
+            // `&self` start can't move the field; clone the owned context for this turn.
+            self.url_ctx.clone(),
         )
         .await
     }
@@ -92,6 +99,10 @@ async fn start_review<R: tauri::Runtime>(
     claude_model: &str,
     pr_number: u64,
     kind: &str,
+    // IMMUTABLE comment-URL source context (AB#1042); handed to the `Starting` session in
+    // `promote_reservation` so the terminal `finalize_turn` resolves the URL against the
+    // project this review ran against (mirrors the codex path).
+    url_ctx: CommentUrlContext,
 ) -> AppResult<StartReviewOutcome> {
     // Atomic test-and-set BEFORE spawning: if this `(project_id, pr, kind)` is already
     // reserved or covered by an in-flight session, do NOT start a second review (the
@@ -153,7 +164,7 @@ async fn start_review<R: tauri::Runtime>(
         // No comment yet — filled by `session::finalize_turn` at a `completed` terminal (AB#1042).
         comment_url: None,
     };
-    registry.promote_reservation(starting.clone());
+    registry.promote_reservation(starting.clone(), url_ctx);
     persist_session(app, &starting);
     reservation.disarm();
 

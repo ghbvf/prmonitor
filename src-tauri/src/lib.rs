@@ -313,6 +313,16 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
     let active = state.sessions.active_pairs(&project_id);
     let record = |cands: &[Candidate]| pr::ledger::record_dispatched(&app, &project_id, cands);
     let report = |msg: String| emit_dispatch_error(&app, &project_id, msg);
+    // Snapshot the comment-URL source context from the project NOW (AB#1042), so each review
+    // this batch starts resolves its pr-review comment URL at the terminal against the project
+    // it ran against — never a config edited mid-review. Each engine `start` clones it per
+    // candidate (the engine `start` takes `&self`), so one snapshot covers the whole batch.
+    let url_ctx = review::session::CommentUrlContext {
+        source_kind: project.source_kind,
+        repo: project.repo.clone(),
+        azure_org: project.azure_org.clone(),
+        azure_project: project.azure_project.clone(),
+    };
     // The ONE place that names a concrete engine for the auto-trigger path. The
     // exhaustive `match` over the sealed `EngineKind` (model.rs) is the Hard carrier:
     // adding a variant without an arm here is a compile error. Each arm monomorphizes
@@ -339,6 +349,7 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
                 repo_root: &project.repo_root,
                 skill_abs_path: &skill_abs,
                 codex_model: &project.codex_model,
+                url_ctx,
             };
             dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
         }
@@ -352,6 +363,7 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
                 repo: &project.repo,
                 repo_root: &project.repo_root,
                 claude_model: &project.claude_model,
+                url_ctx,
             };
             dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
         }
