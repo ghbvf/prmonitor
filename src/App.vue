@@ -202,7 +202,6 @@ watch(activeProjectId, () => {
       v-else-if="currentView === 'settings'"
       class="view"
       @saved="onConfigSaved"
-      @close="goMonitor"
     >
       <!-- Composition root fills SettingsView's `webhook` slot with the pr-slice
            WebhookPanel: SettingsView (config) and WebhookPanel (pr) never import each

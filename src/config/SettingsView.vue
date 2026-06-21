@@ -19,9 +19,10 @@ import ProjectsManager from "./ProjectsManager.vue";
 
 const store = useConfigStore();
 
-// `saved` lets the composition root reschedule (poll interval may have changed);
-// `close` returns to the monitor view.
-const emit = defineEmits<{ saved: []; close: [] }>();
+// `saved` lets the composition root reschedule (poll interval may have changed).
+// Returning to the monitor view is owned by the App.vue app-bar toggle, so this
+// view no longer renders its own back control (avoids a duplicate "返回监控", #68).
+const emit = defineEmits<{ saved: [] }>();
 
 // The synthetic nav id for the projects section (not a GLOBAL_GROUPS id). The
 // per-project authors csv state now lives inside each ProjectCard, so SettingsView
@@ -110,7 +111,6 @@ async function onSave() {
   <section class="settings">
     <header class="settings-header">
       <h2>设置</h2>
-      <button type="button" class="back" @click="emit('close')">← 返回监控</button>
     </header>
 
     <p v-if="store.loading && !store.config" class="muted">加载中…</p>
@@ -194,19 +194,6 @@ async function onSave() {
 .settings-header h2 {
   margin: 0;
   font-size: var(--font-size-lg);
-}
-.back {
-  background: none;
-  border: none;
-  padding: var(--space-2) var(--space-3);
-  font: inherit;
-  font-size: var(--font-size-sm);
-  color: var(--color-accent);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
-.back:hover {
-  background: var(--color-surface-hover);
 }
 .muted {
   padding: var(--space-6);
