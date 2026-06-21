@@ -186,10 +186,12 @@ watch(activeProjectId, () => {
 // re-focuses by clicking a row in the now-PR-filtered ReviewSessions list. Watch
 // `selectedNumber` (not `selectedPr`): selection is by number (#38), so a list
 // refresh re-emitting the same row won't false-trigger — only a real PR switch does.
-// (The project-switch watch above keeps its own clearFocus for the "no PR selected
-// but a session was hydrated on launch" path, where `selectedNumber` stays null.)
-watch(selectedNumber, () => {
-  clearFocus();
+// Skip the → null transition: that fires only from the project-switch watch above
+// (which already clears focus), so guarding it avoids a redundant double clearFocus.
+// That same watch also covers the "no PR selected but a session was hydrated on
+// launch" path, where `selectedNumber` stays null and this watch never fires.
+watch(selectedNumber, (n) => {
+  if (n !== null) clearFocus();
 });
 </script>
 
