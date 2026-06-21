@@ -150,6 +150,8 @@ async fn start_review<R: tauri::Runtime>(
         kind: kind.to_string(),
         status: SessionStatus::Starting,
         created_at_epoch,
+        // No comment yet — filled by `session::finalize_turn` at a `completed` terminal (AB#1042).
+        comment_url: None,
     };
     registry.promote_reservation(starting.clone());
     persist_session(app, &starting);
@@ -182,6 +184,7 @@ async fn start_review<R: tauri::Runtime>(
         parser,
         cancel_rx,
         project_id.to_string(),
+        pr_number,
         session_id.clone(),
         app.clone(),
         registry.clone(),
@@ -228,6 +231,7 @@ async fn pump<R: tauri::Runtime>(
     mut parser: ParserState,
     mut cancel: tokio::sync::watch::Receiver<bool>,
     project_id: String,
+    pr_number: u64,
     session_id: String,
     app: tauri::AppHandle<R>,
     registry: SessionRegistry,
@@ -248,11 +252,13 @@ async fn pump<R: tauri::Runtime>(
                     &claude,
                     &app,
                     &project_id,
+                    pr_number,
                     &session_id,
                     SessionStatus::Done,
                     "interrupted",
                     None,
-                );
+                )
+                .await;
                 break;
             }
             read = process::read_line(&mut reader) => {
@@ -266,11 +272,13 @@ async fn pump<R: tauri::Runtime>(
                             &claude,
                             &app,
                             &project_id,
+                            pr_number,
                             &session_id,
                             SessionStatus::Failed,
                             "failed",
                             Some("claude 进程结束但未返回结果".to_string()),
-                        );
+                        )
+                        .await;
                         break;
                     }
                     Err(e) => {
@@ -279,11 +287,13 @@ async fn pump<R: tauri::Runtime>(
                             &claude,
                             &app,
                             &project_id,
+                            pr_number,
                             &session_id,
                             SessionStatus::Failed,
                             "failed",
                             Some(format!("读取 claude 输出失败: {e}")),
-                        );
+                        )
+                        .await;
                         break;
                     }
                 };
@@ -334,11 +344,13 @@ async fn pump<R: tauri::Runtime>(
                             &claude,
                             &app,
                             &project_id,
+                            pr_number,
                             &session_id,
                             status,
                             wire_status,
                             error,
-                        );
+                        )
+                        .await;
                         break;
                     }
                 }
@@ -391,55 +403,48 @@ fn emit_and_persist<R: tauri::Runtime>(
     }
 }
 
-/// Finish a session: set its terminal status in the registry + DB, emit an optional
-/// `Error` event (for a failed/interrupted run) followed by the terminal `TurnCompleted`,
-/// and deregister from the manager so it no longer holds the cancel sender. The terminal
-/// in-memory `status` and the `wire_status` string are passed EXPLICITLY (the caller knows
-/// the right pairing per exit path): result-success → `(Done, "completed")`, result-error
-/// / EOF / read-error → `(Failed, "failed")`, cancel → `(Done, "interrupted")` — `Done` so
-/// dedup releases, wire "interrupted" so the UI shows a user stop (mirrors codex).
+/// Finish a session by routing its terminal through the SHARED engine-agnostic funnel
+/// [`crate::review::session::finalize_turn`] (AB#1042) — so the claude exits land the
+/// terminal status + resolved comment URL, emit the optional `Error` + terminal
+/// `TurnCompleted`, and signal the completion watch in the SAME order as the codex pump (one
+/// source for the terminal sequence). The terminal in-memory `status` + `wire_status` are
+/// passed EXPLICITLY per exit path (the caller knows the right pairing): result-success →
+/// `(Done, "completed")` (the only path that resolves a comment URL), result-error / EOF /
+/// read-error → `(Failed, "failed")`, cancel → `(Done, "interrupted")` — `Done` so dedup
+/// releases, wire "interrupted" so the UI shows a user stop (mirrors codex).
+///
+/// `claude.deregister(session_id)` stays OUTSIDE the funnel (called here after it), since the
+/// funnel is engine-agnostic and takes no `ClaudeManager` — the cancel-sender cleanup is
+/// claude-specific. `async` because the funnel resolves the comment URL via a subprocess.
 #[allow(clippy::too_many_arguments)]
-fn finish<R: tauri::Runtime>(
+async fn finish<R: tauri::Runtime>(
     registry: &SessionRegistry,
     claude: &ClaudeManager,
     app: &tauri::AppHandle<R>,
     project_id: &str,
+    pr_number: u64,
     session_id: &str,
     status: SessionStatus,
     wire_status: &str,
     error: Option<String>,
 ) {
-    registry.set_status(session_id, status);
-    let db = app.state::<crate::db::Database>();
-    if let Err(e) = history_store::set_status(db.inner(), session_id, status) {
-        eprintln!(
-            "claude review session 状态持久化失败（{session_id}）：{}",
-            e.message
-        );
-        // Symmetry with codex: surface the FIRST persistence failure to the user once
-        // (the shared process-global one-time notice in `session.rs`, review F9).
-        crate::review::session::notify_persist_failure_once(app, project_id);
-    }
-    if let Some(message) = error {
-        let _ = app.emit(
-            REVIEW_EVENT,
-            &ReviewEvent::Error {
-                project_id: project_id.to_string(),
-                thread_id: session_id.to_string(),
-                message,
-            },
-        );
-    }
-    let _ = app.emit(
-        REVIEW_EVENT,
-        &ReviewEvent::TurnCompleted {
-            project_id: project_id.to_string(),
-            thread_id: session_id.to_string(),
-            status: wire_status.to_string(),
-        },
-    );
-    // Deregister WITHOUT signal (the pump is finishing on its own); a later `stop` for
-    // this id then finds nothing and returns false (correct: nothing to stop).
+    // The shared funnel does: resolve URL (completed only) → set status + URL (registry +
+    // DB) → emit Error?+TurnCompleted → signal completion LAST. claude's `session_id` is the
+    // funnel's `thread_id`.
+    crate::review::session::finalize_turn(
+        app,
+        registry,
+        project_id,
+        pr_number,
+        session_id,
+        status,
+        wire_status,
+        error,
+    )
+    .await;
+    // Deregister WITHOUT signal (the pump is finishing on its own; the funnel already
+    // signalled completion); a later `stop` for this id then finds nothing and returns false
+    // (correct: nothing to stop). OUTSIDE the funnel — engine-specific cleanup.
     claude.deregister(session_id);
 }
 

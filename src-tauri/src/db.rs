@@ -28,7 +28,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -150,6 +150,9 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 1 {
         apply_v1(conn)?;
     }
+    if version < 2 {
+        apply_v2(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -157,6 +160,17 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
 
 fn apply_v1(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(SCHEMA_V1).map_err(map_err)?;
+    Ok(())
+}
+
+/// v2 (AB#1042): the trigger funnel persists the resolved review-comment URL per session.
+/// Adds the column with `ALTER TABLE` rather than editing [`SCHEMA_V1`] — a fresh DB
+/// (version 0) runs v1 (which has no `comment_url`) then this v2 step, while an existing
+/// v1 install runs ONLY this step. Editing `SCHEMA_V1` to carry the column would make this
+/// `ADD COLUMN` collide with "duplicate column" on every already-migrated v1 store.
+fn apply_v2(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch("ALTER TABLE review_session ADD COLUMN comment_url TEXT;")
+        .map_err(map_err)?;
     Ok(())
 }
 
@@ -282,6 +296,49 @@ mod tests {
         // Idempotent: marking again (INSERT OR REPLACE) keeps it true with no dup row.
         db.with_tx(mark_legacy_imported).expect("re-mark");
         assert!(db.legacy_imported().expect("read guard"));
+    }
+
+    /// v1 → v2 migration lock (AB#1042, Medium): a DB stamped at v1 (no `comment_url`)
+    /// must gain the column after `run_migrations` runs ONLY the v2 step (not re-running
+    /// v1, which would "duplicate column" had v1 carried it). Seed the v1 schema directly,
+    /// stamp `user_version = 1`, migrate, and assert the column now exists + version is 2.
+    #[test]
+    fn migrate_v1_to_v2_adds_comment_url_column() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        // Replay v1 exactly as an existing v1 install has it (no `comment_url`), then stamp
+        // the version so the runner sees a v1 DB and applies only the v2 delta.
+        apply_v1(&conn).expect("seed v1");
+        conn.pragma_update(None, "user_version", 1)
+            .expect("stamp v1");
+        // Precondition: a v1 `review_session` has NO `comment_url` column.
+        assert!(
+            !review_session_has_comment_url(&conn),
+            "v1 must not already have comment_url"
+        );
+
+        run_migrations(&conn).expect("v1 → v2 migrates");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read version");
+        assert_eq!(version, 2, "stamped to v2");
+        assert!(
+            review_session_has_comment_url(&conn),
+            "v2 added the comment_url column"
+        );
+    }
+
+    /// Whether `review_session` has a `comment_url` column (via `PRAGMA table_info`).
+    fn review_session_has_comment_url(conn: &Connection) -> bool {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(review_session)")
+            .expect("table_info");
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1)) // col 1 = name
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect");
+        names.iter().any(|n| n == "comment_url")
     }
 
     /// Forward-compat guard (pr-review F3): a DB stamped with a HIGHER schema version than

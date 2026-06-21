@@ -141,6 +141,7 @@ pub fn run() {
             review::commands::start_codex,
             review::commands::stop_codex,
             review::commands::start_review,
+            review::commands::trigger_review,
             review::commands::stop_review,
             review::commands::list_review_sessions,
             review::commands::get_session_history,

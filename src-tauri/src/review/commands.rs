@@ -73,6 +73,71 @@ pub fn stop_codex(state: tauri::State<'_, AppState>) -> AppResult<CodexStatus> {
     Ok(state.codex.stop())
 }
 
+/// The ONE place that names a concrete review engine (AB#1042): the shared dispatch body
+/// behind BOTH [`start_review`] (project resolved by id) and [`trigger_review`] (project
+/// resolved by id-or-repo `reference`). Exhaustive `match project.engine_kind` over the
+/// sealed [`EngineKind`] (model.rs) = **Hard** single-source carrier: a new variant without
+/// an arm here is a compile error, and no other callsite may re-state the match (a second
+/// `match EngineKind` would split engine selection).
+///
+/// Folds the `outcome → Result` mapping in (both callers handle a [`StartReviewOutcome`]
+/// identically): `Started` → the session id; `Deduped` (the registry already has an
+/// in-flight review for this `(project_id, pr, kind)`) → a benign "already in flight" error
+/// — a re-start does NOT double-start; stop the running one first to re-review.
+///
+/// `kind` is pre-validated by the caller (both validate before resolving the project).
+async fn dispatch_engine<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    project: &config_service::Project,
+    pr_number: u64,
+    kind: &str,
+) -> AppResult<SessionId> {
+    let outcome = match project.engine_kind {
+        EngineKind::Codex => {
+            let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
+            // MANUAL / explicit force-start: an explicit trigger (UI button OR a CLI/deeplink
+            // entry, AB#1042) overrides a prior `stop_codex`. `resume()` clears the user-stop
+            // flag BEFORE `engine.start()` reaches the `connection()` funnel (which refuses
+            // when stopped). Auto-dispatch does NOT resume, so a stopped server is never
+            // auto-revived (PR #47 F1) — `trigger_review` IS explicit/manual, so it resumes
+            // like `start_review` (same convention for every explicit entry point).
+            state.codex.resume();
+            let engine = CodexEngine {
+                app,
+                codex: &state.codex,
+                registry: &state.sessions,
+                codex_bin: CODEX_BIN,
+                project_id: &project.id,
+                repo: &project.repo,
+                repo_root: &project.repo_root,
+                skill_abs_path: &skill_abs,
+                codex_model: &project.codex_model,
+            };
+            engine.start(pr_number, kind).await?
+        }
+        EngineKind::Claude => {
+            let engine = ClaudeEngine {
+                app,
+                claude: &state.claude,
+                registry: &state.sessions,
+                claude_bin: CLAUDE_BIN,
+                project_id: &project.id,
+                repo: &project.repo,
+                repo_root: &project.repo_root,
+                claude_model: &project.claude_model,
+            };
+            engine.start(pr_number, kind).await?
+        }
+    };
+    match outcome {
+        StartReviewOutcome::Started(session_id) => Ok(session_id),
+        StartReviewOutcome::Deduped => Err(AppError::new(format!(
+            "PR {pr_number} 的 {kind} review 已在进行中"
+        ))),
+    }
+}
+
 /// Start a review for `(project_id, pr_number)` (`kind` = `"review"` or `"check"`),
 /// returning the session id (codex `threadId`). Output streams out-of-band via the
 /// `review:event` Tauri event ([`crate::events::ReviewEvent`]), each event stamped
@@ -95,52 +160,30 @@ pub async fn start_review<R: tauri::Runtime>(
     // `project_validated` is the per-project analogue of the old `load_validated`; the
     // review slice still depends only on `config::service`, never `config::model`.
     let project = config_service::project_validated(&app, &project_id)?;
-    // The ONE place that names a concrete engine for the manual path. Exhaustive `match`
-    // over the sealed `EngineKind` (model.rs) = Hard carrier: a new variant without an arm
-    // here is a compile error. `Deduped` = the registry already has an in-flight review for
-    // this `(project_id, pr, kind)`: a manual re-start is a benign no-op surfaced as an
-    // error (the UI shows it; nothing double-starts). Stop the running one first to re-review.
-    let outcome = match project.engine_kind {
-        EngineKind::Codex => {
-            let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
-            // MANUAL force-start: a user asking to review overrides a prior `stop_codex`.
-            // `resume()` clears the user-stop flag BEFORE `engine.start()` reaches the
-            // `connection()` funnel (which refuses when stopped). Auto-dispatch does NOT
-            // resume, so a stopped server is never auto-revived (PR #47 F1).
-            state.codex.resume();
-            let engine = CodexEngine {
-                app: &app,
-                codex: &state.codex,
-                registry: &state.sessions,
-                codex_bin: CODEX_BIN,
-                project_id: &project.id,
-                repo: &project.repo,
-                repo_root: &project.repo_root,
-                skill_abs_path: &skill_abs,
-                codex_model: &project.codex_model,
-            };
-            engine.start(pr_number, &kind).await?
-        }
-        EngineKind::Claude => {
-            let engine = ClaudeEngine {
-                app: &app,
-                claude: &state.claude,
-                registry: &state.sessions,
-                claude_bin: CLAUDE_BIN,
-                project_id: &project.id,
-                repo: &project.repo,
-                repo_root: &project.repo_root,
-                claude_model: &project.claude_model,
-            };
-            engine.start(pr_number, &kind).await?
-        }
-    };
-    match outcome {
-        StartReviewOutcome::Started(session_id) => Ok(session_id),
-        StartReviewOutcome::Deduped => Err(AppError::new(format!(
-            "PR {pr_number} 的 {kind} review 已在进行中"
-        ))),
-    }
+    dispatch_engine(&app, &state, &project, pr_number, &kind).await
+}
+
+/// Trigger a review by a free-form `reference` (a project `id` OR a `repo`), the
+/// transport-agnostic funnel entry point for a third-party trigger (CLI/deeplink, future —
+/// AB#1042). Resolves the project via [`config_service::project_by_ref_validated`] (id-first,
+/// repo case-insensitive, ambiguity rejected), then shares [`dispatch_engine`] with
+/// [`start_review`] — so engine selection + dedup stay single-source. `kind` is validated
+/// first (same boundary as `start_review`); a `Deduped` surfaces as the same benign error.
+#[tauri::command]
+pub async fn trigger_review<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    reference: String,
+    pr_number: u64,
+    kind: String,
+) -> AppResult<SessionId> {
+    // Reject a bogus `kind` BEFORE resolving the project / any side effect (parity with
+    // `start_review`): an unvalidated kind would run a full review under a bad registry key.
+    validate_kind(&kind)?;
+    // Resolve by id-or-repo + validate the project's filesystem paths (the trigger funnel's
+    // analogue of `project_validated`), keeping the review slice on `config::service` only.
+    let project = config_service::project_by_ref_validated(&app, &reference)?;
+    dispatch_engine(&app, &state, &project, pr_number, &kind).await
 }
 
 /// Interrupt a running review session (by its `threadId`). The terminal

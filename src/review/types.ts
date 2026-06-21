@@ -28,6 +28,10 @@ export interface ReviewSession {
   // sort key for the session list. Mirrors `SessionInfo.created_at_epoch` (Rust) — a UUID
   // `threadId` has no time, so the list is ordered by this instead.
   createdAtEpoch: number;
+  // The resolved pr-review comment URL (AB#1042), present once a session reached a
+  // `completed` terminal and the source kind resolved one (GitHub: exact comment URL;
+  // Azure: PR URL; else absent). Mirrors `SessionInfo.comment_url` (Rust, omitted when None).
+  commentUrl?: string;
 }
 
 // A view-only aggregate of streamed deltas, keyed by codex `itemId`. Message and
