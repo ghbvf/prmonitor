@@ -110,6 +110,24 @@ export function githubCliRequiredForSource(
   }
 }
 
+// Whether the shell should surface GitHub CLI auth status for this project. Manual
+// GitHub projects do not run the background poll loop, but their one-shot pull still
+// discovers PRs through `gh`, so the StatusBar should not claim gh is unnecessary.
+export function githubCliStatusRelevantForSource(
+  sourceKind: SourceKind,
+  mode: UpdateMode,
+): boolean {
+  switch (sourceKind) {
+    case "github":
+      return pollingEnabledForMode(mode) || manualPullAllowedForMode(mode);
+    case "azure":
+    case "bitbucket":
+      return false;
+    default:
+      return assertNever(sourceKind);
+  }
+}
+
 // Whether a mode supports the manual one-shot "立即拉取" (poll-now) trigger (818, F7).
 // This is a DIFFERENT capability from the periodic poll loop (pollingEnabledForMode):
 // the backend `poll_now` Manual branch runs a one-shot `discover_once`, so manual mode

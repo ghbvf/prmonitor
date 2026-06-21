@@ -5,7 +5,7 @@
 // legitimate, exactly as App.vue does its cross-slice wiring.
 import { computed, onMounted, watch } from "vue";
 import { useConfigStore } from "./config/useConfigStore";
-import { githubCliRequiredForSource } from "./types";
+import { githubCliStatusRelevantForSource } from "./types";
 import { usePrStore } from "./pr/usePrStore";
 import { useReviewStore } from "./review/useReviewStore";
 
@@ -20,7 +20,7 @@ const ghRequired = computed(
     configStore.config?.projects.some(
       (p) =>
         p.enabled &&
-        githubCliRequiredForSource(p.sourceKind, p.updateMode),
+        githubCliStatusRelevantForSource(p.sourceKind, p.updateMode),
     ) ?? false,
 );
 // Self-refresh codex status on mount so the StatusBar shows the real state even

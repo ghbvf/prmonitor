@@ -10,6 +10,7 @@ import type { AppConfig, Project } from "./types";
 import {
   UPDATE_MODES,
   githubCliRequiredForSource,
+  githubCliStatusRelevantForSource,
   pollingEnabledForMode,
   manualPullAllowedForMode,
 } from "../types";
@@ -188,6 +189,22 @@ describe("githubCliRequiredForSource (818)", () => {
     for (const mode of UPDATE_MODES) {
       expect(githubCliRequiredForSource("azure", mode)).toBe(false);
       expect(githubCliRequiredForSource("bitbucket", mode)).toBe(false);
+    }
+  });
+});
+
+describe("githubCliStatusRelevantForSource (818)", () => {
+  it("shows gh status for GitHub modes that can call gh", () => {
+    expect(githubCliStatusRelevantForSource("github", "webhook-only")).toBe(false);
+    expect(githubCliStatusRelevantForSource("github", "pull-only")).toBe(true);
+    expect(githubCliStatusRelevantForSource("github", "hybrid")).toBe(true);
+    expect(githubCliStatusRelevantForSource("github", "manual")).toBe(true);
+  });
+
+  it("does not show gh status for Azure or Bitbucket modes", () => {
+    for (const mode of UPDATE_MODES) {
+      expect(githubCliStatusRelevantForSource("azure", mode)).toBe(false);
+      expect(githubCliStatusRelevantForSource("bitbucket", mode)).toBe(false);
     }
   });
 });
