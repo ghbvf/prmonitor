@@ -5,7 +5,7 @@
 // PRs are no longer split across two separate sidebars. Selection is owned by the
 // composition root (App.vue): a PR row's `select` is forwarded up and the selected PR
 // number passed back down for highlighting (keeps pr/review decoupled).
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import type { TrackedPrView } from "../types";
 import { usePrStore } from "./usePrStore";
 import { useProjects } from "../projects";
@@ -65,8 +65,6 @@ watch(activeProjectId, () => {
   showArchived.value = false;
 });
 
-// Hydrate the gh CLI status on mount so the StatusBar has data to show.
-onMounted(() => store.refreshGhStatus());
 </script>
 
 <template>
