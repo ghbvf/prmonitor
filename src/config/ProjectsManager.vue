@@ -5,14 +5,16 @@
 // the draft in place (the parent's reactive AppConfig), committed by SettingsView's
 // existing save flow alongside the global webhook fields.
 //
-// Each project renders as a collapsible row: a always-visible header (chevron + the
+// Each project renders as a collapsible row: an always-visible header (chevron + the
 // 启动/enabled toggle + name + 当前/active pick + delete) over a ProjectCard that holds
 // the detailed fields and only shows when expanded. The header owns the project-identity
 // controls (name/enabled) and the list operations; ProjectCard stays a pure field form.
+// The add/delete draft mutations (and the activeProjectId invariant they keep) live in
+// projectOps.ts so they're unit-testable without a component harness.
 import { ref, watch } from "vue";
-import type { AppConfig, Project } from "./types";
+import type { AppConfig } from "./types";
 import type { ProjectFieldKey } from "./fields";
-import { NEW_PROJECT_DEFAULTS } from "./defaults";
+import { addProjectToDraft, deleteProjectFromDraft } from "./projectOps";
 import ProjectCard from "./ProjectCard.vue";
 
 // The live AppConfig draft (reactive, owned by SettingsView). We mutate `projects`
@@ -26,8 +28,9 @@ const emit = defineEmits<{ edit: [] }>();
 const expanded = ref(new Set<string>());
 // Seed the open set ONCE, when projects first hydrate (length 0 → N): expand the active
 // project so the user lands on their current project open, everything else collapsed.
-// Guarded by `seeded` so re-hydrates and the user's later manual collapses aren't fought
-// (we never re-add a project the user closed).
+// `seeded` is a plain variable, not a ref — it's only read/written inside the watch
+// callback and never used in the template, so it needs no reactivity. It guards against
+// re-hydrates and the user's later manual collapses (we never re-add a closed project).
 let seeded = false;
 watch(
   () => props.draft.projects.length,
@@ -47,21 +50,10 @@ function toggleExpand(id: string) {
   else expanded.value.add(id);
 }
 
-// Sensible defaults for a fresh project — identity (id/name) is minted here, the rest
-// come from the shared NEW_PROJECT_DEFAULTS (single-sourced with the onboarding wizard
-// in defaults.ts) so the two seed paths can't drift.
-function newProject(): Project {
-  return { ...NEW_PROJECT_DEFAULTS, id: crypto.randomUUID(), name: "新项目" };
-}
-
 function addProject() {
-  const p = newProject();
-  props.draft.projects.push(p);
-  // A project (re)added to an empty list must become active: the backend validate()
-  // requires activeProjectId to name an existing project whenever projects is non-empty
-  // (an empty id is valid only for the empty-list / first-launch state).
-  if (props.draft.activeProjectId === "") props.draft.activeProjectId = p.id;
-  // Open the fresh card so its (empty) fields are immediately editable.
+  // projectOps keeps the activeProjectId invariant (first project added to an empty
+  // list becomes active); here we only own the UI concern of opening the fresh card.
+  const p = addProjectToDraft(props.draft);
   expanded.value.add(p.id);
   emit("edit");
 }
@@ -94,18 +86,11 @@ function onEnabled(id: string, e: Event) {
 
 function deleteProject(id: string) {
   // Confirm before the destructive splice — a project carries its repo/label config.
-  if (!window.confirm("确认删除该项目？/ Delete this project?")) return;
-  const idx = props.draft.projects.findIndex((x) => x.id === id);
-  if (idx === -1) return;
-  props.draft.projects.splice(idx, 1);
+  if (!window.confirm("确认删除该项目？")) return;
+  // projectOps keeps activeProjectId pointing at a project that still exists (or "" when
+  // the list empties — the cleared state the backend accepts); we clean up UI state.
+  if (!deleteProjectFromDraft(props.draft, id)) return;
   expanded.value.delete(id);
-  // Keep activeProjectId pointing at a project that still exists: fall back to the new
-  // first project, or "" when the list is now empty. The backend validate() accepts an
-  // empty projects + empty activeProjectId as the cleared / first-launch state, and the
-  // empty-state below lets the user re-add from zero.
-  if (props.draft.activeProjectId === id) {
-    props.draft.activeProjectId = props.draft.projects[0]?.id ?? "";
-  }
   emit("edit");
 }
 
@@ -136,6 +121,8 @@ function setActive(id: string) {
             type="button"
             class="chevron"
             :aria-expanded="isExpanded(p.id)"
+            :aria-controls="`project-card-${p.id}`"
+            :aria-label="(isExpanded(p.id) ? '收起' : '展开') + '项目 ' + (p.name || '新项目')"
             :title="isExpanded(p.id) ? '收起' : '展开'"
             @click="toggleExpand(p.id)"
           >
@@ -153,6 +140,7 @@ function setActive(id: string) {
             type="text"
             :value="p.name"
             placeholder="新项目"
+            :aria-label="`项目 ${p.name || '新项目'} 的名称`"
             @input="onName(p.id, $event)"
           />
           <label class="active-pick">
@@ -165,10 +153,18 @@ function setActive(id: string) {
             />
             <span>当前</span>
           </label>
-          <button type="button" class="delete" @click="deleteProject(p.id)">删除</button>
+          <button
+            type="button"
+            class="delete"
+            :aria-label="`删除项目 ${p.name || '新项目'}`"
+            @click="deleteProject(p.id)"
+          >
+            删除
+          </button>
         </header>
         <ProjectCard
           v-show="isExpanded(p.id)"
+          :id="`project-card-${p.id}`"
           :project="p"
           @update="(key, value) => onUpdate(p.id, key, value)"
           @edit="emit('edit')"
