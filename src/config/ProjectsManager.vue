@@ -84,14 +84,28 @@ function onEnabled(id: string, e: Event) {
   onUpdate(id, "enabled", (e.target as HTMLInputElement).checked);
 }
 
-function deleteProject(id: string) {
-  // Confirm before the destructive splice — a project carries its repo/label config.
-  if (!window.confirm("确认删除该项目？")) return;
+// Two-step in-app delete confirmation. `window.confirm` is unreliable in the Tauri
+// webview (wry doesn't wire WKWebView's JS confirm panel, so it returns false WITHOUT
+// prompting → the splice never ran and the row never disappeared). A pure-Vue confirm
+// strip works in every webview. At most one row is pending at a time — clicking 删除 on
+// another row just moves the pending id.
+const pendingDeleteId = ref<string | null>(null);
+
+function requestDelete(id: string) {
+  // Clicking 删除 only arms the confirm — the destructive splice waits for confirmDelete.
+  pendingDeleteId.value = id;
+}
+function cancelDelete() {
+  pendingDeleteId.value = null;
+}
+function confirmDelete(id: string) {
   // projectOps keeps activeProjectId pointing at a project that still exists (or "" when
   // the list empties — the cleared state the backend accepts); we clean up UI state.
-  if (!deleteProjectFromDraft(props.draft, id)) return;
-  expanded.value.delete(id);
-  emit("edit");
+  if (deleteProjectFromDraft(props.draft, id)) {
+    expanded.value.delete(id);
+    emit("edit");
+  }
+  pendingDeleteId.value = null;
 }
 
 function setActive(id: string) {
@@ -153,11 +167,31 @@ function setActive(id: string) {
             />
             <span>当前</span>
           </label>
+          <template v-if="pendingDeleteId === p.id">
+            <span class="confirm-text">确认删除？</span>
+            <button
+              type="button"
+              class="confirm-yes"
+              :aria-label="`确认删除项目 ${p.name || '新项目'}`"
+              @click="confirmDelete(p.id)"
+            >
+              确认
+            </button>
+            <button
+              type="button"
+              class="confirm-no"
+              :aria-label="`取消删除项目 ${p.name || '新项目'}`"
+              @click="cancelDelete"
+            >
+              取消
+            </button>
+          </template>
           <button
+            v-else
             type="button"
             class="delete"
             :aria-label="`删除项目 ${p.name || '新项目'}`"
-            @click="deleteProject(p.id)"
+            @click="requestDelete(p.id)"
           >
             删除
           </button>
@@ -279,6 +313,34 @@ function setActive(id: string) {
   cursor: pointer;
 }
 .delete:hover {
+  background: var(--color-surface-hover);
+}
+/* Inline delete-confirm strip — replaces the 删除 button while a row is pending. */
+.confirm-text {
+  flex-shrink: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-danger);
+}
+.confirm-yes,
+.confirm-no {
+  flex-shrink: 0;
+  padding: var(--space-2) var(--space-4);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.confirm-yes {
+  color: var(--color-surface);
+  background: var(--color-danger);
+  border: 1px solid var(--color-danger);
+}
+.confirm-no {
+  color: var(--color-text);
+  background: none;
+  border: 1px solid var(--color-border-strong);
+}
+.confirm-no:hover {
   background: var(--color-surface-hover);
 }
 .empty-state {
