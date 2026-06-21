@@ -99,6 +99,15 @@ function statusLabel(status: SessionStatus): string {
       return status;
   }
 }
+
+// Render a session's start time on its row. `createdAtEpoch` is wall-clock EPOCH
+// SECONDS (mirrors `SessionInfo.created_at_epoch`), so scale to ms for `Date`. A 0
+// stamp is the durable fallback the backend writes via `now_epoch().unwrap_or(0)` /
+// for a legacy row predating the column — render nothing rather than "1970/1/1".
+function startedLabel(epoch: number): string {
+  if (!epoch) return "";
+  return new Date(epoch * 1000).toLocaleString();
+}
 </script>
 
 <template>
@@ -133,6 +142,9 @@ function statusLabel(status: SessionStatus): string {
         <span class="badge kind">{{ s.kind }}</span>
         <span class="badge status" :class="`status-${s.status}`">
           {{ statusLabel(s.status) }}
+        </span>
+        <span v-if="startedLabel(s.createdAtEpoch)" class="started">
+          {{ startedLabel(s.createdAtEpoch) }}
         </span>
       </li>
     </ul>
@@ -183,6 +195,13 @@ function statusLabel(status: SessionStatus): string {
 }
 .pr {
   font-size: var(--font-size-md);
+}
+/* Start time sits at the row end (margin-left:auto), muted so it stays secondary to
+   the PR # + status badges. */
+.started {
+  margin-left: auto;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
 }
 .badge {
   display: inline-block;

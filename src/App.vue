@@ -180,6 +180,17 @@ watch(activeProjectId, () => {
   selectedNumber.value = null;
   clearFocus();
 });
+// Switching the SELECTED PR (within a project) must also drop the focused review:
+// the focus is a global singleton, so without this ReviewPanel keeps rendering the
+// previous PR's session stream after you pick a different PR. Blank it; the user
+// re-focuses by clicking a row in the now-PR-filtered ReviewSessions list. Watch
+// `selectedNumber` (not `selectedPr`): selection is by number (#38), so a list
+// refresh re-emitting the same row won't false-trigger — only a real PR switch does.
+// (The project-switch watch above keeps its own clearFocus for the "no PR selected
+// but a session was hydrated on launch" path, where `selectedNumber` stays null.)
+watch(selectedNumber, () => {
+  clearFocus();
+});
 </script>
 
 <template>
