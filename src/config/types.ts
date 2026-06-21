@@ -1,5 +1,5 @@
 // Config slice types. AppConfig is slice-private (mirrors src-tauri/src/config/model.rs).
-import type { SourceKind, EngineKind, UpdateMode } from "../types";
+import type { SourceKind, EngineKind, UpdateMode, LabelSource } from "../types";
 
 // Webhook receiver tunnel mode (#9), config slice-private — mirrors the Rust
 // `WebhookTunnelMode` enum's camelCase wire values. quick = App starts a Cloudflare
@@ -28,6 +28,10 @@ export interface Project {
   authors: string[];
   reviewLabel: string;
   checkLabel: string;
+  // Where trigger labels come from (717): native = the provider's own PR labels;
+  // title = parse `[..]` tags out of the PR title. Default "native"; a Bitbucket source
+  // must use "title" (no native labels). Mirrors the Rust `Project.labelSource` wire field.
+  labelSource: LabelSource;
   skillRelPath: string;
   prCooldownSeconds: number;
   // Data-update mode (818): webhook-only (default, push-driven) / pull-only / hybrid
@@ -38,6 +42,14 @@ export interface Project {
   // empty strings for a github source. Mirrors the Rust `Project.azureOrg`/`azureProject`.
   azureOrg: string;
   azureProject: string;
+  // Bitbucket Server/Data Center connection (717) — only meaningful when
+  // sourceKind === "bitbucket"; empty strings for a github/azure source. Mirrors the Rust
+  // `Project.bitbucketHost`/`bitbucketProject`/`bitbucketToken`. host = Server/DC base URL;
+  // project = project key (e.g. GOCELL, or ~username for a personal repo); token = HTTP
+  // access token (PAT) used as a Bearer credential.
+  bitbucketHost: string;
+  bitbucketProject: string;
+  bitbucketToken: string;
   engineKind: EngineKind;
   autoReview: boolean;
 }

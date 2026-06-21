@@ -22,15 +22,21 @@ export const NEW_PROJECT_DEFAULTS: Omit<Project, "id" | "name"> = {
   authors: [],
   reviewLabel: "pr-status/needs-review-again",
   checkLabel: "pr-status/needs-check-fix",
+  // Label source defaults to "native" (717): use the provider's own PR labels. A
+  // bitbucket source must switch this to "title" (no native labels).
+  labelSource: "native",
   skillRelPath: ".codex/skills/pr-review/SKILL.md",
   prCooldownSeconds: 1800,
   // Default webhook-only (818): push-driven, no CLI poll loop — avoids the account/API
   // risk control that CLI polling can trigger. Source defaults to github with empty
-  // Azure fields (only used when sourceKind switches to "azure").
+  // Azure/Bitbucket fields (only used when sourceKind switches to "azure"/"bitbucket").
   updateMode: "webhook-only",
   sourceKind: "github",
   azureOrg: "",
   azureProject: "",
+  bitbucketHost: "",
+  bitbucketProject: "",
+  bitbucketToken: "",
   engineKind: "codex",
   autoReview: false,
 };

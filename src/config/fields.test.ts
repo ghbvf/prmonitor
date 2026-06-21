@@ -30,12 +30,16 @@ function validProject(): Project {
     authors: [],
     reviewLabel: "pr-status/needs-review-again",
     checkLabel: "pr-status/needs-check-fix",
+    labelSource: "native",
     skillRelPath: ".codex/skills/pr-review/SKILL.md",
     prCooldownSeconds: 1800,
     updateMode: "webhook-only",
     sourceKind: "github",
     azureOrg: "",
     azureProject: "",
+    bitbucketHost: "",
+    bitbucketProject: "",
+    bitbucketToken: "",
     engineKind: "codex",
     autoReview: false,
   };
@@ -76,16 +80,22 @@ describe("PROJECT_GROUPS", () => {
     const engine = PROJECT_GROUPS.find((g) => g.id === "engine");
     expect(engine).toBeDefined();
     const byKey = new Map(engine!.fields.map((f) => [f.key, f]));
-    // sourceKind is now an editable select offering github + azure (818).
+    // sourceKind is now an editable select offering github + azure + bitbucket (818, 717).
     const source = byKey.get("sourceKind");
     expect(source?.kind).toBe("select");
     expect(source?.readonly).toBeFalsy();
-    expect(source?.options).toEqual(["github", "azure"]);
+    expect(source?.options).toEqual(["github", "azure", "bitbucket"]);
     // engineKind stays single-arm read-only (widening tracked by #11).
     expect(byKey.get("engineKind")?.readonly).toBe(true);
     // Azure org/project fields live in the engine group too (818).
     expect(byKey.get("azureOrg")?.kind).toBe("text");
     expect(byKey.get("azureProject")?.kind).toBe("text");
+    // Bitbucket host/project/token fields live in the engine group too (717); the token
+    // is rendered masked.
+    expect(byKey.get("bitbucketHost")?.kind).toBe("text");
+    expect(byKey.get("bitbucketProject")?.kind).toBe("text");
+    expect(byKey.get("bitbucketToken")?.kind).toBe("text");
+    expect(byKey.get("bitbucketToken")?.secret).toBe(true);
   });
 
   it("updateMode is a select single-sourced from UPDATE_MODES (818)", () => {
@@ -112,14 +122,43 @@ describe("PROJECT_GROUPS", () => {
     }
   });
 
-  it("non-azure project fields have no visibleWhen (always visible)", () => {
-    // sourceKind, repo, updateMode, etc. must NOT be conditionally hidden — only the
-    // azure-specific fields carry a predicate.
+  it("bitbucket fields are visibleWhen sourceKind === bitbucket (717)", () => {
+    const byKey = new Map(
+      PROJECT_GROUPS.flatMap((g) => g.fields).map((f) => [f.key, f]),
+    );
+    const bitbucketP = { ...validProject(), sourceKind: "bitbucket" as const };
+    const githubP = { ...validProject(), sourceKind: "github" as const };
+    for (const key of ["bitbucketHost", "bitbucketProject", "bitbucketToken"] as const) {
+      const f = byKey.get(key);
+      expect(f?.visibleWhen).toBeTypeOf("function");
+      expect(f!.visibleWhen!(bitbucketP)).toBe(true);
+      expect(f!.visibleWhen!(githubP)).toBe(false);
+    }
+  });
+
+  it("labelSource is a select single-sourced from LABEL_SOURCES (717)", () => {
+    const f = PROJECT_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "labelSource");
+    expect(f?.kind).toBe("select");
+    expect(f?.options).toEqual(["native", "title"]);
+    // Both wire values carry a Chinese display label.
+    expect(f?.optionLabels?.native).toBeTruthy();
+    expect(f?.optionLabels?.title).toBeTruthy();
+  });
+
+  it("only the azure + bitbucket source fields carry a visibleWhen predicate", () => {
+    // sourceKind, repo, updateMode, labelSource, etc. must NOT be conditionally hidden —
+    // only the per-source connection fields carry a predicate.
     const conditional = PROJECT_GROUPS.flatMap((g) => g.fields)
       .filter((f) => f.visibleWhen)
       .map((f) => f.key)
       .sort();
-    expect(conditional).toEqual(["azureOrg", "azureProject"]);
+    expect(conditional).toEqual([
+      "azureOrg",
+      "azureProject",
+      "bitbucketHost",
+      "bitbucketProject",
+      "bitbucketToken",
+    ]);
   });
 });
 
@@ -176,6 +215,21 @@ describe("validateStep — repo", () => {
     (repo) => {
       expect(
         validateStep("repo", { ...validProject(), sourceKind: "azure", repo }),
+      ).toBeTruthy();
+    },
+  );
+  // Bitbucket source (717): repo is a BARE slug (no slash, no whitespace); the project
+  // key lives in the bitbucketProject field.
+  it("accepts a bare name for a bitbucket source", () => {
+    expect(
+      validateStep("repo", { ...validProject(), sourceKind: "bitbucket", repo: "gocell" }),
+    ).toBeNull();
+  });
+  it.each(["proj/repo", "GOCELL/gocell", "", "  ", "two words"])(
+    "rejects %j for a bitbucket source (slash, whitespace, or empty)",
+    (repo) => {
+      expect(
+        validateStep("repo", { ...validProject(), sourceKind: "bitbucket", repo }),
       ).toBeTruthy();
     },
   );
@@ -269,6 +323,35 @@ describe("validateStep — source (818 F2)", () => {
   });
 });
 
+describe("validateStep — source (717 bitbucket)", () => {
+  function bitbucketProject(): Project {
+    return {
+      ...validProject(),
+      sourceKind: "bitbucket",
+      repo: "gocell",
+      bitbucketHost: "https://bitbucket.mycompany.com",
+      bitbucketProject: "GOCELL",
+      bitbucketToken: "secret-pat",
+    };
+  }
+  it("accepts a bitbucket source with host + project + token filled", () => {
+    expect(validateStep("source", bitbucketProject())).toBeNull();
+  });
+  it.each([
+    { bitbucketHost: "", token: "bitbucketHost" },
+    { bitbucketHost: "   ", token: "bitbucketHost" },
+    { bitbucketProject: "", token: "bitbucketProject" },
+    { bitbucketProject: "  ", token: "bitbucketProject" },
+    { bitbucketToken: "", token: "bitbucketToken" },
+    { bitbucketToken: "   ", token: "bitbucketToken" },
+  ])("rejects a bitbucket source with a blank field %o", ({ token, ...patch }) => {
+    const err = validateStep("source", { ...bitbucketProject(), ...patch });
+    expect(err).toBeTruthy();
+    // Error must start with the offending field token so errorToStep can route it.
+    expect(err!.startsWith(token)).toBe(true);
+  });
+});
+
 describe("STEPS ordering", () => {
   it("is the wizard sequence repo→repoRoot→skill→source→autoReview→done", () => {
     expect(STEPS).toEqual([
@@ -283,14 +366,18 @@ describe("STEPS ordering", () => {
 });
 
 describe("STEP_FIELDS — onboarding wizard step → field wiring (818 F2/F3)", () => {
-  it("the source step owns sourceKind + the azure fields (818 F2)", () => {
+  it("the source step owns sourceKind + the azure + bitbucket fields (818 F2, 717)", () => {
     expect(STEP_FIELDS.source).toContain("sourceKind");
     expect(STEP_FIELDS.source).toContain("azureOrg");
     expect(STEP_FIELDS.source).toContain("azureProject");
+    expect(STEP_FIELDS.source).toContain("bitbucketHost");
+    expect(STEP_FIELDS.source).toContain("bitbucketProject");
+    expect(STEP_FIELDS.source).toContain("bitbucketToken");
   });
 
-  it("the autoReview step surfaces updateMode (818 F3)", () => {
+  it("the autoReview step surfaces updateMode (818 F3) + labelSource (717)", () => {
     expect(STEP_FIELDS.autoReview).toContain("updateMode");
+    expect(STEP_FIELDS.autoReview).toContain("labelSource");
   });
 
   it("every STEP_FIELDS key is a real PROJECT_GROUPS field", () => {
@@ -302,17 +389,26 @@ describe("STEP_FIELDS — onboarding wizard step → field wiring (818 F2/F3)", 
 });
 
 describe("visibleStepFields — conditional fields per step (818 F2)", () => {
-  it("hides the azure fields on the source step for a github source", () => {
+  it("hides the azure + bitbucket fields on the source step for a github source", () => {
     const keys = visibleStepFields("source", validProject()).map((f) => f.key);
-    expect(keys).toContain("sourceKind");
-    expect(keys).not.toContain("azureOrg");
-    expect(keys).not.toContain("azureProject");
+    expect(keys).toEqual(["sourceKind"]);
   });
 
   it("shows the azure fields on the source step for an azure source", () => {
     const draft = { ...validProject(), sourceKind: "azure" as const };
     const keys = visibleStepFields("source", draft).map((f) => f.key);
     expect(keys).toEqual(["sourceKind", "azureOrg", "azureProject"]);
+  });
+
+  it("shows the bitbucket fields on the source step for a bitbucket source (717)", () => {
+    const draft = { ...validProject(), sourceKind: "bitbucket" as const };
+    const keys = visibleStepFields("source", draft).map((f) => f.key);
+    expect(keys).toEqual([
+      "sourceKind",
+      "bitbucketHost",
+      "bitbucketProject",
+      "bitbucketToken",
+    ]);
   });
 });
 
@@ -374,5 +470,18 @@ describe("errorToStep — routes backend AppError messages", () => {
   it("azure messages → source step (818 F2, owned by the source step)", () => {
     expect(errorToStep("azureOrg 不能为空（azure 源需填组织名）")).toBe("source");
     expect(errorToStep("azureProject 不能为空（azure 源需填项目名）")).toBe("source");
+  });
+  // Bitbucket connection fields (717): the source step owns them (rendered + validated for
+  // a bitbucket source), so a backend rejection routes back to source. All three tokens
+  // are bitbucket-prefixed and collide with no other field token.
+  it("bitbucket messages → source step (717, owned by the source step)", () => {
+    expect(errorToStep("bitbucketHost 不能为空（bitbucket 源需填 Server/DC 基址）")).toBe("source");
+    expect(errorToStep("bitbucketProject 不能为空（bitbucket 源需填项目 key）")).toBe("source");
+    expect(errorToStep("bitbucketToken 不能为空（bitbucket 源需填 access token）")).toBe("source");
+  });
+  // labelSource (717) lives in the labels group, surfaced in the autoReview step alongside
+  // reviewLabel/checkLabel, so a backend rejection routes there.
+  it("labelSource message → autoReview step (717)", () => {
+    expect(errorToStep("labelSource 取值非法")).toBe("autoReview");
   });
 });

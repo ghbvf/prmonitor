@@ -9,7 +9,7 @@
 // `keyof AppConfig`). `FieldGroup`/`FieldDef` are generic over the key type so each
 // set is precisely typed and its coverage test can assert exactly that key set.
 import { WEBHOOK_TUNNEL_MODES, type AppConfig, type Project } from "./types";
-import { SOURCE_KINDS, UPDATE_MODES, assertNever, type UpdateMode } from "../types";
+import { SOURCE_KINDS, LABEL_SOURCES, UPDATE_MODES, assertNever, type UpdateMode } from "../types";
 
 // A project field's key (per-project form/wizard) or a global AppConfig field's key
 // (the webhook group). Generic `FieldDef<K>` keeps each group set precisely typed.
@@ -139,6 +139,16 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
     id: "labels",
     title: "标签",
     fields: [
+      {
+        key: "labelSource",
+        label: "标签来源",
+        kind: "select",
+        // Single-sourced from LABEL_SOURCES (717) — type & options can't drift; Chinese
+        // display via optionLabels (ConfigField emits the raw wire value).
+        options: LABEL_SOURCES,
+        optionLabels: { native: "PR 原生标签", title: "从标题解析 [..]" },
+        hint: "native=用 PR 提供方自带标签；title=从标题方括号解析（如 [pr-status/need-fix]）。Bitbucket 源无原生标签，必须选「从标题解析」",
+      },
       { key: "reviewLabel", label: "Review 触发标签", kind: "text", hint: "命中即触发 review" },
       { key: "checkLabel", label: "Check 触发标签", kind: "text", hint: "命中即触发 check 修复" },
     ],
@@ -159,17 +169,21 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
     id: "engine",
     title: "引擎",
     fields: [
-      // PR 来源 now selectable (818): github (gh) or Azure DevOps (az). engineKind stays
-      // single-arm read-only (widening tracked by #11).
+      // PR 来源 now selectable (818, 717): github (gh) / Azure DevOps (az) / Bitbucket
+      // Server (REST). engineKind stays single-arm read-only (widening tracked by #11).
       {
         key: "sourceKind",
         label: "PR 来源",
         kind: "select",
-        // Single-sourced from SOURCE_KINDS (818, F11) — type & options can't drift;
+        // Single-sourced from SOURCE_KINDS (818, F11; 717) — type & options can't drift;
         // Chinese display via optionLabels (ConfigField emits the raw wire value).
         options: SOURCE_KINDS,
-        optionLabels: { github: "GitHub (gh)", azure: "Azure DevOps (az)" },
-        hint: "github=gh CLI；azure=az CLI（需填下方 org/project）",
+        optionLabels: {
+          github: "GitHub (gh)",
+          azure: "Azure DevOps (az)",
+          bitbucket: "Bitbucket Server (REST)",
+        },
+        hint: "github=gh CLI；azure=az CLI（需填下方 org/project）；bitbucket=Bitbucket Server REST（需填下方 host/project/token）",
       },
       {
         key: "azureOrg",
@@ -186,6 +200,31 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         // 818 F14: only shown for an Azure source; hidden (but value preserved) for github.
         visibleWhen: (p) => p.sourceKind === "azure",
         hint: "(仅 Azure 源) Azure DevOps 项目名，如 gocell",
+      },
+      {
+        key: "bitbucketHost",
+        label: "Bitbucket Host",
+        kind: "text",
+        // 717: only shown for a Bitbucket source; hidden (value preserved) otherwise.
+        visibleWhen: (p) => p.sourceKind === "bitbucket",
+        hint: "(仅 Bitbucket 源) Server/DC 基址，如 https://bitbucket.mycompany.com",
+      },
+      {
+        key: "bitbucketProject",
+        label: "Bitbucket 项目 Key",
+        kind: "text",
+        // 717: only shown for a Bitbucket source; hidden (value preserved) otherwise.
+        visibleWhen: (p) => p.sourceKind === "bitbucket",
+        hint: "(仅 Bitbucket 源) 项目 key，如 GOCELL；个人仓库用 ~username",
+      },
+      {
+        key: "bitbucketToken",
+        label: "Bitbucket Token",
+        kind: "text",
+        secret: true,
+        // 717: only shown for a Bitbucket source; hidden (value preserved) otherwise.
+        visibleWhen: (p) => p.sourceKind === "bitbucket",
+        hint: "(仅 Bitbucket 源) HTTP access token（PAT），Bearer 认证",
       },
       {
         key: "engineKind",
@@ -262,22 +301,34 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
 export type StepId = "repo" | "repoRoot" | "skill" | "source" | "autoReview" | "done";
 export const STEPS: StepId[] = ["repo", "repoRoot", "skill", "source", "autoReview", "done"];
 
-// Which per-project fields each onboarding step renders (818 F2/F3). Single-sourced here
-// (not in OnboardingWizard.vue) so the wizard and these unit tests agree. Keys are
-// `keyof Project`; the FieldDefs come from PROJECT_GROUPS. `source` lists the azure
-// fields too — they only render under an azure source via the FieldDef `visibleWhen`
-// predicate (see visibleStepFields). `autoReview` surfaces `updateMode` so the user
-// picks the data-update mode during onboarding instead of silently defaulting (F3).
+// Which per-project fields each onboarding step renders (818 F2/F3; 717). Single-sourced
+// here (not in OnboardingWizard.vue) so the wizard and these unit tests agree. Keys are
+// `keyof Project`; the FieldDefs come from PROJECT_GROUPS. `source` lists the azure +
+// bitbucket connection fields too — they only render under their matching source via the
+// FieldDef `visibleWhen` predicate (see visibleStepFields). `autoReview` surfaces
+// `updateMode` (so the user picks the data-update mode during onboarding instead of
+// silently defaulting, F3) and `labelSource` (717, alongside the trigger labels).
 export const STEP_FIELDS: Record<StepId, ProjectFieldKey[]> = {
   repo: ["repo"],
   repoRoot: ["repoRoot"],
   skill: ["skillRelPath"],
-  source: ["sourceKind", "azureOrg", "azureProject"],
+  // source lists the azure + bitbucket connection fields too (717) — they only render
+  // under their matching source via the FieldDef `visibleWhen` predicate (see
+  // visibleStepFields).
+  source: [
+    "sourceKind",
+    "azureOrg",
+    "azureProject",
+    "bitbucketHost",
+    "bitbucketProject",
+    "bitbucketToken",
+  ],
   autoReview: [
     "updateMode",
     "autoReview",
     "pollIntervalSecs",
     "prCooldownSeconds",
+    "labelSource",
     "reviewLabel",
     "checkLabel",
     "authors",
@@ -313,6 +364,9 @@ export function visibleStepFields(
 
 // owner/name with no whitespace and exactly one slash.
 const REPO_RE = /^[^/\s]+\/[^/\s]+$/;
+// A bare repo slug: one or more non-slash, non-whitespace chars (azure/bitbucket repos,
+// where the org/project key lives in its own field). Mirrors the backend bare-slug check.
+const BARE_SLUG_RE = /^[^/\s]+$/;
 // Windows drive-letter absolute path (C:\ or C:/).
 const WIN_ABS_RE = /^[A-Za-z]:[\\/]/;
 
@@ -323,14 +377,21 @@ const WIN_ABS_RE = /^[A-Za-z]:[\\/]/;
 export function validateStep(step: StepId, draft: Project): string | null {
   switch (step) {
     case "repo":
-      // Repo shape depends on the source (818, F4): a github repo is `owner/name`; an
-      // Azure repo is a BARE name (org/project come from the dedicated azureOrg/
-      // azureProject fields), so a slash there is wrong. Mirrors the backend validate().
+      // Repo shape depends on the source (818 F4; 717): a github repo is `owner/name`; an
+      // Azure repo and a Bitbucket repo are BARE slugs (no slash, no whitespace — the
+      // org/project key come from the dedicated azureOrg/azureProject or bitbucketProject
+      // fields), so a slash there is wrong. Mirrors the backend validate().
       if (draft.sourceKind === "azure") {
         if (draft.repo.trim() === "") return "请填写 Azure 仓库名";
         return draft.repo.includes("/")
           ? "Azure 仓库为裸名称，不含 /（org/project 在下方单独填写）"
           : null;
+      }
+      if (draft.sourceKind === "bitbucket") {
+        if (draft.repo.trim() === "") return "请填写 Bitbucket 仓库名";
+        return BARE_SLUG_RE.test(draft.repo)
+          ? null
+          : "Bitbucket 仓库为裸名称，不含 / 或空白（项目 key 在下方单独填写）";
       }
       return REPO_RE.test(draft.repo) ? null : "仓库需为 owner/name 格式";
     case "repoRoot":
@@ -350,6 +411,17 @@ export function validateStep(step: StepId, draft: Project): string | null {
         if (draft.azureOrg.trim() === "") return "azureOrg 不能为空（azure 源需填组织名）";
         if (draft.azureProject.trim() === "")
           return "azureProject 不能为空（azure 源需填项目名）";
+      }
+      // Bitbucket source (717): the backend `validate_project` requires a non-empty
+      // host/project/token. Gate them here too; errors start with the field token so
+      // errorToStep routes a backend rejection back to this step.
+      if (draft.sourceKind === "bitbucket") {
+        if (draft.bitbucketHost.trim() === "")
+          return "bitbucketHost 不能为空（bitbucket 源需填 Server/DC 基址）";
+        if (draft.bitbucketProject.trim() === "")
+          return "bitbucketProject 不能为空（bitbucket 源需填项目 key）";
+        if (draft.bitbucketToken.trim() === "")
+          return "bitbucketToken 不能为空（bitbucket 源需填 access token）";
       }
       return null;
     case "autoReview": {
@@ -408,17 +480,35 @@ export function validateStep(step: StepId, draft: Project): string | null {
 // gates them — so a backend rejection routes BACK to the source step (not null). Both
 // tokens are azure-prefixed and collide with no other field token, so order among them
 // is moot. Locked by an "azure messages → source" case in fields.test.ts.
+//
+// Bitbucket fields (`bitbucketHost` / `bitbucketProject` / `bitbucketToken`, 717): same
+// story — owned by the source step (visibleWhen sourceKind==="bitbucket", gated by
+// validateStep) so backend rejections route to source. `labelSource` (717) routes to the
+// autoReview step where its labels-group siblings (reviewLabel/checkLabel) live. Locked by
+// fields.test.ts.
 export function errorToStep(message: string): StepId | null {
   const m = message.trimStart();
   if (m.startsWith("skill")) return "skill";
   if (m.startsWith("repoRoot")) return "repoRoot";
   if (m.startsWith("repo")) return "repo";
   if (m.startsWith("azureOrg") || m.startsWith("azureProject")) return "source";
+  // Bitbucket connection fields (717) are owned by the source step alongside the azure
+  // fields (rendered via visibleWhen sourceKind==="bitbucket", gated by validateStep).
+  if (
+    m.startsWith("bitbucketHost") ||
+    m.startsWith("bitbucketProject") ||
+    m.startsWith("bitbucketToken")
+  ) {
+    return "source";
+  }
   if (
     m.startsWith("pollIntervalSecs") ||
     m.startsWith("prCooldownSeconds") ||
     m.startsWith("reviewLabel") ||
-    m.startsWith("checkLabel")
+    m.startsWith("checkLabel") ||
+    // labelSource (717) lives in the labels group, surfaced in the autoReview step
+    // alongside reviewLabel/checkLabel (see STEP_FIELDS).
+    m.startsWith("labelSource")
   ) {
     return "autoReview";
   }

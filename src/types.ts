@@ -33,13 +33,27 @@ export interface TrackedPrView extends PullRequestView {
 }
 
 // Discriminator unions mirroring the `SourceKind` / `EngineKind` Rust enums.
-// SourceKind widens to Azure DevOps (818), single-sourced as an `as const` array
-// (mirrors UPDATE_MODES / WEBHOOK_TUNNEL_MODES): the type is DERIVED from the array,
-// and fields.ts feeds the same array into the sourceKind select `options`, so the type
-// and the UI's option list can never drift. 未来 #11: add "gitlab" / "bitbucket" here.
-export const SOURCE_KINDS = ["github", "azure"] as const;
+// SourceKind widens to Azure DevOps (818) and Bitbucket Server/Data Center (717),
+// single-sourced as an `as const` array (mirrors UPDATE_MODES / WEBHOOK_TUNNEL_MODES):
+// the type is DERIVED from the array, and fields.ts feeds the same array into the
+// sourceKind select `options`, so the type and the UI's option list can never drift.
+// 未来 #11: add "gitlab" here.
+export const SOURCE_KINDS = ["github", "azure", "bitbucket"] as const;
 export type SourceKind = (typeof SOURCE_KINDS)[number];
 export type EngineKind = "codex"; // 未来 #11: | "claude"
+
+// Where a project's trigger labels come from (717) — mirrors the Rust `LabelSource`
+// enum's camelCase wire values. native = use the provider's own PR labels; title =
+// parse `[..]` bracket tags out of the PR title (e.g. `[pr-status/need-fix]`).
+// Default is "native". Bitbucket Server has no native PR labels, so a Bitbucket source
+// MUST use "title".
+//
+// Single-sourced as an `as const` array (mirrors SOURCE_KINDS / UPDATE_MODES): the type
+// is DERIVED from the array, and fields.ts feeds the same array into the labelSource
+// select `options`, so the type and the UI's option list can never drift. (The Rust↔TS
+// mirror remains a separate, golden-locked contract.)
+export const LABEL_SOURCES = ["native", "title"] as const;
+export type LabelSource = (typeof LABEL_SOURCES)[number];
 
 // Per-project data-update mode (818) — mirrors the Rust `UpdateMode` enum's
 // camelCase wire values. webhook-only = default, no CLI polling (push-driven);
@@ -74,6 +88,29 @@ export function pollingEnabledForMode(mode: UpdateMode): boolean {
       return false;
     default:
       return assertNever(mode);
+  }
+}
+
+// Whether a project source/mode combination needs the GitHub CLI to keep automatic
+// PR discovery running. Azure uses `az` and Bitbucket uses reqwest/HTTP (Bearer PAT),
+// and webhook-only/manual do not run the periodic CLI loop, so a failed `gh auth status`
+// must not pause or warn those sources/modes. Exhaustive over SourceKind via the
+// `assertNever` default (Medium — `assertNever`穷尽): a new source forces a decision here.
+export function githubCliRequiredForSource(
+  sourceKind: SourceKind,
+  mode: UpdateMode,
+): boolean {
+  switch (sourceKind) {
+    case "github":
+      return pollingEnabledForMode(mode);
+    case "azure":
+      return false;
+    case "bitbucket":
+      // Bitbucket Server/DC talks REST over reqwest with a Bearer PAT, never the gh CLI,
+      // so a failed `gh auth status` must not gate it.
+      return false;
+    default:
+      return assertNever(sourceKind);
   }
 }
 
