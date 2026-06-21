@@ -11,7 +11,7 @@
 // controls (name/enabled) and the list operations; ProjectCard stays a pure field form.
 // The add/delete draft mutations (and the activeProjectId invariant they keep) live in
 // projectOps.ts so they're unit-testable without a component harness.
-import { ref, watch } from "vue";
+import { nextTick, ref, watch } from "vue";
 import type { AppConfig } from "./types";
 import type { ProjectFieldKey } from "./fields";
 import { addProjectToDraft, deleteProjectFromDraft } from "./projectOps";
@@ -94,6 +94,10 @@ const pendingDeleteId = ref<string | null>(null);
 function requestDelete(id: string) {
   // Clicking 删除 only arms the confirm — the destructive splice waits for confirmDelete.
   pendingDeleteId.value = id;
+  // Move focus onto 确认 so keyboard users land on the confirmation (the 删除 button they
+  // activated just unmounted). Keyed by project id like the chevron/card ids in this file;
+  // only the pending row renders a confirm strip, so the lookup is unambiguous.
+  nextTick(() => document.getElementById(`confirm-yes-${id}`)?.focus());
 }
 function cancelDelete() {
   pendingDeleteId.value = null;
@@ -107,6 +111,15 @@ function confirmDelete(id: string) {
   }
   pendingDeleteId.value = null;
 }
+// Disarm a pending confirm when the draft re-hydrates: SettingsView REPLACES the projects
+// array reference on save/load, while our own delete splices in place (same reference) and
+// won't trip this — so it only clears a strip left armed across a save, never our own edit.
+watch(
+  () => props.draft.projects,
+  () => {
+    pendingDeleteId.value = null;
+  },
+);
 
 function setActive(id: string) {
   props.draft.activeProjectId = id;
@@ -170,10 +183,12 @@ function setActive(id: string) {
           <template v-if="pendingDeleteId === p.id">
             <span class="confirm-text">确认删除？</span>
             <button
+              :id="`confirm-yes-${p.id}`"
               type="button"
               class="confirm-yes"
               :aria-label="`确认删除项目 ${p.name || '新项目'}`"
               @click="confirmDelete(p.id)"
+              @keydown.escape="cancelDelete"
             >
               确认
             </button>
@@ -182,6 +197,7 @@ function setActive(id: string) {
               class="confirm-no"
               :aria-label="`取消删除项目 ${p.name || '新项目'}`"
               @click="cancelDelete"
+              @keydown.escape="cancelDelete"
             >
               取消
             </button>
@@ -335,6 +351,9 @@ function setActive(id: string) {
   background: var(--color-danger);
   border: 1px solid var(--color-danger);
 }
+.confirm-yes:hover {
+  opacity: 0.85;
+}
 .confirm-no {
   color: var(--color-text);
   background: none;
@@ -342,6 +361,11 @@ function setActive(id: string) {
 }
 .confirm-no:hover {
   background: var(--color-surface-hover);
+}
+.confirm-yes:focus-visible,
+.confirm-no:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 .empty-state {
   display: flex;
