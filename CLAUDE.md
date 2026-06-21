@@ -16,3 +16,5 @@ PR 监控 + AI review 桌面应用（Tauri v2 + Vue 3 + Rust）。仓库：githu
 - **issues**（`.claude/skills/issues/SKILL.md`）— GitHub Issue / PR / 评论 / label 的 gh 命令编排单源。
 
 技能正文是单源，本文件只索引、不复制。codex 侧入口见 `.codex/skills/`（薄引用，正文仍指向 `.claude/skills/`）。
+
+**项目已迁移至az(azure devops),相关技能描述待更新**
