@@ -56,10 +56,11 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
     }
 
     async fn stop(&self, session: &SessionId) -> AppResult<()> {
-        // The manager owns the in-flight session's kill handle. Aborting the pump task
-        // drops the `kill_on_drop` child (SIGKILLs `claude -p`). A `false` (unknown id)
-        // is benign here — the command-level `stop_review` is the funnel that decides
-        // claude-vs-codex; an engine-level stop against a gone session is a no-op.
+        // The manager owns the in-flight session's cancel channel. `stop` SIGNALS cancel;
+        // the pump observes it, kills its child, and emits the terminal event via `finish`
+        // (so the session is never left `Running`). A `false` (unknown id) is benign here —
+        // the command-level `stop_review` is the funnel that decides claude-vs-codex; an
+        // engine-level stop against a gone session is a no-op.
         self.claude.stop(session);
         Ok(())
     }
@@ -72,8 +73,9 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
 ///
 /// Flow (mirrors codex's two-phase start, adapted to a subprocess): reserve → spawn →
 /// read the `system/init` line for the session id → `promote_reservation` (Starting) →
-/// register the pump's abort handle → `set_running` → spawn the pump (which owns the
-/// child + reader and continues parsing to the terminal `result`). Any failure before
+/// `set_running` → register the cancel channel (BEFORE the pump spawns, so a `stop` can
+/// never race ahead of registration) → spawn the pump (which owns the child + reader +
+/// cancel receiver and parses to the terminal `result` or a cancel). Any failure before
 /// the pump spawns releases the reservation (RAII guard) and returns `Err`.
 #[allow(clippy::too_many_arguments)]
 async fn start_review<R: tauri::Runtime>(
@@ -158,24 +160,28 @@ async fn start_review<R: tauri::Runtime>(
         },
     );
 
-    // Spawn the pump (owns the child + reader + parser). Register its abort handle so
-    // `stop`/`shutdown` can kill this review: aborting the pump drops the `kill_on_drop`
-    // child. Capture `project_id` as owned so every event is stamped without a per-event
-    // registry lookup (#35), mirroring the codex pump. Use `tokio::spawn` (not
-    // `tauri::async_runtime::spawn`) because the manager keys on a tokio `AbortHandle`,
-    // which tauri's `JoinHandle` does not expose — both run on the same tokio runtime
-    // tauri drives, so the task lands identically.
-    let pump_handle = tokio::spawn(pump(
+    // Register the cancel channel BEFORE spawning the pump (closes the
+    // register-after-spawn race: a `stop` landing between spawn and register would
+    // otherwise miss the review). `stop` SIGNALS this channel; the pump observes it and
+    // converges through `finish` (emitting the terminal event), rather than being aborted
+    // mid-flight and leaving the session stuck `Running`.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    claude.register(session_id.clone(), cancel_tx);
+
+    // Spawn the pump (owns the child + reader + parser + cancel receiver). Capture
+    // `project_id` as owned so every event is stamped without a per-event registry lookup
+    // (#35), mirroring the codex pump.
+    tauri::async_runtime::spawn(pump(
         reader,
         child,
         parser,
+        cancel_rx,
         project_id.to_string(),
         session_id.clone(),
         app.clone(),
         registry.clone(),
         claude.clone(),
     ));
-    claude.register(session_id.clone(), pump_handle.abort_handle());
 
     Ok(StartReviewOutcome::Started(session_id))
 }
@@ -204,16 +210,18 @@ async fn read_session_id<Rd: AsyncBufRead + Unpin>(
     }
 }
 
-/// The pump: owns the child + stdout reader, parses each remaining `stream-json` line to
-/// a [`ReviewEvent`], emits it to the frontend, and persists deltas best-effort — until
-/// the terminal `result` (or EOF / stream error). On a terminal it sets the session's
-/// terminal status, deregisters from the manager, and reaps the child. Mirrors the codex
+/// The pump: owns the child + stdout reader + cancel receiver, parses each remaining
+/// `stream-json` line to a [`ReviewEvent`], emits it to the frontend, and persists deltas
+/// best-effort — until the terminal `result`, EOF, a stream error, OR a cancel signal.
+/// EVERY exit path runs [`finish`] (so the session always gets a terminal `TurnCompleted`
+/// and a terminal status — never left `Running`), then reaps the child. Mirrors the codex
 /// pump's emit-then-persist ordering and best-effort persistence.
 #[allow(clippy::too_many_arguments)]
 async fn pump<R: tauri::Runtime>(
     mut reader: BufReader<tokio::process::ChildStdout>,
     mut child: Child,
     mut parser: ParserState,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
     project_id: String,
     session_id: String,
     app: tauri::AppHandle<R>,
@@ -221,94 +229,122 @@ async fn pump<R: tauri::Runtime>(
     claude: ClaudeManager,
 ) {
     loop {
-        let line = match process::read_line(&mut reader).await {
-            Ok(Some(line)) => line,
-            // EOF before a terminal `result`: the child closed stdout without a result
-            // (killed, crashed, or finished abnormally). End the session as Failed.
-            Ok(None) => {
+        tokio::select! {
+            // A cancel was signalled (`Ok`) by `stop`/`shutdown`, or the sender was
+            // dropped (`Err`) — either way, end the review. SIGKILL the child promptly
+            // (the trailing `wait()` below reaps it), then `finish` as a clean stop:
+            // `Done` is terminal (so dedup releases) while the wire status shows
+            // "interrupted" (a user stop, mirroring codex's interrupted turn).
+            changed = cancel.changed() => {
+                let _ = changed;
+                let _ = child.start_kill();
                 finish(
                     &registry,
                     &claude,
                     &app,
                     &project_id,
                     &session_id,
-                    SessionStatus::Failed,
-                    Some("claude 进程结束但未返回结果".to_string()),
+                    SessionStatus::Done,
+                    "interrupted",
+                    None,
                 );
                 break;
             }
-            Err(e) => {
-                finish(
-                    &registry,
-                    &claude,
-                    &app,
-                    &project_id,
-                    &session_id,
-                    SessionStatus::Failed,
-                    Some(format!("读取 claude 输出失败: {e}")),
-                );
-                break;
-            }
-        };
-
-        let Some(parsed) = process::parse_line(&line, &mut parser, &session_id) else {
-            continue;
-        };
-        match parsed {
-            // A second init (shouldn't happen post-start) carries no UI content → skip.
-            ParsedEvent::SessionStarted { .. } => continue,
-            ParsedEvent::MessageDelta { item_id, text } => {
-                emit_and_persist(
-                    &app,
-                    &project_id,
-                    &session_id,
-                    &item_id,
-                    HistoryItemKind::Message,
-                    text,
-                );
-            }
-            ParsedEvent::ReasoningDelta { item_id, text } => {
-                emit_and_persist(
-                    &app,
-                    &project_id,
-                    &session_id,
-                    &item_id,
-                    HistoryItemKind::Reasoning,
-                    text,
-                );
-            }
-            // Terminal: map to a `failed`/`completed` TurnCompleted (emitting an Error
-            // first when the run errored), set the terminal status, deregister, stop.
-            ParsedEvent::Result { is_error, message } => {
-                let error = is_error.then(|| {
-                    if message.is_empty() {
-                        "claude review 失败".to_string()
-                    } else {
-                        message
+            read = process::read_line(&mut reader) => {
+                let line = match read {
+                    Ok(Some(line)) => line,
+                    // EOF before a terminal `result`: the child closed stdout without a
+                    // result (killed, crashed, or finished abnormally). End as Failed.
+                    Ok(None) => {
+                        finish(
+                            &registry,
+                            &claude,
+                            &app,
+                            &project_id,
+                            &session_id,
+                            SessionStatus::Failed,
+                            "failed",
+                            Some("claude 进程结束但未返回结果".to_string()),
+                        );
+                        break;
                     }
-                });
-                let status = if is_error {
-                    SessionStatus::Failed
-                } else {
-                    SessionStatus::Done
+                    Err(e) => {
+                        finish(
+                            &registry,
+                            &claude,
+                            &app,
+                            &project_id,
+                            &session_id,
+                            SessionStatus::Failed,
+                            "failed",
+                            Some(format!("读取 claude 输出失败: {e}")),
+                        );
+                        break;
+                    }
                 };
-                finish(
-                    &registry,
-                    &claude,
-                    &app,
-                    &project_id,
-                    &session_id,
-                    status,
-                    error,
-                );
-                break;
+
+                let Some(parsed) = process::parse_line(&line, &mut parser, &session_id) else {
+                    continue;
+                };
+                match parsed {
+                    // A second init (shouldn't happen post-start) carries no UI content → skip.
+                    ParsedEvent::SessionStarted { .. } => continue,
+                    ParsedEvent::MessageDelta { item_id, text } => {
+                        emit_and_persist(
+                            &app,
+                            &project_id,
+                            &session_id,
+                            &item_id,
+                            HistoryItemKind::Message,
+                            text,
+                        );
+                    }
+                    ParsedEvent::ReasoningDelta { item_id, text } => {
+                        emit_and_persist(
+                            &app,
+                            &project_id,
+                            &session_id,
+                            &item_id,
+                            HistoryItemKind::Reasoning,
+                            text,
+                        );
+                    }
+                    // Terminal: map to a `completed`/`failed` TurnCompleted (emitting an
+                    // Error first when the run errored), set the terminal status, deregister.
+                    ParsedEvent::Result { is_error, message } => {
+                        let error = is_error.then(|| {
+                            if message.is_empty() {
+                                "claude review 失败".to_string()
+                            } else {
+                                message
+                            }
+                        });
+                        let (status, wire_status) = if is_error {
+                            (SessionStatus::Failed, "failed")
+                        } else {
+                            (SessionStatus::Done, "completed")
+                        };
+                        finish(
+                            &registry,
+                            &claude,
+                            &app,
+                            &project_id,
+                            &session_id,
+                            status,
+                            wire_status,
+                            error,
+                        );
+                        break;
+                    }
+                }
             }
         }
     }
 
-    // Reap the child so it can't linger as a zombie (it has already exited by the time
-    // we see EOF/result; on an abort path this future is dropped before reaching here and
-    // `kill_on_drop` reaps instead).
+    // Reap the child so it can't linger as a zombie: on the result/EOF paths it has
+    // already exited; on the cancel path we just `start_kill`ed it, so this `wait` reaps
+    // the SIGKILLed child. (`kill_on_drop(true)` is the backstop if this future is dropped
+    // before reaching here.)
     let _ = child.wait().await;
 }
 
@@ -344,13 +380,20 @@ fn emit_and_persist<R: tauri::Runtime>(
             "claude review history 持久化失败（{session_id}/{item_id}）：{}",
             e.message
         );
+        // Symmetry with codex (review F9): the first silent persist failure raises one
+        // app-level notice; later failures only log (the shared process-global guard).
+        crate::review::session::notify_persist_failure_once(app, project_id);
     }
 }
 
 /// Finish a session: set its terminal status in the registry + DB, emit an optional
-/// `Error` event (for a failed/aborted run) followed by the terminal `TurnCompleted`, and
-/// deregister from the manager so it no longer holds a handle. The terminal wire status
-/// mirrors codex's: `Done → "completed"`, `Failed → "failed"`.
+/// `Error` event (for a failed/interrupted run) followed by the terminal `TurnCompleted`,
+/// and deregister from the manager so it no longer holds the cancel sender. The terminal
+/// in-memory `status` and the `wire_status` string are passed EXPLICITLY (the caller knows
+/// the right pairing per exit path): result-success → `(Done, "completed")`, result-error
+/// / EOF / read-error → `(Failed, "failed")`, cancel → `(Done, "interrupted")` — `Done` so
+/// dedup releases, wire "interrupted" so the UI shows a user stop (mirrors codex).
+#[allow(clippy::too_many_arguments)]
 fn finish<R: tauri::Runtime>(
     registry: &SessionRegistry,
     claude: &ClaudeManager,
@@ -358,6 +401,7 @@ fn finish<R: tauri::Runtime>(
     project_id: &str,
     session_id: &str,
     status: SessionStatus,
+    wire_status: &str,
     error: Option<String>,
 ) {
     registry.set_status(session_id, status);
@@ -367,6 +411,9 @@ fn finish<R: tauri::Runtime>(
             "claude review session 状态持久化失败（{session_id}）：{}",
             e.message
         );
+        // Symmetry with codex: surface the FIRST persistence failure to the user once
+        // (the shared process-global one-time notice in `session.rs`, review F9).
+        crate::review::session::notify_persist_failure_once(app, project_id);
     }
     if let Some(message) = error {
         let _ = app.emit(
@@ -378,10 +425,6 @@ fn finish<R: tauri::Runtime>(
             },
         );
     }
-    let wire_status = match status {
-        SessionStatus::Done => "completed",
-        _ => "failed",
-    };
     let _ = app.emit(
         REVIEW_EVENT,
         &ReviewEvent::TurnCompleted {
@@ -390,7 +433,7 @@ fn finish<R: tauri::Runtime>(
             status: wire_status.to_string(),
         },
     );
-    // Deregister WITHOUT abort (the pump is finishing on its own); a later `stop` for
+    // Deregister WITHOUT signal (the pump is finishing on its own); a later `stop` for
     // this id then finds nothing and returns false (correct: nothing to stop).
     claude.deregister(session_id);
 }
@@ -405,6 +448,9 @@ fn persist_session<R: tauri::Runtime>(app: &tauri::AppHandle<R>, info: &SessionI
             "claude review session 持久化失败（{}）：{}",
             info.thread_id, e.message
         );
+        // Symmetry with codex (review F9): the first silent persist failure raises one
+        // app-level notice; later failures only log (the shared process-global guard).
+        crate::review::session::notify_persist_failure_once(app, &info.project_id);
     }
 }
 
@@ -454,6 +500,26 @@ mod tests {
         let id = read_session_id(&mut reader, &mut parser).await.expect("ok");
         assert_eq!(id, Some("sid-7".to_string()));
         // The next line (message_start) is still unread → the pump would consume it.
+        let next = process::read_line(&mut reader).await.unwrap();
+        assert!(next.unwrap().contains("message_start"));
+    }
+
+    /// A non-init line (e.g. `system/status`) BEFORE the init line is parsed-and-dropped;
+    /// `read_session_id` keeps reading to the init line, returns its session id, and leaves
+    /// the following line for the pump. (Defends the "init is not necessarily the very
+    /// first line" path.)
+    #[tokio::test]
+    async fn read_session_id_skips_leading_status_then_captures_init() {
+        let data = concat!(
+            "{\"type\":\"system\",\"subtype\":\"status\",\"message\":\"warming up\"}\n",
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"sid-9\"}\n",
+            "{\"type\":\"stream_event\",\"event\":{\"type\":\"message_start\",\"message\":{\"id\":\"m1\"}}}\n",
+        );
+        let mut reader = tokio::io::BufReader::new(data.as_bytes());
+        let mut parser = ParserState::default();
+        let id = read_session_id(&mut reader, &mut parser).await.expect("ok");
+        assert_eq!(id, Some("sid-9".to_string()));
+        // The init line was consumed; the NEXT unread line is the message_start (pump's).
         let next = process::read_line(&mut reader).await.unwrap();
         assert!(next.unwrap().contains("message_start"));
     }

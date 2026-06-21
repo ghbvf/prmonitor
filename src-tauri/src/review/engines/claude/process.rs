@@ -479,6 +479,22 @@ mod tests {
     }
 
     #[test]
+    fn result_without_is_error_field_defaults_to_non_error() {
+        // A `result` line missing `is_error` must NOT panic and must default to a
+        // non-error completion (`is_error:false`) — defends the `.unwrap_or(false)` so a
+        // shape change can't silently flip a success into a failure.
+        let mut st = ParserState::default();
+        let line = r#"{"type":"result","subtype":"success","result":"done"}"#;
+        assert_eq!(
+            parse(line, &mut st),
+            Some(ParsedEvent::Result {
+                is_error: false,
+                message: "done".to_string()
+            })
+        );
+    }
+
+    #[test]
     fn malformed_or_empty_lines_are_skipped() {
         let mut st = ParserState::default();
         assert_eq!(parse("", &mut st), None);
@@ -507,6 +523,37 @@ mod tests {
         assert_eq!(
             read_line(&mut reader).await.unwrap().as_deref(),
             Some("line two\n")
+        );
+        assert_eq!(read_line(&mut reader).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_line_truncates_over_long_line_then_continues_at_next() {
+        // A pathological over-cap line must be truncated at the cap (so it can't OOM): the
+        // first read yields exactly the capped chunk (no trailing newline — the cap is hit
+        // mid-line), and the line's remainder (through its terminating newline) is
+        // discarded so the NEXT read resumes cleanly at the following intact `"ok\n"` line.
+        // The over-long line IS newline-terminated here (a full logical line longer than
+        // the cap), followed by a separate short line.
+        let mut data = vec![b'x'; STDOUT_MAX_LINE + 16];
+        data.push(b'\n'); // terminates the over-long line
+        data.extend_from_slice(b"ok\n"); // a separate, intact following line
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+
+        let first = read_line(&mut reader).await.unwrap().expect("a chunk");
+        assert_eq!(
+            first.len(),
+            STDOUT_MAX_LINE,
+            "first read capped at the limit"
+        );
+        assert!(!first.ends_with('\n'), "the capped chunk has no newline");
+        assert!(first.bytes().all(|b| b == b'x'), "all the over-long filler");
+
+        // The remainder of the over-long line (its leftover filler + terminating newline)
+        // was discarded, so the next read returns the intact following line, not filler.
+        assert_eq!(
+            read_line(&mut reader).await.unwrap().as_deref(),
+            Some("ok\n")
         );
         assert_eq!(read_line(&mut reader).await.unwrap(), None);
     }

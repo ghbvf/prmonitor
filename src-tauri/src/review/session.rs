@@ -550,7 +550,15 @@ static PERSIST_FAILURE_NOTIFIED: AtomicBool = AtomicBool::new(false);
 /// [`ReviewEvent::DispatchError`] (the existing availability-banner channel, which already
 /// covers background write failures) so the user learns their history may not survive a
 /// restart. Subsequent failures only log, so a broken DB never spams a notice per delta.
-fn notify_persist_failure_once<R: tauri::Runtime>(app: &tauri::AppHandle<R>, project_id: &str) {
+///
+/// `pub(super)` so the claude engine (`engines::claude`) reuses the SAME one-time notice
+/// on its own persist failures (#718) — a single process-global notice across BOTH engines
+/// is correct (the static `PERSIST_FAILURE_NOTIFIED` is shared, not per-engine), so a
+/// broken DB still raises exactly one banner regardless of which engine hit it first.
+pub(super) fn notify_persist_failure_once<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_id: &str,
+) {
     if PERSIST_FAILURE_NOTIFIED.swap(true, Ordering::Relaxed) {
         return;
     }
