@@ -304,7 +304,7 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
             return;
         }
     };
-    let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
+    let skill_abs = review::commands::skill_abs_path(&project.repo_root, &project.skill_rel_path);
     let state = app.state::<AppState>();
     // The review slice owns "what counts as active"; the pr slice owns the ledger.
     // Both are scoped to this project (#35) so a PR number active in one project does
@@ -371,16 +371,6 @@ fn emit_dispatch_error<R: tauri::Runtime>(
             message,
         },
     );
-}
-
-/// Absolute path to the pr-review skill file codex attaches to a turn. `repo_root`
-/// is an absolute dir and `skill_rel_path` a relative path under it (both
-/// config-validated), so the join is absolute and infallible.
-fn skill_abs_path(repo_root: &str, skill_rel_path: &str) -> String {
-    std::path::Path::new(repo_root)
-        .join(skill_rel_path)
-        .to_string_lossy()
-        .into_owned()
 }
 
 #[cfg(test)]

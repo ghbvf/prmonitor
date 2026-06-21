@@ -217,7 +217,12 @@ pub fn get_pr_sessions<R: tauri::Runtime>(
 /// Resolve the absolute path to the pr-review skill file codex attaches to the
 /// turn. `repo_root` is an absolute dir and `skill_rel_path` a relative path under
 /// it (both config-validated), so the join is absolute and infallible.
-fn skill_abs_path(repo_root: &str, skill_rel_path: &str) -> String {
+///
+/// Single source for both codex callsites — the manual `start_review` here and the
+/// auto path's `run_auto_dispatch` in the composition root (`lib.rs`), which calls
+/// `review::commands::skill_abs_path` rather than keeping its own copy. The review
+/// slice owns the codex skill-path concept, so it lives here (`pub(crate)`).
+pub(crate) fn skill_abs_path(repo_root: &str, skill_rel_path: &str) -> String {
     std::path::Path::new(repo_root)
         .join(skill_rel_path)
         .to_string_lossy()
