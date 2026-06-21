@@ -1,9 +1,9 @@
 <script setup lang="ts">
-// Per-project editor card (#35): renders ONE project's editable fields. Reuses the
-// fields.ts PROJECT_GROUPS field defs through the shared ConfigField, plus a `name`
-// text input for the project's display name (an identity field PROJECT_GROUPS omits).
-// Stateless about persistence — it emits granular `update`/`delete` to the parent
-// (ProjectsManager), which owns the AppConfig draft and the save flow.
+// Per-project editor card (#35): renders ONE project's editable fields via the shared
+// ConfigField over fields.ts PROJECT_GROUPS. Identity controls (name/enabled) and the
+// delete/active actions live in the ProjectsManager row header, not here — this stays a
+// pure field form. Stateless about persistence — it emits granular `update` to the
+// parent (ProjectsManager), which owns the AppConfig draft and the save flow.
 //
 // Each card owns its OWN `authorsInput` csv buffer (a local ref keyed off this
 // card's project) so N cards never share author state: the parent renders one card
@@ -22,7 +22,6 @@ const emit = defineEmits<{
   // A single per-project field changed (key + new value). `authors` arrives already
   // normalized to string[]; every other key carries its native value type.
   update: [key: ProjectFieldKey, value: string | number | boolean | string[]];
-  delete: [];
   edit: [];
 }>();
 
@@ -99,28 +98,10 @@ function authorsArray(): string[] {
     .map((a) => a.trim())
     .filter((a) => a.length > 0);
 }
-
-function onName(e: Event) {
-  emit("update", "name", (e.target as HTMLInputElement).value);
-  emit("edit");
-}
 </script>
 
 <template>
   <article class="project-card">
-    <header class="card-head">
-      <label class="name-field">
-        <span class="label">项目名称</span>
-        <input
-          type="text"
-          :value="project.name"
-          placeholder="新项目"
-          @input="onName"
-        />
-      </label>
-      <button type="button" class="delete" @click="emit('delete')">删除</button>
-    </header>
-
     <!-- Risk banner (818, F8): only pull-only / hybrid run the periodic CLI poll loop,
          which can trip account/API rate-limit risk control. Warn for those two only —
          manual (on-demand one-shot) and webhook-only don't poll periodically. -->
@@ -151,51 +132,6 @@ function onName(e: Event) {
   background: var(--color-surface);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
-}
-.card-head {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: var(--space-4);
-  padding-bottom: var(--space-4);
-  border-bottom: 1px solid var(--color-border);
-}
-.name-field {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  flex: 1;
-}
-.name-field .label {
-  font-size: var(--font-size-sm);
-  color: var(--color-text);
-}
-.name-field input {
-  padding: var(--space-2) var(--space-3);
-  font: inherit;
-  font-size: var(--font-size-md);
-  color: var(--color-text);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-sm);
-}
-.name-field input:focus {
-  outline: none;
-  border-color: var(--color-accent);
-}
-.delete {
-  flex-shrink: 0;
-  padding: var(--space-2) var(--space-4);
-  font: inherit;
-  font-size: var(--font-size-sm);
-  color: var(--color-danger);
-  background: none;
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
-.delete:hover {
-  background: var(--color-surface-hover);
 }
 .risk-banner {
   margin: 0;
