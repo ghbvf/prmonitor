@@ -51,6 +51,11 @@ export interface Project {
   bitbucketProject: string;
   bitbucketToken: string;
   engineKind: EngineKind;
+  // Hand-typed model overrides per engine — only meaningful for the matching engineKind
+  // (codexModel when "codex", claudeModel when "claude"); empty = the engine's own default.
+  // Mirror the Rust `Project.codexModel`/`claudeModel` wire fields (golden-locked on Rust).
+  codexModel: string;
+  claudeModel: string;
   autoReview: boolean;
 }
 

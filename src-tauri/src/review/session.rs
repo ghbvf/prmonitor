@@ -345,6 +345,7 @@ pub async fn start_review<R: tauri::Runtime>(
     repo: &str,
     repo_root: &str,
     skill_abs_path: &str,
+    codex_model: &str,
     project_id: &str,
     pr_number: u64,
     kind: &str,
@@ -425,6 +426,10 @@ pub async fn start_review<R: tauri::Runtime>(
                 writable_roots: vec![repo_root.to_string()],
             },
             cwd: Some(repo_root.to_string()),
+            // Per-turn model override: blank config → None → codex's configured default.
+            // Trim to match the emptiness check — a padded name must not reach the RPC
+            // with surrounding whitespace (e.g. `{"model":"  gpt-5.1-codex  "}`).
+            model: (!codex_model.trim().is_empty()).then(|| codex_model.trim().to_string()),
         },
     )
     .await

@@ -189,22 +189,43 @@ pub struct ClaudeProcess {
     pub stderr: ChildStderr,
 }
 
+/// Build the `claude -p` argument vector. Pure (no spawn) so the `--model` insertion is
+/// unit-testable — `spawn_claude` itself needs a real child and can't be. A non-blank
+/// `model` appends `--model <name>`; a blank one (config left empty) is omitted, so claude
+/// falls back to its own default model.
+fn claude_cli_args(model: &str, prompt: &str) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_string(),
+        prompt.to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--include-partial-messages".to_string(),
+        "--permission-mode".to_string(),
+        "bypassPermissions".to_string(),
+    ];
+    if !model.trim().is_empty() {
+        args.push("--model".to_string());
+        // Trim to match the emptiness check above: a padded name like "  sonnet "
+        // must reach claude as "sonnet", not with surrounding spaces (an unknown model).
+        args.push(model.trim().to_string());
+    }
+    args
+}
+
 /// Spawn `claude -p "<prompt>" --output-format stream-json --verbose
-/// --include-partial-messages --permission-mode bypassPermissions` in `repo_root`,
-/// with piped stdout/stderr and `kill_on_drop(true)`. Headless print mode is
-/// unattended (`bypassPermissions`), so a review never blocks on an approval prompt.
-pub fn spawn_claude(claude_bin: &str, repo_root: &str, prompt: &str) -> AppResult<ClaudeProcess> {
+/// --include-partial-messages --permission-mode bypassPermissions [--model <name>]` in
+/// `repo_root`, with piped stdout/stderr and `kill_on_drop(true)`. Headless print mode is
+/// unattended (`bypassPermissions`), so a review never blocks on an approval prompt. A
+/// blank `model` omits `--model` (claude CLI default).
+pub fn spawn_claude(
+    claude_bin: &str,
+    repo_root: &str,
+    model: &str,
+    prompt: &str,
+) -> AppResult<ClaudeProcess> {
     let mut cmd = Command::new(claude_bin);
-    cmd.arg("-p")
-        .arg(prompt)
-        .args([
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--permission-mode",
-            "bypassPermissions",
-        ])
+    cmd.args(claude_cli_args(model, prompt))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -334,6 +355,41 @@ mod tests {
                 assert!(!p.contains(pat.as_str()), "{p:?} must not contain {pat:?}");
             }
         }
+    }
+
+    // ── CLI arg builder (the --model injection seam — NO subprocess) ─────────────
+    #[test]
+    fn claude_cli_args_omit_model_when_blank() {
+        for blank in ["", "   "] {
+            let args = claude_cli_args(blank, "/pr-review 7");
+            assert!(
+                !args.iter().any(|a| a == "--model"),
+                "blank model must not add --model: {args:?}"
+            );
+            // The base flags are still present.
+            assert_eq!(args[0], "-p");
+            assert_eq!(args[1], "/pr-review 7");
+            assert!(args.iter().any(|a| a == "bypassPermissions"));
+        }
+    }
+
+    #[test]
+    fn claude_cli_args_append_model_when_set() {
+        let args = claude_cli_args("claude-opus-4-1", "/pr-review 7");
+        // `--model <name>` is appended as the trailing pair.
+        let n = args.len();
+        assert_eq!(args[n - 2], "--model");
+        assert_eq!(args[n - 1], "claude-opus-4-1");
+    }
+
+    #[test]
+    fn claude_cli_args_trim_padded_model_name() {
+        // A padded name reaches claude trimmed (matches the emptiness check) — not with
+        // surrounding spaces that the CLI would treat as an unknown model.
+        let args = claude_cli_args("  claude-opus-4-1  ", "/pr-review 7");
+        let n = args.len();
+        assert_eq!(args[n - 2], "--model");
+        assert_eq!(args[n - 1], "claude-opus-4-1");
     }
 
     // ── pure stream-json line parser (the testable seam — NO subprocess) ─────────

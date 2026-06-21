@@ -117,6 +117,7 @@ pub async fn start_review<R: tauri::Runtime>(
                 repo: &project.repo,
                 repo_root: &project.repo_root,
                 skill_abs_path: &skill_abs,
+                codex_model: &project.codex_model,
             };
             engine.start(pr_number, &kind).await?
         }
@@ -129,6 +130,7 @@ pub async fn start_review<R: tauri::Runtime>(
                 project_id: &project.id,
                 repo: &project.repo,
                 repo_root: &project.repo_root,
+                claude_model: &project.claude_model,
             };
             engine.start(pr_number, &kind).await?
         }
@@ -173,6 +175,8 @@ pub async fn stop_review<R: tauri::Runtime>(
         repo: "",
         repo_root: "",
         skill_abs_path: "",
+        // `stop` resolves purely by session id; model is irrelevant on the interrupt path.
+        codex_model: "",
     };
     engine.stop(&session_id).await
 }

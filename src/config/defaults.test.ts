@@ -30,6 +30,8 @@ function githubProject(): Project {
     bitbucketProject: "",
     bitbucketToken: "",
     engineKind: "codex",
+    codexModel: "",
+    claudeModel: "",
     autoReview: false,
   };
 }

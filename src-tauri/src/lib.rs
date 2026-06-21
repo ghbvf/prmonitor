@@ -337,6 +337,7 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
                 repo: &project.repo,
                 repo_root: &project.repo_root,
                 skill_abs_path: &skill_abs,
+                codex_model: &project.codex_model,
             };
             dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
         }
@@ -349,6 +350,7 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
                 project_id: &project_id,
                 repo: &project.repo,
                 repo_root: &project.repo_root,
+                claude_model: &project.claude_model,
             };
             dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
         }
