@@ -104,7 +104,12 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         key: "skillRelPath",
         label: "Skill 路径",
         kind: "text",
-        hint: "相对仓库根的 skill 路径，如 .codex/skills/pr-review/SKILL.md",
+        hint: "相对仓库根的 skill 路径，如 .codex/skills/pr-review/SKILL.md（仅 codex 引擎）",
+        // codex-only (#718): the claude engine discovers `.claude/skills/` from the
+        // repo cwd, so it needs no configured skill path. Hidden for a claude project,
+        // mirroring the source-conditional azure/bitbucket fields below; the backend
+        // `validate_project` likewise skips skillRelPath unless engineKind === codex.
+        visibleWhen: (p) => p.engineKind === "codex",
       },
     ],
   },
@@ -413,6 +418,10 @@ export function validateStep(step: StepId, draft: Project): string | null {
     case "repoRoot":
       return draft.repoRoot.trim() !== "" ? null : "请填写本地 clone 的绝对路径";
     case "skill": {
+      // codex-only (#718): the claude engine discovers `.claude/skills/` from cwd, so
+      // skillRelPath is unused — skip the gate (the field is hidden via visibleWhen and
+      // the backend `validate_project` skips it for a non-codex engine).
+      if (draft.engineKind !== "codex") return null;
       const p = draft.skillRelPath;
       if (p.trim() === "") return "请填写 skill 相对路径";
       if (p.startsWith("/") || WIN_ABS_RE.test(p)) return "skill 必须是相对路径";

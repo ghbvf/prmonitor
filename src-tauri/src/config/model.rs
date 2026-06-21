@@ -364,31 +364,40 @@ pub fn validate_project(project: &Project) -> AppResult<()> {
         )));
     }
 
-    let skill_rel = Path::new(&project.skill_rel_path);
-    if skill_rel.is_absolute() {
-        return Err(AppError::new(format!(
-            "skillRelPath 必须是相对路径: {}",
-            project.skill_rel_path
-        )));
-    }
-    let skill = root.join(skill_rel);
-    if !skill.is_file() {
-        return Err(AppError::new(format!(
-            "skill 路径不存在: {}",
-            skill.display()
-        )));
-    }
-    let root_canon = root
-        .canonicalize()
-        .map_err(|e| AppError::new(format!("repoRoot 规范化失败: {e}")))?;
-    let skill_canon = skill
-        .canonicalize()
-        .map_err(|e| AppError::new(format!("skill 路径规范化失败: {e}")))?;
-    if !skill_canon.starts_with(&root_canon) {
-        return Err(AppError::new(format!(
-            "skillRelPath 不能逃逸 repoRoot: {}",
-            project.skill_rel_path
-        )));
+    // `skillRelPath` is the codex pr-review skill path (`.codex/skills/...`) the codex
+    // engine attaches to a turn. The claude engine (#718) discovers `.claude/skills/`
+    // from the turn cwd instead, so the field is unused for it — validate it ONLY for
+    // a codex project, mirroring how source-specific fields (azure org/project,
+    // bitbucket host/project/token) are validated only under their matching source.
+    // A claude project keeps whatever value sits in `skill_rel_path` (the field is
+    // hidden in the UI via `engineKind==="codex"` visibleWhen) but it is never used.
+    if project.engine_kind == EngineKind::Codex {
+        let skill_rel = Path::new(&project.skill_rel_path);
+        if skill_rel.is_absolute() {
+            return Err(AppError::new(format!(
+                "skillRelPath 必须是相对路径: {}",
+                project.skill_rel_path
+            )));
+        }
+        let skill = root.join(skill_rel);
+        if !skill.is_file() {
+            return Err(AppError::new(format!(
+                "skill 路径不存在: {}",
+                skill.display()
+            )));
+        }
+        let root_canon = root
+            .canonicalize()
+            .map_err(|e| AppError::new(format!("repoRoot 规范化失败: {e}")))?;
+        let skill_canon = skill
+            .canonicalize()
+            .map_err(|e| AppError::new(format!("skill 路径规范化失败: {e}")))?;
+        if !skill_canon.starts_with(&root_canon) {
+            return Err(AppError::new(format!(
+                "skillRelPath 不能逃逸 repoRoot: {}",
+                project.skill_rel_path
+            )));
+        }
     }
 
     if project.poll_interval_secs == 0 {
@@ -924,6 +933,26 @@ mod tests {
         assert!(validate(&with_project(Project {
             repo_root: format!("{}/src", env!("CARGO_MANIFEST_DIR")),
             skill_rel_path: "../Cargo.toml".to_string(),
+            ..valid_project()
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn validate_skips_skill_path_for_claude_engine() {
+        // #718: the claude engine discovers `.claude/skills/` from the turn cwd, so
+        // `skillRelPath` is unused for it — `validate_project` must NOT reject a claude
+        // project for a missing/bad skill path. The SAME bad path under codex still
+        // rejects, proving the gate is engine-conditional, not a blanket skip.
+        assert!(validate(&with_project(Project {
+            skill_rel_path: "definitely_missing.md".to_string(),
+            engine_kind: EngineKind::Claude,
+            ..valid_project()
+        }))
+        .is_ok());
+        assert!(validate(&with_project(Project {
+            skill_rel_path: "definitely_missing.md".to_string(),
+            engine_kind: EngineKind::Codex,
             ..valid_project()
         }))
         .is_err());

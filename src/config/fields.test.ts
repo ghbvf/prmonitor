@@ -160,9 +160,10 @@ describe("PROJECT_GROUPS", () => {
     expect(f?.optionLabels?.title).toBeTruthy();
   });
 
-  it("only the azure + bitbucket source fields carry a visibleWhen predicate", () => {
+  it("only the azure + bitbucket source fields and the codex-only skill path carry a visibleWhen predicate", () => {
     // sourceKind, repo, updateMode, labelSource, etc. must NOT be conditionally hidden —
-    // only the per-source connection fields carry a predicate.
+    // only the per-source connection fields (gated on sourceKind) and skillRelPath
+    // (gated on engineKind === codex, #718) carry a predicate.
     const conditional = PROJECT_GROUPS.flatMap((g) => g.fields)
       .filter((f) => f.visibleWhen)
       .map((f) => f.key)
@@ -173,6 +174,7 @@ describe("PROJECT_GROUPS", () => {
       "bitbucketHost",
       "bitbucketProject",
       "bitbucketToken",
+      "skillRelPath",
     ]);
   });
 });
@@ -304,6 +306,32 @@ describe("validateStep — skill", () => {
     expect(
       validateStep("skill", { ...validProject(), skillRelPath: "/etc/x" }),
     ).toBeTruthy();
+  });
+  it("skips the gate for a non-codex engine (#718)", () => {
+    // claude discovers `.claude/skills/` from cwd → skillRelPath is unused, so an empty
+    // path must NOT block (the field is also hidden via visibleWhen; backend skips it too).
+    expect(
+      validateStep("skill", {
+        ...validProject(),
+        engineKind: "claude",
+        skillRelPath: "",
+      }),
+    ).toBeNull();
+  });
+});
+
+describe("skillRelPath field is codex-only (#718)", () => {
+  it("is hidden for a claude project, shown for codex", () => {
+    const field = PROJECT_GROUPS.flatMap((g) => g.fields).find(
+      (f) => f.key === "skillRelPath",
+    );
+    expect(field?.visibleWhen).toBeDefined();
+    expect(field?.visibleWhen?.({ ...validProject(), engineKind: "codex" })).toBe(
+      true,
+    );
+    expect(
+      field?.visibleWhen?.({ ...validProject(), engineKind: "claude" }),
+    ).toBe(false);
   });
 });
 
