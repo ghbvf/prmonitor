@@ -7,6 +7,7 @@
 // composition root (App.vue) passes the selected PR down, keeping pr/review decoupled.
 import { computed, ref, watch } from "vue";
 import { getPrSessions } from "./api";
+import { formatStartedAt } from "./sessionTime";
 import { useReviewStore } from "./useReviewStore";
 import type { ReviewSession, SessionStatus } from "./types";
 
@@ -65,7 +66,7 @@ watch(sessions, () => loadDurable(false));
 // durable snapshot still appears. Newest-first by `createdAtEpoch` (#70, review F10):
 // `threadId` is a UUID with no time, so sorting on it scrambled the list — the epoch is
 // the real creation order, with `threadId` as a stable tiebreaker for equal stamps.
-const visibleSessions = computed<ReviewSession[]>(() => {
+const visibleSessions = computed(() => {
   if (props.prNumber == null) return [];
   const byThread = new Map<string, ReviewSession>();
   for (const s of durable.value) byThread.set(s.threadId, s);
@@ -74,10 +75,15 @@ const visibleSessions = computed<ReviewSession[]>(() => {
       byThread.set(s.threadId, s);
     }
   }
-  return [...byThread.values()].sort(
-    (a, b) =>
-      b.createdAtEpoch - a.createdAtEpoch || a.threadId.localeCompare(b.threadId),
-  );
+  // Precompute each row's start-time label so the template reads it once (avoids
+  // calling the formatter twice for the v-if + interpolation).
+  return [...byThread.values()]
+    .sort(
+      (a, b) =>
+        b.createdAtEpoch - a.createdAtEpoch ||
+        a.threadId.localeCompare(b.threadId),
+    )
+    .map((s) => ({ ...s, started: formatStartedAt(s.createdAtEpoch) }));
 });
 
 // Bilingual label for each session lifecycle status (mirrors ReviewPanel's
@@ -134,6 +140,7 @@ function statusLabel(status: SessionStatus): string {
         <span class="badge status" :class="`status-${s.status}`">
           {{ statusLabel(s.status) }}
         </span>
+        <span v-if="s.started" class="started">{{ s.started }}</span>
       </li>
     </ul>
   </section>
@@ -183,6 +190,16 @@ function statusLabel(status: SessionStatus): string {
 }
 .pr {
   font-size: var(--font-size-md);
+}
+/* Start time sits at the row end (margin-left:auto), muted so it stays secondary to
+   the PR # + status badges. nowrap + no-shrink keeps the stamp on one line in a
+   narrow column instead of wrapping/clipping. */
+.started {
+  margin-left: auto;
+  flex-shrink: 0;
+  white-space: nowrap;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
 }
 .badge {
   display: inline-block;
