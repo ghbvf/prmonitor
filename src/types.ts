@@ -152,6 +152,25 @@ export function manualPullAllowedForMode(mode: UpdateMode): boolean {
   }
 }
 
+// Whether a project's PERIODIC poll loop should be running: the project is enabled AND
+// its mode runs the loop. Mirrors the backend `periodic_polling` gate
+// (src-tauri/src/pr/scheduler.rs: `p.enabled && (PullOnly || Hybrid)`), so the frontend's
+// optimistic "running" flag matches what the scheduler actually starts — a disabled or
+// webhook-only/manual project gets no loop, so it must read as not-running rather than
+// the old blanket optimistic true (#150 F1b). `enabled` is the dimension the mode-only
+// `pollingEnabledForMode` gate omitted.
+export function periodicPollEligible(enabled: boolean, mode: UpdateMode): boolean {
+  return enabled && pollingEnabledForMode(mode);
+}
+
+// Whether the manual one-shot "立即拉取" should be offered: the project is enabled AND its
+// mode supports an on-demand pull. A disabled project is fully off (the backend skips it
+// in validation/scheduling/webhook routing), so the UI offers it no poll actions either
+// (#150 F1b) — `enabled` is the dimension the mode-only `manualPullAllowedForMode` omitted.
+export function manualPullEligible(enabled: boolean, mode: UpdateMode): boolean {
+  return enabled && manualPullAllowedForMode(mode);
+}
+
 // Every arm carries `projectId` (#35): events fan out per monitored project, so the
 // frontend routes each payload to the project it belongs to. Discriminant stays `kind`.
 export type ReviewEvent =

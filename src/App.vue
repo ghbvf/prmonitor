@@ -18,7 +18,7 @@ import { useReviewStore } from "./review/useReviewStore";
 import { reschedule, startPolling } from "./pr/api";
 import { useAppView } from "./useAppView";
 import { useProjects } from "./projects";
-import { githubCliRequiredForSource } from "./types";
+import { githubCliRequiredForSource, periodicPollEligible } from "./types";
 
 const version = ref("");
 // Gate view selection until the config load resolves, so a first-launch user never
@@ -108,13 +108,20 @@ async function onConfigSaved() {
   // switcher + active selection before reconciling the loops (#35).
   await configStore.load();
   if (configStore.config) useProjects().hydrate(configStore.config);
-  const ids = useProjects().projects.value.map((p) => p.id);
+  const projects = useProjects().projects.value;
+  const ids = projects.map((p) => p.id);
   const activeId = activeProjectId.value;
   try {
     // start_polling reconciles ALL enabled projects' loops (idempotent); recovers a
     // project whose loop was gated off at launch by a previously-invalid config.
     await startPolling();
-    for (const id of ids) prStore.polling[id] = true;
+    // Reflect the backend reconcile per project: a loop runs only for poll-eligible
+    // projects (enabled && pull/hybrid), so set the optimistic flag from eligibility
+    // instead of a blanket true — otherwise disabled/webhook-only/manual projects would
+    // show "监控中" in the nav until visited (#150 F1b).
+    for (const p of projects) {
+      prStore.polling[p.id] = periodicPollEligible(p.enabled, p.updateMode);
+    }
   } catch (e) {
     // start_polling rejects under an invalid config (finding F1). Keep the flags
     // honest and surface the error (finding F3) so a saved-but-not-running monitor is
@@ -141,11 +148,15 @@ async function onOnboardingDone() {
   // active selection reflect it before the monitor view mounts (#35).
   await configStore.load();
   if (configStore.config) useProjects().hydrate(configStore.config);
-  const ids = useProjects().projects.value.map((p) => p.id);
+  const projects = useProjects().projects.value;
+  const ids = projects.map((p) => p.id);
   const activeId = activeProjectId.value;
   try {
     await startPolling();
-    for (const id of ids) prStore.polling[id] = true;
+    // Eligibility-based optimistic flag (#150 F1b), as in onConfigSaved.
+    for (const p of projects) {
+      prStore.polling[p.id] = periodicPollEligible(p.enabled, p.updateMode);
+    }
   } catch (e) {
     // Keep the polling flags honest (PollControls won't claim the loop is running)
     // AND surface the error (finding F3) so the user sees why the monitor didn't

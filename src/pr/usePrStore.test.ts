@@ -265,6 +265,36 @@ describe("usePrStore toggle()", () => {
     expect(api.pollStatus).toHaveBeenCalledWith("p1");
   });
 
+  it("paused -> resume calls startPolling and sets polling per eligibility (#150 F1b)", async () => {
+    // Mixed modes/enabled: only an enabled pull/hybrid project is poll-eligible, so the
+    // resume branch must NOT blanket-true webhook-only / disabled projects.
+    useProjects().hydrate({
+      projects: [
+        { ...project("p1"), updateMode: "pull-only" }, // enabled + pull → eligible
+        { ...project("p2"), updateMode: "webhook-only" }, // mode-ineligible
+        { ...project("p3"), updateMode: "hybrid", enabled: false }, // disabled
+      ],
+      activeProjectId: "p1",
+      webhookEnabled: false,
+      webhookPort: 0,
+      webhookSecret: "",
+      cloudflaredBin: "",
+      webhookTunnelMode: "quick",
+      webhookTunnelCommand: "",
+      webhookPublicUrl: "",
+    });
+    const store = usePrStore();
+    // Start the active project paused so toggle() takes the resume branch.
+    store.polling.p1 = false;
+
+    await store.toggle();
+
+    expect(api.startPolling).toHaveBeenCalledOnce();
+    expect(store.pollingFor("p1")).toBe(true); // enabled + pull-only
+    expect(store.pollingFor("p2")).toBe(false); // webhook-only → no loop
+    expect(store.pollingFor("p3")).toBe(false); // disabled → no loop
+  });
+
   it("on a rejected command sets error and does NOT flip polling", async () => {
     vi.mocked(api.stopPolling).mockRejectedValueOnce({ message: "stop failed" });
     const store = usePrStore();

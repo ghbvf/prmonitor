@@ -6,27 +6,33 @@
 import { computed, onMounted, onUnmounted } from "vue";
 import { usePrStore } from "./usePrStore";
 import { useProjects } from "../projects";
-import { manualPullAllowedForMode, pollingEnabledForMode } from "../types";
+import { manualPullEligible, periodicPollEligible } from "../types";
 
 const store = usePrStore();
 const { activeProjectId, projects } = useProjects();
 
-// The active project's update mode (818), or null when no project is resolved.
-const activeMode = computed(
-  () => projects.value.find((x) => x.id === activeProjectId.value)?.updateMode ?? null,
+// The active project (818), or null when none is resolved. Both capability gates below
+// read its `enabled` + `updateMode`.
+const activeProject = computed(
+  () => projects.value.find((x) => x.id === activeProjectId.value) ?? null,
 );
 
-// Two DISTINCT capability gates (818, F7):
-// - manualPullEnabled gates "立即拉取" (one-shot poll-now): allowed for everything except
+// Two DISTINCT capability gates (818, F7), each now also gated on the project's `enabled`
+// (#150 F1b — a disabled project is fully off, so the UI offers it no poll actions):
+// - manualPullEnabled gates "立即拉取" (one-shot poll-now): enabled AND any mode except
 //   webhook-only — manual mode runs a backend one-shot `discover_once` on demand.
-// - periodicPollEnabled gates "暂停/恢复轮询" (the periodic loop): only pull-only / hybrid.
-// Both helpers are exhaustive over UpdateMode (assertNever), so a new mode can't slip
-// past either gate. Default to false when no project is resolved.
+// - periodicPollEnabled gates "暂停/恢复轮询" (the periodic loop): enabled AND pull/hybrid.
+// The underlying mode helpers stay exhaustive over UpdateMode (assertNever), so a new
+// mode can't slip past either gate. Default to false when no project is resolved.
 const manualPullEnabled = computed(() =>
-  activeMode.value ? manualPullAllowedForMode(activeMode.value) : false,
+  activeProject.value
+    ? manualPullEligible(activeProject.value.enabled, activeProject.value.updateMode)
+    : false,
 );
 const periodicPollEnabled = computed(() =>
-  activeMode.value ? pollingEnabledForMode(activeMode.value) : false,
+  activeProject.value
+    ? periodicPollEligible(activeProject.value.enabled, activeProject.value.updateMode)
+    : false,
 );
 
 // Backstop poll-status refresh cadence: a fully-idle/failing loop emits no events, so
@@ -137,7 +143,10 @@ onUnmounted(() => {
         {{ store.pollingActive ? "暂停轮询" : "恢复轮询" }}
       </button>
     </div>
-    <p v-if="!periodicPollEnabled" class="muted">
+    <p v-if="activeProject && !activeProject.enabled" class="muted">
+      当前项目已禁用（未启动监控）。在「设置 → 项目」勾选「启动」以开启。
+    </p>
+    <p v-else-if="!periodicPollEnabled" class="muted">
       当前项目未启用 CLI 定时轮询（仅 pull/hybrid 模式有定时拉取）。
     </p>
     <p class="muted">上次拉取：{{ lastPulledText }}</p>
