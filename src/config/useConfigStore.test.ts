@@ -39,6 +39,8 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
       bitbucketProject: "",
       bitbucketToken: "",
       engineKind: "codex",
+      codexModel: "",
+      claudeModel: "",
       autoReview: false,
     },
   ],

@@ -29,6 +29,10 @@ pub struct CodexEngine<'a, R: tauri::Runtime> {
     pub repo_root: &'a str,
     /// Absolute path to the pr-review skill file attached to the turn.
     pub skill_abs_path: &'a str,
+    /// Hand-typed codex model name (empty = codex's configured default). Set as the
+    /// per-turn `model` override on `turn/start` (the app-server is shared, so model
+    /// selection can't be a spawn flag).
+    pub codex_model: &'a str,
 }
 
 impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
@@ -41,6 +45,7 @@ impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
             self.repo,
             self.repo_root,
             self.skill_abs_path,
+            self.codex_model,
             self.project_id,
             pr_number,
             kind,

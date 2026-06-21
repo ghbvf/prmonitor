@@ -248,6 +248,24 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         optionLabels: { codex: "Codex", claude: "Claude (claude -p)" },
         hint: "codex=codex app-server；claude=claude -p（Claude Code headless，复用 claude CLI 登录）",
       },
+      {
+        key: "claudeModel",
+        label: "Claude 模型",
+        kind: "text",
+        hint: "claude -p 的 --model，如 claude-opus-4-1 / sonnet；留空=claude CLI 默认（仅 claude 引擎）",
+        // claude-only: mirrors skillRelPath's codex-only visibility. Hidden (value
+        // preserved) for a codex project; empty = the claude CLI's default model.
+        visibleWhen: (p) => p.engineKind === "claude",
+      },
+      {
+        key: "codexModel",
+        label: "Codex 模型",
+        kind: "text",
+        hint: "codex turn 的 model 覆盖，如 gpt-5.1-codex；留空=codex 默认（仅 codex 引擎）",
+        // codex-only: the app-server is shared, so model rides the per-turn RPC. Hidden
+        // (value preserved) for a claude project; empty = codex's configured default.
+        visibleWhen: (p) => p.engineKind === "codex",
+      },
     ],
   },
 ];

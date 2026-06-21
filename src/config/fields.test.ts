@@ -48,6 +48,8 @@ function validProject(): Project {
     bitbucketProject: "",
     bitbucketToken: "",
     engineKind: "codex",
+    codexModel: "",
+    claudeModel: "",
     autoReview: false,
   };
 }
@@ -160,10 +162,11 @@ describe("PROJECT_GROUPS", () => {
     expect(f?.optionLabels?.title).toBeTruthy();
   });
 
-  it("only the azure + bitbucket source fields and the codex-only skill path carry a visibleWhen predicate", () => {
+  it("only the azure + bitbucket source fields and the per-engine skill/model fields carry a visibleWhen predicate", () => {
     // sourceKind, repo, updateMode, labelSource, etc. must NOT be conditionally hidden —
-    // only the per-source connection fields (gated on sourceKind) and skillRelPath
-    // (gated on engineKind === codex, #718) carry a predicate.
+    // only the per-source connection fields (gated on sourceKind), skillRelPath +
+    // codexModel (gated on engineKind === codex, #718), and claudeModel (gated on
+    // engineKind === claude) carry a predicate.
     const conditional = PROJECT_GROUPS.flatMap((g) => g.fields)
       .filter((f) => f.visibleWhen)
       .map((f) => f.key)
@@ -174,6 +177,8 @@ describe("PROJECT_GROUPS", () => {
       "bitbucketHost",
       "bitbucketProject",
       "bitbucketToken",
+      "claudeModel",
+      "codexModel",
       "skillRelPath",
     ]);
   });

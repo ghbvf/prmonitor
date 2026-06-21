@@ -55,6 +55,13 @@ pub struct Project {
     /// Which review engine runs against a PR. #11 reservation: today only
     /// [`EngineKind::Codex`]; future variant gates Claude.
     pub engine_kind: EngineKind,
+    /// 手填的 codex 模型名（仅 [`EngineKind::Codex`] 用）。非空时作为 `turn/start` 的
+    /// `model` 覆盖（codex app-server 是单进程，模型只能 per-turn 选）；留空=codex 默认。
+    /// 自由文本不校验（模型列表多变）。
+    pub codex_model: String,
+    /// 手填的 claude 模型名（仅 [`EngineKind::Claude`] 用）。非空时作为 `claude -p` 的
+    /// `--model` 参数；留空=claude CLI 默认。自由文本不校验。
+    pub claude_model: String,
     /// 是否在发现 dispatchable PR 时自动派发 review（false=仅手动「开始 review」触发）。
     pub auto_review: bool,
     /// 本项目 PR 列表的更新模式（#818）。默认 [`UpdateMode::WebhookOnly`]：**启动不自动
@@ -99,6 +106,9 @@ impl Default for Project {
             pr_cooldown_seconds: 1800,
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
+            // 模型留空 = 各引擎用自身默认（不注入 --model / turn model）。
+            codex_model: String::new(),
+            claude_model: String::new(),
             // Boot defaults to manual review: scheduler polls/emits but does NOT
             // auto-dispatch codex at startup (avoids clashing with other review
             // processes). Flip-back guarded by `default_auto_review_is_off`.
@@ -644,6 +654,8 @@ mod tests {
             pr_cooldown_seconds: 1800,
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
+            codex_model: "gpt-5.1-codex".to_string(),
+            claude_model: "claude-opus-4-1".to_string(),
             auto_review: false,
             update_mode: UpdateMode::WebhookOnly,
             azure_org: "myorg".to_string(),
@@ -672,6 +684,9 @@ mod tests {
         assert_eq!(v["sourceKind"], "github");
         assert!(v.get("engineKind").is_some());
         assert_eq!(v["engineKind"], "codex");
+        // 手填模型字段 wire camelCase（Medium 载体）。
+        assert!(v.get("codexModel").is_some());
+        assert!(v.get("claudeModel").is_some());
         assert!(v.get("autoReview").is_some());
         // #818: the new data-source-mode fields.
         assert!(v.get("updateMode").is_some());
@@ -694,6 +709,8 @@ mod tests {
         assert!(v.get("pr_cooldown_seconds").is_none());
         assert!(v.get("source_kind").is_none());
         assert!(v.get("engine_kind").is_none());
+        assert!(v.get("codex_model").is_none());
+        assert!(v.get("claude_model").is_none());
         assert!(v.get("auto_review").is_none());
         // #818: snake_case forms of the new fields absent.
         assert!(v.get("update_mode").is_none());

@@ -38,6 +38,9 @@ pub struct ClaudeEngine<'a, R: tauri::Runtime> {
     pub repo: &'a str,
     /// Absolute local clone path `claude -p` runs in (the cwd; skills resolve from here).
     pub repo_root: &'a str,
+    /// Hand-typed claude model name (empty = claude CLI default). Passed as `--model`
+    /// to the `claude -p` subprocess when non-blank.
+    pub claude_model: &'a str,
 }
 
 impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
@@ -49,6 +52,7 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
             self.claude_bin,
             self.project_id,
             self.repo_root,
+            self.claude_model,
             pr_number,
             kind,
         )
@@ -85,6 +89,7 @@ async fn start_review<R: tauri::Runtime>(
     claude_bin: &str,
     project_id: &str,
     repo_root: &str,
+    claude_model: &str,
     pr_number: u64,
     kind: &str,
 ) -> AppResult<StartReviewOutcome> {
@@ -106,7 +111,7 @@ async fn start_review<R: tauri::Runtime>(
 
     // Spawn the one-shot child. `?` releases the reservation (guard Drop) on failure.
     let prompt = process::review_prompt(pr_number, kind);
-    let proc = process::spawn_claude(claude_bin, repo_root, &prompt)?;
+    let proc = process::spawn_claude(claude_bin, repo_root, claude_model, &prompt)?;
     let process::ClaudeProcess {
         child,
         stdout,

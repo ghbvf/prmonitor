@@ -39,6 +39,9 @@ export const NEW_PROJECT_DEFAULTS: Omit<Project, "id" | "name"> = {
   bitbucketProject: "",
   bitbucketToken: "",
   engineKind: "codex",
+  // Empty = each engine uses its own default model (no --model / turn model injected).
+  codexModel: "",
+  claudeModel: "",
   autoReview: false,
 };
 

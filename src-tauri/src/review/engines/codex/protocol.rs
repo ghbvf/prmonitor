@@ -102,6 +102,12 @@ pub struct TurnStartParams {
     pub sandbox_policy: SandboxPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Per-turn model override ("Override the model for this turn and subsequent
+    /// turns" in the codex app-server v2 schema). The app-server is a single shared
+    /// process, so model selection must ride the per-turn RPC, not a spawn flag.
+    /// `None` (config left blank) omits the key → codex uses its configured default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 /// One input item for `turn/start`. The pr-review turn sends a [`Self::Skill`]
@@ -482,12 +488,14 @@ mod tests {
                 writable_roots: vec!["/repo".to_string()],
             },
             cwd: Some("/repo".to_string()),
+            model: None,
         })
         .expect("TurnStartParams serializes");
 
         assert_eq!(v["threadId"], "th_1");
         assert_eq!(v["approvalPolicy"], "never");
         assert!(v.get("thread_id").is_none()); // snake_case absent.
+        assert!(v.get("model").is_none()); // None → key omitted (codex default).
 
         // Skill input item.
         assert_eq!(v["input"][0]["type"], "skill");
@@ -501,6 +509,25 @@ mod tests {
         assert_eq!(v["sandboxPolicy"]["type"], "workspaceWrite");
         assert_eq!(v["sandboxPolicy"]["networkAccess"], true);
         assert_eq!(v["sandboxPolicy"]["writableRoots"][0], "/repo");
+    }
+
+    #[test]
+    fn turn_start_params_serialize_model_override_when_set() {
+        let v = serde_json::to_value(TurnStartParams {
+            thread_id: "th_1".to_string(),
+            input: vec![],
+            approval_policy: "never".to_string(),
+            sandbox_policy: SandboxPolicy {
+                kind: "workspaceWrite".to_string(),
+                network_access: true,
+                writable_roots: vec![],
+            },
+            cwd: None,
+            model: Some("gpt-5.1-codex".to_string()),
+        })
+        .expect("TurnStartParams serializes");
+        // Some → key present with the configured model (the per-turn override).
+        assert_eq!(v["model"], "gpt-5.1-codex");
     }
 
     #[test]
