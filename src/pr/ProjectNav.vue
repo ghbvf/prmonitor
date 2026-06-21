@@ -21,9 +21,15 @@ const { projects, activeProjectId } = useProjects();
 // Status dot intent: an unseen-PR project warns; otherwise it tracks running (success)
 // vs paused (muted). has-new takes priority so the badge isn't lost behind paused.
 type DotIntent = "new" | "monitoring" | "paused";
-function dotIntent(id: string): DotIntent {
-  if (store.hasNewPr[id]) return "new";
-  return store.pollingFor(id) ? "monitoring" : "paused";
+function dotIntent(project: { id: string; enabled: boolean }): DotIntent {
+  if (store.hasNewPr[project.id]) return "new";
+  // A disabled project runs no poll loop AND gets no webhook routes — the backend skips
+  // it entirely (scheduler.rs `periodic_polling` and the webhook routing both gate on
+  // `enabled`), so it's never "监控中" regardless of the optimistic `pollingFor` flag
+  // (which defaults true and only reconciles to backend truth once the project is
+  // visited). enabled projects keep the existing running/paused semantics.
+  if (!project.enabled) return "paused";
+  return store.pollingFor(project.id) ? "monitoring" : "paused";
 }
 function dotTitle(intent: DotIntent): string {
   switch (intent) {
@@ -78,8 +84,8 @@ watch(activeProjectId, () => {
         >
           <span
             class="dot"
-            :class="dotIntent(project.id)"
-            :title="dotTitle(dotIntent(project.id))"
+            :class="dotIntent(project)"
+            :title="dotTitle(dotIntent(project))"
           ></span>
           <h2 class="name" :title="project.name">{{ project.name }}</h2>
           <span v-if="prCount(project.id) > 0" class="badge">

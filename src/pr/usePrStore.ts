@@ -23,6 +23,7 @@ import {
   stopPolling,
 } from "./api";
 import type { TrackedPrView } from "../types";
+import { periodicPollEligible } from "../types";
 import type { GhStatus, PollStatus } from "./types";
 import { useProjects } from "../projects";
 
@@ -235,7 +236,12 @@ export const usePrStore = defineStore("pr", {
           for (const id of ids) this.polling[id] = false;
         } else {
           await startPolling();
-          for (const id of ids) this.polling[id] = true;
+          // Reflect backend eligibility, not a blanket true: startPolling only runs loops
+          // for poll-eligible projects (enabled && pull/hybrid), so an ineligible project
+          // must stay not-running (#150 F1b).
+          for (const p of useProjects().projects.value) {
+            this.polling[p.id] = periodicPollEligible(p.enabled, p.updateMode);
+          }
         }
         // Reflect the start/stop in the active project's backend diagnostics (#62).
         void this.refreshPollStatus(activeId);
