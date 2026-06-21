@@ -7,7 +7,12 @@
 // keys) and GLOBAL_GROUPS (global webhook `AppConfig` keys).
 import { describe, expect, it } from "vitest";
 import type { AppConfig, Project } from "./types";
-import { UPDATE_MODES, pollingEnabledForMode, manualPullAllowedForMode } from "../types";
+import {
+  UPDATE_MODES,
+  githubCliRequiredForSource,
+  pollingEnabledForMode,
+  manualPullAllowedForMode,
+} from "../types";
 import {
   PROJECT_GROUPS,
   GLOBAL_GROUPS,
@@ -168,6 +173,22 @@ describe("pollingEnabledForMode (818)", () => {
     expect(pollingEnabledForMode("pull-only")).toBe(true);
     expect(pollingEnabledForMode("hybrid")).toBe(true);
     expect(pollingEnabledForMode("manual")).toBe(false);
+  });
+});
+
+describe("githubCliRequiredForSource (818)", () => {
+  it("requires gh only for GitHub modes that run the poll loop", () => {
+    expect(githubCliRequiredForSource("github", "webhook-only")).toBe(false);
+    expect(githubCliRequiredForSource("github", "pull-only")).toBe(true);
+    expect(githubCliRequiredForSource("github", "hybrid")).toBe(true);
+    expect(githubCliRequiredForSource("github", "manual")).toBe(false);
+  });
+
+  it("does not require gh for Azure or Bitbucket modes", () => {
+    for (const mode of UPDATE_MODES) {
+      expect(githubCliRequiredForSource("azure", mode)).toBe(false);
+      expect(githubCliRequiredForSource("bitbucket", mode)).toBe(false);
+    }
   });
 });
 

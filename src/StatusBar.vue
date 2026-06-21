@@ -3,21 +3,39 @@
 // `gh` CLI auth state (pr store) and codex availability (review store). Living at
 // the shell layer — not inside a slice — is what makes reading across both slices
 // legitimate, exactly as App.vue does its cross-slice wiring.
-import { onMounted } from "vue";
+import { computed, onMounted, watch } from "vue";
+import { useConfigStore } from "./config/useConfigStore";
+import { githubCliRequiredForSource } from "./types";
 import { usePrStore } from "./pr/usePrStore";
 import { useReviewStore } from "./review/useReviewStore";
 
 const store = usePrStore();
+const configStore = useConfigStore();
 // Destructure the codex ref so the template auto-unwraps it (the review store is
 // a plain factory object, not a Pinia store, so `review.codex` would stay a Ref).
 const { codex, refreshCodexStatus, startCodexServer, stopCodexServer } =
   useReviewStore();
+const ghRequired = computed(
+  () =>
+    configStore.config?.projects.some(
+      (p) =>
+        p.enabled &&
+        githubCliRequiredForSource(p.sourceKind, p.updateMode),
+    ) ?? false,
+);
 // Self-refresh codex status on mount so the StatusBar shows the real state even
 // when the user never opened ReviewPanel. Only refresh when still null to avoid
 // clobbering a fresher value from another source (e.g. ReviewPanel's own poll).
 onMounted(() => {
   if (codex.value == null) refreshCodexStatus();
 });
+watch(
+  ghRequired,
+  (required) => {
+    if (required) void store.refreshGhStatus();
+  },
+  { immediate: true },
+);
 </script>
 
 <template>
@@ -25,9 +43,24 @@ onMounted(() => {
     <span class="item">
       <span
         class="dot"
-        :class="store.gh?.authenticated ? 'ok' : 'warn'"
+        :class="
+          !ghRequired
+            ? 'idle'
+            : store.gh == null
+              ? 'idle'
+              : store.gh.authenticated
+                ? 'ok'
+                : 'warn'
+        "
       ></span>
-      <span class="text">gh — {{ store.gh?.message ?? "未知 / unknown" }}</span>
+      <span class="text">
+        gh —
+        {{
+          !ghRequired
+            ? "当前配置不需要"
+            : (store.gh?.message ?? "检查中… / checking")
+        }}
+      </span>
     </span>
 
     <span class="item">

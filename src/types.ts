@@ -91,6 +91,25 @@ export function pollingEnabledForMode(mode: UpdateMode): boolean {
   }
 }
 
+// Whether a project source/mode combination needs the GitHub CLI to keep automatic
+// PR discovery running. Azure uses `az`, Bitbucket uses its REST API, and
+// webhook-only/manual do not run the periodic CLI loop, so a failed `gh auth
+// status` must not pause or warn those modes.
+export function githubCliRequiredForSource(
+  sourceKind: SourceKind,
+  mode: UpdateMode,
+): boolean {
+  switch (sourceKind) {
+    case "github":
+      return pollingEnabledForMode(mode);
+    case "azure":
+    case "bitbucket":
+      return false;
+    default:
+      return assertNever(sourceKind);
+  }
+}
+
 // Whether a mode supports the manual one-shot "立即拉取" (poll-now) trigger (818, F7).
 // This is a DIFFERENT capability from the periodic poll loop (pollingEnabledForMode):
 // the backend `poll_now` Manual branch runs a one-shot `discover_once`, so manual mode
