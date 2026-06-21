@@ -403,15 +403,23 @@ describe("validateStep — autoReview (717 bitbucket gates)", () => {
 });
 
 describe("STEPS ordering", () => {
-  it("is the wizard sequence repo→repoRoot→skill→source→autoReview→done", () => {
+  it("is the wizard sequence source→repo→repoRoot→skill→autoReview→done (717 F8)", () => {
+    // `source` comes BEFORE `repo` so the source is chosen before validateStep("repo")
+    // branches the repo-shape check on draft.sourceKind — otherwise a Bitbucket/Azure
+    // bare slug would be checked against the default github owner/name rule and the user
+    // could never advance past the repo step.
     expect(STEPS).toEqual([
+      "source",
       "repo",
       "repoRoot",
       "skill",
-      "source",
       "autoReview",
       "done",
     ]);
+  });
+
+  it("source step precedes the repo step (717 F8)", () => {
+    expect(STEPS.indexOf("source")).toBeLessThan(STEPS.indexOf("repo"));
   });
 });
 

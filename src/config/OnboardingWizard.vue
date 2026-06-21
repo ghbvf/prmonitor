@@ -10,7 +10,8 @@
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useConfigStore } from "./useConfigStore";
 import type { AppConfig, Project } from "./types";
-import { DEFAULT_PROJECT_ID, NEW_PROJECT_DEFAULTS } from "./defaults";
+import { DEFAULT_PROJECT_ID, NEW_PROJECT_DEFAULTS, applySourceKindDefaults } from "./defaults";
+import type { SourceKind } from "../types";
 import {
   STEPS,
   visibleStepFields,
@@ -102,6 +103,13 @@ function fieldValue(def: FieldDef): string | number | boolean | string[] {
 function setField(def: FieldDef, value: string | number | boolean | string[]) {
   if (def.key === "authors") {
     authorsInput.value = Array.isArray(value) ? value.join(", ") : String(value);
+    return;
+  }
+  // Changing the source auto-corrects the fields a Bitbucket source requires (717):
+  // labelSource→title + updateMode off webhook/hybrid, otherwise the backend rejects the
+  // github-shaped defaults. Shared helper with ProjectCard so the two surfaces can't drift.
+  if (def.key === "sourceKind") {
+    applySourceKindDefaults(draft, value as SourceKind);
     return;
   }
   // FieldDef.kind matches its Project value type, so the assignment is type-correct

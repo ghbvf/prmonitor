@@ -4,6 +4,7 @@
 // Mirrors the backend single-project defaults (AppConfig::default in
 // config/model.rs) so an added/onboarded project is immediately valid except for
 // the user-supplied repo/repoRoot.
+import type { SourceKind } from "../types";
 import type { Project } from "./types";
 
 // The fixed id the wizard gives the first project; mirrors the backend migration's
@@ -40,3 +41,25 @@ export const NEW_PROJECT_DEFAULTS: Omit<Project, "id" | "name"> = {
   engineKind: "codex",
   autoReview: false,
 };
+
+// Auto-correct the project fields a Bitbucket source REQUIRES (717), applied in-place
+// whenever the user changes `sourceKind`. The backend `validate_project` rejects a
+// Bitbucket source that keeps the github-shaped defaults (labelSource "native",
+// updateMode "webhook-only"/"hybrid"), so without this the user would have to manually
+// fix two more fields or hit a submit error. Shared by BOTH places sourceKind is edited
+// (OnboardingWizard.setField + ProjectCard.setField) so the two surfaces can't drift.
+//
+// Minimal by design: only when switching TO "bitbucket", only the two offending fields,
+// and only when updateMode is webhook-driven (no inbound webhook on Bitbucket). Switching
+// to a non-bitbucket source is a no-op — we never clobber a user's azure config etc.
+export function applySourceKindDefaults(draft: Project, sourceKind: SourceKind): void {
+  draft.sourceKind = sourceKind;
+  if (sourceKind !== "bitbucket") return;
+  // Bitbucket Server has no native PR labels → labels MUST come from the title.
+  draft.labelSource = "title";
+  // Bitbucket has no inbound webhook → webhook-driven modes are invalid; downgrade to
+  // pull-only. pull-only / manual are already fine, so leave them untouched.
+  if (draft.updateMode === "webhook-only" || draft.updateMode === "hybrid") {
+    draft.updateMode = "pull-only";
+  }
+}

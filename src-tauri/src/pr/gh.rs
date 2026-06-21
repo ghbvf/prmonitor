@@ -26,6 +26,12 @@ use super::source::PrSource;
 /// timed-out (or cancelled) future kills the child — see [`GithubCli::run_pr_list`].
 const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// `gh pr list` defaults to only 30 rows (AB#717 F6). The title-label path fetches ALL open
+/// PRs (no `--label` server filter) and classifies client-side, so the default would silently
+/// drop the 31st+ open PR; the native path's per-label list can also exceed 30. Pass an explicit
+/// high `--limit` so neither path truncates. (gh caps it server-side at the repo's PR count.)
+const GH_PR_LIST_LIMIT: u32 = 1000;
+
 /// `--json` field set requested from `gh pr list`. `router.py` only needs the
 /// gating fields; the prmonitor UI additionally needs `title,url,labels`.
 const PR_LIST_FIELDS: &str =
@@ -222,7 +228,10 @@ impl GithubCli {
         if let Some(label) = label {
             cmd.args(["--label", label]);
         }
-        cmd.args(["--json", PR_LIST_FIELDS]).kill_on_drop(true);
+        // F6: override gh's default 30-row cap so neither path silently truncates.
+        let limit_str = GH_PR_LIST_LIMIT.to_string();
+        cmd.args(["--limit", &limit_str, "--json", PR_LIST_FIELDS])
+            .kill_on_drop(true);
 
         let ctx = label
             .map(|l| format!("label={l}"))

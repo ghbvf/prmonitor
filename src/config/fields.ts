@@ -297,9 +297,16 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
 ];
 
 // Onboarding wizard step sequence. `done` is a confirm-only step; `source` is
-// confirm-only for github but gates the azure org/project for an azure source (F2).
+// confirm-only for github but gates the azure org/project for an azure source (F2) and
+// the bitbucket host/project/token for a bitbucket source (717).
+//
+// `source` comes FIRST (717 F8): `validateStep("repo")` branches the repo-shape check on
+// `draft.sourceKind` (github → owner/name; azure/bitbucket → bare slug). If `repo` were
+// gated before the user picked the source, a valid Bitbucket/Azure bare slug would be
+// checked against the default github `owner/name` rule and the user could never advance.
+// Picking the source first means the repo step always validates against the right shape.
 export type StepId = "repo" | "repoRoot" | "skill" | "source" | "autoReview" | "done";
-export const STEPS: StepId[] = ["repo", "repoRoot", "skill", "source", "autoReview", "done"];
+export const STEPS: StepId[] = ["source", "repo", "repoRoot", "skill", "autoReview", "done"];
 
 // Which per-project fields each onboarding step renders (818 F2/F3; 717). Single-sourced
 // here (not in OnboardingWizard.vue) so the wizard and these unit tests agree. Keys are

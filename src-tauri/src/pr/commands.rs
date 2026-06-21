@@ -220,15 +220,15 @@ pub(crate) async fn discover<R: tauri::Runtime>(
                     "Bitbucket 源未配置 bitbucketHost / bitbucketProject / bitbucketToken / repo（请在设置中补全）",
                 ));
             }
-            let source = BitbucketServer::new(
-                bitbucket_host,
-                bitbucket_project,
-                params.repo.clone(),
-                bitbucket_token,
-                params.review_label.clone(),
-                params.check_label.clone(),
+            let source = BitbucketServer::new(super::bitbucket::BitbucketSourceConfig {
+                host: bitbucket_host,
+                project: bitbucket_project,
+                repo: params.repo.clone(),
+                token: bitbucket_token,
+                review_label: params.review_label.clone(),
+                check_label: params.check_label.clone(),
                 label_source,
-            );
+            });
             let rows = source.discover_rows().await?;
             let mut views = Vec::with_capacity(rows.len());
             let mut dispatchable = Vec::new();

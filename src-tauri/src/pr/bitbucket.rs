@@ -33,6 +33,12 @@ const BB_PAGE_LIMIT: u32 = 100;
 const BB_MAX_PAGES: u32 = 50;
 const BB_MAX_PRS: usize = 5000;
 
+/// Max response body we will buffer + parse (the HTTP analogue of azure.rs's bounded
+/// stdout read). A hostile / misconfigured server could stream an enormous body; the
+/// bounded reader stops here (erroring) rather than allocating unboundedly. 10 MiB is far
+/// above any realistic page of PR JSON.
+const BB_MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
 /// Max chars of an error-response body surfaced in a non-2xx error. The token lives in
 /// the request header (never echoed in the body), so this can't leak it; the cap just
 /// bounds the message. Counts CHARS so the slice never splits a UTF-8 boundary.
@@ -153,6 +159,28 @@ fn err_body_tail(body: &str) -> String {
     format!("…{tail}")
 }
 
+/// Reads a response body to EOF but stops once more than `limit` bytes arrive, returning
+/// `Err` instead of buffering an unbounded body (F4). `content_length` is a fast pre-reject;
+/// the streamed chunk loop bounds chunked / lying-length responses too. The token lives in
+/// the request header, never the body, so this never risks leaking it.
+async fn read_body_capped(mut resp: reqwest::Response, limit: usize) -> AppResult<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n as usize > limit) {
+        return Err(AppError::new("Bitbucket 响应体超过大小上限"));
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| AppError::new(format!("读取 Bitbucket 响应失败: {}", e.without_url())))?
+    {
+        buf.extend_from_slice(&chunk);
+        if buf.len() > limit {
+            return Err(AppError::new("Bitbucket 响应体超过大小上限"));
+        }
+    }
+    Ok(buf)
+}
+
 /// Maps deserialized Bitbucket PRs into display-ready [`BbRow`]s — the pure core shared
 /// by [`parse_rows`] (single-page, for tests) and [`BitbucketServer::discover_rows`]
 /// (all paginated PRs).
@@ -184,23 +212,27 @@ fn map_rows(
             continue; // no trigger label: not a monitored PR
         };
 
-        let from_ref = pr.from_ref;
-        let to_ref = pr.to_ref;
-        let head_sha = from_ref
-            .as_ref()
-            .map(|r| r.latest_commit.clone())
-            .unwrap_or_default();
-        let head_ref = from_ref
-            .as_ref()
-            .map(|r| r.display_id.clone())
-            .unwrap_or_default();
+        // F2 (fail-closed): a real open PR always carries `fromRef` with a `latestCommit`
+        // (→ head_sha, the dispatch key) and `displayId` (→ head_ref). A missing/empty one
+        // is a malformed response — skip the PR rather than emitting an empty-head candidate
+        // that would corrupt the dispatch ledger key (`{number}@{headSha}:{kind}`).
+        let Some(from_ref) = pr.from_ref else {
+            continue;
+        };
+        let head_sha = from_ref.latest_commit;
+        let head_ref = from_ref.display_id;
+        if head_sha.is_empty() || head_ref.is_empty() {
+            continue;
+        }
         // Cross-repo (fork) PR ⇒ the source branch's repo differs from the target's.
-        // Poll data is authoritative, so a missing repo id defaults to same-repo (false).
-        let from_id = from_ref.and_then(|r| r.repository).and_then(|r| r.id);
-        let to_id = to_ref.and_then(|r| r.repository).and_then(|r| r.id);
+        // F3 (fail-closed): an UNKNOWN repo identity (either id absent) is treated as
+        // cross-repo, so the shared `should_skip` gate drops it — we never auto-dispatch a
+        // PR whose origin we can't attribute (mirrors the GitHub webhook fork fail-safe).
+        let from_id = from_ref.repository.and_then(|r| r.id);
+        let to_id = pr.to_ref.and_then(|r| r.repository).and_then(|r| r.id);
         let is_cross_repository = match (from_id, to_id) {
             (Some(a), Some(b)) => a != b,
-            _ => false,
+            _ => true,
         };
         // Author: prefer the username (`name`), fall back to `displayName`, then "".
         let author = pr
@@ -280,15 +312,28 @@ fn rows_into_candidates(rows: Vec<BbRow>) -> Vec<Candidate> {
         .collect()
 }
 
+/// Construction inputs for [`BitbucketServer`] (AB#717 F11) — a named struct so the call
+/// site reads field-by-field instead of a 7-positional-arg constructor where the same-typed
+/// `String`s could silently transpose.
+pub struct BitbucketSourceConfig {
+    /// Base host URL, e.g. `https://bitbucket.example.com` (validated `https://` by config).
+    pub host: String,
+    /// Project key (e.g. `GOCELL`, or `~username` for a personal repo).
+    pub project: String,
+    /// Repository slug.
+    pub repo: String,
+    /// HTTP access token (PAT) → `Authorization: Bearer <token>`.
+    pub token: String,
+    pub review_label: String,
+    pub check_label: String,
+    pub label_source: LabelSource,
+}
+
 /// The Bitbucket Server / Data Center PR source backed by the REST API (AB#717).
 pub struct BitbucketServer {
-    /// Base host URL, e.g. `https://bitbucket.example.com` (validated URL-safe by config).
     host: String,
-    /// Project key (e.g. `GOCELL`, or `~username` for a personal repo).
     project: String,
-    /// Repository slug.
     repo: String,
-    /// HTTP access token (PAT) → `Authorization: Bearer <token>`.
     token: String,
     review_label: String,
     check_label: String,
@@ -296,24 +341,15 @@ pub struct BitbucketServer {
 }
 
 impl BitbucketServer {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        host: String,
-        project: String,
-        repo: String,
-        token: String,
-        review_label: String,
-        check_label: String,
-        label_source: LabelSource,
-    ) -> Self {
+    pub fn new(cfg: BitbucketSourceConfig) -> Self {
         Self {
-            host,
-            project,
-            repo,
-            token,
-            review_label,
-            check_label,
-            label_source,
+            host: cfg.host,
+            project: cfg.project,
+            repo: cfg.repo,
+            token: cfg.token,
+            review_label: cfg.review_label,
+            check_label: cfg.check_label,
+            label_source: cfg.label_source,
         }
     }
 
@@ -352,20 +388,21 @@ impl BitbucketServer {
 
         let status = resp.status();
         if !status.is_success() {
-            // The body may carry an error description; the token is NOT in the body.
-            let body = resp.text().await.unwrap_or_default();
+            // The body may carry an error description; the token is NOT in the body. Read it
+            // bounded (best-effort — an empty body just yields a status-only message).
+            let code = status.as_u16();
+            let body = read_body_capped(resp, BB_MAX_BODY_BYTES)
+                .await
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(&body);
             return Err(AppError::new(format!(
-                "Bitbucket pull-requests 失败 (HTTP {}): {}",
-                status.as_u16(),
-                err_body_tail(&body)
+                "Bitbucket pull-requests 失败 (HTTP {code}): {}",
+                err_body_tail(&text)
             )));
         }
-        resp.json::<BbPage>().await.map_err(|e| {
-            AppError::new(format!(
-                "解析 Bitbucket pull-requests 响应失败: {}",
-                e.without_url()
-            ))
-        })
+        let body = read_body_capped(resp, BB_MAX_BODY_BYTES).await?;
+        serde_json::from_slice::<BbPage>(&body)
+            .map_err(|e| AppError::new(format!("解析 Bitbucket pull-requests 响应失败: {e}")))
     }
 
     /// Discovers all open PRs as display-ready [`BbRow`]s (conflict rows included, marked).
@@ -380,18 +417,28 @@ impl BitbucketServer {
             .build()
             .map_err(|e| AppError::new(format!("无法构造 Bitbucket HTTP 客户端: {e}")))?;
 
+        // F5 (fail-closed): the discovery list must be COMPLETE or an error — a partial list
+        // treated as authoritative silently drops PRs (missed dispatches / a PR that looks
+        // "gone"). So hitting either cap WITHOUT reaching `isLastPage`, or a missing pagination
+        // cursor, is an error — never a silent truncated `Ok`.
         let mut all: Vec<BbPr> = Vec::new();
         let mut start = 0u32;
+        let mut completed = false;
         for _ in 0..BB_MAX_PAGES {
             let page = self.fetch_page(&client, start).await?;
+            let is_last = page.is_last_page;
             all.extend(page.values);
-            if page.is_last_page || all.len() >= BB_MAX_PRS {
+            if is_last {
+                completed = true;
                 break;
             }
+            if all.len() >= BB_MAX_PRS {
+                return Err(AppError::new(format!(
+                    "Bitbucket 开放 PR 数超过上限 {BB_MAX_PRS}（无法完整发现，请收窄监控仓库）"
+                )));
+            }
             // Bitbucket guarantees `nextPageStart` whenever `isLastPage` is false; its absence
-            // means a truncated / malformed response. Erroring (rather than silently stopping)
-            // prevents a partial PR list being treated as authoritative (data-loss → missed
-            // dispatches).
+            // means a truncated / malformed response.
             match page.next_page_start {
                 Some(next) => start = next,
                 None => {
@@ -400,6 +447,11 @@ impl BitbucketServer {
                     ))
                 }
             }
+        }
+        if !completed {
+            return Err(AppError::new(format!(
+                "Bitbucket 分页页数超过上限 {BB_MAX_PAGES}（未达 isLastPage，无法完整发现）"
+            )));
         }
         Ok(map_rows(
             all,
@@ -502,7 +554,7 @@ mod tests {
     #[test]
     fn parse_rows_trims_trailing_slash_in_constructed_url() {
         let json = r#"{ "isLastPage": true, "values": [
-            { "id": 7, "title": "Fix [pr-status/needs-check-fix]", "fromRef": { "displayId": "fix" } }
+            { "id": 7, "title": "Fix [pr-status/needs-check-fix]", "fromRef": { "displayId": "fix", "latestCommit": "sha" } }
         ] }"#;
         let r = parse_rows(
             json,
@@ -559,6 +611,50 @@ mod tests {
         let r = rows(&json).expect("parses");
         assert_eq!(r.len(), 1);
         assert!(r[0].candidate.is_cross_repository);
+    }
+
+    #[test]
+    fn parse_rows_skips_pr_with_missing_or_empty_head_fields() {
+        // F2 (fail-closed): a trigger-tagged PR missing `fromRef`, or with an empty
+        // `latestCommit` / `displayId`, is malformed → skipped (no empty-head candidate that
+        // would corrupt the dispatch ledger key).
+        let no_from_ref = format!(
+            r#"{{ "isLastPage": true, "values": [
+                {{ "id": 1, "title": "X [{REVIEW}]" }}
+            ] }}"#
+        );
+        assert!(rows(&no_from_ref).expect("parses").is_empty());
+
+        let empty_commit = format!(
+            r#"{{ "isLastPage": true, "values": [
+                {{ "id": 2, "title": "X [{REVIEW}]", "fromRef": {{ "displayId": "b", "latestCommit": "" }} }}
+            ] }}"#
+        );
+        assert!(rows(&empty_commit).expect("parses").is_empty());
+
+        let empty_branch = format!(
+            r#"{{ "isLastPage": true, "values": [
+                {{ "id": 3, "title": "X [{REVIEW}]", "fromRef": {{ "displayId": "", "latestCommit": "sha" }} }}
+            ] }}"#
+        );
+        assert!(rows(&empty_branch).expect("parses").is_empty());
+    }
+
+    #[test]
+    fn parse_rows_unknown_repo_identity_is_cross_repo_fail_closed() {
+        // F3 (fail-closed): a trigger-tagged PR whose repo identity is unknown (no repository
+        // id on either ref) is treated as cross-repo, so the shared `should_skip` gate drops it.
+        let json = format!(
+            r#"{{ "isLastPage": true, "values": [
+                {{ "id": 4, "title": "X [{REVIEW}]", "fromRef": {{ "displayId": "b", "latestCommit": "sha" }} }}
+            ] }}"#
+        );
+        let r = rows(&json).expect("parses");
+        assert_eq!(r.len(), 1);
+        assert!(
+            r[0].candidate.is_cross_repository,
+            "unknown repo identity → fail-closed cross-repo"
+        );
     }
 
     #[test]

@@ -29,7 +29,10 @@ pub struct Project {
     /// Whether this project is polled/reviewed. Disabled projects are skipped by
     /// `validate` (their fields are not checked) and by the scheduler.
     pub enabled: bool,
-    /// Monitored repo, `owner/name`.
+    /// Monitored repo. Shape is source-dependent: `owner/name` for
+    /// [`SourceKind::Github`]; a bare repository name/slug for [`SourceKind::Azure`]
+    /// (org/project come from `azure_org`/`azure_project`) and [`SourceKind::Bitbucket`]
+    /// (project key comes from `bitbucket_project`). Validated per-source in `validate_project`.
     pub repo: String,
     /// Absolute path to the local clone codex runs the pr-review skill against.
     pub repo_root: String,
@@ -45,8 +48,9 @@ pub struct Project {
     pub skill_rel_path: String,
     /// Per-PR cooldown between dispatches of the same `(pr, kind)`.
     pub pr_cooldown_seconds: u64,
-    /// Which PR source backs the monitor. #11 reservation: today only
-    /// [`SourceKind::Github`]; future variants gate GitLab/Bitbucket.
+    /// Which PR source backs the monitor: [`SourceKind::Github`] (`gh` CLI),
+    /// [`SourceKind::Azure`] (`az` CLI), or [`SourceKind::Bitbucket`] (REST). #11
+    /// reservation: future variant gates GitLab.
     pub source_kind: SourceKind,
     /// Which review engine runs against a PR. #11 reservation: today only
     /// [`EngineKind::Codex`]; future variant gates Claude.
