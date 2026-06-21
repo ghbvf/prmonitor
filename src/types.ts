@@ -40,7 +40,12 @@ export interface TrackedPrView extends PullRequestView {
 // 未来 #11: add "gitlab" here.
 export const SOURCE_KINDS = ["github", "azure", "bitbucket"] as const;
 export type SourceKind = (typeof SOURCE_KINDS)[number];
-export type EngineKind = "codex"; // 未来 #11: | "claude"
+// #718: review engines, single-sourced as an `as const` array (mirrors SOURCE_KINDS /
+// UPDATE_MODES). The type is DERIVED from the array, and fields.ts feeds the same array
+// into the engineKind select `options`, so the type and the UI option list can't drift.
+// Wire values mirror the Rust `EngineKind` camelCase serde form (locked by a golden test).
+export const ENGINE_KINDS = ["codex", "claude"] as const;
+export type EngineKind = (typeof ENGINE_KINDS)[number];
 
 // Where a project's trigger labels come from (717) — mirrors the Rust `LabelSource`
 // enum's camelCase wire values. native = use the provider's own PR labels; title =

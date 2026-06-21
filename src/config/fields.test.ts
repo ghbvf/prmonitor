@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import type { AppConfig, Project } from "./types";
 import {
   UPDATE_MODES,
+  ENGINE_KINDS,
   githubCliRequiredForSource,
   githubCliStatusRelevantForSource,
   pollingEnabledForMode,
@@ -82,7 +83,7 @@ describe("PROJECT_GROUPS", () => {
     expect(f?.kind).toBe("checkbox");
   });
 
-  it("engine group: sourceKind selectable (818), engineKind read-only (#11)", () => {
+  it("engine group: sourceKind selectable (818), engineKind selectable (#718)", () => {
     const engine = PROJECT_GROUPS.find((g) => g.id === "engine");
     expect(engine).toBeDefined();
     const byKey = new Map(engine!.fields.map((f) => [f.key, f]));
@@ -91,8 +92,16 @@ describe("PROJECT_GROUPS", () => {
     expect(source?.kind).toBe("select");
     expect(source?.readonly).toBeFalsy();
     expect(source?.options).toEqual(["github", "azure", "bitbucket"]);
-    // engineKind stays single-arm read-only (widening tracked by #11).
-    expect(byKey.get("engineKind")?.readonly).toBe(true);
+    // engineKind is now an editable select single-sourced from ENGINE_KINDS (#718),
+    // no longer single-arm read-only. options === the as-const array (can't drift from
+    // the type), with a Chinese display label for each wire value.
+    const eng = byKey.get("engineKind");
+    expect(eng?.kind).toBe("select");
+    expect(eng?.readonly).toBeFalsy();
+    expect(eng?.options).toEqual(ENGINE_KINDS);
+    for (const k of ENGINE_KINDS) {
+      expect(eng?.optionLabels?.[k]).toBeTruthy();
+    }
     // Azure org/project fields live in the engine group too (818).
     expect(byKey.get("azureOrg")?.kind).toBe("text");
     expect(byKey.get("azureProject")?.kind).toBe("text");

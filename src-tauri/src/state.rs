@@ -13,6 +13,11 @@ pub struct AppState {
     /// The resident codex app-server connection (PR5). Lazily started, kept alive
     /// so reviews start fast; killed on app shutdown. Methods take `&self`.
     pub codex: crate::review::engines::codex::CodexManager,
+    /// In-flight `claude -p` reviews' kill handles, keyed by session id (#718). A
+    /// claude review is a one-shot subprocess (no resident process), so this holds
+    /// only each live review's pump-task abort handle for `stop`/shutdown. Methods
+    /// take `&self`.
+    pub claude: crate::review::engines::claude::ClaudeManager,
     /// Review sessions keyed by `threadId` (PR6). Shared (`Arc` inside) with each
     /// session's streaming pump task; methods take `&self`.
     pub sessions: crate::review::session::SessionRegistry,

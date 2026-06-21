@@ -9,7 +9,14 @@
 // `keyof AppConfig`). `FieldGroup`/`FieldDef` are generic over the key type so each
 // set is precisely typed and its coverage test can assert exactly that key set.
 import { WEBHOOK_TUNNEL_MODES, type AppConfig, type Project } from "./types";
-import { SOURCE_KINDS, LABEL_SOURCES, UPDATE_MODES, assertNever, type UpdateMode } from "../types";
+import {
+  SOURCE_KINDS,
+  ENGINE_KINDS,
+  LABEL_SOURCES,
+  UPDATE_MODES,
+  assertNever,
+  type UpdateMode,
+} from "../types";
 
 // A project field's key (per-project form/wizard) or a global AppConfig field's key
 // (the webhook group). Generic `FieldDef<K>` keeps each group set precisely typed.
@@ -170,7 +177,7 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
     title: "引擎",
     fields: [
       // PR 来源 now selectable (818, 717): github (gh) / Azure DevOps (az) / Bitbucket
-      // Server (REST). engineKind stays single-arm read-only (widening tracked by #11).
+      // Server (REST). engineKind is now a real select too (#718): codex / claude.
       {
         key: "sourceKind",
         label: "PR 来源",
@@ -230,9 +237,11 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         key: "engineKind",
         label: "Review 引擎",
         kind: "select",
-        options: ["codex"],
-        readonly: true,
-        hint: "暂仅支持 codex（#11）",
+        // Single-sourced from ENGINE_KINDS (#718) — type & options can't drift; Chinese
+        // display via optionLabels (ConfigField emits the raw camelCase wire value).
+        options: ENGINE_KINDS,
+        optionLabels: { codex: "Codex", claude: "Claude (claude -p)" },
+        hint: "codex=codex app-server；claude=claude -p（Claude Code headless，复用 claude CLI 登录）",
       },
     ],
   },
