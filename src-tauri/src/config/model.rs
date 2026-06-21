@@ -684,9 +684,9 @@ mod tests {
         assert_eq!(v["sourceKind"], "github");
         assert!(v.get("engineKind").is_some());
         assert_eq!(v["engineKind"], "codex");
-        // 手填模型字段 wire camelCase（Medium 载体）。
-        assert!(v.get("codexModel").is_some());
-        assert!(v.get("claudeModel").is_some());
+        // 手填模型字段 wire camelCase + 值（Medium 载体；与 engineKind 的值断言风格一致）。
+        assert_eq!(v["codexModel"], "gpt-5.1-codex");
+        assert_eq!(v["claudeModel"], "claude-opus-4-1");
         assert!(v.get("autoReview").is_some());
         // #818: the new data-source-mode fields.
         assert!(v.get("updateMode").is_some());

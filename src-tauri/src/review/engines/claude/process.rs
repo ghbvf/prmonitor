@@ -206,7 +206,9 @@ fn claude_cli_args(model: &str, prompt: &str) -> Vec<String> {
     ];
     if !model.trim().is_empty() {
         args.push("--model".to_string());
-        args.push(model.to_string());
+        // Trim to match the emptiness check above: a padded name like "  sonnet "
+        // must reach claude as "sonnet", not with surrounding spaces (an unknown model).
+        args.push(model.trim().to_string());
     }
     args
 }
@@ -375,6 +377,16 @@ mod tests {
     fn claude_cli_args_append_model_when_set() {
         let args = claude_cli_args("claude-opus-4-1", "/pr-review 7");
         // `--model <name>` is appended as the trailing pair.
+        let n = args.len();
+        assert_eq!(args[n - 2], "--model");
+        assert_eq!(args[n - 1], "claude-opus-4-1");
+    }
+
+    #[test]
+    fn claude_cli_args_trim_padded_model_name() {
+        // A padded name reaches claude trimmed (matches the emptiness check) — not with
+        // surrounding spaces that the CLI would treat as an unknown model.
+        let args = claude_cli_args("  claude-opus-4-1  ", "/pr-review 7");
         let n = args.len();
         assert_eq!(args[n - 2], "--model");
         assert_eq!(args[n - 1], "claude-opus-4-1");

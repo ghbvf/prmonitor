@@ -427,7 +427,9 @@ pub async fn start_review<R: tauri::Runtime>(
             },
             cwd: Some(repo_root.to_string()),
             // Per-turn model override: blank config → None → codex's configured default.
-            model: (!codex_model.trim().is_empty()).then(|| codex_model.to_string()),
+            // Trim to match the emptiness check — a padded name must not reach the RPC
+            // with surrounding whitespace (e.g. `{"model":"  gpt-5.1-codex  "}`).
+            model: (!codex_model.trim().is_empty()).then(|| codex_model.trim().to_string()),
         },
     )
     .await

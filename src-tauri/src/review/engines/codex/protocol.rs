@@ -1,8 +1,9 @@
 //! Typed subset of the codex app-server protocol we use: the `initialize` /
 //! `initialized` handshake (v1), `thread/start` (v2), and the streaming
 //! `ServerNotification`s. Shapes verified against `codex app-server
-//! generate-json-schema` (codex 0.139.0); regenerate from the installed binary
-//! when bumping codex.
+//! generate-json-schema` (codex 0.139.0; `TurnStartParams.model` re-verified against
+//! 0.141.0 — v2 documents it as "Override the model for this turn and subsequent
+//! turns"); regenerate from the installed binary when bumping codex.
 //!
 //! Wire contract: serde `camelCase` (the app-server speaks camelCase, `jsonrpc`
 //! field omitted — see `codec`). Outgoing params serialize camelCase; incoming
