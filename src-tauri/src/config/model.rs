@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
-use crate::model::{EngineKind, SourceKind, UpdateMode, WebhookTunnelMode};
+use crate::model::{EngineKind, LabelSource, SourceKind, UpdateMode, WebhookTunnelMode};
 
 /// One monitored project (#35). What was previously the flat per-repo subset of
 /// [`AppConfig`] is now a list element: each project carries its own repo, paths,
@@ -29,7 +29,10 @@ pub struct Project {
     /// Whether this project is polled/reviewed. Disabled projects are skipped by
     /// `validate` (their fields are not checked) and by the scheduler.
     pub enabled: bool,
-    /// Monitored repo, `owner/name`.
+    /// Monitored repo. Shape is source-dependent: `owner/name` for
+    /// [`SourceKind::Github`]; a bare repository name/slug for [`SourceKind::Azure`]
+    /// (org/project come from `azure_org`/`azure_project`) and [`SourceKind::Bitbucket`]
+    /// (project key comes from `bitbucket_project`). Validated per-source in `validate_project`.
     pub repo: String,
     /// Absolute path to the local clone codex runs the pr-review skill against.
     pub repo_root: String,
@@ -45,8 +48,9 @@ pub struct Project {
     pub skill_rel_path: String,
     /// Per-PR cooldown between dispatches of the same `(pr, kind)`.
     pub pr_cooldown_seconds: u64,
-    /// Which PR source backs the monitor. #11 reservation: today only
-    /// [`SourceKind::Github`]; future variants gate GitLab/Bitbucket.
+    /// Which PR source backs the monitor: [`SourceKind::Github`] (`gh` CLI),
+    /// [`SourceKind::Azure`] (`az` CLI), or [`SourceKind::Bitbucket`] (REST). #11
+    /// reservation: future variant gates GitLab.
     pub source_kind: SourceKind,
     /// Which review engine runs against a PR. #11 reservation: today only
     /// [`EngineKind::Codex`]; future variant gates Claude.
@@ -63,6 +67,20 @@ pub struct Project {
     /// Azure DevOps 项目名（#818，仅 [`SourceKind::Azure`] 用）。`az repos pr list
     /// --project <project>` 的 `<project>`。GitHub 源留空。
     pub azure_project: String,
+    /// 标签来源（AB#717）：`native`=用来源方自带的 PR 标签；`title`=从 PR 标题的方括号
+    /// 片段解析（如 `[pr-status/need-fix]`）。默认 [`LabelSource::Native`]（向后兼容）。
+    /// Bitbucket Server 无原生 PR 标签，故 [`SourceKind::Bitbucket`] 项目**必须**用
+    /// [`LabelSource::Title`]（由 [`validate_project`] 强制）。
+    pub label_source: LabelSource,
+    /// Bitbucket Server/DC 基址（AB#717，仅 [`SourceKind::Bitbucket`] 用），如
+    /// `https://bitbucket.mycompany.com`。被插值进 REST URL，故须 URL 安全。其余源留空。
+    pub bitbucket_host: String,
+    /// Bitbucket 项目 key（AB#717，仅 [`SourceKind::Bitbucket`] 用），如 `GOCELL`；个人
+    /// 仓库用 `~username`。REST 路径段 `.../projects/{project}/repos/{repo}/...`。其余源留空。
+    pub bitbucket_project: String,
+    /// Bitbucket HTTP access token（PAT，AB#717，仅 [`SourceKind::Bitbucket`] 用），用作
+    /// `Authorization: Bearer <token>`。无 CLI 登录，故凭据存配置。其余源留空。
+    pub bitbucket_token: String,
 }
 
 impl Default for Project {
@@ -91,6 +109,12 @@ impl Default for Project {
             update_mode: UpdateMode::WebhookOnly,
             azure_org: String::new(),
             azure_project: String::new(),
+            // AB#717: default to the status-quo (provider's own PR labels). A Bitbucket
+            // project must override this to `Title` (enforced by `validate_project`).
+            label_source: LabelSource::default(),
+            bitbucket_host: String::new(),
+            bitbucket_project: String::new(),
+            bitbucket_token: String::new(),
         }
     }
 }
@@ -180,8 +204,9 @@ const WEBHOOK_SECRET_MIN_LEN: usize = 16;
 /// blank one makes every poll match nothing / fail).
 ///
 /// Errors funnel through [`AppError`], and each message **starts with** the
-/// offending field's wire name (`repo` / `azureOrg` / `azureProject` / `repoRoot` /
-/// `skillRelPath` / `skill` / `pollIntervalSecs` / `prCooldownSeconds` /
+/// offending field's wire name (`repo` / `azureOrg` / `azureProject` /
+/// `bitbucketHost` / `bitbucketProject` / `bitbucketToken` / `labelSource` /
+/// `repoRoot` / `skillRelPath` / `skill` / `pollIntervalSecs` / `prCooldownSeconds` /
 /// `reviewLabel` / `checkLabel`). That prefix is the cross-end routing contract the
 /// onboarding wizard's `errorToStep` (src/config/fields.ts) keys on — locked at
 /// this end by the `validate_error_*` test below (PR #41 F4, Medium). Checks run in
@@ -234,6 +259,98 @@ pub fn validate_project(project: &Project) -> AppResult<()> {
             }
             if project.repo.trim().is_empty() {
                 return Err(AppError::new("repo 不能为空（Azure 源必填仓库名）"));
+            }
+        }
+        SourceKind::Bitbucket => {
+            // AB#717: host/project/repo/token are separate REST inputs, so the repo is a
+            // bare non-empty slug (NOT owner/name). Messages keep the camelCase field
+            // prefix the wizard routes on.
+            if project.bitbucket_host.trim().is_empty() {
+                return Err(AppError::new("bitbucketHost 不能为空（Bitbucket 源必填）"));
+            }
+            // `bitbucket_host` is interpolated into the REST URL base, so it must be
+            // URL-safe (parity with the azure_org guard #818 F2): reject whitespace,
+            // control chars, and query/fragment/userinfo delimiters (`# ? @`) that would
+            // split the URL or smuggle a different target. `/` and `:` ARE allowed (the
+            // host is a full base URL like `https://bitbucket.example.com:7990/ctx`).
+            if project
+                .bitbucket_host
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '#' | '?' | '@'))
+            {
+                return Err(AppError::new(format!(
+                    "bitbucketHost 含非法字符（不能有空白、控制字符或 # ? @）: {}",
+                    project.bitbucket_host
+                )));
+            }
+            // The Bearer PAT must never traverse a plaintext connection, so the host MUST be
+            // an `https://` URL. The char check above allows `:` / `/` (a base URL needs them),
+            // so it can't catch an `http://` scheme — this does. (The client also sets
+            // `https_only(true)` as belt-and-braces.)
+            if !project
+                .bitbucket_host
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("https://")
+            {
+                return Err(AppError::new(format!(
+                    "bitbucketHost 必须是 https:// 开头的 URL（Bearer 凭据不能走明文 HTTP）: {}",
+                    project.bitbucket_host
+                )));
+            }
+            if project.bitbucket_project.trim().is_empty() {
+                return Err(AppError::new(
+                    "bitbucketProject 不能为空（Bitbucket 源必填）",
+                ));
+            }
+            // `bitbucket_project` and `repo` are interpolated as URL PATH SEGMENTS
+            // (`.../projects/{project}/repos/{repo}/...`), so a `/` would forge extra path
+            // segments and `# ? @` would split the URL — reject them (plus whitespace /
+            // control). `~` (personal project key) is unreserved and allowed.
+            if project
+                .bitbucket_project
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '#' | '?' | '@'))
+            {
+                return Err(AppError::new(format!(
+                    "bitbucketProject 含非法字符（不能有空白、控制字符或 / # ? @）: {}",
+                    project.bitbucket_project
+                )));
+            }
+            if project.bitbucket_token.trim().is_empty() {
+                return Err(AppError::new("bitbucketToken 不能为空（Bitbucket 源必填）"));
+            }
+            if project.repo.trim().is_empty() {
+                return Err(AppError::new("repo 不能为空（Bitbucket 源必填仓库 slug）"));
+            }
+            if project
+                .repo
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '#' | '?' | '@'))
+            {
+                return Err(AppError::new(format!(
+                    "repo 含非法字符（Bitbucket 仓库 slug 不能有空白、控制字符或 / # ? @）: {}",
+                    project.repo
+                )));
+            }
+            // Bitbucket Server PRs carry NO native labels, so `Native` would never match a
+            // trigger label → nothing is ever monitored. Require `Title` (parse labels from
+            // the PR title). Machine-checkable robust constraint, not a comment-only rule.
+            if project.label_source != LabelSource::Title {
+                return Err(AppError::new(
+                    "labelSource 必须为「从标题解析」（Bitbucket 源无原生标签）",
+                ));
+            }
+            // Bitbucket has NO inbound webhook (poll/API discovery only), so webhook-only /
+            // hybrid would never update the list (silent dead config — the default is
+            // webhook-only). Require a polling mode (pull-only or manual).
+            if matches!(
+                project.update_mode,
+                UpdateMode::WebhookOnly | UpdateMode::Hybrid
+            ) {
+                return Err(AppError::new(
+                    "updateMode：Bitbucket 源无入站 webhook，请改用 pull-only 或 manual",
+                ));
             }
         }
     }
@@ -522,6 +639,10 @@ mod tests {
             update_mode: UpdateMode::WebhookOnly,
             azure_org: "myorg".to_string(),
             azure_project: "myproject".to_string(),
+            label_source: LabelSource::default(),
+            bitbucket_host: "https://bitbucket.example.com".to_string(),
+            bitbucket_project: "GOCELL".to_string(),
+            bitbucket_token: "secret-pat".to_string(),
         };
 
         let v = serde_json::to_value(&project).expect("Project serializes");
@@ -548,6 +669,12 @@ mod tests {
         assert_eq!(v["updateMode"], "webhook-only");
         assert!(v.get("azureOrg").is_some());
         assert!(v.get("azureProject").is_some());
+        // AB#717: the label-source toggle + Bitbucket source fields.
+        assert!(v.get("labelSource").is_some());
+        assert_eq!(v["labelSource"], "native");
+        assert!(v.get("bitbucketHost").is_some());
+        assert!(v.get("bitbucketProject").is_some());
+        assert!(v.get("bitbucketToken").is_some());
 
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("repo_root").is_none());
@@ -563,6 +690,11 @@ mod tests {
         assert!(v.get("update_mode").is_none());
         assert!(v.get("azure_org").is_none());
         assert!(v.get("azure_project").is_none());
+        // AB#717: snake_case forms of the new fields absent.
+        assert!(v.get("label_source").is_none());
+        assert!(v.get("bitbucket_host").is_none());
+        assert!(v.get("bitbucket_project").is_none());
+        assert!(v.get("bitbucket_token").is_none());
     }
 
     /// First-launch marker lock (Medium). The frontend routes a fresh install into
@@ -953,6 +1085,150 @@ mod tests {
             ..valid_project()
         })
         .is_err());
+    }
+
+    #[test]
+    fn validate_bitbucket_source_requires_host_project_token_and_title_labels() {
+        // AB#717: a Bitbucket-source project must supply host/project/token + a bare repo
+        // slug, and MUST use title-parsed labels (no native labels on Bitbucket Server).
+        // Each rejection's message starts with the camelCase wire field so `errorToStep`
+        // routes it.
+        let bb_base = Project {
+            source_kind: SourceKind::Bitbucket,
+            repo: "myrepo".to_string(),
+            bitbucket_host: "https://bitbucket.example.com".to_string(),
+            bitbucket_project: "GOCELL".to_string(),
+            bitbucket_token: "secret-pat".to_string(),
+            label_source: LabelSource::Title,
+            // Bitbucket has no inbound webhook → must use a polling mode (default is
+            // webhook-only, which is rejected for Bitbucket — see the updateMode case below).
+            update_mode: UpdateMode::PullOnly,
+            ..valid_project()
+        };
+        // A complete Bitbucket project validates.
+        assert!(validate_project(&bb_base).is_ok());
+
+        // Empty host → rejected, message starts with `bitbucketHost`.
+        let host_err = validate_project(&Project {
+            bitbucket_host: "   ".to_string(),
+            ..bb_base.clone()
+        })
+        .unwrap_err()
+        .message;
+        assert!(host_err.starts_with("bitbucketHost"), "{host_err}");
+
+        // URL-unsafe host chars (whitespace / `# ? @`) rejected with the `bitbucketHost`
+        // prefix; `/` and `:` are allowed (the host is a full base URL).
+        for bad in ["bitbucket example.com", "host#x", "host?x", "host@x"] {
+            let err = validate_project(&Project {
+                bitbucket_host: bad.to_string(),
+                ..bb_base.clone()
+            })
+            .unwrap_err()
+            .message;
+            assert!(err.starts_with("bitbucketHost"), "host {bad:?}: {err}");
+        }
+        assert!(validate_project(&Project {
+            bitbucket_host: "https://bitbucket.example.com:7990/ctx".to_string(),
+            ..bb_base.clone()
+        })
+        .is_ok());
+
+        // Empty project → rejected, message starts with `bitbucketProject`.
+        let proj_err = validate_project(&Project {
+            bitbucket_project: String::new(),
+            ..bb_base.clone()
+        })
+        .unwrap_err()
+        .message;
+        assert!(proj_err.starts_with("bitbucketProject"), "{proj_err}");
+
+        // Empty token → rejected, message starts with `bitbucketToken`.
+        let token_err = validate_project(&Project {
+            bitbucket_token: "   ".to_string(),
+            ..bb_base.clone()
+        })
+        .unwrap_err()
+        .message;
+        assert!(token_err.starts_with("bitbucketToken"), "{token_err}");
+
+        // Empty repo slug → rejected, message starts with `repo`.
+        let repo_err = validate_project(&Project {
+            repo: "   ".to_string(),
+            ..bb_base.clone()
+        })
+        .unwrap_err()
+        .message;
+        assert!(repo_err.starts_with("repo"), "{repo_err}");
+
+        // Native labels on a Bitbucket project → rejected (no native labels exist),
+        // message starts with `labelSource`.
+        let label_err = validate_project(&Project {
+            label_source: LabelSource::Native,
+            ..bb_base.clone()
+        })
+        .unwrap_err()
+        .message;
+        assert!(label_err.starts_with("labelSource"), "{label_err}");
+
+        // A non-https host → rejected (Bearer PAT must not go over plaintext), message
+        // starts with `bitbucketHost`. `http://` passes the char check but fails the scheme check.
+        let http_err = validate_project(&Project {
+            bitbucket_host: "http://bitbucket.example.com".to_string(),
+            ..bb_base.clone()
+        })
+        .unwrap_err()
+        .message;
+        assert!(http_err.starts_with("bitbucketHost"), "{http_err}");
+
+        // project / repo are URL path segments → a `/` (and `# ? @` / whitespace) is rejected.
+        for bad in ["a/b", "a#b", "a b"] {
+            let proj_bad = validate_project(&Project {
+                bitbucket_project: bad.to_string(),
+                ..bb_base.clone()
+            })
+            .unwrap_err()
+            .message;
+            assert!(
+                proj_bad.starts_with("bitbucketProject"),
+                "proj {bad:?}: {proj_bad}"
+            );
+            let repo_bad = validate_project(&Project {
+                repo: bad.to_string(),
+                ..bb_base.clone()
+            })
+            .unwrap_err()
+            .message;
+            assert!(repo_bad.starts_with("repo"), "repo {bad:?}: {repo_bad}");
+        }
+        // `~user` personal project key is allowed (unreserved).
+        assert!(validate_project(&Project {
+            bitbucket_project: "~alice".to_string(),
+            ..bb_base.clone()
+        })
+        .is_ok());
+
+        // Bitbucket has no inbound webhook → webhook-only / hybrid rejected (message starts
+        // with `updateMode`); pull-only / manual accepted.
+        for mode in [UpdateMode::WebhookOnly, UpdateMode::Hybrid] {
+            let mode_err = validate_project(&Project {
+                update_mode: mode,
+                ..bb_base.clone()
+            })
+            .unwrap_err()
+            .message;
+            assert!(mode_err.starts_with("updateMode"), "{mode:?}: {mode_err}");
+        }
+        for mode in [UpdateMode::PullOnly, UpdateMode::Manual] {
+            assert!(
+                validate_project(&Project {
+                    update_mode: mode,
+                    ..bb_base.clone()
+                })
+                .is_ok(),
+                "{mode:?} should be accepted for Bitbucket"
+            );
+        }
     }
 
     #[test]

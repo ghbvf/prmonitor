@@ -12,7 +12,8 @@
 // authors round-trip, now per-card).
 import { computed, ref, watch } from "vue";
 import type { Project } from "./types";
-import { pollingEnabledForMode } from "../types";
+import { pollingEnabledForMode, type SourceKind } from "../types";
+import { applySourceKindDefaults } from "./defaults";
 import { PROJECT_GROUPS, type FieldDef, type ProjectFieldKey } from "./fields";
 import ConfigField from "./ConfigField.vue";
 
@@ -69,6 +70,24 @@ function setField(def: FieldDef, value: string | number | boolean | string[]) {
   if (key === "authors") {
     authorsInput.value = Array.isArray(value) ? value.join(", ") : String(value);
     emit("update", "authors", authorsArray());
+    return;
+  }
+  // Changing the source auto-corrects the fields a Bitbucket source requires (717): the
+  // backend `validate_project` rejects the github-shaped defaults (labelSource "native",
+  // updateMode webhook-only/hybrid). This card is stateless (it emits granular updates to
+  // ProjectsManager rather than holding the draft), so run the shared helper on a copy and
+  // emit one `update` per field it changed — keeping the bitbucket rule single-sourced with
+  // OnboardingWizard instead of re-implementing it here.
+  if (key === "sourceKind") {
+    const next = { ...props.project };
+    applySourceKindDefaults(next, value as SourceKind);
+    emit("update", "sourceKind", next.sourceKind);
+    if (next.labelSource !== props.project.labelSource) {
+      emit("update", "labelSource", next.labelSource);
+    }
+    if (next.updateMode !== props.project.updateMode) {
+      emit("update", "updateMode", next.updateMode);
+    }
     return;
   }
   emit("update", key, value);

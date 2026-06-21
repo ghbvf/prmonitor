@@ -88,7 +88,7 @@ use subtle::ConstantTimeEq;
 
 use super::ledger;
 use crate::error::{AppError, AppResult};
-use crate::model::{Candidate, SourceKind, WebhookTunnelMode};
+use crate::model::{Candidate, LabelSource, SourceKind, WebhookTunnelMode};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -415,6 +415,12 @@ pub struct ProjectRoute {
     pub review_label: String,
     /// Label that classifies an event as a `check` turn (this project's).
     pub check_label: String,
+    /// Where this project's trigger labels come from (AB#717). The GitHub path
+    /// ([`parse_delivery`]) resolves effective labels (native vs title-parsed) from the
+    /// payload via this before classifying, so a `title`-source project classifies a
+    /// webhook PR by its title tags — parity with the poll path. The Azure path re-runs
+    /// `az` discovery (which already honors it), so it does NOT read this.
+    pub label_source: LabelSource,
 }
 
 /// Owns the running receiver + tunnel. `&self` methods + interior mutability so it
@@ -1441,10 +1447,16 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
     let Some(labels_arr) = pr.get("labels").and_then(Value::as_array) else {
         return ParseResult::Malformed;
     };
-    let labels: Vec<String> = labels_arr
+    let native_labels: Vec<String> = labels_arr
         .iter()
         .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
         .collect();
+    // AB#717: resolve effective labels (native vs title-parsed) before classifying, so a
+    // project using title labels classifies a webhook PR by its title tags too (parity with
+    // the poll path). For a native-source project this is exactly the provider labels. The
+    // structural `labels` array is still REQUIRED above (GitHub always sends it) — we only
+    // change which names feed classification + the tracked row's display labels.
+    let labels = super::labels::effective_labels(native_labels, &title, route.label_source);
     let action = payload
         .get("action")
         .and_then(Value::as_str)
@@ -1825,6 +1837,7 @@ mod tests {
             azure_project: String::new(),
             review_label: review_label.to_string(),
             check_label: check_label.to_string(),
+            label_source: LabelSource::Native,
         }
     }
 
@@ -1844,6 +1857,7 @@ mod tests {
             azure_project: project.to_string(),
             review_label: review_label.to_string(),
             check_label: check_label.to_string(),
+            label_source: LabelSource::Native,
         }
     }
 
@@ -1958,6 +1972,35 @@ mod tests {
         assert_eq!(ev.url, "https://github.com/owner/repo/pull/42");
         assert_eq!(ev.labels, vec!["needs-review".to_string()]);
         assert_eq!(ev.repo, "owner/repo");
+    }
+
+    #[test]
+    fn parse_delivery_title_source_classifies_from_title_tags() {
+        // AB#717: a title-source project classifies a webhook PR by bracketed title tags,
+        // ignoring native labels — parity with the poll path. The effective labels also
+        // become the tracked row's display labels.
+        let routes = vec![ProjectRoute {
+            label_source: LabelSource::Title,
+            ..route("default", "owner/repo", "needs-review", "needs-check")
+        }];
+        // Native label carries the trigger, but the title does NOT → not dispatched.
+        let native_only = pr_payload(&["needs-review"], serde_json::json!({ "title": "No tags" }));
+        assert!(
+            matches!(
+                routable(&native_only, &routes).intent,
+                IngestIntent::StatusOnly { .. }
+            ),
+            "native label is ignored under Title mode → StatusOnly"
+        );
+        // Title carries the trigger tag → dispatched as review; effective labels from title.
+        let title_tagged = pr_payload(
+            &[],
+            serde_json::json!({ "title": "Fix login [needs-review]" }),
+        );
+        let ev = routable(&title_tagged, &routes);
+        assert_eq!(ev.labels, vec!["needs-review".to_string()]);
+        let c = dispatch_candidate(&title_tagged, &routes);
+        assert_eq!(c.kind, "review");
     }
 
     #[test]

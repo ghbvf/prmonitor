@@ -21,8 +21,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::error::{AppError, AppResult};
-use crate::model::Candidate;
+use crate::model::{Candidate, LabelSource};
 
+use super::labels;
 use super::source::PrSource;
 
 /// Wall-clock budget for the single `az` invocation. A hung subprocess (network
@@ -217,6 +218,7 @@ pub fn parse_rows(
     repo: &str,
     review_label: &str,
     check_label: &str,
+    label_source: LabelSource,
 ) -> AppResult<Vec<AzRow>> {
     let raw: Vec<RawPr> = serde_json::from_str(json)
         .map_err(|e| AppError::new(format!("解析 az repos pr list JSON 失败: {e}")))?;
@@ -224,25 +226,20 @@ pub fn parse_rows(
     let mut rows = Vec::new();
     for pr in raw {
         // `labels` is `None` for `null` / absent (the real Azure shape for a no-label PR);
-        // `.iter().flatten()` yields nothing in that case → no trigger label → dropped below.
-        let labels: Vec<String> = pr
+        // `.iter().flatten()` yields nothing in that case → no native trigger label.
+        let native: Vec<String> = pr
             .labels
             .iter()
             .flatten()
             .map(|l| l.name.clone())
             .filter(|n| !n.is_empty())
             .collect();
-        let has_review = labels.iter().any(|n| n == review_label);
-        let has_check = labels.iter().any(|n| n == check_label);
-
-        // Classify by trigger label, mirroring gh `merge_rows`: both labels → conflict,
-        // kept with kind "review" (the review row gh keeps); neither → not monitored,
-        // dropped; exactly one → that kind, no conflict.
-        let (kind, conflict) = match (has_review, has_check) {
-            (true, true) => ("review", true),
-            (true, false) => ("review", false),
-            (false, true) => ("check", false),
-            (false, false) => continue, // no trigger label: not a monitored PR
+        // AB#717: resolve effective labels (native vs title-parsed) then classify by
+        // trigger label via the shared helper — both labels → conflict (kept, kind
+        // "review", gh parity); neither → not monitored, dropped; one → that kind.
+        let labels = labels::effective_labels(native, &pr.title, label_source);
+        let Some((kind, conflict)) = labels::classify(&labels, review_label, check_label) else {
+            continue; // no trigger label: not a monitored PR
         };
 
         let head_sha = pr
@@ -324,6 +321,7 @@ fn parse_pr_list(
     repo: &str,
     review_label: &str,
     check_label: &str,
+    label_source: LabelSource,
 ) -> AppResult<Vec<Candidate>> {
     Ok(rows_into_candidates(parse_rows(
         json,
@@ -332,6 +330,7 @@ fn parse_pr_list(
         repo,
         review_label,
         check_label,
+        label_source,
     )?))
 }
 
@@ -343,6 +342,7 @@ pub struct AzureDevOpsCli {
     repo: String,
     review_label: String,
     check_label: String,
+    label_source: LabelSource,
 }
 
 impl AzureDevOpsCli {
@@ -352,6 +352,7 @@ impl AzureDevOpsCli {
         repo: String,
         review_label: String,
         check_label: String,
+        label_source: LabelSource,
     ) -> Self {
         Self {
             az_bin: "az".to_string(),
@@ -360,6 +361,7 @@ impl AzureDevOpsCli {
             repo,
             review_label,
             check_label,
+            label_source,
         }
     }
 
@@ -459,6 +461,7 @@ impl AzureDevOpsCli {
             &self.repo,
             &self.review_label,
             &self.check_label,
+            self.label_source,
         )
     }
 }
@@ -485,13 +488,13 @@ mod tests {
     /// `parse_rows` with the test org/project/repo wired in (so each case only passes the
     /// JSON + labels). The single Azure parser under test.
     fn rows(json: &str) -> AppResult<Vec<AzRow>> {
-        parse_rows(json, ORG, PROJECT, REPO, REVIEW, CHECK)
+        parse_rows(json, ORG, PROJECT, REPO, REVIEW, CHECK, LabelSource::Native)
     }
 
     /// `parse_pr_list` (the trait gating view: rows minus conflict → candidates) with the
     /// test org/project/repo wired in.
     fn candidates(json: &str) -> AppResult<Vec<Candidate>> {
-        parse_pr_list(json, ORG, PROJECT, REPO, REVIEW, CHECK)
+        parse_pr_list(json, ORG, PROJECT, REPO, REVIEW, CHECK, LabelSource::Native)
     }
 
     #[test]
@@ -562,8 +565,16 @@ mod tests {
                 }}
             ]"#
         );
-        let r =
-            parse_rows(&json, "my org", "my project", "my repo", REVIEW, CHECK).expect("parses");
+        let r = parse_rows(
+            &json,
+            "my org",
+            "my project",
+            "my repo",
+            REVIEW,
+            CHECK,
+            LabelSource::Native,
+        )
+        .expect("parses");
         assert_eq!(r.len(), 1);
         assert_eq!(
             r[0].url,
@@ -698,6 +709,60 @@ mod tests {
         assert!(
             r[0].candidate.is_cross_repository,
             "a present forkSource marks the PR cross-repo"
+        );
+    }
+
+    #[test]
+    fn parse_rows_title_mode_classifies_from_bracketed_title_ignoring_native_labels() {
+        // AB#717: with LabelSource::Title, the PR's native `labels` are ignored; the trigger
+        // labels are parsed from bracketed title segments instead.
+        let json = format!(
+            r#"[
+                {{
+                    "pullRequestId": 21,
+                    "title": "Fix login [{REVIEW}]",
+                    "lastMergeSourceCommit": {{ "commitId": "sha" }},
+                    "sourceRefName": "refs/heads/fix",
+                    "createdBy": {{ "uniqueName": "dev@example.com" }},
+                    "isDraft": false,
+                    "labels": [{{ "name": "area/ui" }}]
+                }}
+            ]"#
+        );
+        let r = parse_rows(&json, ORG, PROJECT, REPO, REVIEW, CHECK, LabelSource::Title)
+            .expect("parses");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].candidate.kind, "review");
+        // Effective labels come from the title, NOT the native `area/ui`.
+        assert_eq!(r[0].labels, vec![REVIEW.to_string()]);
+
+        // A native-only review label (no title tag) is NOT monitored under Title mode.
+        let native_only = format!(
+            r#"[
+                {{
+                    "pullRequestId": 22,
+                    "title": "No tags here",
+                    "lastMergeSourceCommit": {{ "commitId": "sha" }},
+                    "sourceRefName": "refs/heads/x",
+                    "createdBy": {{ "uniqueName": "dev@example.com" }},
+                    "isDraft": false,
+                    "labels": [{{ "name": "{REVIEW}" }}]
+                }}
+            ]"#
+        );
+        assert!(
+            parse_rows(
+                &native_only,
+                ORG,
+                PROJECT,
+                REPO,
+                REVIEW,
+                CHECK,
+                LabelSource::Title
+            )
+            .expect("parses")
+            .is_empty(),
+            "native label is ignored under Title mode"
         );
     }
 
