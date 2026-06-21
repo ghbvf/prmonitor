@@ -58,10 +58,11 @@ fn build_view(
 /// static (`should_skip`) then cooldown (`cooldown_skip`) — and surfaces the dispatchable
 /// candidate only when nothing gates it (`skip_reason` None).
 ///
-/// Both source arms feed this: the GitHub arm via [`build_view`] (`GhRow`) and the Azure
-/// arm directly from an [`super::azure::AzRow`]. Extracting it gives both sources FULL
-/// display + gating parity (title / url / all labels / kept-conflict), so the only
-/// difference between sources is how the rows are fetched, not how they are shown or
+/// All three source arms feed this: the GitHub arm via [`build_view`] (`GhRow`), and the
+/// Azure / Bitbucket arms directly from an [`super::azure::AzRow`] / [`super::bitbucket::BbRow`].
+/// Extracting it gives every source FULL display + gating parity (title / url / all labels /
+/// kept-conflict), so the only difference between sources is how the rows are fetched, not
+/// how they are shown or
 /// gated. Pure (no `AppHandle`) so the gate composition is unit-tested.
 #[allow(clippy::too_many_arguments)]
 fn build_view_parts(
@@ -213,9 +214,10 @@ pub(crate) async fn discover<R: tauri::Runtime>(
             if bitbucket_host.trim().is_empty()
                 || bitbucket_project.trim().is_empty()
                 || bitbucket_token.trim().is_empty()
+                || params.repo.trim().is_empty()
             {
                 return Err(crate::error::AppError::new(
-                    "Bitbucket 源未配置 bitbucketHost / bitbucketProject / bitbucketToken（请在设置中补全）",
+                    "Bitbucket 源未配置 bitbucketHost / bitbucketProject / bitbucketToken / repo（请在设置中补全）",
                 ));
             }
             let source = BitbucketServer::new(
@@ -921,10 +923,19 @@ pub async fn start_webhook<R: tauri::Runtime>(
     // periodic CLI poll is its SOLE update source, so it gets NO route (a push must not
     // update / auto-dispatch it). The handler matches an event's repo against these and
     // tags the dispatched candidate with the owning project's id (#35).
+    //
+    // AB#717: Bitbucket Server has NO inbound webhook handler, so a Bitbucket project never
+    // gets a route — without this filter a manual-mode Bitbucket project (webhook-eligible)
+    // would be added but every delivery would silently `WrongRepo`. (Config also rejects
+    // webhook-only / hybrid for Bitbucket, so only manual could otherwise reach here.)
     let routes: Vec<super::webhook::ProjectRoute> = cfg
         .projects
         .iter()
-        .filter(|p| p.enabled && webhook_route_eligible(p.update_mode))
+        .filter(|p| {
+            p.enabled
+                && webhook_route_eligible(p.update_mode)
+                && p.source_kind != SourceKind::Bitbucket
+        })
         .map(|p| super::webhook::ProjectRoute {
             id: p.id.clone(),
             // AB#822: the handler routes Azure events only to Azure routes and GitHub events
@@ -935,9 +946,10 @@ pub async fn start_webhook<R: tauri::Runtime>(
             azure_project: p.azure_project.clone(),
             review_label: p.review_label.clone(),
             check_label: p.check_label.clone(),
-            // AB#717: the GitHub webhook path classifies from the payload — it must honor
+            // AB#717: the GitHub webhook path classifies from the payload, so it must honor
             // the project's label source (native vs title-parsed). The Azure path re-runs
-            // `az` discovery (which already honors it), so it ignores this field.
+            // `az` discovery (which already honors labelSource in `parse_rows`), so it does
+            // not read this field. (Bitbucket has no route — filtered out above.)
             label_source: p.label_source,
         })
         .collect();
@@ -1042,8 +1054,9 @@ mod tests {
         }
     }
 
-    // #818: `build_view_parts` is the source-agnostic core both the GitHub (`GhRow`) and
-    // Azure (`AzRow`) arms feed. It applies the SAME gate composition as the old per-source
+    // #818 / AB#717: `build_view_parts` is the source-agnostic core all three arms feed —
+    // GitHub (`GhRow`), Azure (`AzRow`), and Bitbucket (`BbRow`). It applies the SAME gate
+    // composition as the old per-source
     // builders — conflict short-circuits to the both-labels reason, otherwise static then
     // cooldown — and carries the row's real title / url / labels through to the view, so an
     // Azure row now has FULL display parity with GitHub. A clean row dispatches; a conflict

@@ -279,10 +279,39 @@ pub fn validate_project(project: &Project) -> AppResult<()> {
                     project.bitbucket_host
                 )));
             }
+            // The Bearer PAT must never traverse a plaintext connection, so the host MUST be
+            // an `https://` URL. The char check above allows `:` / `/` (a base URL needs them),
+            // so it can't catch an `http://` scheme — this does. (The client also sets
+            // `https_only(true)` as belt-and-braces.)
+            if !project
+                .bitbucket_host
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("https://")
+            {
+                return Err(AppError::new(format!(
+                    "bitbucketHost 必须是 https:// 开头的 URL（Bearer 凭据不能走明文 HTTP）: {}",
+                    project.bitbucket_host
+                )));
+            }
             if project.bitbucket_project.trim().is_empty() {
                 return Err(AppError::new(
                     "bitbucketProject 不能为空（Bitbucket 源必填）",
                 ));
+            }
+            // `bitbucket_project` and `repo` are interpolated as URL PATH SEGMENTS
+            // (`.../projects/{project}/repos/{repo}/...`), so a `/` would forge extra path
+            // segments and `# ? @` would split the URL — reject them (plus whitespace /
+            // control). `~` (personal project key) is unreserved and allowed.
+            if project
+                .bitbucket_project
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '#' | '?' | '@'))
+            {
+                return Err(AppError::new(format!(
+                    "bitbucketProject 含非法字符（不能有空白、控制字符或 / # ? @）: {}",
+                    project.bitbucket_project
+                )));
             }
             if project.bitbucket_token.trim().is_empty() {
                 return Err(AppError::new("bitbucketToken 不能为空（Bitbucket 源必填）"));
@@ -290,12 +319,33 @@ pub fn validate_project(project: &Project) -> AppResult<()> {
             if project.repo.trim().is_empty() {
                 return Err(AppError::new("repo 不能为空（Bitbucket 源必填仓库 slug）"));
             }
+            if project
+                .repo
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '#' | '?' | '@'))
+            {
+                return Err(AppError::new(format!(
+                    "repo 含非法字符（Bitbucket 仓库 slug 不能有空白、控制字符或 / # ? @）: {}",
+                    project.repo
+                )));
+            }
             // Bitbucket Server PRs carry NO native labels, so `Native` would never match a
             // trigger label → nothing is ever monitored. Require `Title` (parse labels from
             // the PR title). Machine-checkable robust constraint, not a comment-only rule.
             if project.label_source != LabelSource::Title {
                 return Err(AppError::new(
                     "labelSource 必须为「从标题解析」（Bitbucket 源无原生标签）",
+                ));
+            }
+            // Bitbucket has NO inbound webhook (poll/API discovery only), so webhook-only /
+            // hybrid would never update the list (silent dead config — the default is
+            // webhook-only). Require a polling mode (pull-only or manual).
+            if matches!(
+                project.update_mode,
+                UpdateMode::WebhookOnly | UpdateMode::Hybrid
+            ) {
+                return Err(AppError::new(
+                    "updateMode：Bitbucket 源无入站 webhook，请改用 pull-only 或 manual",
                 ));
             }
         }
@@ -1046,6 +1096,9 @@ mod tests {
             bitbucket_project: "GOCELL".to_string(),
             bitbucket_token: "secret-pat".to_string(),
             label_source: LabelSource::Title,
+            // Bitbucket has no inbound webhook → must use a polling mode (default is
+            // webhook-only, which is rejected for Bitbucket — see the updateMode case below).
+            update_mode: UpdateMode::PullOnly,
             ..valid_project()
         };
         // A complete Bitbucket project validates.
@@ -1113,6 +1166,65 @@ mod tests {
         .unwrap_err()
         .message;
         assert!(label_err.starts_with("labelSource"), "{label_err}");
+
+        // A non-https host → rejected (Bearer PAT must not go over plaintext), message
+        // starts with `bitbucketHost`. `http://` passes the char check but fails the scheme check.
+        let http_err = validate_project(&Project {
+            bitbucket_host: "http://bitbucket.example.com".to_string(),
+            ..bb_base.clone()
+        })
+        .unwrap_err()
+        .message;
+        assert!(http_err.starts_with("bitbucketHost"), "{http_err}");
+
+        // project / repo are URL path segments → a `/` (and `# ? @` / whitespace) is rejected.
+        for bad in ["a/b", "a#b", "a b"] {
+            let proj_bad = validate_project(&Project {
+                bitbucket_project: bad.to_string(),
+                ..bb_base.clone()
+            })
+            .unwrap_err()
+            .message;
+            assert!(
+                proj_bad.starts_with("bitbucketProject"),
+                "proj {bad:?}: {proj_bad}"
+            );
+            let repo_bad = validate_project(&Project {
+                repo: bad.to_string(),
+                ..bb_base.clone()
+            })
+            .unwrap_err()
+            .message;
+            assert!(repo_bad.starts_with("repo"), "repo {bad:?}: {repo_bad}");
+        }
+        // `~user` personal project key is allowed (unreserved).
+        assert!(validate_project(&Project {
+            bitbucket_project: "~alice".to_string(),
+            ..bb_base.clone()
+        })
+        .is_ok());
+
+        // Bitbucket has no inbound webhook → webhook-only / hybrid rejected (message starts
+        // with `updateMode`); pull-only / manual accepted.
+        for mode in [UpdateMode::WebhookOnly, UpdateMode::Hybrid] {
+            let mode_err = validate_project(&Project {
+                update_mode: mode,
+                ..bb_base.clone()
+            })
+            .unwrap_err()
+            .message;
+            assert!(mode_err.starts_with("updateMode"), "{mode:?}: {mode_err}");
+        }
+        for mode in [UpdateMode::PullOnly, UpdateMode::Manual] {
+            assert!(
+                validate_project(&Project {
+                    update_mode: mode,
+                    ..bb_base.clone()
+                })
+                .is_ok(),
+                "{mode:?} should be accepted for Bitbucket"
+            );
+        }
     }
 
     #[test]

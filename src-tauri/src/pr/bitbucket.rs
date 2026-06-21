@@ -339,7 +339,16 @@ impl BitbucketServer {
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
-            .map_err(|e| AppError::new(format!("Bitbucket pull-requests 请求失败: {e}")))?;
+            // `without_url()` strips the request URL from the error Display: a transport
+            // error otherwise embeds the full REST URL (host/project/repo) into a message
+            // that surfaces to the frontend. The token lives in the header, never the URL,
+            // so it is not at risk here — this just avoids leaking the endpoint shape.
+            .map_err(|e| {
+                AppError::new(format!(
+                    "Bitbucket pull-requests 请求失败: {}",
+                    e.without_url()
+                ))
+            })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -351,9 +360,12 @@ impl BitbucketServer {
                 err_body_tail(&body)
             )));
         }
-        resp.json::<BbPage>()
-            .await
-            .map_err(|e| AppError::new(format!("解析 Bitbucket pull-requests 响应失败: {e}")))
+        resp.json::<BbPage>().await.map_err(|e| {
+            AppError::new(format!(
+                "解析 Bitbucket pull-requests 响应失败: {}",
+                e.without_url()
+            ))
+        })
     }
 
     /// Discovers all open PRs as display-ready [`BbRow`]s (conflict rows included, marked).
@@ -362,6 +374,9 @@ impl BitbucketServer {
     pub async fn discover_rows(&self) -> AppResult<Vec<BbRow>> {
         let client = reqwest::Client::builder()
             .timeout(BB_TIMEOUT)
+            // Defense-in-depth alongside the config-time `https://` check: never send the
+            // Bearer PAT over a plaintext `http://` connection even if a bad host slips through.
+            .https_only(true)
             .build()
             .map_err(|e| AppError::new(format!("无法构造 Bitbucket HTTP 客户端: {e}")))?;
 
@@ -373,9 +388,17 @@ impl BitbucketServer {
             if page.is_last_page || all.len() >= BB_MAX_PRS {
                 break;
             }
+            // Bitbucket guarantees `nextPageStart` whenever `isLastPage` is false; its absence
+            // means a truncated / malformed response. Erroring (rather than silently stopping)
+            // prevents a partial PR list being treated as authoritative (data-loss → missed
+            // dispatches).
             match page.next_page_start {
                 Some(next) => start = next,
-                None => break, // not last page but no cursor → stop rather than loop
+                None => {
+                    return Err(AppError::new(
+                        "Bitbucket 分页响应异常：isLastPage=false 但缺少 nextPageStart",
+                    ))
+                }
             }
         }
         Ok(map_rows(

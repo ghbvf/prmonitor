@@ -352,6 +352,56 @@ describe("validateStep — source (717 bitbucket)", () => {
   });
 });
 
+// Bitbucket-only autoReview gates (717): the backend `validate_project` enforces two
+// extra constraints for a Bitbucket source — labels must be title-parsed (no native
+// labels) and webhook-driven update modes are invalid (no inbound webhook). validateStep
+// pre-gates both in the autoReview step (where labelSource + updateMode are surfaced), so
+// the user is caught before submit. Error tokens (`labelSource`/`updateMode`) route via
+// errorToStep back to this step. Backend remains the source of truth.
+describe("validateStep — autoReview (717 bitbucket gates)", () => {
+  function bitbucketProject(): Project {
+    return {
+      ...validProject(),
+      sourceKind: "bitbucket",
+      repo: "gocell",
+      bitbucketHost: "https://bitbucket.mycompany.com",
+      bitbucketProject: "GOCELL",
+      bitbucketToken: "secret-pat",
+      labelSource: "title",
+      updateMode: "pull-only",
+    };
+  }
+  it("accepts a bitbucket source with labelSource=title + updateMode=pull-only", () => {
+    expect(validateStep("autoReview", bitbucketProject())).toBeNull();
+  });
+  it("blocks a bitbucket source whose labelSource is native (no native labels)", () => {
+    const err = validateStep("autoReview", {
+      ...bitbucketProject(),
+      labelSource: "native",
+    });
+    expect(err).toBeTruthy();
+    // Error must start with the field token so errorToStep can route it.
+    expect(err!.startsWith("labelSource")).toBe(true);
+  });
+  it.each(["webhook-only", "hybrid"] as const)(
+    "blocks a bitbucket source whose updateMode is %s (no inbound webhook)",
+    (updateMode) => {
+      const err = validateStep("autoReview", {
+        ...bitbucketProject(),
+        updateMode,
+      });
+      expect(err).toBeTruthy();
+      // Error must start with the field token so errorToStep can route it.
+      expect(err!.startsWith("updateMode")).toBe(true);
+    },
+  );
+  it("does not impose the bitbucket gates on a github source", () => {
+    // validProject() is github with labelSource=native + updateMode=webhook-only —
+    // those are fine for github, so the autoReview step must still pass.
+    expect(validateStep("autoReview", validProject())).toBeNull();
+  });
+});
+
 describe("STEPS ordering", () => {
   it("is the wizard sequence repo→repoRoot→skill→source→autoReview→done", () => {
     expect(STEPS).toEqual([
@@ -483,5 +533,12 @@ describe("errorToStep — routes backend AppError messages", () => {
   // reviewLabel/checkLabel, so a backend rejection routes there.
   it("labelSource message → autoReview step (717)", () => {
     expect(errorToStep("labelSource 取值非法")).toBe("autoReview");
+    expect(errorToStep("labelSource 必须为 title（Bitbucket 源无原生标签）")).toBe("autoReview");
+  });
+  // updateMode (717) lives in the polling group, surfaced in the autoReview step. The
+  // backend rejects webhook-only/hybrid for a Bitbucket source (no inbound webhook), so
+  // its rejection routes back to the autoReview step too.
+  it("updateMode message → autoReview step (717)", () => {
+    expect(errorToStep("updateMode Bitbucket 源不支持 webhook（无入站）")).toBe("autoReview");
   });
 });

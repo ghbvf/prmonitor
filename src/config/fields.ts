@@ -90,7 +90,7 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         key: "repo",
         label: "仓库",
         kind: "text",
-        hint: "GitHub 源: owner/name（如 ghbvf/prmonitor）；Azure 源: 裸仓库名（org/project 见下方）",
+        hint: "GitHub 源: owner/name（如 ghbvf/prmonitor）；Azure 源: 裸仓库名（org/project 见下方）；Bitbucket 源: 裸仓库 slug（项目 Key 见下方）",
       },
       { key: "repoRoot", label: "本地路径", kind: "text", hint: "本地 clone 的绝对路径" },
       {
@@ -442,6 +442,23 @@ export function validateStep(step: StepId, draft: Project): string | null {
       if (draft.reviewLabel.trim() === "" || draft.checkLabel.trim() === "") {
         return "Review 与 Check 触发标签不能为空";
       }
+      // Bitbucket source (717): the backend `validate_project` enforces two extra
+      // constraints, surfaced in this step (labelSource lives in the labels group;
+      // updateMode in the polling group — both rendered here). Pre-gate them so the
+      // user is caught before the round-trip; errors start with the field token so
+      // errorToStep routes a backend rejection back to this step. Backend remains the
+      // source of truth.
+      if (draft.sourceKind === "bitbucket") {
+        // Bitbucket Server has no native PR labels, so labels MUST come from the title.
+        if (draft.labelSource !== "title") {
+          return "labelSource 必须选「从标题解析」（Bitbucket 源无原生标签）";
+        }
+        // Bitbucket has no inbound webhook, so webhook-driven modes are invalid —
+        // only pull-only / manual make sense.
+        if (draft.updateMode === "webhook-only" || draft.updateMode === "hybrid") {
+          return "updateMode：Bitbucket 源不支持 webhook（无入站），请选 pull-only 或 manual";
+        }
+      }
       return null;
     }
     case "done":
@@ -483,9 +500,12 @@ export function validateStep(step: StepId, draft: Project): string | null {
 //
 // Bitbucket fields (`bitbucketHost` / `bitbucketProject` / `bitbucketToken`, 717): same
 // story — owned by the source step (visibleWhen sourceKind==="bitbucket", gated by
-// validateStep) so backend rejections route to source. `labelSource` (717) routes to the
-// autoReview step where its labels-group siblings (reviewLabel/checkLabel) live. Locked by
-// fields.test.ts.
+// validateStep) so backend rejections route to source. `labelSource` and `updateMode`
+// (717) route to the autoReview step: labelSource sits beside its labels-group siblings
+// (reviewLabel/checkLabel), and updateMode sits in the polling group — both surfaced in
+// the autoReview step, where the backend's Bitbucket-only constraints (labelSource must be
+// "title"; updateMode may not be webhook-only/hybrid) are also pre-gated by validateStep.
+// Locked by fields.test.ts.
 export function errorToStep(message: string): StepId | null {
   const m = message.trimStart();
   if (m.startsWith("skill")) return "skill";
@@ -508,7 +528,11 @@ export function errorToStep(message: string): StepId | null {
     m.startsWith("checkLabel") ||
     // labelSource (717) lives in the labels group, surfaced in the autoReview step
     // alongside reviewLabel/checkLabel (see STEP_FIELDS).
-    m.startsWith("labelSource")
+    m.startsWith("labelSource") ||
+    // updateMode (717) lives in the polling group, surfaced in the autoReview step;
+    // the backend rejects webhook-only/hybrid for a Bitbucket source (no inbound
+    // webhook), so its rejection routes back here.
+    m.startsWith("updateMode")
   ) {
     return "autoReview";
   }

@@ -59,6 +59,13 @@ function hydrate(cfg: AppConfig) {
   draft.sourceKind = p.sourceKind;
   draft.engineKind = p.engineKind;
   draft.autoReview = p.autoReview;
+  draft.updateMode = p.updateMode;
+  draft.labelSource = p.labelSource;
+  draft.azureOrg = p.azureOrg;
+  draft.azureProject = p.azureProject;
+  draft.bitbucketHost = p.bitbucketHost;
+  draft.bitbucketProject = p.bitbucketProject;
+  draft.bitbucketToken = p.bitbucketToken;
   authorsInput.value = p.authors.join(", ");
 }
 
@@ -186,7 +193,7 @@ async function finish() {
       <div class="step-body">
         <template v-if="currentStep === 'repo'">
           <h2>连接仓库</h2>
-          <p class="lead">填写要监控的 GitHub 仓库。</p>
+          <p class="lead">填写要监控的仓库（GitHub: owner/name；Azure / Bitbucket: 裸仓库名/slug）。</p>
         </template>
         <template v-else-if="currentStep === 'repoRoot'">
           <h2>本地仓库路径</h2>
@@ -198,7 +205,7 @@ async function finish() {
         </template>
         <template v-else-if="currentStep === 'source'">
           <h2>PR 来源</h2>
-          <p class="lead">选择 PR 来源；Azure 源需填写组织 / 项目。</p>
+          <p class="lead">选择 PR 来源；Azure 源需填写组织 / 项目；Bitbucket 源需填写 Host / 项目 Key / Token。</p>
         </template>
         <template v-else-if="currentStep === 'autoReview'">
           <h2>自动 review</h2>
@@ -229,6 +236,12 @@ async function finish() {
             <div><dt>Azure 组织</dt><dd>{{ draft.azureOrg || "—" }}</dd></div>
             <div><dt>Azure 项目</dt><dd>{{ draft.azureProject || "—" }}</dd></div>
           </template>
+          <template v-if="draft.sourceKind === 'bitbucket'">
+            <div><dt>Bitbucket Host</dt><dd>{{ draft.bitbucketHost || "—" }}</dd></div>
+            <div><dt>Bitbucket 项目 Key</dt><dd>{{ draft.bitbucketProject || "—" }}</dd></div>
+            <div><dt>Bitbucket Token</dt><dd>{{ draft.bitbucketToken ? "●●●●" : "—" }}</dd></div>
+          </template>
+          <div><dt>标签来源</dt><dd>{{ draft.labelSource }}</dd></div>
           <div><dt>数据更新模式</dt><dd>{{ draft.updateMode }}</dd></div>
           <div><dt>自动 review</dt><dd>{{ draft.autoReview ? "自动" : "手动" }}</dd></div>
           <div><dt>轮询间隔</dt><dd>{{ draft.pollIntervalSecs }} 秒</dd></div>
