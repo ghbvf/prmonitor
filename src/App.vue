@@ -18,6 +18,7 @@ import { useReviewStore } from "./review/useReviewStore";
 import { reschedule, startPolling } from "./pr/api";
 import { useAppView } from "./useAppView";
 import { useProjects } from "./projects";
+import { githubCliRequiredForSource } from "./types";
 
 const version = ref("");
 // Gate view selection until the config load resolves, so a first-launch user never
@@ -41,7 +42,22 @@ const { activeProjectId } = useProjects();
 // dispatcher emits it on a bad config / start failure / ledger-write failure, so
 // the same banner that warns "auto review paused" also reports "auto review failed".
 const { codex, dispatchError, clearDispatchError, clearFocus } = useReviewStore();
-const ghBlocked = computed(() => prStore.gh?.authenticated === false);
+const activeProject = computed(
+  () =>
+    configStore.config?.projects.find((p) => p.id === activeProjectId.value) ??
+    null,
+);
+const activeProjectNeedsGh = computed(
+  () =>
+    activeProject.value?.enabled === true &&
+    githubCliRequiredForSource(
+      activeProject.value.sourceKind,
+      activeProject.value.updateMode,
+    ),
+);
+const ghBlocked = computed(
+  () => activeProjectNeedsGh.value && prStore.gh?.authenticated === false,
+);
 const codexBlocked = computed(() => codex.value?.available === false);
 const showPrompt = computed(() => ghBlocked.value || codexBlocked.value);
 // dispatchError is keyed per project (#35): show the active project's notice.
