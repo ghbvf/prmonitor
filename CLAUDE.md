@@ -14,6 +14,7 @@ PR 监控 + AI review 桌面应用（Tauri v2 + Vue 3 + Rust）。仓库：githu
 - **fix**（`.claude/skills/fix/SKILL.md`）— 问题诊断与修复：验证 + 根因 + 复杂度分级 + 修复 + 收尾。
 - **pr-review**（`.claude/skills/pr-review/SKILL.md`）— 对 PR 跑六维度分级 review；`--check` 验证上一轮修复。
 - **issues**（`.claude/skills/issues/SKILL.md`）— GitHub Issue / PR / 评论 / label 的 gh 命令编排单源。
+- **app-build-run**（`.claude/skills/app-build-run/SKILL.md`）— 本地启动 Tauri App，编译 Apple/macOS 与 Windows x64 桌面包。
 
 技能正文是单源，本文件只索引、不复制。codex 侧入口见 `.codex/skills/`（薄引用，正文仍指向 `.claude/skills/`）。
 
