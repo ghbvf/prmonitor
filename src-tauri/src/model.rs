@@ -26,9 +26,9 @@ pub struct Candidate {
 /// is a compile error — the missing arm cannot be expressed. Today it has one
 /// variant, so the seam is reserved but not yet load-bearing.
 ///
-/// #11 design reservation: future variants `GitLab` / `Bitbucket`. Wire strings
-/// for `Github` / `Azure` are pinned to `"github"` / `"azure"` (cross-agent
-/// contract; the frontend mirrors them and a serde golden test locks them).
+/// #11 design reservation: future variant `GitLab`. Wire strings for `Github` /
+/// `Azure` / `Bitbucket` are pinned to `"github"` / `"azure"` / `"bitbucket"`
+/// (cross-agent contract; the frontend mirrors them and a serde golden test locks them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SourceKind {
@@ -38,7 +38,35 @@ pub enum SourceKind {
     /// inbound Azure DevOps Service Hooks on `/webhook` (`git.pullrequest.created/updated`,
     /// AB#822) — both feed the same PR list / dispatch path.
     Azure,
-    // future #11: GitLab, Bitbucket
+    /// Bitbucket Server / Data Center: pulled via the REST API v1.0 over HTTP
+    /// (`{host}/rest/api/1.0/projects/{project}/repos/{repo}/pull-requests`, `reqwest`,
+    /// AB#717). Bitbucket Server PRs carry NO native labels, so a Bitbucket project
+    /// must use [`LabelSource::Title`] (status labels written into the PR title, e.g.
+    /// `[pr-status/need-fix]`). No inbound webhook yet (poll/API discovery only).
+    Bitbucket,
+    // future #11: GitLab
+}
+
+/// Where a project's review/check trigger labels come from (AB#717).
+///
+/// **Hard carrier** (sealed enum): label resolution branches on an exhaustive
+/// `match LabelSource { ... }` (`crate::pr::labels::effective_labels`), so adding a
+/// variant without handling it is a compile error.
+///
+/// Wire strings are pinned camelCase (`"native" | "title"`) — a cross-agent contract
+/// the frontend's TS union mirrors exactly; a serde golden test below locks it.
+///
+/// - [`Native`](Self::Native) (default, status quo): labels are the source provider's
+///   own PR labels (GitHub labels / Azure DevOps tags).
+/// - [`Title`](Self::Title): labels are parsed from bracketed segments in the PR title
+///   (`[pr-status/need-fix][wip]` → `["pr-status/need-fix", "wip"]`). The ONLY viable
+///   mode for Bitbucket Server, which has no native PR labels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum LabelSource {
+    #[default]
+    Native,
+    Title,
 }
 
 /// Per-project data-update mode (#818): how a project's PR list is kept fresh.
@@ -230,9 +258,29 @@ mod tests {
             serde_json::to_value(SourceKind::Azure).expect("SourceKind serializes"),
             "azure"
         );
+        // AB#717: the Bitbucket Server source variant pins to "bitbucket".
+        assert_eq!(
+            serde_json::to_value(SourceKind::Bitbucket).expect("SourceKind serializes"),
+            "bitbucket"
+        );
         assert_eq!(
             serde_json::to_value(EngineKind::Codex).expect("EngineKind serializes"),
             "codex"
+        );
+        // AB#717: per-project label source. camelCase wire strings the frontend mirrors;
+        // a variant rename or `rename_all` change surfaces here. Default is `Native`
+        // (the status-quo: provider's own PR labels).
+        assert_eq!(
+            serde_json::to_value(LabelSource::Native).expect("LabelSource serializes"),
+            "native"
+        );
+        assert_eq!(
+            serde_json::to_value(LabelSource::Title).expect("LabelSource serializes"),
+            "title"
+        );
+        assert_eq!(
+            serde_json::to_value(LabelSource::default()).expect("LabelSource serializes"),
+            "native"
         );
         // #818: per-project data-update modes. kebab-case wire strings the frontend
         // mirrors; a variant rename or `rename_all` change surfaces here. Default is

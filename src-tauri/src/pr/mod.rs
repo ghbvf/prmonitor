@@ -8,9 +8,11 @@
 //! `reschedule` / `gh_status` Tauri commands.
 
 pub mod azure;
+pub mod bitbucket;
 pub mod commands;
 pub mod discover;
 pub mod gh;
+pub mod labels;
 pub mod ledger;
 pub mod registry;
 pub mod scheduler;

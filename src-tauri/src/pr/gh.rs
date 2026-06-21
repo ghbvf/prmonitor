@@ -1,17 +1,24 @@
 //! GitHub [`super::source::PrSource`] implementation via the `gh` CLI.
 //!
-//! `discover` shells out to `gh pr list --repo <repo> --state open --label
-//! <label> --json ...` for each trigger label and maps the JSON into
-//! [`Candidate`]s (gating) plus the display fields the PR list needs. Parsing is
-//! split into pure functions (`parse_pr_list` / `to_row` / `merge_rows`) so the
-//! `router.py` discovery semantics are unit-tested without invoking `gh`.
+//! `discover` shells out to `gh pr list --repo <repo> --state open ... --json ...`
+//! and maps the JSON into [`Candidate`]s (gating) plus the display fields the PR
+//! list needs. The fetch shape depends on the project's [`crate::model::LabelSource`]
+//! (AB#717):
+//! - `Native` (status quo): one `--label <label>` call per trigger label, merged by
+//!   PR number (`parse_pr_list` / `to_row` / `merge_rows`).
+//! - `Title`: ONE all-open-PRs call (no `--label`), classified client-side from
+//!   bracketed title segments (`to_row_classified`, sharing `super::labels::classify`).
+//!
+//! Parsing is split into pure functions so the `router.py` discovery semantics are
+//! unit-tested without invoking `gh`.
 
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::error::{AppError, AppResult};
-use crate::model::Candidate;
+use crate::model::{Candidate, LabelSource};
 
+use super::labels;
 use super::source::PrSource;
 
 /// Wall-clock budget for any single `gh` invocation. A hung subprocess (network
@@ -106,6 +113,44 @@ fn to_row(raw: RawPr, kind: &str) -> GhRow {
     }
 }
 
+/// Maps one raw gh row into a [`GhRow`] for the title-label path (AB#717), returning
+/// `None` when it carries no trigger label (not monitored). Unlike [`to_row`] (which
+/// stamps a server-filtered `kind` and never conflicts), this resolves effective labels
+/// via [`labels::effective_labels`] and derives `kind` + `conflict` client-side through
+/// the shared [`labels::classify`] — the same classification the native two-call path
+/// gets from `merge_rows`, but from a single all-open-PRs fetch.
+fn to_row_classified(
+    raw: RawPr,
+    review_label: &str,
+    check_label: &str,
+    label_source: crate::model::LabelSource,
+) -> Option<GhRow> {
+    let native: Vec<String> = raw
+        .labels
+        .into_iter()
+        .map(|l| l.name)
+        .filter(|n| !n.is_empty())
+        .collect();
+    let labels = labels::effective_labels(native, &raw.title, label_source);
+    let (kind, conflict) = labels::classify(&labels, review_label, check_label)?;
+    let author = raw.author.map(|a| a.login).unwrap_or_default();
+    Some(GhRow {
+        candidate: Candidate {
+            number: raw.number,
+            head_sha: raw.head_ref_oid,
+            head_ref: raw.head_ref_name,
+            author,
+            is_cross_repository: raw.is_cross_repository,
+            is_draft: raw.is_draft,
+            kind: kind.to_string(),
+        },
+        title: raw.title,
+        url: raw.url,
+        labels,
+        conflict,
+    })
+}
+
 /// Merges the review-labelled and check-labelled rows by PR number, marking a
 /// PR present under both labels as a `conflict` (mirrors `router.py`
 /// `discover_candidates`). The `BTreeMap` yields rows sorted by PR number.
@@ -144,15 +189,22 @@ pub struct GithubCli {
     repo: String,
     review_label: String,
     check_label: String,
+    label_source: LabelSource,
 }
 
 impl GithubCli {
-    pub fn new(repo: String, review_label: String, check_label: String) -> Self {
+    pub fn new(
+        repo: String,
+        review_label: String,
+        check_label: String,
+        label_source: LabelSource,
+    ) -> Self {
         Self {
             gh_bin: "gh".to_string(),
             repo,
             review_label,
             check_label,
+            label_source,
         }
     }
 
@@ -161,24 +213,22 @@ impl GithubCli {
     /// `kill_on_drop(true)`: if this future is dropped (timeout, or the
     /// scheduler's stop-select tearing down an in-flight cycle), the child `gh`
     /// process is killed — closing the cancellation domain (F1).
-    async fn run_pr_list(&self, label: &str) -> AppResult<String> {
+    async fn run_pr_list(&self, label: Option<&str>) -> AppResult<String> {
         let mut cmd = Command::new(&self.gh_bin);
-        cmd.args([
-            "pr",
-            "list",
-            "--repo",
-            &self.repo,
-            "--state",
-            "open",
-            "--label",
-            label,
-            "--json",
-            PR_LIST_FIELDS,
-        ])
-        .kill_on_drop(true);
+        cmd.args(["pr", "list", "--repo", &self.repo, "--state", "open"]);
+        // AB#717: the native path filters server-side per trigger label (one call each);
+        // the title-label path passes `None` to fetch ALL open PRs and classify client-side
+        // (a title tag isn't a real label, so `--label` would match nothing).
+        if let Some(label) = label {
+            cmd.args(["--label", label]);
+        }
+        cmd.args(["--json", PR_LIST_FIELDS]).kill_on_drop(true);
 
+        let ctx = label
+            .map(|l| format!("label={l}"))
+            .unwrap_or_else(|| "all open".to_string());
         let output = match tokio::time::timeout(GH_TIMEOUT, cmd.output()).await {
-            Err(_) => return Err(AppError::new(format!("gh pr list 超时（label={label}）"))),
+            Err(_) => return Err(AppError::new(format!("gh pr list 超时（{ctx}）"))),
             Ok(Err(e)) => {
                 return Err(AppError::new(format!(
                     "无法运行 gh（未安装或不在 PATH？）: {e}"
@@ -190,7 +240,7 @@ impl GithubCli {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(AppError::new(format!(
-                "gh pr list 失败（label={label}）: {}",
+                "gh pr list 失败（{ctx}）: {}",
                 stderr.trim()
             )));
         }
@@ -198,17 +248,42 @@ impl GithubCli {
     }
 
     /// Discovers open PRs carrying either trigger label as display-ready rows
-    /// (conflict PRs included, marked). Two `gh` calls (review + check labels).
+    /// (conflict PRs included, marked). Branches on the project's [`LabelSource`]
+    /// (AB#717):
+    /// - [`LabelSource::Native`] (status quo): two `gh` calls (review + check labels)
+    ///   with server-side `--label` filtering, merged by PR number.
+    /// - [`LabelSource::Title`]: ONE `gh` call for all open PRs, then client-side
+    ///   classify from bracketed title segments (`--label` can't match a title tag).
     pub async fn discover_rows(&self) -> AppResult<Vec<GhRow>> {
-        let review = parse_pr_list(&self.run_pr_list(&self.review_label).await?)?
-            .into_iter()
-            .map(|r| to_row(r, "review"))
-            .collect();
-        let check = parse_pr_list(&self.run_pr_list(&self.check_label).await?)?
-            .into_iter()
-            .map(|r| to_row(r, "check"))
-            .collect();
-        Ok(merge_rows(review, check))
+        match self.label_source {
+            LabelSource::Native => {
+                let review = parse_pr_list(&self.run_pr_list(Some(&self.review_label)).await?)?
+                    .into_iter()
+                    .map(|r| to_row(r, "review"))
+                    .collect();
+                let check = parse_pr_list(&self.run_pr_list(Some(&self.check_label)).await?)?
+                    .into_iter()
+                    .map(|r| to_row(r, "check"))
+                    .collect();
+                Ok(merge_rows(review, check))
+            }
+            LabelSource::Title => {
+                let mut rows: Vec<GhRow> = parse_pr_list(&self.run_pr_list(None).await?)?
+                    .into_iter()
+                    .filter_map(|raw| {
+                        to_row_classified(
+                            raw,
+                            &self.review_label,
+                            &self.check_label,
+                            self.label_source,
+                        )
+                    })
+                    .collect();
+                // Sort by PR number for parity with the native path's BTreeMap order.
+                rows.sort_by_key(|r| r.candidate.number);
+                Ok(rows)
+            }
+        }
     }
 }
 
@@ -399,6 +474,69 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].candidate.kind, "review");
         assert!(!merged[0].conflict);
+    }
+
+    // AB#717: the title-label path resolves effective labels from the PR title and
+    // classifies client-side, ignoring native labels.
+    #[test]
+    fn to_row_classified_uses_title_tags_and_ignores_native_labels() {
+        use crate::model::LabelSource;
+        const REVIEW: &str = "pr-status/needs-review-again";
+        const CHECK: &str = "pr-status/needs-check-fix";
+
+        let raw = RawPr {
+            number: 7,
+            title: format!("Fix login [{REVIEW}]"),
+            url: "https://x/7".to_string(),
+            head_ref_name: "fix".to_string(),
+            head_ref_oid: "sha".to_string(),
+            author: Some(RawAuthor {
+                login: "octocat".to_string(),
+            }),
+            is_cross_repository: false,
+            is_draft: false,
+            // Native label is ignored under Title mode.
+            labels: vec![RawLabel {
+                name: "area/ui".to_string(),
+            }],
+        };
+        let row = to_row_classified(raw, REVIEW, CHECK, LabelSource::Title).expect("monitored");
+        assert_eq!(row.candidate.kind, "review");
+        assert_eq!(row.labels, vec![REVIEW.to_string()]);
+        assert!(!row.conflict);
+
+        // Native-only trigger label (no title tag) → not monitored under Title mode.
+        let raw_native_only = RawPr {
+            number: 8,
+            title: "No tags".to_string(),
+            url: "https://x/8".to_string(),
+            head_ref_name: "x".to_string(),
+            head_ref_oid: "sha".to_string(),
+            author: None,
+            is_cross_repository: false,
+            is_draft: false,
+            labels: vec![RawLabel {
+                name: REVIEW.to_string(),
+            }],
+        };
+        assert!(to_row_classified(raw_native_only, REVIEW, CHECK, LabelSource::Title).is_none());
+
+        // Both trigger tags in the title → conflict, kept with kind "review".
+        let raw_both = RawPr {
+            number: 9,
+            title: format!("[{REVIEW}][{CHECK}] both"),
+            url: "https://x/9".to_string(),
+            head_ref_name: "x".to_string(),
+            head_ref_oid: "sha".to_string(),
+            author: None,
+            is_cross_repository: false,
+            is_draft: false,
+            labels: vec![],
+        };
+        let row_both =
+            to_row_classified(raw_both, REVIEW, CHECK, LabelSource::Title).expect("kept");
+        assert!(row_both.conflict);
+        assert_eq!(row_both.candidate.kind, "review");
     }
 
     // Wire-shape lock for `GhStatus` — the `gh_status` command's front/back wire

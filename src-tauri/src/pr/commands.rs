@@ -7,6 +7,7 @@ use crate::error::AppResult;
 use crate::model::{Candidate, PullRequestView, SourceKind, UpdateMode};
 
 use super::azure::AzureDevOpsCli;
+use super::bitbucket::BitbucketServer;
 use super::discover::{self, MonitorParams};
 use super::gh::{gh_auth_status, GhRow, GhStatus, GithubCli};
 use super::ledger::{now_epoch, Ledger};
@@ -112,10 +113,16 @@ pub(crate) async fn discover<R: tauri::Runtime>(
     // a type contract — `AppConfig` stays config-private; we resolve THIS project by
     // id and snapshot the fields the pr slice needs into `MonitorParams`).
     let project = config_service::project(app, project_id)?;
-    // Capture the source-select fields before `project` is consumed into `params` (#818).
+    // Capture the source-select fields before `project` is consumed into `params` (#818,
+    // AB#717). `label_source` is needed by every source arm; the bitbucket_* fields only
+    // by the Bitbucket arm.
     let source_kind = project.source_kind;
     let azure_org = project.azure_org.clone();
     let azure_project = project.azure_project.clone();
+    let label_source = project.label_source;
+    let bitbucket_host = project.bitbucket_host.clone();
+    let bitbucket_project = project.bitbucket_project.clone();
+    let bitbucket_token = project.bitbucket_token.clone();
     let params = MonitorParams {
         repo: project.repo,
         review_label: project.review_label,
@@ -142,6 +149,7 @@ pub(crate) async fn discover<R: tauri::Runtime>(
                 params.repo.clone(),
                 params.review_label.clone(),
                 params.check_label.clone(),
+                label_source,
             );
             let rows = source.discover_rows().await?;
             let mut views = Vec::with_capacity(rows.len());
@@ -172,12 +180,58 @@ pub(crate) async fn discover<R: tauri::Runtime>(
                 params.repo.clone(),
                 params.review_label.clone(),
                 params.check_label.clone(),
+                label_source,
             );
             let rows = source.discover_rows().await?;
             let mut views = Vec::with_capacity(rows.len());
             let mut dispatchable = Vec::new();
             for row in rows {
                 // Structurally identical to the GitHub arm — full display + gating parity.
+                let (view, disp) = build_view_parts(
+                    row.candidate,
+                    row.title,
+                    row.labels,
+                    row.url,
+                    row.conflict,
+                    &params,
+                    &ledger,
+                    now,
+                );
+                if let Some(disp) = disp {
+                    dispatchable.push(disp);
+                }
+                views.push(view);
+            }
+            (views, dispatchable)
+        }
+        SourceKind::Bitbucket => {
+            // Defense-in-depth (parity with the Azure arm): the reschedule/reconcile path
+            // reaches here via the NON-validated `config_service::load`, so a hand-edited /
+            // partially-migrated Bitbucket project could carry empty host/project/token.
+            // Guard before building the HTTP client. (`validate_project` is the primary gate
+            // on the save path; this is the belt-and-braces backstop.)
+            if bitbucket_host.trim().is_empty()
+                || bitbucket_project.trim().is_empty()
+                || bitbucket_token.trim().is_empty()
+            {
+                return Err(crate::error::AppError::new(
+                    "Bitbucket 源未配置 bitbucketHost / bitbucketProject / bitbucketToken（请在设置中补全）",
+                ));
+            }
+            let source = BitbucketServer::new(
+                bitbucket_host,
+                bitbucket_project,
+                params.repo.clone(),
+                bitbucket_token,
+                params.review_label.clone(),
+                params.check_label.clone(),
+                label_source,
+            );
+            let rows = source.discover_rows().await?;
+            let mut views = Vec::with_capacity(rows.len());
+            let mut dispatchable = Vec::new();
+            for row in rows {
+                // Structurally identical to the other arms — full display + gating parity.
                 let (view, disp) = build_view_parts(
                     row.candidate,
                     row.title,
@@ -881,6 +935,10 @@ pub async fn start_webhook<R: tauri::Runtime>(
             azure_project: p.azure_project.clone(),
             review_label: p.review_label.clone(),
             check_label: p.check_label.clone(),
+            // AB#717: the GitHub webhook path classifies from the payload — it must honor
+            // the project's label source (native vs title-parsed). The Azure path re-runs
+            // `az` discovery (which already honors it), so it ignores this field.
+            label_source: p.label_source,
         })
         .collect();
     state

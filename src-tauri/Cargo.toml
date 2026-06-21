@@ -54,6 +54,13 @@ futures = "0.3"
 # (registry/ledger) — the pump's async path calls these sub-millisecond sync writes
 # directly without holding the connection lock across an `.await`.
 rusqlite = { version = "0.32", features = ["bundled"] }
+# Outbound HTTP client for the Bitbucket Server/DC REST API source (AB#717) — the
+# first outbound HTTP dependency (gh/az are CLI subprocesses; axum is the INBOUND
+# webhook server). `rustls-tls` avoids a system OpenSSL build dependency (pure-Rust
+# TLS, consistent with rusqlite's `bundled`); `json` deserializes paginated PR pages.
+# `default-features = false` drops the default native-tls stack. Reuses the existing
+# tokio runtime (async reqwest), mirroring how gh/az run on tokio::process.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # Pin: brotli 8.0.3 (pulled transitively by tauri-codegen/tauri-utils) requires
 # alloc-no-stdlib "^2.0", but alloc-stdlib/brotli-decompressor accept ">=2.0.4,<4"
