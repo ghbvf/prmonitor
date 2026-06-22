@@ -210,3 +210,32 @@ export type ReviewEvent =
 export type PrEvent =
   | { kind: "updated"; projectId: string; prs: TrackedPrView[] }
   | { kind: "error"; projectId: string; message: string };
+
+// ── Event pipeline contracts (AB#1079, epic AB#1078) ──────────────────────────────
+// The normalized inbound-event envelope shared by the inbox (1065) / rule engine (1068) /
+// outbox (1066). Mirrors `model.rs::Event` + `EventType` (the event-pipeline keystone).
+
+// The class of a normalized event — mirrors the Rust `EventType` enum's camelCase wire
+// values (locked by the model.rs golden test). Single-sourced as an `as const` array
+// (mirrors SOURCE_KINDS / ENGINE_KINDS): the type is DERIVED from the array. Default is
+// "pullRequest" (the only class the current webhook path emits).
+export const EVENT_TYPES = ["pullRequest", "issue", "comment", "label", "generic"] as const;
+export type EventType = (typeof EVENT_TYPES)[number];
+
+// A normalized inbound event (AB#1079) — mirrors `model.rs::Event` (serde camelCase; locked
+// by the model.rs golden test). Generalizes the webhook event with a cross-source identity
+// (`source` / `eventType`) and the `dedupeKey` the inbox dedups on. `number` is null for an
+// event class with no PR/issue number (a generic webhook), mirroring the Rust `Option<u64>`.
+export interface Event {
+  dedupeKey: string;
+  source: SourceKind;
+  eventType: EventType;
+  projectId: string;
+  repo: string;
+  number: number | null;
+  title: string;
+  body: string;
+  labels: string[];
+  url: string;
+  receivedAtEpoch: number;
+}

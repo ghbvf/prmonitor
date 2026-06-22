@@ -196,6 +196,83 @@ pub struct TrackedPrView {
     pub archived: bool,
 }
 
+/// The class of a normalized inbound [`Event`] (AB#1079, epic AB#1078): the event
+/// pipeline's first cross-slice discriminator. The inbox (AB#1065) persists it; the rule
+/// engine (AB#1068) matches on it.
+///
+/// **Hard carrier** (sealed enum): once a consumer (the inbox normalizer / rule matcher)
+/// branches on an exhaustive `match EventType { ... }`, adding a variant without an arm is
+/// a compile error — the missing arm cannot be expressed. Today the seam is RESERVED (no
+/// consumer yet — the webhook path only emits `PullRequest`), exactly like [`SourceKind`]'s
+/// reserved-but-not-yet-load-bearing note; the Hard carrier closes when the inbox lands.
+///
+/// Wire strings are pinned camelCase (`"pullRequest" | "issue" | "comment" | "label" |
+/// "generic"`) — a cross-agent contract the frontend's `EVENT_TYPES` (`src/types.ts`)
+/// mirrors; the serde golden test below (`event_type_serializes_to_pinned_wire_strings`)
+/// is the **Medium** carrier locking them against a `rename_all` / variant drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum EventType {
+    /// A pull-request event (the only class the current webhook path emits).
+    #[default]
+    PullRequest,
+    /// An issue event (reserved for the inbox's issue ingestion, AB#1065).
+    Issue,
+    /// An issue/PR comment event.
+    Comment,
+    /// A label add/remove event.
+    Label,
+    /// A generic webhook event that does not map to the classes above.
+    Generic,
+}
+
+/// A normalized inbound event — the event pipeline's cross-slice envelope (AB#1079,
+/// epic AB#1078). External deliveries (the webhook today; future connectors, AB#1070) are
+/// normalized into this shape; the inbox (AB#1065) persists it (dedup by
+/// [`dedupe_key`](Self::dedupe_key)), the rule engine (AB#1068) matches on its fields, and
+/// the outbox (AB#1066) acts on the result. It GENERALIZES the existing
+/// `crate::pr::webhook::WebhookEvent` (`project_id` / `repo` / `number` / `title` /
+/// `labels` / `url`), adding the cross-source identity (`source` / `event_type`) and the
+/// idempotency key the inbox dedups on.
+///
+/// `Serialize` + `Deserialize`: the inbox stores it (as JSON) and reads it back, and it is
+/// a front/back contract mirrored in `src/types.ts` (`Event`). The serde golden below
+/// (`event_wire_shape_is_camel_case`) is the **Medium** carrier locking the camelCase wire
+/// shape (upstream = Rust `rename_all`; the downstream TS mirror is hand-kept — the open
+/// end of this funnel, future Hard path = codegen `types.ts` from `model.rs` +
+/// `git diff --exit-code`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Event {
+    /// Idempotency key the inbox dedups on (AB#1065): the SAME logical delivery (a webhook
+    /// retry, a tunnel re-delivery) yields the SAME key, so it is processed exactly once.
+    /// Composed by the inbox normalizer from a delivery's stable identity; the exact key
+    /// format is defined by the inbox (AB#1065), not pinned here.
+    pub dedupe_key: String,
+    /// Which source produced the event (reuses the existing source discriminator).
+    pub source: SourceKind,
+    /// The event class (PR / issue / comment / label / generic).
+    pub event_type: EventType,
+    /// The matched project id (routing key), mirroring `WebhookEvent::project_id`.
+    pub project_id: String,
+    /// The repo `owner/name` (GitHub) or bare repo name (Azure), for matching / diagnostics.
+    pub repo: String,
+    /// The PR/issue number, or `None` for an event class that has none (a generic webhook).
+    /// Serializes to JSON `null` (not omitted) so the TS mirror's `number | null` stays a
+    /// closed contract.
+    pub number: Option<u64>,
+    /// The PR/issue title (`""` when absent), for title matchers / display.
+    pub title: String,
+    /// The PR/issue body (`""` when absent), for body matchers.
+    pub body: String,
+    /// The effective labels (post-[`LabelSource`] resolution), for label matchers.
+    pub labels: Vec<String>,
+    /// The event's HTML URL (`""` when absent).
+    pub url: String,
+    /// When the event was received (epoch seconds), stamped by the ingress.
+    pub received_at_epoch: u64,
+}
+
 /// Serde wire-shape locks for `model.rs`'s cross-slice types.
 ///
 /// The **Medium carrier** for these serde shapes per
@@ -439,5 +516,98 @@ mod tests {
         assert_eq!(v["presence"], "current");
         let stale = serde_json::to_value(PrPresence::Stale).expect("PrPresence serializes");
         assert_eq!(stale, "stale");
+    }
+
+    // Cross-agent wire contract lock for the AB#1079 event-pipeline discriminator
+    // `EventType` (Medium carrier per ai-robust.md): the frontend's `EVENT_TYPES`
+    // (`src/types.ts`) mirrors these exact camelCase strings. A variant rename or a
+    // `rename_all` change surfaces here (the exhaustive `match` a future inbox/rule
+    // consumer adds is the Hard carrier). Default is `PullRequest` (the only class the
+    // current webhook path emits).
+    #[test]
+    fn event_type_serializes_to_pinned_wire_strings() {
+        assert_eq!(
+            serde_json::to_value(EventType::PullRequest).expect("EventType serializes"),
+            "pullRequest"
+        );
+        assert_eq!(
+            serde_json::to_value(EventType::Issue).expect("EventType serializes"),
+            "issue"
+        );
+        assert_eq!(
+            serde_json::to_value(EventType::Comment).expect("EventType serializes"),
+            "comment"
+        );
+        assert_eq!(
+            serde_json::to_value(EventType::Label).expect("EventType serializes"),
+            "label"
+        );
+        assert_eq!(
+            serde_json::to_value(EventType::Generic).expect("EventType serializes"),
+            "generic"
+        );
+        assert_eq!(
+            serde_json::to_value(EventType::default()).expect("EventType serializes"),
+            "pullRequest"
+        );
+    }
+
+    // Front/back contract lock for the AB#1079 normalized `Event` envelope (Medium carrier
+    // per ai-robust.md): mirrored in `src/types.ts` (`Event`); a field change must be synced
+    // there in lockstep (the open end of the funnel — future Hard path = codegen from
+    // `model.rs` + `git diff --exit-code`). Locks camelCase keys present + snake_case absent,
+    // the nested `source`/`eventType` wire strings, and that an absent `number` (a generic /
+    // non-numbered event) serializes as JSON null (not omitted) so the TS mirror's
+    // `number: number | null` stays a closed contract.
+    #[test]
+    fn event_wire_shape_is_camel_case() {
+        let event = Event {
+            dedupe_key: "github:pullRequest:owner/repo#7:labeled".to_string(),
+            source: SourceKind::Github,
+            event_type: EventType::PullRequest,
+            project_id: "p1".to_string(),
+            repo: "owner/repo".to_string(),
+            number: Some(7),
+            title: "Add feature".to_string(),
+            body: "body text".to_string(),
+            labels: vec!["pr-review".to_string()],
+            url: "https://example.com/pr/7".to_string(),
+            received_at_epoch: 1_700_000_000,
+        };
+
+        let v = serde_json::to_value(&event).expect("Event serializes");
+
+        // camelCase keys present.
+        assert!(v.get("dedupeKey").is_some());
+        assert!(v.get("source").is_some());
+        assert!(v.get("eventType").is_some());
+        assert!(v.get("projectId").is_some());
+        assert!(v.get("repo").is_some());
+        assert!(v.get("number").is_some());
+        assert!(v.get("title").is_some());
+        assert!(v.get("body").is_some());
+        assert!(v.get("labels").is_some());
+        assert!(v.get("url").is_some());
+        assert!(v.get("receivedAtEpoch").is_some());
+
+        // snake_case forms absent — a rename of any multi-word field surfaces here.
+        assert!(v.get("dedupe_key").is_none());
+        assert!(v.get("event_type").is_none());
+        assert!(v.get("project_id").is_none());
+        assert!(v.get("received_at_epoch").is_none());
+
+        // The nested kind enums serialize to their pinned wire strings.
+        assert_eq!(v["source"], "github");
+        assert_eq!(v["eventType"], "pullRequest");
+
+        // An absent `number` (a generic / non-numbered event) serializes as JSON null
+        // (not omitted), keeping the TS mirror's `number: number | null` a closed contract.
+        let generic = Event {
+            number: None,
+            event_type: EventType::Generic,
+            ..event
+        };
+        let gv = serde_json::to_value(&generic).expect("Event serializes");
+        assert_eq!(gv["number"], serde_json::Value::Null);
     }
 }
