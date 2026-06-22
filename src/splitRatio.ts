@@ -11,11 +11,14 @@ export const DEFAULT_TOP_RATIO = 0.35;
 // leaves both panes (and their scrollbars) usable instead of collapsing one to a sliver.
 export const MIN_RATIO = 0.15;
 
-// Clamp a top-pane ratio into the usable band [minRatio, 1 - minRatio]. NaN (bad input)
-// falls back to the smallest valid top rather than propagating into a style value.
+// Clamp a top-pane ratio into the usable band [lo, 1 - lo]. NaN (bad input) falls back to
+// the smallest valid top rather than propagating into a style value. minRatio is itself
+// normalized into [0, 0.5] so a caller passing >= 0.5 (no room for both panes) collapses
+// to the 50/50 midpoint instead of an inverted band that returns inconsistent values.
 export function clampRatio(ratio: number, minRatio: number): number {
-  const hi = 1 - minRatio;
-  if (Number.isNaN(ratio) || ratio < minRatio) return minRatio;
+  const lo = Math.min(Math.max(minRatio, 0), 0.5);
+  const hi = 1 - lo;
+  if (Number.isNaN(ratio) || ratio < lo) return lo;
   if (ratio > hi) return hi;
   return ratio;
 }
@@ -30,6 +33,8 @@ export function ratioFromPointer(
   rectHeight: number,
   minRatio: number,
 ): number {
-  if (rectHeight <= 0) return minRatio;
+  // No meaningful position (container not laid out) → smallest valid top, routed through
+  // clampRatio so an out-of-range minRatio is normalized here too.
+  if (rectHeight <= 0) return clampRatio(0, minRatio);
   return clampRatio((clientY - rectTop) / rectHeight, minRatio);
 }

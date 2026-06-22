@@ -14,13 +14,16 @@ import {
   ratioFromPointer,
 } from "./splitRatio";
 
+// `initialTopRatio` only SEEDS the ratio at setup — later prop changes do not re-drive
+// the split (the ratio is user-controlled after mount, by design). `minRatio` bounds how
+// small either pane may get.
 const props = withDefaults(
-  defineProps<{ defaultTopRatio?: number; minRatio?: number }>(),
-  { defaultTopRatio: DEFAULT_TOP_RATIO, minRatio: MIN_RATIO },
+  defineProps<{ initialTopRatio?: number; minRatio?: number }>(),
+  { initialTopRatio: DEFAULT_TOP_RATIO, minRatio: MIN_RATIO },
 );
 
 const rootEl = ref<HTMLElement | null>(null);
-const topRatio = ref(clampRatio(props.defaultTopRatio, props.minRatio));
+const topRatio = ref(clampRatio(props.initialTopRatio, props.minRatio));
 const dragging = ref(false);
 
 // One arrow press nudges the split by 2% (a11y: the separator is keyboard-operable).
@@ -55,6 +58,12 @@ function onKeydown(e: KeyboardEvent) {
   } else if (e.key === "ArrowDown") {
     topRatio.value = clampRatio(topRatio.value + KEY_STEP, props.minRatio);
     e.preventDefault();
+  } else if (e.key === "Home") {
+    topRatio.value = clampRatio(0, props.minRatio); // smallest top pane
+    e.preventDefault();
+  } else if (e.key === "End") {
+    topRatio.value = clampRatio(1, props.minRatio); // largest top pane
+    e.preventDefault();
   }
 }
 </script>
@@ -68,6 +77,7 @@ function onKeydown(e: KeyboardEvent) {
       class="divider"
       role="separator"
       aria-orientation="horizontal"
+      aria-label="调整面板高度 / Resize panes"
       :aria-valuenow="Math.round(topRatio * 100)"
       aria-valuemin="0"
       aria-valuemax="100"
@@ -98,12 +108,17 @@ function onKeydown(e: KeyboardEvent) {
   flex-basis: 0;
   min-height: 0;
   overflow-y: auto;
+  /* Small vertical inset so pane content doesn't sit flush against the divider. */
+  padding: var(--space-2) 0;
 }
 .divider {
   flex: none;
   height: var(--space-3);
   cursor: row-resize;
   background: var(--color-border);
+  /* Stop touch devices (touchscreen Windows) from turning a drag into a scroll gesture
+     that would steal the pointer capture mid-resize. */
+  touch-action: none;
 }
 .divider:hover,
 .split.dragging .divider {

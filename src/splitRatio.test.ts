@@ -39,6 +39,18 @@ describe("clampRatio", () => {
   it("falls back to minRatio on NaN", () => {
     expect(clampRatio(Number.NaN, 0.15)).toBe(0.15);
   });
+
+  it("collapses an unusable minRatio (>= 0.5) to the 50/50 midpoint", () => {
+    // Band would invert (lo > hi) — normalize minRatio to 0.5 so both edges meet at 0.5.
+    expect(clampRatio(0.7, 0.6)).toBe(0.5);
+    expect(clampRatio(0.3, 0.6)).toBe(0.5);
+    expect(clampRatio(0.5, 0.6)).toBe(0.5);
+  });
+
+  it("treats a negative minRatio as 0 (full range usable)", () => {
+    expect(clampRatio(0.5, -1)).toBe(0.5);
+    expect(clampRatio(0.01, -1)).toBe(0.01);
+  });
 });
 
 describe("ratioFromPointer", () => {
