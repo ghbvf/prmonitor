@@ -2,13 +2,19 @@
 // commands, and the streamed `review:event` Tauri event.
 import { invoke, listen } from "../api";
 import type { ReviewEvent } from "../types";
-import type { CodexStatus, ReviewSession, StreamItem } from "./types";
+import type { ClaudeStatus, CodexStatus, ReviewSession, StreamItem } from "./types";
 
 // Mirrors `src-tauri/src/events.rs::REVIEW_EVENT` (pinned by a Rust test).
 const REVIEW_EVENT = "review:event" as const;
 
 export function getCodexStatus(): Promise<CodexStatus> {
   return invoke<CodexStatus>("get_codex_status");
+}
+
+// claude availability (one-shot `claude --version`); no start/stop — claude has no
+// resident server (unlike codex).
+export function getClaudeStatus(): Promise<ClaudeStatus> {
+  return invoke<ClaudeStatus>("get_claude_status");
 }
 
 // Explicitly start the resident codex app-server (clears the user-stop flag).

@@ -10,8 +10,8 @@ import type { AppConfig, Project } from "./types";
 import {
   UPDATE_MODES,
   ENGINE_KINDS,
-  githubCliRequiredForSource,
-  githubCliStatusRelevantForSource,
+  autoReviewSourceCli,
+  statusBarSourceTool,
   pollingEnabledForMode,
   manualPullAllowedForMode,
 } from "../types";
@@ -195,35 +195,46 @@ describe("pollingEnabledForMode (818)", () => {
   });
 });
 
-describe("githubCliRequiredForSource (818)", () => {
-  it("requires gh only for GitHub modes that run the poll loop", () => {
-    expect(githubCliRequiredForSource("github", "webhook-only")).toBe(false);
-    expect(githubCliRequiredForSource("github", "pull-only")).toBe(true);
-    expect(githubCliRequiredForSource("github", "hybrid")).toBe(true);
-    expect(githubCliRequiredForSource("github", "manual")).toBe(false);
+describe("autoReviewSourceCli (818)", () => {
+  it("requires gh only for GitHub poll modes (webhook classifies from the payload)", () => {
+    expect(autoReviewSourceCli("github", "webhook-only")).toBe(null);
+    expect(autoReviewSourceCli("github", "pull-only")).toBe("gh");
+    expect(autoReviewSourceCli("github", "hybrid")).toBe("gh");
+    expect(autoReviewSourceCli("github", "manual")).toBe(null);
   });
 
-  it("does not require gh for Azure or Bitbucket modes", () => {
+  it("requires az for every auto-updating Azure mode incl. webhook (re-runs az), not manual", () => {
+    // Azure's webhook path re-runs `az` discovery (pr/webhook.rs → discover_once), so
+    // webhook-only/pull-only/hybrid all auto-depend on az; manual is on-demand only.
+    expect(autoReviewSourceCli("azure", "webhook-only")).toBe("az");
+    expect(autoReviewSourceCli("azure", "pull-only")).toBe("az");
+    expect(autoReviewSourceCli("azure", "hybrid")).toBe("az");
+    expect(autoReviewSourceCli("azure", "manual")).toBe(null);
+  });
+
+  it("never blocks on a CLI for Bitbucket (REST + token)", () => {
     for (const mode of UPDATE_MODES) {
-      expect(githubCliRequiredForSource("azure", mode)).toBe(false);
-      expect(githubCliRequiredForSource("bitbucket", mode)).toBe(false);
+      expect(autoReviewSourceCli("bitbucket", mode)).toBe(null);
     }
   });
 });
 
-describe("githubCliStatusRelevantForSource (818)", () => {
-  it("shows gh status for GitHub modes that can call gh", () => {
-    expect(githubCliStatusRelevantForSource("github", "webhook-only")).toBe(false);
-    expect(githubCliStatusRelevantForSource("github", "pull-only")).toBe(true);
-    expect(githubCliStatusRelevantForSource("github", "hybrid")).toBe(true);
-    expect(githubCliStatusRelevantForSource("github", "manual")).toBe(true);
-  });
-
-  it("does not show gh status for Azure or Bitbucket modes", () => {
-    for (const mode of UPDATE_MODES) {
-      expect(githubCliStatusRelevantForSource("azure", mode)).toBe(false);
-      expect(githubCliStatusRelevantForSource("bitbucket", mode)).toBe(false);
-    }
+describe("statusBarSourceTool (818)", () => {
+  it("surfaces the source tool for any discovering mode; Azure always uses az", () => {
+    // GitHub/Bitbucket: only webhook-only (purely push-driven, no CLI/REST) shows nothing.
+    expect(statusBarSourceTool("github", "webhook-only")).toBe(null);
+    expect(statusBarSourceTool("github", "pull-only")).toBe("gh");
+    expect(statusBarSourceTool("github", "hybrid")).toBe("gh");
+    expect(statusBarSourceTool("github", "manual")).toBe("gh");
+    // Azure: webhook re-runs `az` discovery, so az is surfaced in EVERY mode incl. webhook-only.
+    expect(statusBarSourceTool("azure", "webhook-only")).toBe("az");
+    expect(statusBarSourceTool("azure", "pull-only")).toBe("az");
+    expect(statusBarSourceTool("azure", "hybrid")).toBe("az");
+    expect(statusBarSourceTool("azure", "manual")).toBe("az");
+    expect(statusBarSourceTool("bitbucket", "webhook-only")).toBe(null);
+    expect(statusBarSourceTool("bitbucket", "pull-only")).toBe("bitbucket");
+    expect(statusBarSourceTool("bitbucket", "hybrid")).toBe("bitbucket");
+    expect(statusBarSourceTool("bitbucket", "manual")).toBe("bitbucket");
   });
 });
 

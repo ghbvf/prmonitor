@@ -10,6 +10,7 @@
 import { ref } from "vue";
 import type { ReviewEvent } from "../types";
 import {
+  getClaudeStatus,
   getCodexStatus,
   getSessionHistory,
   listReviewSessions,
@@ -20,7 +21,13 @@ import {
   stopReview,
 } from "./api";
 import { useProjects } from "../projects";
-import type { CodexStatus, ReviewSession, SessionStatus, StreamItem } from "./types";
+import type {
+  ClaudeStatus,
+  CodexStatus,
+  ReviewSession,
+  SessionStatus,
+  StreamItem,
+} from "./types";
 
 // A rejected Tauri invoke throws the AppError object `{ message }`; fall back to
 // a stringified form for any non-conforming throw.
@@ -29,6 +36,7 @@ function toMessage(err: unknown): string {
 }
 
 const codex = ref<CodexStatus | null>(null);
+const claude = ref<ClaudeStatus | null>(null);
 
 // All review sessions the backend currently tracks (#8 auto-trigger can run
 // several concurrently). Drives the ReviewSessions list; refreshed event-driven
@@ -80,6 +88,21 @@ async function refreshCodexStatus() {
       available: false,
       desiredRunning: true,
       message: message || "codex 状态获取失败",
+    };
+  }
+}
+
+// Hydrate claude availability. Tolerates a rejected command by surfacing an
+// unavailable status rather than throwing (mirrors refreshCodexStatus).
+async function refreshClaudeStatus() {
+  try {
+    claude.value = await getClaudeStatus();
+  } catch (err) {
+    const message = toMessage(err);
+    console.error("claude 状态获取失败", err);
+    claude.value = {
+      available: false,
+      message: message || "claude 状态获取失败",
     };
   }
 }
@@ -399,6 +422,8 @@ export function useReviewStore() {
   return {
     codex,
     refreshCodexStatus,
+    claude,
+    refreshClaudeStatus,
     startCodexServer,
     stopCodexServer,
     sessions,

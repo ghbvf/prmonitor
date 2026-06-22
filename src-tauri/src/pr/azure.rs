@@ -16,7 +16,7 @@
 
 use std::process::Stdio;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
@@ -473,6 +473,77 @@ impl PrSource for AzureDevOpsCli {
     async fn discover(&self) -> AppResult<Vec<Candidate>> {
         Ok(rows_into_candidates(self.discover_rows().await?))
     }
+}
+
+/// `az` CLI auth status reported to the StatusBar (pr-slice-private wire type;
+/// mirrored in `src/pr/types.ts`, not `model.rs` / `src/types.ts`).
+///
+/// NOTE: `az account show` only proves `az` is installed and logged into an Azure
+/// ACCOUNT — it does NOT prove Azure DevOps (`az repos pr list`, which needs the
+/// `azure-devops` extension + a DevOps-scoped PAT/login) will work. So a true
+/// `authenticated` is "az 已登录", not "DevOps 可用"; the success message says so.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AzStatus {
+    pub authenticated: bool,
+    pub message: String,
+}
+
+/// The four mutually-exclusive outcomes of the `az account show` probe, so the
+/// AzStatus mapping is a PURE function unit-tested without spawning `az`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AzProbe {
+    /// `az account show` exited 0 — az installed + logged in.
+    LoggedIn,
+    /// Ran but exited non-zero — az installed but not logged in.
+    NotLoggedIn,
+    /// Failed to spawn — binary missing / not on PATH.
+    NotFound,
+    /// Timed out.
+    Timeout,
+}
+
+/// PURE outcome → AzStatus mapping (unit-tested). Honest wording: a logged-in az is
+/// not a proof DevOps works (see `AzStatus` doc), so the success message says so.
+fn classify_az(probe: AzProbe) -> AzStatus {
+    match probe {
+        AzProbe::LoggedIn => AzStatus {
+            authenticated: true,
+            message: "az 已登录（Azure DevOps 连接将在拉取时验证）".to_string(),
+        },
+        AzProbe::NotLoggedIn => AzStatus {
+            authenticated: false,
+            message: "az 未登录（运行 az login）".to_string(),
+        },
+        AzProbe::NotFound => AzStatus {
+            authenticated: false,
+            message: "未找到 az CLI（请安装并 az login）".to_string(),
+        },
+        AzProbe::Timeout => AzStatus {
+            authenticated: false,
+            message: "az 状态检查超时".to_string(),
+        },
+    }
+}
+
+/// Probes `az account show` for the StatusBar. Never errors — every failure maps to
+/// `authenticated: false` with a human-readable message (mirrors `gh_auth_status`).
+/// `kill_on_drop(true)` + `AZ_TIMEOUT` bound a hung/auth-prompting child. Only the exit
+/// code is read (the message text is fixed by `classify_az`), so stdout/stderr are
+/// discarded to `null` — no account JSON is buffered into memory or surfaced anywhere.
+pub async fn az_auth_status(az_bin: &str) -> AzStatus {
+    let mut cmd = Command::new(az_bin);
+    cmd.args(["account", "show"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let probe = match tokio::time::timeout(AZ_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) if output.status.success() => AzProbe::LoggedIn,
+        Ok(Ok(_)) => AzProbe::NotLoggedIn,
+        Ok(Err(_)) => AzProbe::NotFound,
+        Err(_) => AzProbe::Timeout,
+    };
+    classify_az(probe)
 }
 
 #[cfg(test)]
@@ -988,5 +1059,36 @@ mod tests {
             .await
             .expect("empty")
             .is_empty());
+    }
+
+    // Wire-shape lock for `AzStatus` — the `az_status` command's front/back wire type,
+    // mirrored in `src/pr/types.ts` (Medium carrier per ai-robust.md). Both fields are
+    // single-word, so there is no snake_case variant to assert ABSENT (cf. CodexStatus's
+    // `desired_running`); add a `.is_none()` check here if a multi-word field is added.
+    #[test]
+    fn az_status_wire_shape_is_camel_case() {
+        let v = serde_json::to_value(AzStatus {
+            authenticated: true,
+            message: "ok".to_string(),
+        })
+        .expect("AzStatus serializes");
+        assert!(v.get("authenticated").is_some());
+        assert!(v.get("message").is_some());
+    }
+
+    // The pure `classify_az` mapping: each probe arm carries the right `authenticated`
+    // bool with a non-empty message, and `LoggedIn` is the ONLY `authenticated: true`
+    // outcome (so a logged-in az is the sole success signal the StatusBar shows green).
+    #[test]
+    fn classify_az_maps_each_probe_arm() {
+        let logged_in = classify_az(AzProbe::LoggedIn);
+        assert!(logged_in.authenticated);
+        assert!(!logged_in.message.is_empty());
+
+        for probe in [AzProbe::NotLoggedIn, AzProbe::NotFound, AzProbe::Timeout] {
+            let status = classify_az(probe);
+            assert!(!status.authenticated, "{probe:?} must not be authenticated");
+            assert!(!status.message.is_empty(), "{probe:?} message non-empty");
+        }
     }
 }

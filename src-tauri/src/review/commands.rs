@@ -7,7 +7,7 @@ use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::model::EngineKind;
 use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
-use crate::review::engines::claude::process::CLAUDE_BIN;
+use crate::review::engines::claude::process::{claude_availability, ClaudeStatus, CLAUDE_BIN};
 use crate::review::engines::claude::ClaudeEngine;
 use crate::review::engines::codex::{CodexEngine, CodexStatus};
 use crate::review::history_store::{self, HistoryItem};
@@ -68,6 +68,14 @@ pub async fn get_codex_status<R: tauri::Runtime>(
 ) -> AppResult<CodexStatus> {
     let repo_root = config_service::active_repo_root(&app)?;
     Ok(state.codex.status(CODEX_BIN, &repo_root).await)
+}
+
+/// Reports `claude` CLI availability for the StatusBar. One-shot `claude --version`
+/// probe — claude has NO resident server (unlike codex), so there is no start/stop
+/// and this takes no `app`/`state`/repo_root. The probe never errors.
+#[tauri::command]
+pub async fn get_claude_status() -> AppResult<ClaudeStatus> {
+    Ok(claude_availability(CLAUDE_BIN).await)
 }
 
 /// 显式启动常驻 codex app-server（清除「已停止」标记并拉起握手）。返回最新状态。

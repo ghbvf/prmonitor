@@ -6,7 +6,7 @@ use crate::config::service as config_service;
 use crate::error::AppResult;
 use crate::model::{Candidate, PullRequestView, SourceKind, UpdateMode};
 
-use super::azure::AzureDevOpsCli;
+use super::azure::{az_auth_status, AzStatus, AzureDevOpsCli};
 use super::bitbucket::BitbucketServer;
 use super::discover::{self, MonitorParams};
 use super::gh::{gh_auth_status, GhRow, GhStatus, GithubCli};
@@ -405,6 +405,13 @@ pub async fn reschedule<R: tauri::Runtime>(
 #[tauri::command]
 pub async fn gh_status() -> AppResult<GhStatus> {
     Ok(gh_auth_status("gh").await)
+}
+
+/// Reports `az` CLI auth status for the StatusBar (Azure source). Mirrors `gh_status`:
+/// no args, hardcodes the PATH-resolved `az` binary; the probe never errors.
+#[tauri::command]
+pub async fn az_status() -> AppResult<AzStatus> {
+    Ok(az_auth_status("az").await)
 }
 
 /// Returns `project_id`'s retained tracked-PR list (#35) — that project's persisted

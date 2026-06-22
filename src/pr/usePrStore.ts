@@ -13,6 +13,7 @@
 // process-global, not per project.
 import { defineStore } from "pinia";
 import {
+  azStatus,
   getPrs,
   ghStatus,
   onPrsUpdated,
@@ -24,7 +25,7 @@ import {
 } from "./api";
 import type { TrackedPrView } from "../types";
 import { periodicPollEligible } from "../types";
-import type { GhStatus, PollStatus } from "./types";
+import type { AzStatus, GhStatus, PollStatus } from "./types";
 import { useProjects } from "../projects";
 
 interface PrState {
@@ -46,6 +47,9 @@ interface PrState {
   // gh CLI auth is process-global, not per-project — stays scalar.
   gh: GhStatus | null;
   ghLoading: boolean;
+  // az CLI auth is process-global, not per-project — stays scalar (mirrors gh).
+  az: AzStatus | null;
+  azLoading: boolean;
   // Per-project backend poll-loop status (#62), keyed by projectId. Null until the
   // first refreshPollStatus lands (or if its command rejects). Diagnostics-only —
   // distinct from the optimistic `polling` flag above, which mirrors the UI toggle.
@@ -69,6 +73,8 @@ export const usePrStore = defineStore("pr", {
     snapshotLoaded: {},
     gh: null,
     ghLoading: false,
+    az: null,
+    azLoading: false,
     pollStatus: {},
   }),
   getters: {
@@ -269,6 +275,17 @@ export const usePrStore = defineStore("pr", {
         this.gh = { authenticated: false, message: toMessage(err) };
       } finally {
         this.ghLoading = false;
+      }
+    },
+    async refreshAzStatus() {
+      if (this.azLoading) return;
+      this.azLoading = true;
+      try {
+        this.az = await azStatus();
+      } catch (err) {
+        this.az = { authenticated: false, message: toMessage(err) };
+      } finally {
+        this.azLoading = false;
       }
     },
     // Read one project's backend poll-loop status into its partition (#62). Pure

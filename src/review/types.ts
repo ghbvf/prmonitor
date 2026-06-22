@@ -6,6 +6,13 @@ export interface CodexStatus {
   message: string;
 }
 
+// Review 切片私有 wire 型，镜像 src-tauri 的 ClaudeStatus（不进 src/types.ts —— 对标 CodexStatus）。
+// claude 是一次性 `claude -p`，无常驻进程，故无 desiredRunning / 无启动停止：只报「已安装可用」。
+export interface ClaudeStatus {
+  available: boolean;
+  message: string;
+}
+
 // Mirrors `session.rs::SessionStatus` (serde camelCase). Slice-private.
 export type SessionStatus =
   | "starting"

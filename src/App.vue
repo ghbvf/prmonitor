@@ -18,7 +18,7 @@ import { useReviewStore } from "./review/useReviewStore";
 import { reschedule, startPolling } from "./pr/api";
 import { useAppView } from "./useAppView";
 import { useProjects } from "./projects";
-import { githubCliRequiredForSource, periodicPollEligible } from "./types";
+import { autoReviewSourceCli, periodicPollEligible } from "./types";
 
 const version = ref("");
 // Gate view selection until the config load resolves, so a first-launch user never
@@ -33,33 +33,61 @@ const { currentView, goMonitor, goSettings, goOnboarding } = useAppView();
 const { activeProjectId } = useProjects();
 
 // Login / availability banner (composition layer only): #8 auto-triggers reviews,
-// which silently stall if `gh` isn't authenticated or codex is unavailable.
-// Reading BOTH slices' status (gh from the pr store, codex from the review store)
-// is legitimate here — App is the cross-slice wiring point, exactly like StatusBar.
-// Hidden while either status is still loading (null) so a cold start doesn't flash
-// a false warning; shown only on a confirmed unavailable signal.
-// `dispatchError` is the session-less auto-trigger notice (#8): the backend
-// dispatcher emits it on a bad config / start failure / ledger-write failure, so
-// the same banner that warns "auto review paused" also reports "auto review failed".
-const { codex, dispatchError, clearDispatchError, clearFocus } = useReviewStore();
+// which silently stall if the active project's SELECTED source CLI isn't authed or its
+// SELECTED engine is unavailable. Reading BOTH slices' status (gh/az from the pr store,
+// codex/claude from the review store) is legitimate here — App is the cross-slice wiring
+// point, exactly like StatusBar. Hidden while a status is still loading (null) so a cold
+// start doesn't flash a false warning; shown only on a confirmed unavailable signal.
+// Keyed to the ACTIVE project (vs the StatusBar's enabled-aggregate): the banner is about
+// the project you're looking at, which has exactly one source + one engine.
+// `dispatchError` is the session-less auto-trigger notice (#8): the backend dispatcher
+// emits it on a bad config / start failure / ledger-write failure, so the same banner that
+// warns "auto review paused" also reports "auto review failed".
+const { codex, claude, dispatchError, clearDispatchError, clearFocus } =
+  useReviewStore();
 const activeProject = computed(
   () =>
     configStore.config?.projects.find((p) => p.id === activeProjectId.value) ??
     null,
 );
-const activeProjectNeedsGh = computed(
-  () =>
-    activeProject.value?.enabled === true &&
-    githubCliRequiredForSource(
-      activeProject.value.sourceKind,
-      activeProject.value.updateMode,
-    ),
+// A DISABLED project never auto-reviews (the backend skips it in scheduling / webhook
+// routing), so its source/engine health must NOT drive the "paused" banner — gate every
+// half on this. (Both halves share it; without it, switching to a disabled project would
+// surface its cached gh/az/codex/claude failure as a spurious pause.)
+const activeEnabled = computed(() => activeProject.value?.enabled === true);
+// The source CLI the active project's AUTO-review pipeline depends on (gh / az / null).
+const activeSourceCli = computed(() =>
+  activeEnabled.value
+    ? autoReviewSourceCli(
+        activeProject.value!.sourceKind,
+        activeProject.value!.updateMode,
+      )
+    : null,
 );
 const ghBlocked = computed(
-  () => activeProjectNeedsGh.value && prStore.gh?.authenticated === false,
+  () => activeSourceCli.value === "gh" && prStore.gh?.authenticated === false,
 );
-const codexBlocked = computed(() => codex.value?.available === false);
-const showPrompt = computed(() => ghBlocked.value || codexBlocked.value);
+const azBlocked = computed(
+  () => activeSourceCli.value === "az" && prStore.az?.authenticated === false,
+);
+// Engine half — gate on the ACTIVE project's SELECTED engine (so codex's state never
+// blocks a claude project, and vice versa) AND on `enabled` (a disabled project doesn't
+// auto-review). Null-safe (`?.`) so a cold start (status still null) shows no false warn.
+const codexBlocked = computed(
+  () =>
+    activeEnabled.value &&
+    activeProject.value?.engineKind === "codex" &&
+    codex.value?.available === false,
+);
+const claudeBlocked = computed(
+  () =>
+    activeEnabled.value &&
+    activeProject.value?.engineKind === "claude" &&
+    claude.value?.available === false,
+);
+const sourceBlocked = computed(() => ghBlocked.value || azBlocked.value);
+const engineBlocked = computed(() => codexBlocked.value || claudeBlocked.value);
+const showPrompt = computed(() => sourceBlocked.value || engineBlocked.value);
 // dispatchError is keyed per project (#35): show the active project's notice.
 const activeDispatchError = computed(
   () => dispatchError.value[activeProjectId.value] ?? null,
@@ -284,9 +312,15 @@ watch(selectedNumber, (n) => {
             <template v-if="ghBlocked">
               gh 未登录，请运行 <code>gh auth login</code>
             </template>
-            <template v-if="ghBlocked && codexBlocked"> ；</template>
+            <template v-if="azBlocked">
+              az 未登录，请运行 <code>az login</code>
+            </template>
+            <template v-if="sourceBlocked && engineBlocked"> ；</template>
             <template v-if="codexBlocked">
               codex 不可用（{{ codex?.message }}）
+            </template>
+            <template v-if="claudeBlocked">
+              claude 不可用（{{ claude?.message }}）
             </template>
           </p>
           <p v-if="activeDispatchError" class="line dispatch-error">
@@ -309,6 +343,9 @@ watch(selectedNumber, (n) => {
       </main>
     </div>
 
+    <!-- Mounted in EVERY non-booting view (sibling of the view switch above): it owns the
+         gated source/engine status probing the banner above reads, so it must stay here —
+         don't move it inside a view branch. -->
     <StatusBar />
   </div>
 </template>

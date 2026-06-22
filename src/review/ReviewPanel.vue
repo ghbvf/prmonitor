@@ -22,7 +22,6 @@ const {
   listenerError,
   start,
   stop,
-  refreshCodexStatus,
   init,
 } = useReviewStore();
 
@@ -40,11 +39,13 @@ const finalLabel = computed(() => {
   }
 });
 
-// Attach the streamed-event listener for the panel's lifetime; hydrate codex
-// availability for the StatusBar. Mirrors PollControls' mount/unmount pattern.
+// Attach the streamed-event listener for the panel's lifetime. Mirrors PollControls'
+// mount/unmount pattern. Codex/claude availability is probed by the always-mounted
+// StatusBar (gated to the engines actually in use), so this panel no longer probes
+// codex — a passive probe lazily spawns the resident codex app-server, which a
+// claude-only config must never trigger.
 let unlisten: Awaited<ReturnType<typeof init>> | null = null;
 onMounted(async () => {
-  refreshCodexStatus();
   unlisten = await init();
 });
 onUnmounted(() => unlisten?.());

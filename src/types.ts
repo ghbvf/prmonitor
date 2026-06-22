@@ -96,38 +96,56 @@ export function pollingEnabledForMode(mode: UpdateMode): boolean {
   }
 }
 
-// Whether a project source/mode combination needs the GitHub CLI to keep automatic
-// PR discovery running. Azure uses `az`, Bitbucket uses its REST API, and
-// webhook-only/manual do not run the periodic CLI loop, so a failed `gh auth
-// status` must not pause or warn those modes.
-export function githubCliRequiredForSource(
+// The source-side CLI/REST tool a project surfaces, keyed by `SourceKind`:
+// GitHub→`gh`, Azure→`az`, Bitbucket→its REST API (labelled `bitbucket`, no CLI).
+// Adding a source (e.g. `gitlab`, 未来 #11) is a COMPILE error in the assertNever
+// switches below until its tool is mapped — the StatusBar can't silently miss it.
+export type SourceTool = "gh" | "az" | "bitbucket";
+
+// Which source tool the StatusBar should surface for this project, or `null` when the
+// mode runs NO discovery for that source. GitHub/Bitbucket discover only via the poll
+// loop OR a manual one-shot pull, so webhook-only drops out (GitHub's webhook path
+// classifies from the payload — no `gh`; Bitbucket has no webhook handler). AZURE is the
+// exception: its webhook path is a refresh signal that RE-RUNS `az` discovery
+// (src-tauri/src/pr/webhook.rs → SchedulerSet::discover_once → `az repos pr list`), so
+// `az` is invoked in EVERY azure mode — always surface it. assertNever 穷尽 (Medium): a
+// new SourceKind must be classified here.
+export function statusBarSourceTool(
   sourceKind: SourceKind,
   mode: UpdateMode,
-): boolean {
+): SourceTool | null {
+  const discovers = pollingEnabledForMode(mode) || manualPullAllowedForMode(mode);
   switch (sourceKind) {
     case "github":
-      return pollingEnabledForMode(mode);
+      return discovers ? "gh" : null;
     case "azure":
+      return "az"; // poll/manual call `az`; webhook re-runs `az` discovery — always used
     case "bitbucket":
-      return false;
+      return discovers ? "bitbucket" : null;
     default:
       return assertNever(sourceKind);
   }
 }
 
-// Whether the shell should surface GitHub CLI auth status for this project. Manual
-// GitHub projects do not run the background poll loop, but their one-shot pull still
-// discovers PRs through `gh`, so the StatusBar should not claim gh is unnecessary.
-export function githubCliStatusRelevantForSource(
+// Which source CLI the active project's AUTOMATIC review pipeline depends on (a failed
+// auth pauses auto review), or `null`. GitHub auto-discovers via `gh` only in the poll
+// loop (pull-only/hybrid) — its webhook path classifies from the payload, and manual is
+// on-demand. AZURE re-runs `az` in BOTH the poll loop AND the webhook refresh signal, so
+// every auto-updating azure mode (webhook-only/pull-only/hybrid) needs `az`; manual azure
+// is on-demand only, so it's excluded to avoid a false "paused" when no webhook is set up.
+// Bitbucket uses a REST token (no live-blockable CLI). Drives the App.vue "自动 review 已
+// 暂停" banner. assertNever 穷尽 (Medium).
+export function autoReviewSourceCli(
   sourceKind: SourceKind,
   mode: UpdateMode,
-): boolean {
+): "gh" | "az" | null {
   switch (sourceKind) {
     case "github":
-      return pollingEnabledForMode(mode) || manualPullAllowedForMode(mode);
+      return pollingEnabledForMode(mode) ? "gh" : null;
     case "azure":
+      return mode === "manual" ? null : "az";
     case "bitbucket":
-      return false;
+      return null;
     default:
       return assertNever(sourceKind);
   }

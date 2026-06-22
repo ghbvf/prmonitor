@@ -3,6 +3,7 @@
 import { invoke, listen } from "../api";
 import type { PrEvent, TrackedPrView } from "../types";
 import type {
+  AzStatus,
   GhStatus,
   PollStatus,
   WebhookDelivery,
@@ -60,6 +61,10 @@ export function setPrArchived(
 
 export function ghStatus(): Promise<GhStatus> {
   return invoke<GhStatus>("gh_status");
+}
+
+export function azStatus(): Promise<AzStatus> {
+  return invoke<AzStatus>("az_status");
 }
 
 // Webhook receiver + Cloudflare tunnel controls (#9). Each returns the current

@@ -14,6 +14,7 @@
 
 use std::process::Stdio;
 
+use serde::Serialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
@@ -22,6 +23,74 @@ use crate::error::{AppError, AppResult};
 /// The `claude` binary name (PATH-resolved). Single source mirrored by the review
 /// command + composition root, like codex's `CODEX_BIN`.
 pub const CLAUDE_BIN: &str = "claude";
+
+/// Wall-clock budget for the `claude --version` availability probe. Mirrors codex's
+/// status probe discipline; `kill_on_drop(true)` kills a hung child.
+const CLAUDE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `claude` CLI availability for the StatusBar (review-slice-private wire type;
+/// mirrored in `src/review/types.ts`). Unlike `CodexStatus` there is NO
+/// `desiredRunning`: `claude -p` is a one-shot per review (no resident server to
+/// start/stop), so a `claude --version` probe can only report installed-or-not.
+/// `available` means "claude CLI is installed + on PATH" — NOT that login/auth is
+/// valid (that surfaces at review time); the message says "已就绪", not "可用".
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeStatus {
+    pub available: bool,
+    pub message: String,
+}
+
+/// The mutually-exclusive outcomes of the `claude --version` probe, so the
+/// ClaudeStatus mapping is a PURE function unit-tested without spawning `claude`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeProbe {
+    Ready,
+    Errored,
+    NotFound,
+    Timeout,
+}
+
+/// PURE outcome → ClaudeStatus mapping (unit-tested).
+fn classify_claude(probe: ClaudeProbe) -> ClaudeStatus {
+    match probe {
+        ClaudeProbe::Ready => ClaudeStatus {
+            available: true,
+            message: "claude CLI 已就绪".to_string(),
+        },
+        ClaudeProbe::Errored => ClaudeStatus {
+            available: false,
+            message: "claude 异常退出（检查安装 / 登录）".to_string(),
+        },
+        ClaudeProbe::NotFound => ClaudeStatus {
+            available: false,
+            message: "未找到 claude CLI（请安装并登录）".to_string(),
+        },
+        ClaudeProbe::Timeout => ClaudeStatus {
+            available: false,
+            message: "claude 状态检查超时".to_string(),
+        },
+    }
+}
+
+/// Probes `claude --version` for the StatusBar. Never errors — every failure maps to
+/// `available: false` with a human-readable message. Fast + non-interactive. Only the
+/// exit code is read (the message text is fixed by `classify_claude`), so stdout/stderr
+/// are discarded to `null` rather than buffered.
+pub async fn claude_availability(claude_bin: &str) -> ClaudeStatus {
+    let mut cmd = Command::new(claude_bin);
+    cmd.args(["--version"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let probe = match tokio::time::timeout(CLAUDE_PROBE_TIMEOUT, cmd.output()).await {
+        Ok(Ok(output)) if output.status.success() => ClaudeProbe::Ready,
+        Ok(Ok(_)) => ClaudeProbe::Errored,
+        Ok(Err(_)) => ClaudeProbe::NotFound,
+        Err(_) => ClaudeProbe::Timeout,
+    };
+    classify_claude(probe)
+}
 
 /// Max bytes buffered for a single stdout line. One `stream-json` line is a whole
 /// JSON object; a delta line stays small, but this bounds memory against a
@@ -327,6 +396,40 @@ pub fn stdout_reader(stdout: ChildStdout) -> BufReader<ChildStdout> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── claude availability status (the StatusBar wire type + pure classifier) ───
+    // Wire-shape lock for `ClaudeStatus`, mirrored in `src/review/types.ts` (Medium
+    // carrier per ai-robust.md). Both fields are single-word, so there is no snake_case
+    // variant to assert ABSENT (cf. CodexStatus's `desired_running`); add a `.is_none()`
+    // check here if a multi-word field is added.
+    #[test]
+    fn claude_status_wire_shape_is_camel_case() {
+        let v = serde_json::to_value(ClaudeStatus {
+            available: true,
+            message: "ok".to_string(),
+        })
+        .expect("ClaudeStatus serializes");
+        assert!(v.get("available").is_some());
+        assert!(v.get("message").is_some());
+    }
+
+    #[test]
+    fn classify_claude_maps_each_arm() {
+        // Ready is the ONLY available:true arm; every failure is available:false.
+        let ready = classify_claude(ClaudeProbe::Ready);
+        assert!(ready.available);
+        assert!(!ready.message.is_empty());
+
+        for probe in [
+            ClaudeProbe::Errored,
+            ClaudeProbe::NotFound,
+            ClaudeProbe::Timeout,
+        ] {
+            let s = classify_claude(probe);
+            assert!(!s.available, "{probe:?} must map to available:false");
+            assert!(!s.message.is_empty(), "{probe:?} must carry a message");
+        }
+    }
 
     // ── prompt builder ──────────────────────────────────────────────────────────
     #[test]

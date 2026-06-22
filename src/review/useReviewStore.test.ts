@@ -9,6 +9,9 @@ vi.mock("./api", () => ({
   getCodexStatus: vi.fn(() =>
     Promise.resolve({ available: true, desiredRunning: true, message: "ok" }),
   ),
+  getClaudeStatus: vi.fn(() =>
+    Promise.resolve({ available: true, message: "ok" }),
+  ),
   startCodex: vi.fn(() =>
     Promise.resolve({ available: true, desiredRunning: true, message: "ok" }),
   ),
@@ -39,6 +42,10 @@ beforeEach(() => {
     desiredRunning: true,
     message: "ok",
   });
+  vi.mocked(api.getClaudeStatus).mockResolvedValue({
+    available: true,
+    message: "ok",
+  });
   vi.mocked(api.startReview).mockResolvedValue("th_1");
   vi.mocked(api.stopReview).mockResolvedValue();
   vi.mocked(api.listReviewSessions).mockResolvedValue([]);
@@ -47,6 +54,7 @@ beforeEach(() => {
   // Module-level singleton state: reset between tests so each starts clean.
   const s = useReviewStore();
   s.codex.value = null;
+  s.claude.value = null;
   s.sessions.value = [];
   s.items.value = [];
   s.running.value = false;
@@ -99,6 +107,28 @@ describe("useReviewStore refreshCodexStatus()", () => {
 
     expect(store.codex.value?.available).toBe(false);
     expect(store.codex.value?.message).toBe("boom");
+  });
+});
+
+describe("useReviewStore refreshClaudeStatus()", () => {
+  it("writes claude.value from getClaudeStatus on success", async () => {
+    const store = useReviewStore();
+    expect(store.claude.value).toBeNull();
+
+    await store.refreshClaudeStatus();
+
+    expect(api.getClaudeStatus).toHaveBeenCalledOnce();
+    expect(store.claude.value).toEqual({ available: true, message: "ok" });
+  });
+
+  it("on a rejected invoke sets an unavailable claude status", async () => {
+    vi.mocked(api.getClaudeStatus).mockRejectedValueOnce({ message: "boom" });
+    const store = useReviewStore();
+
+    await store.refreshClaudeStatus();
+
+    expect(store.claude.value?.available).toBe(false);
+    expect(store.claude.value?.message).toBe("boom");
   });
 });
 
