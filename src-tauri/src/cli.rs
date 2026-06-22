@@ -4,16 +4,15 @@
 //! slice's local-API wire types + the `config` slice's loader, so it is composition, not a
 //! slice.
 //!
-//! **Two runtime situations, one early `argv` branch** ([`crate::run`] calls [`parse`]):
-//!  - **App running** → this binary is a THIN HTTP CLIENT over the AB#1043 local API — the
-//!    request/response channel that plays VS Code's `VSCODE_IPC_HOOK_CLI` / `code --wait` role:
-//!    `POST /reviews`, then with `--watch` poll `GET /reviews/{id}` to a terminal state and
-//!    print the comment URL. The Tauri GUI is never built; exit codes follow `gh run watch`
-//!    (always 0 unless `--exit-status`). [`run_client_blocking`] returns [`ClientOutcome::Handled`].
-//!  - **App not running** (connection refused) → [`run_client_blocking`] returns
-//!    [`ClientOutcome::AppNotRunning`]; `lib.rs` falls through to the Tauri builder so THIS
-//!    process becomes the single-instance FIRST instance, boots the GUI + local API, and
-//!    triggers the review in-process.
+//! The binary is ALWAYS a THIN HTTP CLIENT over the AB#1043 local API — the request/response
+//! channel that plays VS Code's `VSCODE_IPC_HOOK_CLI` / `code --wait` role: `POST /reviews`, then
+//! with `--watch` poll `GET /reviews/{id}` to a terminal state and print the comment URL. The CLI
+//! process NEVER becomes the GUI; exit codes follow `gh run watch` (always 0 unless `--exit-status`).
+//!  - **App running** → trigger succeeds immediately.
+//!  - **App not running** (connection refused) → the CLI LAUNCHES the app as a DETACHED child and
+//!    keeps polling until its local API binds, then runs the same client path. Because the CLI
+//!    stays a pure HTTP client (it never forwards argv via single-instance), `--watch`/`--json`/
+//!    `--exit-status` work on cold start too AND no single-instance race can drop the request.
 //!
 //! **Governance (AB-robust).** The client REUSES the local API's `TriggerRequest` /
 //! `TriggerResponse` / `StatusResponse` / `ErrorBody` structs — ONE definition, both sides
@@ -144,7 +143,7 @@ impl std::fmt::Debug for ReviewArgs {
 
 /// What [`parse`] resolved the process invocation to.
 pub enum Invocation {
-    /// `prmonitor review …` — run the CLI client (maybe falling through to a GUI cold start).
+    /// `prmonitor review …` — run the CLI client (which itself launches the app on a cold start).
     Review(ReviewArgs),
     /// Anything else — boot the GUI normally.
     Gui,
@@ -165,19 +164,25 @@ pub fn parse() -> Invocation {
     }
 }
 
-/// The outcome of attempting the HTTP client path.
-pub enum ClientOutcome {
-    /// The request reached the app (or hit a definitive client/usage error). The process should
-    /// exit with this code — do NOT fall through to a GUI.
-    Handled(i32),
-    /// The local API was unreachable (connection refused) ⇒ the app is not running; the caller
-    /// should fall through to the Tauri builder for the single-instance cold start.
-    AppNotRunning,
+/// Cold-start retry budget: after launching the app, how long to wait for its local API to bind,
+/// and how often to retry the connect. The CLI stays a thin HTTP client the whole time (it never
+/// becomes the GUI), so `--watch`/`--json`/`--exit-status` work on cold start too.
+const COLD_START_DEADLINE: Duration = Duration::from_secs(30);
+const COLD_START_POLL: Duration = Duration::from_millis(300);
+
+/// The result of a single trigger POST.
+enum Trigger {
+    /// The app accepted the trigger (202) — carries the session id + status URL.
+    Ok(TriggerResponse),
+    /// Connection refused — nothing is listening (the app is not running yet).
+    NotRunning,
+    /// A definitive failure (HTTP 4xx/5xx, parse/transport error) — exit with this code.
+    Failed(i32),
 }
 
 /// Synchronous entry for [`crate::run`] — owns a single-threaded tokio runtime for the client
-/// (built before any Tauri runtime exists).
-pub fn run_client_blocking(args: &ReviewArgs) -> ClientOutcome {
+/// (built before any Tauri runtime exists). Returns the process exit code.
+pub fn run_client_blocking(args: &ReviewArgs) -> i32 {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -185,19 +190,19 @@ pub fn run_client_blocking(args: &ReviewArgs) -> ClientOutcome {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("无法创建运行时: {e}");
-            return ClientOutcome::Handled(1);
+            return 1;
         }
     };
     rt.block_on(run_client(args))
 }
 
-async fn run_client(args: &ReviewArgs) -> ClientOutcome {
+async fn run_client(args: &ReviewArgs) -> i32 {
     let endpoint = resolve_endpoint(args);
     if endpoint.port == 0 {
         // Single non-zero error code for every failure (gh: non-zero = failed); a CI `&&` chain
         // only cares that it is not 0.
         eprintln!("本地 API 已禁用（端口为 0）；在设置中设置 localApiPort 后重试");
-        return ClientOutcome::Handled(1);
+        return 1;
     }
     // `redirect(none)`: the local API only ever returns 2xx/4xx/5xx, never a redirect. Refusing to
     // follow 3xx hardens the bearer-token requests — a rogue/hijacked listener cannot bounce the
@@ -210,35 +215,32 @@ async fn run_client(args: &ReviewArgs) -> ClientOutcome {
         Ok(c) => c,
         Err(e) => {
             eprintln!("无法创建 HTTP 客户端: {e}");
-            return ClientOutcome::Handled(1);
+            return 1;
         }
     };
     let base = format!("http://127.0.0.1:{}", endpoint.port);
 
-    // 1) Trigger the review.
-    let resp = client
-        .post(format!("{base}/reviews"))
-        .bearer_auth(&endpoint.token)
-        .json(&args.trigger_request())
-        .send()
-        .await;
-    let resp = match resp {
-        Ok(r) => r,
-        // Connection refused = nothing listening = app not running → cold-start fall-through.
-        Err(e) if e.is_connect() => return ClientOutcome::AppNotRunning,
-        Err(e) => {
-            eprintln!("触发请求失败: {e}");
-            return ClientOutcome::Handled(1);
-        }
-    };
-    if !resp.status().is_success() {
-        return ClientOutcome::Handled(report_http_error(resp).await);
-    }
-    let trigger: TriggerResponse = match resp.json().await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("解析触发响应失败: {e}");
-            return ClientOutcome::Handled(1);
+    // 1) Trigger. If the app is running, this succeeds immediately. If it is NOT running, launch it
+    //    and retry-connect until its local API binds — the CLI stays a thin HTTP client throughout
+    //    (it never becomes the GUI nor forwards argv via single-instance), so `--watch`/`--json`/
+    //    `--exit-status` work on cold start AND no single-instance race can drop the request.
+    let trigger = match post_trigger(&client, &base, &endpoint.token, args).await {
+        Trigger::Ok(tr) => tr,
+        Trigger::Failed(code) => return code,
+        Trigger::NotRunning => {
+            eprintln!("app 未运行：正在启动 app…");
+            if let Err(e) = spawn_detached_gui() {
+                eprintln!("启动 app 失败：{e}");
+                return 1;
+            }
+            match await_app_then_trigger(&client, &base, &endpoint.token, args).await {
+                Trigger::Ok(tr) => tr,
+                Trigger::Failed(code) => return code,
+                Trigger::NotRunning => {
+                    eprintln!("启动 app 后本地 API 未在 {COLD_START_DEADLINE:?} 内就绪");
+                    return 1;
+                }
+            }
         }
     };
 
@@ -248,7 +250,7 @@ async fn run_client(args: &ReviewArgs) -> ClientOutcome {
         emit(&args.json, &value, || {
             format!("review 已触发：{}\n{}", trigger.id, trigger.status_url)
         });
-        return ClientOutcome::Handled(0);
+        return 0;
     }
 
     // 3) --watch: poll the server-provided status URL to a terminal state. The URL is
@@ -256,9 +258,80 @@ async fn run_client(args: &ReviewArgs) -> ClientOutcome {
     // hijacked/rogue listener must never receive the token off-box.
     if !is_loopback_http_url(&trigger.status_url) {
         eprintln!("拒绝轮询非 loopback 的 statusUrl：{}", trigger.status_url);
-        return ClientOutcome::Handled(1);
+        return 1;
     }
     watch_to_terminal(&client, &endpoint.token, &trigger.status_url, args).await
+}
+
+/// One trigger POST. Connection-refused is reported distinctly ([`Trigger::NotRunning`]) so the
+/// caller can launch the app and retry; every other failure is terminal.
+async fn post_trigger(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    args: &ReviewArgs,
+) -> Trigger {
+    let resp = client
+        .post(format!("{base}/reviews"))
+        .bearer_auth(token)
+        .json(&args.trigger_request())
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) if e.is_connect() => return Trigger::NotRunning,
+        Err(e) => {
+            eprintln!("触发请求失败: {e}");
+            return Trigger::Failed(1);
+        }
+    };
+    if !resp.status().is_success() {
+        return Trigger::Failed(report_http_error(resp).await);
+    }
+    match resp.json::<TriggerResponse>().await {
+        Ok(tr) => Trigger::Ok(tr),
+        Err(e) => {
+            eprintln!("解析触发响应失败: {e}");
+            Trigger::Failed(1)
+        }
+    }
+}
+
+/// After launching the app, retry [`post_trigger`] until its local API binds (the first non-refused
+/// result wins — so exactly one review is triggered) or the cold-start deadline elapses.
+async fn await_app_then_trigger(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    args: &ReviewArgs,
+) -> Trigger {
+    let mut waited = Duration::ZERO;
+    loop {
+        match post_trigger(client, base, token, args).await {
+            Trigger::NotRunning => {
+                if waited >= COLD_START_DEADLINE {
+                    return Trigger::NotRunning;
+                }
+                tokio::time::sleep(COLD_START_POLL).await;
+                waited += COLD_START_POLL;
+            }
+            settled => return settled,
+        }
+    }
+}
+
+/// Launch the GUI as a DETACHED child (this same binary with no args → the [`Invocation::Gui`] path
+/// → `build_app`). stdio is nulled so the GUI's output never pollutes the CLI's stdout (which
+/// carries the result); the child is not awaited, so it outlives this CLI process. single-instance
+/// dedups if two cold starts race — both CLIs then connect to the one GUI's API.
+fn spawn_detached_gui() -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_child| ())
 }
 
 async fn watch_to_terminal(
@@ -266,7 +339,7 @@ async fn watch_to_terminal(
     token: &str,
     status_url: &str,
     args: &ReviewArgs,
-) -> ClientOutcome {
+) -> i32 {
     // No overall deadline — INTENTIONAL, matching `gh run watch`: a review runs as long as it
     // runs, and the caller's environment (a CI job timeout, or Ctrl-C) bounds the wait. The
     // per-request `REQUEST_TIMEOUT` still prevents a single hung socket from blocking forever.
@@ -279,17 +352,17 @@ async fn watch_to_terminal(
             // it rather than silently falling back to a cold start.
             Err(e) => {
                 eprintln!("轮询请求失败: {e}");
-                return ClientOutcome::Handled(1);
+                return 1;
             }
         };
         if !resp.status().is_success() {
-            return ClientOutcome::Handled(report_http_error(resp).await);
+            return report_http_error(resp).await;
         }
         let status: StatusResponse = match resp.json().await {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("解析状态响应失败: {e}");
-                return ClientOutcome::Handled(1);
+                return 1;
             }
         };
         if is_terminal(status.status) {
@@ -298,7 +371,7 @@ async fn watch_to_terminal(
             emit(&args.json, &value, || {
                 human_status(status.status, status.comment_url.as_deref())
             });
-            return ClientOutcome::Handled(exit_code(status.status, has_url, args.exit_status));
+            return exit_code(status.status, has_url, args.exit_status);
         }
         // Progress feedback to stderr (stdout stays reserved for the final result), so the user
         // can tell the command is waiting, not hung.
@@ -405,17 +478,24 @@ fn human_status(status: SessionStatus, comment_url: Option<&str>) -> String {
 
 /// Whether `url` is a plain-HTTP loopback URL — the ONLY shape the local API emits
 /// (`http://127.0.0.1:{port}/…`). Guards the bearer-token poll: a server-provided status URL
-/// pointing off-box (a rogue/hijacked listener) must never receive the token. Pure — unit-tested.
+/// pointing off-box (a rogue/hijacked listener) must never receive the token.
+///
+/// PARSE the authority — a `starts_with` prefix check is fooled by userinfo, since the real host
+/// of `http://127.0.0.1:8788@evil.com/…` is `evil.com` (codex F1). Reject any non-`http` scheme,
+/// any embedded user/password, and any non-loopback host (which also rejects look-alikes like
+/// `127.0.0.1.evil.com`). Pure — unit-tested incl. the userinfo bypass.
 pub(crate) fn is_loopback_http_url(url: &str) -> bool {
-    const LOOPBACK_PREFIXES: [&str; 6] = [
-        "http://127.0.0.1:",
-        "http://127.0.0.1/",
-        "http://localhost:",
-        "http://localhost/",
-        "http://[::1]:",
-        "http://[::1]/",
-    ];
-    LOOPBACK_PREFIXES.iter().any(|p| url.starts_with(p))
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    parsed.scheme() == "http"
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && matches!(
+            parsed.host_str(),
+            Some("127.0.0.1") | Some("localhost") | Some("[::1]")
+        )
 }
 
 /// Terminal = the review reached an end state (`done` or `failed`); polling stops. Pure.
@@ -615,6 +695,18 @@ mod tests {
         assert!(!is_loopback_http_url(
             "http://127.0.0.1.evil.com/reviews/th-1"
         ));
+        // codex F1: userinfo bypass — the real authority host is `evil.com`, NOT the prefix. A
+        // `starts_with` prefix check passed these; the URL parser must reject them.
+        assert!(!is_loopback_http_url(
+            "http://127.0.0.1:8788@evil.com/reviews/th-1"
+        ));
+        assert!(!is_loopback_http_url(
+            "http://127.0.0.1@evil.com/reviews/th-1"
+        ));
+        assert!(!is_loopback_http_url(
+            "http://user:pass@127.0.0.1:8788/reviews/th-1"
+        ));
+        assert!(!is_loopback_http_url("not a url"));
     }
 
     /// **Medium** carrier: the restated bundle identifier must equal `tauri.conf.json`'s

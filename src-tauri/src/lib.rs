@@ -37,43 +37,24 @@ use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // AB#1044: branch on `argv` BEFORE building Tauri. `prmonitor review …` runs as a thin HTTP
-    // client over the AB#1043 local API (the `code --wait` role); only a cold start (app not
-    // running) falls through to build the GUI and trigger the review in-process. Anything else
-    // (no/unknown subcommand) is a normal GUI launch.
+    // AB#1044: branch on `argv` BEFORE building Tauri. `prmonitor review …` runs entirely as a thin
+    // HTTP client over the AB#1043 local API (the `code --wait` role) — including launching the app
+    // on a cold start and then connecting to it (see `cli::run_client_blocking`). It NEVER becomes
+    // the GUI. Anything else (no/unknown subcommand) is a normal GUI launch.
     match cli::parse() {
-        cli::Invocation::Review(args) => match cli::run_client_blocking(&args) {
-            cli::ClientOutcome::Handled(code) => std::process::exit(code),
-            cli::ClientOutcome::AppNotRunning => {
-                // Cold start: tell the user the GUI is launching (so the trigger isn't "silent"),
-                // and that the blocking flags don't apply here — the full --watch/--exit-status
-                // contract is the app-running HTTP path. (Wiring those into the launched GUI is a
-                // separate, larger change.)
-                eprintln!("app 未运行：启动 GUI 并在后台触发 review。");
-                if args.watch || args.exit_status {
-                    eprintln!(
-                        "注意：--watch / --exit-status 在冷启动下不生效；app 运行后重试可获得阻塞 + 退出码。"
-                    );
-                }
-                build_app(Some(args))
-            }
-        },
-        cli::Invocation::Gui => build_app(None),
+        cli::Invocation::Review(args) => std::process::exit(cli::run_client_blocking(&args)),
+        cli::Invocation::Gui => build_app(),
     }
 }
 
-/// A cold-start CLI review stashed into managed state (AB#1044): a `prmonitor review` launched
-/// while the app was DOWN falls through to [`build_app`]; `setup` reads this and triggers the
-/// review in-process once the local API is up.
-struct PendingCliReview(cli::ReviewArgs);
-
-/// Build + run the Tauri GUI. `pending` carries a cold-start CLI review to fire after `setup`.
-fn build_app(pending: Option<cli::ReviewArgs>) {
-    let mut builder = tauri::Builder::default()
+/// Build + run the Tauri GUI.
+fn build_app() {
+    tauri::Builder::default()
         // Single-instance MUST be the FIRST plugin (AB#1044): it claims the OS lock before any
         // window work, so a second launch focuses the existing window instead of opening a
-        // duplicate. A `prmonitor review` while the app is running never reaches here (the early
-        // `cli::parse` HTTP-client path handles it), so this callback only resurfaces the window.
+        // duplicate (incl. when two cold-start CLIs each spawn the GUI — only one survives, and
+        // both CLIs then connect to its local API). The CLI never forwards a `review` request
+        // through this callback, so it only needs to resurface the window.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.unminimize();
@@ -83,11 +64,7 @@ fn build_app(pending: Option<cli::ReviewArgs>) {
         }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
-        .manage(AppState::default());
-    if let Some(args) = pending {
-        builder = builder.manage(PendingCliReview(args));
-    }
-    builder
+        .manage(AppState::default())
         .setup(|app| {
             // Open + migrate the unified SQLite store and manage it as a `tauri::State`
             // BEFORE anything that reads persistence (config load / poll start). It is a
@@ -175,31 +152,6 @@ fn build_app(pending: Option<cli::ReviewArgs>) {
             // setting/clearing it in Settings takes effect without a restart. A bind failure is
             // logged + swallowed inside the spawned task (a port clash must not crash the app).
             state.local_api.start(app.handle().clone());
-            // Cold-start CLI trigger (AB#1044): if this process was launched as `prmonitor
-            // review` while the app was DOWN, fire that review now. We already hold the
-            // AppHandle, so call the SAME transport-agnostic `trigger_review` funnel the local
-            // API wraps (engine selection + dedup stay single-source) — directly, not over HTTP.
-            // Spawned so a slow project-resolve/dispatch never blocks `setup` from returning.
-            if let Some(pending) = app.try_state::<PendingCliReview>() {
-                let args = pending.0.clone();
-                let app_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = app_handle.state::<AppState>();
-                    let kind = args.kind().to_string();
-                    match review::commands::trigger_review(
-                        app_handle.clone(),
-                        state,
-                        args.reference(),
-                        args.pr,
-                        kind,
-                    )
-                    .await
-                    {
-                        Ok(id) => eprintln!("已在新启动的 app 内触发 review（会话 {id}）"),
-                        Err(e) => eprintln!("CLI 触发 review 失败：{}", e.message),
-                    }
-                });
-            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
