@@ -21,6 +21,13 @@
       "csp": null
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["prmonitor"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",

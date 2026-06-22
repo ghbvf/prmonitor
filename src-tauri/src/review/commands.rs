@@ -26,8 +26,10 @@ pub(crate) const CODEX_BIN: &str = "codex";
 /// would silently run a full review while the registry/ledger key keeps the bogus
 /// kind, splitting dedup. Whitelisting here fails fast before any session starts. The
 /// Hard path (future) is a shared Rust enum ↔ TS union; this is the Medium guard until
-/// then. Pure (no `AppHandle`) so it is unit-testable.
-fn validate_kind(kind: &str) -> AppResult<()> {
+/// then. Pure (no `AppHandle`) so it is unit-testable. `pub(crate)` so the deeplink parser
+/// ([`crate::review::deeplink`], AB#1045) validates `kind` at the same funnel boundary
+/// instead of restating the whitelist.
+pub(crate) fn validate_kind(kind: &str) -> AppResult<()> {
     if kind == "review" || kind == "check" {
         Ok(())
     } else {
@@ -43,8 +45,9 @@ fn validate_kind(kind: &str) -> AppResult<()> {
 /// flow into the engine and start a bogus `/pr-review 0`. Fail-closed BEFORE any project resolve
 /// / engine dispatch (parity with [`validate_kind`]), shared by both [`start_review`] and
 /// [`trigger_review`] so the single funnel can't be bypassed. Pure (no `AppHandle`) so it is
-/// unit-testable.
-fn validate_pr_number(pr_number: u64) -> AppResult<()> {
+/// unit-testable. `pub(crate)` so the deeplink parser ([`crate::review::deeplink`], AB#1045)
+/// rejects `pr=0` at parse time, the same boundary the CLI/local-API hit.
+pub(crate) fn validate_pr_number(pr_number: u64) -> AppResult<()> {
     if pr_number == 0 {
         Err(AppError::new("pr 非法（PR 号必须大于 0）: 0"))
     } else {
