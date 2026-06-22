@@ -19,9 +19,11 @@
 //! A command running before that manage would panic on `app.state::<Database>()`
 //! (fail-fast) — but `setup` completes before any command is served, so it never does.
 
+use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use tauri::Manager;
 
 use crate::error::{AppError, AppResult};
@@ -59,6 +61,27 @@ impl Database {
         let conn =
             Connection::open(&path).map_err(|e| AppError::new(format!("打开 SQLite 失败: {e}")))?;
         Self::from_conn(conn)
+    }
+
+    /// Opens an EXISTING `prmonitor.db` READ-ONLY at `path`, WITHOUT running migrations — for an
+    /// out-of-app reader (the AB#1044 CLI client) that only needs the config blob while the
+    /// running app owns the file. Read-only + a bounded `busy_timeout` rides out the app's brief
+    /// write locks and GUARANTEES a second process never migrates / mutates the live store (a
+    /// stale CLI binary must not stamp the schema or write through `from_conn`). Errors if the
+    /// file is absent (= the app has never run / written config), letting the caller fall back.
+    pub fn open_readonly_at(path: &Path) -> AppResult<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| AppError::new(format!("打开 SQLite（只读）失败: {e}")))?;
+        conn.busy_timeout(Duration::from_millis(2000))
+            .map_err(map_err)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// In-memory database — schema migrated, no legacy import. Used by store round-trip

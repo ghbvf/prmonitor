@@ -1,0 +1,524 @@
+//! `prmonitor review …` CLI subcommand (AB#1044 — CLI/Deeplink Phase 2).
+//!
+//! Composition-layer module (a sibling of [`crate::dispatch`]): it consumes the `review`
+//! slice's local-API wire types + the `config` slice's loader, so it is composition, not a
+//! slice.
+//!
+//! **Two runtime situations, one early `argv` branch** ([`crate::run`] calls [`parse`]):
+//!  - **App running** → this binary is a THIN HTTP CLIENT over the AB#1043 local API — the
+//!    request/response channel that plays VS Code's `VSCODE_IPC_HOOK_CLI` / `code --wait` role:
+//!    `POST /reviews`, then with `--watch` poll `GET /reviews/{id}` to a terminal state and
+//!    print the comment URL. The Tauri GUI is never built; exit codes follow `gh run watch`
+//!    (always 0 unless `--exit-status`). [`run_client_blocking`] returns [`ClientOutcome::Handled`].
+//!  - **App not running** (connection refused) → [`run_client_blocking`] returns
+//!    [`ClientOutcome::AppNotRunning`]; `lib.rs` falls through to the Tauri builder so THIS
+//!    process becomes the single-instance FIRST instance, boots the GUI + local API, and
+//!    triggers the review in-process.
+//!
+//! **Governance (AB-robust).** The client REUSES the local API's `TriggerRequest` /
+//! `TriggerResponse` / `StatusResponse` / `ErrorBody` structs — ONE definition, both sides
+//! (Hard; the round-trip goldens live next to those structs in `local_api.rs`). The only datum
+//! it must restate is the bundle identifier (to find `prmonitor.db` without a Tauri app); that
+//! restatement is locked **Medium** by [`tests::app_identifier_matches_tauri_conf`].
+
+use std::time::Duration;
+
+use clap::{ArgGroup, Args, Parser, Subcommand};
+
+use crate::config::service as config_service;
+use crate::db::Database;
+use crate::review::local_api::{ErrorBody, StatusResponse, TriggerRequest, TriggerResponse};
+use crate::review::session::SessionStatus;
+
+/// The bundle identifier (`tauri.conf.json` `identifier`). The CLI runs BEFORE any Tauri app
+/// exists, so it cannot ask Tauri for `app_data_dir()`; it reconstructs the DB path as
+/// `dirs::data_dir()/{APP_IDENTIFIER}/prmonitor.db` (Tauri's own convention). Restating the
+/// identifier is the one unavoidable duplication — locked **Medium** by a golden test that
+/// reads `tauri.conf.json` and asserts equality, so a future identifier change fails CI here.
+pub(crate) const APP_IDENTIFIER: &str = "com.ghbvf.prmonitor";
+
+/// `--watch` poll cadence (mirrors `gh run watch`'s steady low-frequency poll).
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+
+/// Per-request HTTP timeout (the trigger + each poll). Generous, but a hung socket must not
+/// block a CI `&&` chain forever.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Parser, Debug)]
+#[command(name = "prmonitor", bin_name = "prmonitor")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Trigger a PR review on the running prmonitor app (or launch it, then trigger).
+    Review(ReviewArgs),
+}
+
+/// `prmonitor review` arguments. Exactly one of `--repo` / `--project-id` identifies the project
+/// (the `target` group); the rest mirror `gh run watch` ergonomics.
+#[derive(Args, Debug, Clone)]
+#[command(group = ArgGroup::new("target").required(true))]
+pub struct ReviewArgs {
+    /// PR / MR number (must be > 0; the trigger funnel rejects 0).
+    #[arg(long)]
+    pub pr: u64,
+    /// Target project by `owner/name` repo (case-insensitive). One of --repo / --project-id.
+    #[arg(long, group = "target")]
+    pub repo: Option<String>,
+    /// Target project by its configured project id. One of --repo / --project-id.
+    #[arg(long = "project-id", group = "target")]
+    pub project_id: Option<String>,
+    /// Re-check a prior fix round (`kind=check`) instead of a full review.
+    #[arg(long)]
+    pub check: bool,
+    /// Block until the review reaches a terminal state, then print the comment URL.
+    #[arg(long)]
+    pub watch: bool,
+    /// Emit machine JSON. Bare `--json` prints the whole object; `--json status,commentUrl`
+    /// projects those fields (gh convention).
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub json: Option<String>,
+    /// With `--watch`, exit non-zero unless the review COMPLETED (a comment was posted).
+    #[arg(long = "exit-status")]
+    pub exit_status: bool,
+    /// Override the local API port (else `PRMONITOR_LOCAL_API_PORT`, else saved config).
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// Override the bearer token (else `PRMONITOR_LOCAL_API_TOKEN`, else saved config).
+    #[arg(long)]
+    pub token: Option<String>,
+}
+
+impl ReviewArgs {
+    /// The free-form `reference` the trigger funnel resolves (id-or-repo). The clap `target`
+    /// group guarantees exactly one of repo / project_id is set.
+    pub fn reference(&self) -> String {
+        self.repo
+            .clone()
+            .or_else(|| self.project_id.clone())
+            .unwrap_or_default()
+    }
+
+    /// `"check"` re-runs a prior fix round; otherwise a full `"review"` (the funnel whitelists
+    /// exactly these two).
+    pub fn kind(&self) -> &'static str {
+        if self.check {
+            "check"
+        } else {
+            "review"
+        }
+    }
+
+    /// Build the POST body — the SAME struct the server deserializes (Hard, single-source).
+    fn trigger_request(&self) -> TriggerRequest {
+        TriggerRequest {
+            project_id: self.project_id.clone(),
+            repo: self.repo.clone(),
+            pr: self.pr,
+            kind: self.kind().to_string(),
+        }
+    }
+}
+
+/// What [`parse`] resolved the process invocation to.
+pub enum Invocation {
+    /// `prmonitor review …` — run the CLI client (maybe falling through to a GUI cold start).
+    Review(ReviewArgs),
+    /// Anything else — boot the GUI normally.
+    Gui,
+}
+
+/// Parse `argv` for the `review` subcommand. clap's strict parser only runs when `argv[1] ==
+/// "review"`, so a normal GUI launch (incl. macOS bundle args like `-psn_…`) never trips it.
+/// On a malformed `review` invocation clap prints usage + exits (its default), which is correct
+/// for a CLI.
+pub fn parse() -> Invocation {
+    let is_review = std::env::args().nth(1).as_deref() == Some("review");
+    if !is_review {
+        return Invocation::Gui;
+    }
+    match Cli::parse().command {
+        Some(Command::Review(args)) => Invocation::Review(args),
+        None => Invocation::Gui,
+    }
+}
+
+/// The outcome of attempting the HTTP client path.
+pub enum ClientOutcome {
+    /// The request reached the app (or hit a definitive client/usage error). The process should
+    /// exit with this code — do NOT fall through to a GUI.
+    Handled(i32),
+    /// The local API was unreachable (connection refused) ⇒ the app is not running; the caller
+    /// should fall through to the Tauri builder for the single-instance cold start.
+    AppNotRunning,
+}
+
+/// Synchronous entry for [`crate::run`] — owns a single-threaded tokio runtime for the client
+/// (built before any Tauri runtime exists).
+pub fn run_client_blocking(args: &ReviewArgs) -> ClientOutcome {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("无法创建运行时: {e}");
+            return ClientOutcome::Handled(1);
+        }
+    };
+    rt.block_on(run_client(args))
+}
+
+async fn run_client(args: &ReviewArgs) -> ClientOutcome {
+    let endpoint = resolve_endpoint(args);
+    if endpoint.port == 0 {
+        eprintln!("本地 API 已禁用（端口为 0）；在设置中设置 localApiPort 后重试");
+        return ClientOutcome::Handled(2);
+    }
+    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("无法创建 HTTP 客户端: {e}");
+            return ClientOutcome::Handled(1);
+        }
+    };
+    let base = format!("http://127.0.0.1:{}", endpoint.port);
+
+    // 1) Trigger the review.
+    let resp = client
+        .post(format!("{base}/reviews"))
+        .bearer_auth(&endpoint.token)
+        .json(&args.trigger_request())
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        // Connection refused = nothing listening = app not running → cold-start fall-through.
+        Err(e) if e.is_connect() => return ClientOutcome::AppNotRunning,
+        Err(e) => {
+            eprintln!("触发请求失败: {e}");
+            return ClientOutcome::Handled(1);
+        }
+    };
+    if !resp.status().is_success() {
+        return ClientOutcome::Handled(report_http_error(resp).await);
+    }
+    let trigger: TriggerResponse = match resp.json().await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("解析触发响应失败: {e}");
+            return ClientOutcome::Handled(1);
+        }
+    };
+
+    // 2) No --watch: print the trigger result (id + statusUrl) and return success.
+    if !args.watch {
+        let value = serde_json::to_value(&trigger).unwrap_or(serde_json::Value::Null);
+        emit(&args.json, &value, || {
+            format!("review 已触发：{}\n{}", trigger.id, trigger.status_url)
+        });
+        return ClientOutcome::Handled(0);
+    }
+
+    // 3) --watch: poll the server-provided status URL to a terminal state.
+    watch_to_terminal(&client, &endpoint.token, &trigger.status_url, args).await
+}
+
+async fn watch_to_terminal(
+    client: &reqwest::Client,
+    token: &str,
+    status_url: &str,
+    args: &ReviewArgs,
+) -> ClientOutcome {
+    loop {
+        tokio::time::sleep(WATCH_POLL_INTERVAL).await;
+        let resp = match client.get(status_url).bearer_auth(token).send().await {
+            Ok(r) => r,
+            // Mid-watch connection loss (app quit) is a real error, NOT "never running" — report
+            // it rather than silently falling back to a cold start.
+            Err(e) => {
+                eprintln!("轮询请求失败: {e}");
+                return ClientOutcome::Handled(1);
+            }
+        };
+        if !resp.status().is_success() {
+            return ClientOutcome::Handled(report_http_error(resp).await);
+        }
+        let status: StatusResponse = match resp.json().await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("解析状态响应失败: {e}");
+                return ClientOutcome::Handled(1);
+            }
+        };
+        if is_terminal(status.status) {
+            let has_url = status.comment_url.is_some();
+            let value = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
+            emit(&args.json, &value, || {
+                human_status(status.status, status.comment_url.as_deref())
+            });
+            return ClientOutcome::Handled(exit_code(status.status, has_url, args.exit_status));
+        }
+    }
+}
+
+/// Print a failed HTTP response's `{message}` body and map it to a non-zero exit code. A 4xx/5xx
+/// is a usage/auth error (bad token, dedup, unknown project), NOT a review outcome, so it always
+/// exits non-zero regardless of `--exit-status`.
+async fn report_http_error(resp: reqwest::Response) -> i32 {
+    let status = resp.status();
+    let msg = resp
+        .json::<ErrorBody>()
+        .await
+        .map(|b| b.message)
+        .unwrap_or_else(|_| "（无错误详情）".to_string());
+    eprintln!("请求失败（HTTP {}）：{}", status.as_u16(), msg);
+    1
+}
+
+struct Endpoint {
+    port: u16,
+    token: String,
+}
+
+/// Resolve (port, token): flag > env > saved config (or its defaults). Never hard-fails — a
+/// missing/unreadable config falls back to `AppConfig::default()` (port 8788, empty token), and
+/// the POST result disambiguates: connection-refused ⇒ app not running (cold start); 401 ⇒ token
+/// unset/wrong. (`port == 0` is handled by the caller as "API disabled".)
+fn resolve_endpoint(args: &ReviewArgs) -> Endpoint {
+    let cfg = load_saved_config().unwrap_or_default();
+    let port = args.port.or_else(env_port).unwrap_or(cfg.local_api_port);
+    let token = args
+        .token
+        .clone()
+        .or_else(|| std::env::var("PRMONITOR_LOCAL_API_TOKEN").ok())
+        .unwrap_or(cfg.local_api_token);
+    Endpoint { port, token }
+}
+
+fn env_port() -> Option<u16> {
+    std::env::var("PRMONITOR_LOCAL_API_PORT")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Read the saved `AppConfig` from `prmonitor.db` WITHOUT a Tauri app (read-only, no migration —
+/// see [`Database::open_readonly_at`]). `None` on any failure (no db / locked / parse); the
+/// caller falls back to defaults.
+fn load_saved_config() -> Option<crate::config::model::AppConfig> {
+    let path = dirs::data_dir()?.join(APP_IDENTIFIER).join("prmonitor.db");
+    let db = Database::open_readonly_at(&path).ok()?;
+    config_service::load_db(&db).ok()
+}
+
+/// Print either projected JSON (when `--json[=fields]` is set) or the human fallback.
+fn emit(json_opt: &Option<String>, value: &serde_json::Value, human: impl FnOnce() -> String) {
+    match json_opt {
+        None => println!("{}", human()),
+        Some(fields) => println!("{}", render_json(value, fields)),
+    }
+}
+
+/// Render the `--json` output: a bare `--json` (empty fields) prints the whole compact object;
+/// otherwise project the requested comma-separated fields (gh `--json` convention; an absent
+/// field renders as `null`). Pure — unit-tested.
+pub(crate) fn render_json(value: &serde_json::Value, fields: &str) -> String {
+    let fields = fields.trim();
+    if fields.is_empty() {
+        return value.to_string();
+    }
+    // Build the object directly (not via `serde_json::Map`, which sorts keys without the
+    // `preserve_order` feature) so the output keeps the user's requested field order; key + value
+    // go through `serde_json::to_string` for correct quoting/escaping.
+    let parts: Vec<String> = fields
+        .split(',')
+        .filter_map(|f| {
+            let f = f.trim();
+            if f.is_empty() {
+                return None;
+            }
+            let val = value.get(f).cloned().unwrap_or(serde_json::Value::Null);
+            let key = serde_json::to_string(f).ok()?;
+            let val = serde_json::to_string(&val).ok()?;
+            Some(format!("{key}:{val}"))
+        })
+        .collect();
+    format!("{{{}}}", parts.join(","))
+}
+
+fn human_status(status: SessionStatus, comment_url: Option<&str>) -> String {
+    match (status, comment_url) {
+        (SessionStatus::Done, Some(url)) => format!("✓ review 完成：{url}"),
+        (SessionStatus::Done, None) => "⚠ review 结束但未生成评论链接（可能被中断）".to_string(),
+        (SessionStatus::Failed, _) => "✗ review 失败".to_string(),
+        // Unreachable: only Done/Failed are terminal, but stay total.
+        _ => format!("review 状态：{status:?}"),
+    }
+}
+
+/// Terminal = the review reached an end state (`done` or `failed`); polling stops. Pure.
+pub(crate) fn is_terminal(status: SessionStatus) -> bool {
+    matches!(status, SessionStatus::Done | SessionStatus::Failed)
+}
+
+/// `gh run watch` exit semantics. Without `--exit-status`, ALWAYS 0 (the trigger/poll succeeded
+/// as a command). With `--exit-status`, 0 ONLY for a COMPLETED review — `Done` AND a comment URL
+/// was posted; an interrupted (`Done` + no URL) or `Failed` review exits non-zero so a CI `&&`
+/// chain stops. A rare completed-but-URL-unresolved review is a (documented) false negative. Pure.
+pub(crate) fn exit_code(
+    status: SessionStatus,
+    has_comment_url: bool,
+    exit_status_flag: bool,
+) -> i32 {
+    if !exit_status_flag {
+        return 0;
+    }
+    match status {
+        SessionStatus::Done if has_comment_url => 0,
+        _ => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_review(argv: &[&str]) -> Result<ReviewArgs, clap::Error> {
+        match Cli::try_parse_from(argv)?.command {
+            Some(Command::Review(a)) => Ok(a),
+            None => panic!("expected a review subcommand"),
+        }
+    }
+
+    #[test]
+    fn parses_repo_target_and_defaults() {
+        let a = parse_review(&["prmonitor", "review", "--pr", "7", "--repo", "owner/name"])
+            .expect("valid");
+        assert_eq!(a.pr, 7);
+        assert_eq!(a.repo.as_deref(), Some("owner/name"));
+        assert_eq!(a.project_id, None);
+        assert!(!a.check && !a.watch && !a.exit_status);
+        assert_eq!(a.json, None);
+        assert_eq!(a.kind(), "review");
+        assert_eq!(a.reference(), "owner/name");
+    }
+
+    #[test]
+    fn project_id_target_and_check_flag() {
+        let a = parse_review(&[
+            "prmonitor",
+            "review",
+            "--pr",
+            "3",
+            "--project-id",
+            "p1",
+            "--check",
+        ])
+        .expect("valid");
+        assert_eq!(a.reference(), "p1");
+        assert_eq!(a.kind(), "check");
+        let body = a.trigger_request();
+        assert_eq!(body.project_id.as_deref(), Some("p1"));
+        assert_eq!(body.repo, None);
+        assert_eq!(body.pr, 3);
+        assert_eq!(body.kind, "check");
+    }
+
+    #[test]
+    fn target_group_requires_exactly_one() {
+        // Neither repo nor project-id → error.
+        assert!(parse_review(&["prmonitor", "review", "--pr", "7"]).is_err());
+        // Both → error (the group is single-select).
+        assert!(parse_review(&[
+            "prmonitor",
+            "review",
+            "--pr",
+            "7",
+            "--repo",
+            "o/n",
+            "--project-id",
+            "p1",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn json_flag_bare_vs_fields() {
+        let bare = parse_review(&[
+            "prmonitor",
+            "review",
+            "--pr",
+            "7",
+            "--repo",
+            "o/n",
+            "--json",
+        ])
+        .expect("valid");
+        assert_eq!(bare.json.as_deref(), Some(""));
+        let fields = parse_review(&[
+            "prmonitor",
+            "review",
+            "--pr",
+            "7",
+            "--repo",
+            "o/n",
+            "--json",
+            "status,commentUrl",
+        ])
+        .expect("valid");
+        assert_eq!(fields.json.as_deref(), Some("status,commentUrl"));
+    }
+
+    #[test]
+    fn render_json_projects_or_dumps() {
+        let v = serde_json::json!({"status": "done", "commentUrl": "https://x/c"});
+        // Bare → whole compact object.
+        let whole = render_json(&v, "");
+        assert!(whole.contains("\"status\":\"done\""));
+        assert!(whole.contains("\"commentUrl\":\"https://x/c\""));
+        // Field projection keeps order + only requested keys.
+        assert_eq!(
+            render_json(&v, "status,commentUrl"),
+            "{\"status\":\"done\",\"commentUrl\":\"https://x/c\"}"
+        );
+        assert_eq!(render_json(&v, "status"), "{\"status\":\"done\"}");
+        // Absent field → null.
+        assert_eq!(render_json(&v, "missing"), "{\"missing\":null}");
+    }
+
+    #[test]
+    fn is_terminal_only_done_and_failed() {
+        assert!(is_terminal(SessionStatus::Done));
+        assert!(is_terminal(SessionStatus::Failed));
+        assert!(!is_terminal(SessionStatus::Starting));
+        assert!(!is_terminal(SessionStatus::Running));
+        assert!(!is_terminal(SessionStatus::Interrupting));
+    }
+
+    #[test]
+    fn exit_code_follows_gh_run_watch() {
+        // Without --exit-status: always 0, even on failure.
+        assert_eq!(exit_code(SessionStatus::Failed, false, false), 0);
+        assert_eq!(exit_code(SessionStatus::Done, false, false), 0);
+        // With --exit-status: 0 only for a completed review (Done + URL).
+        assert_eq!(exit_code(SessionStatus::Done, true, true), 0);
+        // Done without a URL = interrupted → non-zero.
+        assert_eq!(exit_code(SessionStatus::Done, false, true), 1);
+        assert_eq!(exit_code(SessionStatus::Failed, false, true), 1);
+    }
+
+    /// **Medium** carrier: the restated bundle identifier must equal `tauri.conf.json`'s
+    /// `identifier`, or the CLI resolves the WRONG `prmonitor.db` and silently reads no config.
+    #[test]
+    fn app_identifier_matches_tauri_conf() {
+        let conf = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+            .expect("read tauri.conf.json");
+        let v: serde_json::Value = serde_json::from_str(&conf).expect("parse tauri.conf.json");
+        assert_eq!(v["identifier"].as_str(), Some(APP_IDENTIFIER));
+    }
+}

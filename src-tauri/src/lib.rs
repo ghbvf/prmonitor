@@ -18,6 +18,7 @@
 // Modules are `pub` so forward-looking seams and shared types (e.g.
 // `pr::source::PrSource`, `review::engine::ReviewEngine`) count as reachable API
 // in this skeleton rather than tripping `dead_code` before their first use.
+pub mod cli;
 pub mod config;
 pub mod db;
 pub mod dispatch;
@@ -36,10 +37,45 @@ use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    // AB#1044: branch on `argv` BEFORE building Tauri. `prmonitor review …` runs as a thin HTTP
+    // client over the AB#1043 local API (the `code --wait` role); only a cold start (app not
+    // running) falls through to build the GUI and trigger the review in-process. Anything else
+    // (no/unknown subcommand) is a normal GUI launch.
+    match cli::parse() {
+        cli::Invocation::Review(args) => match cli::run_client_blocking(&args) {
+            cli::ClientOutcome::Handled(code) => std::process::exit(code),
+            cli::ClientOutcome::AppNotRunning => build_app(Some(args)),
+        },
+        cli::Invocation::Gui => build_app(None),
+    }
+}
+
+/// A cold-start CLI review stashed into managed state (AB#1044): a `prmonitor review` launched
+/// while the app was DOWN falls through to [`build_app`]; `setup` reads this and triggers the
+/// review in-process once the local API is up.
+struct PendingCliReview(cli::ReviewArgs);
+
+/// Build + run the Tauri GUI. `pending` carries a cold-start CLI review to fire after `setup`.
+fn build_app(pending: Option<cli::ReviewArgs>) {
+    let mut builder = tauri::Builder::default()
+        // Single-instance MUST be the FIRST plugin (AB#1044): it claims the OS lock before any
+        // window work, so a second launch focuses the existing window instead of opening a
+        // duplicate. A `prmonitor review` while the app is running never reaches here (the early
+        // `cli::parse` HTTP-client path handles it), so this callback only resurfaces the window.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
-        .manage(AppState::default())
+        .manage(AppState::default());
+    if let Some(args) = pending {
+        builder = builder.manage(PendingCliReview(args));
+    }
+    builder
         .setup(|app| {
             // Open + migrate the unified SQLite store and manage it as a `tauri::State`
             // BEFORE anything that reads persistence (config load / poll start). It is a
@@ -127,6 +163,31 @@ pub fn run() {
             // setting/clearing it in Settings takes effect without a restart. A bind failure is
             // logged + swallowed inside the spawned task (a port clash must not crash the app).
             state.local_api.start(app.handle().clone());
+            // Cold-start CLI trigger (AB#1044): if this process was launched as `prmonitor
+            // review` while the app was DOWN, fire that review now. We already hold the
+            // AppHandle, so call the SAME transport-agnostic `trigger_review` funnel the local
+            // API wraps (engine selection + dedup stay single-source) — directly, not over HTTP.
+            // Spawned so a slow project-resolve/dispatch never blocks `setup` from returning.
+            if let Some(pending) = app.try_state::<PendingCliReview>() {
+                let args = pending.0.clone();
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app_handle.state::<AppState>();
+                    let kind = args.kind().to_string();
+                    match review::commands::trigger_review(
+                        app_handle.clone(),
+                        state,
+                        args.reference(),
+                        args.pr,
+                        kind,
+                    )
+                    .await
+                    {
+                        Ok(id) => eprintln!("已在新启动的 app 内触发 review（会话 {id}）"),
+                        Err(e) => eprintln!("CLI 触发 review 失败：{}", e.message),
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
