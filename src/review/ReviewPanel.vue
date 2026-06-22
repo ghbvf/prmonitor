@@ -2,7 +2,7 @@
 // Review streaming panel: starts/stops a review for the selected PR and renders
 // the streamed deltas. The selected PR is passed down by the composition root
 // (App.vue) so the pr slice and review slice stay decoupled.
-import { computed, onMounted, onUnmounted } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useProjects } from "../projects";
 import type { PullRequestView } from "../types";
 import ReviewStream from "./ReviewStream.vue";
@@ -18,12 +18,46 @@ const {
   finalStatus,
   error,
   activePr,
+  activeThreadId,
   listenerReady,
   listenerError,
   start,
   stop,
+  sendMessage,
   init,
 } = useReviewStore();
+
+// Follow-up chat composer (#chat). Local UI state: the draft text and whether the
+// composer is collapsed to a thin header bar.
+const draft = ref("");
+const collapsed = ref(false);
+
+// The composer is usable only when a session is focused, no turn is running (the
+// input FREEZES during a review/follow-up turn), and the event listener is attached
+// (a reply could otherwise be missed). Mirrors the store's `sendMessage` guard.
+const canChat = computed(
+  () =>
+    activeThreadId.value != null && !running.value && listenerReady.value,
+);
+
+function onSend() {
+  const text = draft.value.trim();
+  if (!text || !canChat.value || activeThreadId.value == null) return;
+  // `sendMessage` re-checks the same guard, so a race that flipped `running` between
+  // the click and here is still safe (it no-ops). Clear the draft optimistically.
+  sendMessage(activeProjectId.value, activeThreadId.value, text);
+  draft.value = "";
+}
+
+// Enter sends; Shift+Enter inserts a newline (default textarea behavior, so we only
+// intercept the bare Enter). A composing IME Enter (keyCode 229 / isComposing) must
+// NOT send — it's committing a candidate.
+function onKeydown(e: KeyboardEvent) {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    onSend();
+  }
+}
 
 // Friendly label for the codex turn status ("interrupted" / "completed" / ...).
 const finalLabel = computed(() => {
@@ -93,6 +127,49 @@ function onStart() {
     <p v-if="running && items.length === 0" class="muted">等待输出… / waiting</p>
 
     <ReviewStream :items="items" />
+
+    <!-- Follow-up chat composer (#chat). Collapses to a thin header bar via the
+         toggle; frozen (disabled) while a turn is running or no session is focused. -->
+    <div class="composer" :class="{ collapsed }">
+      <div class="composer-head">
+        <span class="composer-title">对话 / Chat</span>
+        <button
+          type="button"
+          class="toggle"
+          @click="collapsed = !collapsed"
+        >
+          {{ collapsed ? "展开 / expand" : "缩小 / collapse" }}
+        </button>
+      </div>
+
+      <template v-if="!collapsed">
+        <p v-if="activeThreadId == null" class="muted hint">
+          运行 review 后可对话 / Run a review to chat
+        </p>
+        <div class="composer-body">
+          <textarea
+            v-model="draft"
+            class="composer-input"
+            rows="3"
+            :disabled="!canChat"
+            :placeholder="
+              running
+                ? '运行中，请稍候… / running…'
+                : '输入消息，Enter 发送、Shift+Enter 换行 / Enter to send'
+            "
+            @keydown="onKeydown"
+          ></textarea>
+          <button
+            type="button"
+            class="send"
+            :disabled="!canChat || draft.trim().length === 0"
+            @click="onSend"
+          >
+            发送 / Send
+          </button>
+        </div>
+      </template>
+    </div>
   </section>
 </template>
 
@@ -130,5 +207,59 @@ function onStart() {
   margin: var(--space-4) 0 0;
   color: var(--color-danger);
   font-size: var(--font-size-sm);
+}
+.composer {
+  margin-top: var(--space-4);
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--space-3);
+}
+.composer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.composer-title {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+.composer .toggle {
+  padding: var(--space-1) var(--space-3);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+.hint {
+  margin: var(--space-3) 0 0;
+  font-size: var(--font-size-sm);
+}
+.composer-body {
+  margin-top: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.composer-input {
+  font: inherit;
+  padding: var(--space-2) var(--space-3);
+  resize: vertical;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--space-2);
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+.composer-input:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.composer .send {
+  align-self: flex-end;
+  padding: var(--space-2) var(--space-5);
+  font: inherit;
+  cursor: pointer;
+}
+.composer .send:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 </style>
