@@ -247,6 +247,13 @@ describe("GLOBAL_GROUPS", () => {
     const f = GLOBAL_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "webhookSecret");
     expect(f?.secret).toBe(true);
   });
+
+  // AB#1043: the local API token is a bearer secret — it must render masked, same as the
+  // webhook secret. Locks the `secret: true` flag against a future refactor dropping it.
+  it("masks the localApiToken field", () => {
+    const f = GLOBAL_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "localApiToken");
+    expect(f?.secret).toBe(true);
+  });
 });
 
 describe("validateStep — repo", () => {

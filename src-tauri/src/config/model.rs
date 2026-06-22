@@ -1370,6 +1370,33 @@ mod tests {
         .is_ok());
     }
 
+    // AB#1043: the local API token has no enable flag — an EMPTY token is the "disabled"
+    // sentinel (always valid), but a NON-empty token must clear `LOCAL_API_TOKEN_MIN_LEN` (a
+    // short token is brute-forceable by a local process). Mirrors the `webhookSecret` length
+    // gate. This is the Medium carrier for that validate rule (without a test the rule would
+    // be an untested Soft check).
+    #[test]
+    fn validate_local_api_token_min_length() {
+        // Empty token = disabled → valid (the baseline already leaves it empty).
+        assert!(validate(&valid_base()).is_ok());
+
+        // A too-short non-empty token is rejected, routed by the `localApiToken` field prefix.
+        let short_err = validate(&AppConfig {
+            local_api_token: "shh".to_string(), // 3 chars < LOCAL_API_TOKEN_MIN_LEN
+            ..valid_base()
+        })
+        .unwrap_err()
+        .message;
+        assert!(short_err.starts_with("localApiToken"), "{short_err}");
+
+        // A sufficiently long token is accepted.
+        assert!(validate(&AppConfig {
+            local_api_token: "local-api-token-0123456789".to_string(),
+            ..valid_base()
+        })
+        .is_ok());
+    }
+
     #[test]
     fn validate_command_mode_requires_tunnel_command() {
         let base = AppConfig {

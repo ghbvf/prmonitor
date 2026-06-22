@@ -60,11 +60,14 @@ use crate::state::AppState;
 const BIND_RETRIES: u32 = 10;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(20);
 /// Trigger bodies are tiny (`{projectId, pr, kind}`). Cap what an unauthenticated POST can
-/// make us buffer before the auth check rejects it (the webhook uses the same defense).
+/// make us buffer before the auth check rejects it (the same body-cap defense the webhook
+/// receiver uses, with a smaller cap — a trigger body is far smaller than a webhook payload).
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
 // ===========================================================================================
 // Wire types (serde camelCase — golden-locked by the wire-shape tests below; **Medium**).
+// HTTP-only: these are NOT Tauri commands, so they intentionally have NO `src/types.ts` mirror —
+// the camelCase contract is locked by the goldens here, not by a hand-mirrored TS interface.
 // ===========================================================================================
 
 /// `POST /reviews` request body. Exactly one of `projectId` / `repo` identifies the project;
@@ -326,7 +329,10 @@ async fn handle_status<R: tauri::Runtime>(
                 comment_url: info.comment_url,
             },
         ),
-        None => error_response(StatusCode::NOT_FOUND, format!("未找到 review 会话: {id}")),
+        // Do not echo the caller-supplied `id` back into the message (avoid reflecting
+        // untrusted path input into a body a downstream tool might log/render); the caller
+        // already knows which id it polled from the request line.
+        None => error_response(StatusCode::NOT_FOUND, "未找到指定的 review 会话"),
     }
 }
 
@@ -362,6 +368,11 @@ impl LocalApiManager {
     /// final bind failure is LOGGED + SWALLOWED — a port clash must never crash the desktop app
     /// (setup does not await this), and the feature is opt-in via the curl client anyway.
     pub fn start<R: tauri::Runtime>(&self, app: tauri::AppHandle<R>) {
+        // Idempotent: a second `start` (e.g. a future setup refactor) must NOT spawn a second
+        // listener and orphan the first's task — one resident listener for the app's life.
+        if self.runtime.lock().unwrap().is_some() {
+            return;
+        }
         let port = match config_service::load(&app) {
             Ok(cfg) => cfg.local_api_port,
             Err(e) => {
@@ -398,10 +409,13 @@ impl LocalApiManager {
                 match bound {
                     Some(l) => l,
                     None => {
-                        eprintln!(
-                            "本地 API：端口 {port} 监听失败，已跳过（{}）",
-                            last_err.expect("a failed bind recorded its error")
-                        );
+                        // Defensive: `last_err` is `Some` whenever a bind was attempted and
+                        // failed (BIND_RETRIES > 0), but degrade gracefully rather than panic
+                        // in this detached task if that invariant ever changes.
+                        let reason = last_err
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "no bind attempt (BIND_RETRIES is 0)".to_string());
+                        eprintln!("本地 API：端口 {port} 监听失败，已跳过（{reason}）");
                         return;
                     }
                 }
