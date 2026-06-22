@@ -39,6 +39,12 @@ pub struct CodexEngine<'a, R: tauri::Runtime> {
     /// against — never a config edited mid-review. `pub(crate)`: the field's type is a
     /// crate-internal context, and the only constructors (commands.rs / lib.rs) are in-crate.
     pub(crate) url_ctx: CommentUrlContext,
+    /// The PR number for the FOLLOW-UP (`send_message`) path only — the `ReviewEngine`
+    /// trait's `send_message(session, message, user_item_id)` carries no `pr_number`, so the
+    /// command resolves it (in-memory registry or durable row) and sets it here. The
+    /// `start`/`stop` paths take `pr_number` as a method arg and ignore this field (set to 0
+    /// at those construction sites).
+    pub pr_number: u64,
 }
 
 impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
@@ -68,6 +74,30 @@ impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
             self.codex_bin,
             self.repo_root,
             session,
+        )
+        .await
+    }
+
+    async fn send_message(
+        &self,
+        session: &SessionId,
+        message: &str,
+        user_item_id: &str,
+    ) -> AppResult<()> {
+        session::resume_turn(
+            self.app,
+            self.codex,
+            self.registry,
+            self.codex_bin,
+            self.repo_root,
+            self.codex_model,
+            self.project_id,
+            self.pr_number,
+            session,
+            message,
+            user_item_id,
+            // `&self` can't move the field; clone the owned context for this follow-up turn.
+            self.url_ctx.clone(),
         )
         .await
     }

@@ -42,4 +42,25 @@ pub trait ReviewEngine {
     async fn start(&self, pr_number: u64, kind: &str) -> AppResult<StartReviewOutcome>;
     /// Interrupt a running session.
     async fn stop(&self, session: &SessionId) -> AppResult<()>;
+    /// Continue an EXISTING (terminal `Done`/`Failed`) session with a follow-up user
+    /// `message`, streaming the reply through the SAME [`crate::events::ReviewEvent`]
+    /// pipeline (`MessageDelta` / `ReasoningDelta` / `TurnCompleted`) the initial review
+    /// used. `user_item_id` is the CALLER-supplied id the user's typed message is persisted
+    /// under (so the frontend's optimistic bubble id == the persisted id, and reopen-dedup
+    /// works). Each engine continues its own conversation: codex issues a second turn on the
+    /// resident thread (same-app-run only — no `thread/resume` in the protocol); claude
+    /// `--resume`s the on-disk transcript (cross-restart). Persisting the user message and
+    /// the registry/status transitions are reused, NOT duplicated.
+    ///
+    /// AI-robust carrier (per `.claude/rules/prmonitor/ai-robust.md`): **Hard**. This is a
+    /// trait METHOD, so every concrete [`ReviewEngine`] (`CodexEngine`, `ClaudeEngine`) MUST
+    /// implement follow-up — a new engine that omits it is a compile error, not a silently
+    /// missing capability. The command routes to it via the same exhaustive `match
+    /// EngineKind` the start path uses, never a downcast.
+    async fn send_message(
+        &self,
+        session: &SessionId,
+        message: &str,
+        user_item_id: &str,
+    ) -> AppResult<()>;
 }

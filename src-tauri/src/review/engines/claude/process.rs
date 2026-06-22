@@ -258,11 +258,14 @@ pub struct ClaudeProcess {
     pub stderr: ChildStderr,
 }
 
-/// Build the `claude -p` argument vector. Pure (no spawn) so the `--model` insertion is
-/// unit-testable — `spawn_claude` itself needs a real child and can't be. A non-blank
-/// `model` appends `--model <name>`; a blank one (config left empty) is omitted, so claude
-/// falls back to its own default model.
-fn claude_cli_args(model: &str, prompt: &str) -> Vec<String> {
+/// Build the `claude -p` argument vector. Pure (no spawn) so the `--model` / `--resume`
+/// insertion is unit-testable — `spawn_claude` itself needs a real child and can't be. A
+/// non-blank `model` appends `--model <name>`; a blank one (config left empty) is omitted,
+/// so claude falls back to its own default model. A `resume: Some(id)` appends `--resume
+/// <id>` to continue an existing on-disk transcript (the chat-continuation follow-up path —
+/// cross-restart capable, since claude persists transcripts on disk); the initial
+/// `start_review` call site passes `None`.
+fn claude_cli_args(model: &str, prompt: &str, resume: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
         prompt.to_string(),
@@ -279,22 +282,32 @@ fn claude_cli_args(model: &str, prompt: &str) -> Vec<String> {
         // must reach claude as "sonnet", not with surrounding spaces (an unknown model).
         args.push(model.trim().to_string());
     }
+    // Follow-up turn: resume the existing transcript by its session id. `--resume` makes the
+    // continuation cross-restart (claude reads the persisted transcript from disk), unlike
+    // codex which keeps the thread only in the resident process's memory.
+    if let Some(id) = resume {
+        args.push("--resume".to_string());
+        args.push(id.to_string());
+    }
     args
 }
 
 /// Spawn `claude -p "<prompt>" --output-format stream-json --verbose
-/// --include-partial-messages --permission-mode bypassPermissions [--model <name>]` in
-/// `repo_root`, with piped stdout/stderr and `kill_on_drop(true)`. Headless print mode is
-/// unattended (`bypassPermissions`), so a review never blocks on an approval prompt. A
-/// blank `model` omits `--model` (claude CLI default).
+/// --include-partial-messages --permission-mode bypassPermissions [--model <name>]
+/// [--resume <id>]` in `repo_root`, with piped stdout/stderr and `kill_on_drop(true)`.
+/// Headless print mode is unattended (`bypassPermissions`), so a review never blocks on an
+/// approval prompt. A blank `model` omits `--model` (claude CLI default). A `resume:
+/// Some(id)` continues an existing transcript (the chat-continuation follow-up path); the
+/// initial review passes `None`.
 pub fn spawn_claude(
     claude_bin: &str,
     repo_root: &str,
     model: &str,
     prompt: &str,
+    resume: Option<&str>,
 ) -> AppResult<ClaudeProcess> {
     let mut cmd = Command::new(claude_bin);
-    cmd.args(claude_cli_args(model, prompt))
+    cmd.args(claude_cli_args(model, prompt, resume))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -464,7 +477,7 @@ mod tests {
     #[test]
     fn claude_cli_args_omit_model_when_blank() {
         for blank in ["", "   "] {
-            let args = claude_cli_args(blank, "/pr-review 7");
+            let args = claude_cli_args(blank, "/pr-review 7", None);
             assert!(
                 !args.iter().any(|a| a == "--model"),
                 "blank model must not add --model: {args:?}"
@@ -478,21 +491,40 @@ mod tests {
 
     #[test]
     fn claude_cli_args_append_model_when_set() {
-        let args = claude_cli_args("claude-opus-4-1", "/pr-review 7");
-        // `--model <name>` is appended as the trailing pair.
+        let args = claude_cli_args("claude-opus-4-1", "/pr-review 7", None);
+        // `--model <name>` is appended as the trailing pair (no `--resume` on the start path).
         let n = args.len();
         assert_eq!(args[n - 2], "--model");
         assert_eq!(args[n - 1], "claude-opus-4-1");
+        assert!(
+            !args.iter().any(|a| a == "--resume"),
+            "start path: no --resume"
+        );
     }
 
     #[test]
     fn claude_cli_args_trim_padded_model_name() {
         // A padded name reaches claude trimmed (matches the emptiness check) — not with
         // surrounding spaces that the CLI would treat as an unknown model.
-        let args = claude_cli_args("  claude-opus-4-1  ", "/pr-review 7");
+        let args = claude_cli_args("  claude-opus-4-1  ", "/pr-review 7", None);
         let n = args.len();
         assert_eq!(args[n - 2], "--model");
         assert_eq!(args[n - 1], "claude-opus-4-1");
+    }
+
+    #[test]
+    fn claude_cli_args_append_resume_when_set() {
+        // The follow-up (chat-continuation) path passes `Some(session_id)` → `--resume <id>`
+        // is present so claude continues the on-disk transcript. The initial review passes
+        // `None` (asserted above), so this flag distinguishes a follow-up from a fresh review.
+        let args = claude_cli_args("", "follow-up question", Some("sess-42"));
+        let idx = args
+            .iter()
+            .position(|a| a == "--resume")
+            .expect("--resume present when resume Some");
+        assert_eq!(args[idx + 1], "sess-42", "--resume carries the session id");
+        // The raw user message is the prompt (NOT a `/pr-review N`) on a follow-up.
+        assert_eq!(args[1], "follow-up question");
     }
 
     // ── pure stream-json line parser (the testable seam — NO subprocess) ─────────

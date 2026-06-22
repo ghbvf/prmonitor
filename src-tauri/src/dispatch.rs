@@ -208,6 +208,15 @@ mod tests {
         async fn stop(&self, _session: &String) -> AppResult<()> {
             Ok(())
         }
+        // `auto_dispatch` only ever calls `start`; the follow-up path never reaches this fake.
+        async fn send_message(
+            &self,
+            _session: &String,
+            _message: &str,
+            _user_item_id: &str,
+        ) -> AppResult<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]

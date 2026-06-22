@@ -27,6 +27,11 @@ use crate::error::AppResult;
 pub enum HistoryItemKind {
     Message,
     Reasoning,
+    /// A follow-up message the USER typed into the chat composer (the chat-continuation
+    /// feature). Persisted as a history item BEFORE the engine's reply turn is issued, so it
+    /// survives restart/reopen and renders inline with the conversation. Wire string `"user"`
+    /// — the frontend mirrors it as `StreamItem.kind` `"user"`.
+    User,
 }
 
 impl HistoryItemKind {
@@ -35,6 +40,7 @@ impl HistoryItemKind {
         match self {
             Self::Message => "message",
             Self::Reasoning => "reasoning",
+            Self::User => "user",
         }
     }
 
@@ -44,6 +50,7 @@ impl HistoryItemKind {
     fn from_wire(s: &str) -> Self {
         match s {
             "reasoning" => Self::Reasoning,
+            "user" => Self::User,
             _ => Self::Message,
         }
     }
@@ -474,6 +481,17 @@ mod tests {
         assert_eq!(v["kind"], "message");
         assert!(v.get("text").is_some());
         assert!(v.get("item_id").is_none());
+
+        // A `User` history item (chat-continuation) serializes `kind: "user"` — the wire
+        // string the frontend mirrors as `StreamItem.kind` `"user"`.
+        let user = HistoryItem {
+            item_id: "u1".to_string(),
+            kind: HistoryItemKind::User,
+            text: "follow-up".to_string(),
+        };
+        let uv = serde_json::to_value(&user).expect("serializes");
+        assert_eq!(uv["kind"], "user");
+        assert!(uv.get("itemId").is_some());
     }
 
     // `HistoryItemKind` lock (pr-review F7, Medium carrier): the DB-stored `as_wire` string
@@ -482,7 +500,14 @@ mod tests {
     // (or between the two Rust sources) fails here.
     #[test]
     fn history_item_kind_wire_matches_serde_and_round_trips() {
-        for kind in [HistoryItemKind::Message, HistoryItemKind::Reasoning] {
+        // `User` (chat-continuation) is a Medium serde golden carrier alongside Message /
+        // Reasoning: its DB-stored `as_wire` string MUST equal the serde form `"user"` the
+        // frontend mirrors as `StreamItem.kind` `"user"`, and `from_wire` must round-trip it.
+        for kind in [
+            HistoryItemKind::Message,
+            HistoryItemKind::Reasoning,
+            HistoryItemKind::User,
+        ] {
             let serde_wire = serde_json::to_value(kind).expect("serializes");
             assert_eq!(
                 serde_wire,
@@ -495,6 +520,9 @@ mod tests {
                 "round-trips"
             );
         }
+        // The user variant pins to the exact wire string `"user"` the frontend mirrors.
+        assert_eq!(HistoryItemKind::User.as_wire(), "user");
+        assert_eq!(HistoryItemKind::from_wire("user"), HistoryItemKind::User);
         // Unknown / corrupt stored value degrades to Message (content kept, not dropped).
         assert_eq!(HistoryItemKind::from_wire("???"), HistoryItemKind::Message);
     }

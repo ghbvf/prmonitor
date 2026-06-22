@@ -182,6 +182,21 @@ enum BeginInterrupt {
     NotFound,
 }
 
+/// Outcome of [`SessionRegistry::begin_resume`] — the atomic guard that makes a chat
+/// follow-up (`send_message`) race-free: only a TERMINAL (`Done`/`Failed`) session may be
+/// resumed into a new `Running` turn, so two concurrent sends can't both proceed.
+pub(super) enum BeginResume {
+    /// Was terminal (`Done`/`Failed`); flipped to `Running` — the caller now owns the
+    /// follow-up turn for this session.
+    Proceed,
+    /// Still `Starting`/`Running`/`Interrupting` — a turn is already in flight, so a
+    /// follow-up must wait (rejected, not started). Prevents a concurrent double-send.
+    Busy,
+    /// No session with this id in the in-memory registry (the caller rehydrates from the
+    /// durable row first, so this means it truly does not exist).
+    NotFound,
+}
+
 impl SessionRegistry {
     /// Test-only direct session insert. Production starts a session via
     /// [`Self::promote_reservation`] (which also consumes the reservation); tests use
@@ -328,6 +343,44 @@ impl SessionRegistry {
                 _ => BeginInterrupt::AlreadyHandled,
             },
         }
+    }
+
+    /// Atomically begin a chat follow-up (`send_message`). Only a TERMINAL
+    /// (`Done`/`Failed`) session flips to [`SessionStatus::Running`] and yields
+    /// [`BeginResume::Proceed`]; a still-`Starting`/`Running`/`Interrupting` session is
+    /// [`BeginResume::Busy`] (a turn is in flight — a concurrent double-send is rejected,
+    /// never double-started); a missing session is [`BeginResume::NotFound`]. The
+    /// check-and-set is one synchronous critical section (mirrors [`Self::begin_interrupt`]),
+    /// so two concurrent follow-ups can't both proceed. The caller must
+    /// [`Self::rehydrate`] a durable terminal row into the registry BEFORE this if the app
+    /// restarted (the in-memory map is empty then) — so a `NotFound` here means the session
+    /// genuinely does not exist.
+    pub(super) fn begin_resume(&self, thread_id: &str) -> BeginResume {
+        let mut st = self.inner.lock().unwrap();
+        match st.sessions.get_mut(thread_id) {
+            None => BeginResume::NotFound,
+            Some(info) => match info.status {
+                SessionStatus::Done | SessionStatus::Failed => {
+                    info.status = SessionStatus::Running;
+                    BeginResume::Proceed
+                }
+                _ => BeginResume::Busy,
+            },
+        }
+    }
+
+    /// Re-insert a durable session row into the in-memory registry, so a follow-up
+    /// (`send_message`) after an app restart — when the registry is empty but a durable
+    /// `Done` row exists — can drive the SAME lifecycle transitions (`begin_resume` →
+    /// `set_running` → `finalize_turn`) the live path uses. Reuses the same insert path as
+    /// [`Self::promote_reservation`] (sessions + a fresh [`CommentUrlContext`]): the first
+    /// turn's `finalize_turn` consumed the original context via [`Self::take_url_context`],
+    /// so a follow-up turn needs its own re-inserted context to resolve cleanly. A no-op
+    /// overwrite if the session is somehow already present (the live path never rehydrates).
+    pub(super) fn rehydrate(&self, info: SessionInfo, url_ctx: CommentUrlContext) {
+        let mut st = self.inner.lock().unwrap();
+        st.url_contexts.insert(info.thread_id.clone(), url_ctx);
+        st.sessions.insert(info.thread_id.clone(), info);
     }
 
     /// Revert a failed interrupt: [`SessionStatus::Interrupting`] →
@@ -628,6 +681,200 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
     ));
 
     Ok(StartReviewOutcome::Started(thread_id))
+}
+
+/// Continue an EXISTING codex session with a follow-up user `message` (chat continuation):
+/// issue a SECOND `turn/start` on the SAME `thread_id` and stream the reply through the
+/// existing [`pump`], reusing the whole `ReviewEvent` pipeline. Sibling of [`start_review`].
+///
+/// Flow (mirrors `start_review`'s two-phase shape, adapted to a follow-up):
+/// 1. `begin_resume` guard — rehydrate the durable terminal row first if the session is not
+///    in the in-memory registry (after a restart the registry is empty but a `Done` row may
+///    exist). A `Busy` (a turn already in flight) or a genuine `NotFound` is an error.
+/// 2. `codex.connection` (the command already called `state.codex.resume()`).
+/// 3. `subscribe()` BEFORE issuing the turn (no early delta missed, same as `start_review`).
+/// 4. Persist the user message to history BEFORE the turn (ordered before the reply).
+/// 5. A second `turn/start` on the EXISTING `thread_id` — the pr-review skill is NOT
+///    re-attached (it is already in the thread context); only the raw user `message` is sent.
+/// 6. On `start_turn` error: set the session `Failed` + persist + return a clear error.
+/// 7. On success: `set_running` + persist Running + spawn the existing `pump`.
+///
+/// `pub(crate)` (not `pub`) like `start_review`: only the in-crate codex engine adapter
+/// calls it, and its `url_ctx: CommentUrlContext` param is a crate-internal type.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resume_turn<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    codex: &CodexManager,
+    registry: &SessionRegistry,
+    codex_bin: &str,
+    repo_root: &str,
+    codex_model: &str,
+    project_id: &str,
+    pr_number: u64,
+    thread_id: &str,
+    message: &str,
+    user_item_id: &str,
+    // The IMMUTABLE comment-URL source context (AB#1042), captured by the caller from the
+    // project. Re-inserted via `rehydrate` (the first turn's `finalize_turn` consumed the
+    // original) so this follow-up turn's `finalize_turn` resolves the URL cleanly.
+    url_ctx: CommentUrlContext,
+) -> AppResult<()> {
+    // Rehydrate a durable terminal row into the registry if it isn't live (the registry is
+    // empty after a restart, but a `Done`/`Failed` row may persist). The durable status is
+    // terminal (or `fail_orphaned_sessions` made it so at startup), so `begin_resume` below
+    // accepts it. If neither the registry NOR the durable row has it, `begin_resume` returns
+    // NotFound. The caller resolved `pr_number`/`project_id` from the same row, so the
+    // rehydrated `SessionInfo` is consistent with the durable record.
+    if registry.get(thread_id).is_none() {
+        let rehydrated = SessionInfo {
+            project_id: project_id.to_string(),
+            thread_id: thread_id.to_string(),
+            turn_id: String::new(),
+            pr_number,
+            kind: String::new(),
+            status: SessionStatus::Done,
+            created_at_epoch: super::history_store::now_epoch(),
+            comment_url: None,
+        };
+        registry.rehydrate(rehydrated, url_ctx.clone());
+    }
+
+    // Atomic guard: only a terminal session flips to `Running` and proceeds. A turn already
+    // in flight (`Busy`) or a genuinely absent session is rejected before any side effect.
+    match registry.begin_resume(thread_id) {
+        BeginResume::Proceed => {}
+        BeginResume::Busy => {
+            return Err(AppError::new(format!(
+                "review 会话仍在进行中，无法续聊: {thread_id}"
+            )))
+        }
+        BeginResume::NotFound => {
+            return Err(AppError::new(format!("未找到 review 会话: {thread_id}")))
+        }
+    }
+
+    // The command already called `state.codex.resume()`; `connection` spawns/reuses the
+    // resident app-server. A connection failure leaves the session `Running` — flip it back
+    // to `Failed` so it isn't stuck, then surface the error.
+    let client = match codex.connection(codex_bin, repo_root).await {
+        Ok(client) => client,
+        Err(e) => {
+            registry.set_status(thread_id, SessionStatus::Failed);
+            persist_status(app, thread_id, SessionStatus::Failed);
+            return Err(e);
+        }
+    };
+
+    // Subscribe before the turn so the buffered broadcast yields every delta from turn start.
+    let rx = client.subscribe();
+
+    // Persist the user's typed message to history BEFORE issuing the turn, under the
+    // CALLER-supplied `user_item_id` (so the frontend's optimistic bubble id == the
+    // persisted id, and reopen-dedup works). History is ordered by rowid (`ORDER BY h.id`),
+    // so inserting this row first places the user message before the reply. Best-effort
+    // (logged + swallowed), the same contract as the delta persistence.
+    persist_user_message(app, project_id, thread_id, user_item_id, message);
+
+    // Issue a SECOND turn on the EXISTING thread. The pr-review skill is NOT re-attached —
+    // it is already in this thread's context; we send only the raw user message. Same
+    // sandbox / approval / cwd / per-turn model as `start_review`.
+    let turn_id = match process::start_turn(
+        &client,
+        TurnStartParams {
+            thread_id: thread_id.to_string(),
+            input: vec![UserInput::Text {
+                text: message.to_string(),
+            }],
+            approval_policy: "never".to_string(),
+            sandbox_policy: SandboxPolicy {
+                kind: "workspaceWrite".to_string(),
+                network_access: true,
+                writable_roots: vec![repo_root.to_string()],
+            },
+            cwd: Some(repo_root.to_string()),
+            model: (!codex_model.trim().is_empty()).then(|| codex_model.trim().to_string()),
+        },
+    )
+    .await
+    {
+        Ok(turn_id) => turn_id,
+        // KNOWN LIMITATION (not a bug): codex follow-up works only WITHIN the same app run.
+        // The resident app-server keeps the thread in memory; the codex app-server protocol
+        // has NO `thread/resume`, so after an app restart the thread is gone and this
+        // `turn/start` fails. Mark the session `Failed` (so it isn't stuck `Running`) and
+        // surface a clear, user-facing error directing them to re-start a review. (Claude
+        // works cross-restart via `--resume` — only codex has this limit.)
+        Err(_) => {
+            registry.set_status(thread_id, SessionStatus::Failed);
+            persist_status(app, thread_id, SessionStatus::Failed);
+            return Err(AppError::new(
+                "codex 线程已失效（应用重启后无法续聊，请重新发起 review）".to_string(),
+            ));
+        }
+    };
+
+    registry.set_running(thread_id, turn_id.clone());
+    // Mirror the Running transition into `review_session`. `upsert_session` keys `created_at`
+    // on first insert (ON CONFLICT preserves it), so re-stamping `now` here is harmless.
+    let live = registry
+        .get(thread_id)
+        .map(|info| SessionInfo {
+            status: SessionStatus::Running,
+            turn_id: turn_id.clone(),
+            ..info
+        })
+        .unwrap_or_else(|| SessionInfo {
+            project_id: project_id.to_string(),
+            thread_id: thread_id.to_string(),
+            turn_id,
+            pr_number,
+            kind: String::new(),
+            status: SessionStatus::Running,
+            created_at_epoch: super::history_store::now_epoch(),
+            comment_url: None,
+        });
+    persist_session(app, &live);
+
+    // Spawn the SAME pump as `start_review` — same signature/usage — to stream the reply.
+    tauri::async_runtime::spawn(pump(
+        rx,
+        project_id.to_string(),
+        pr_number,
+        thread_id.to_string(),
+        app.clone(),
+        registry.clone(),
+    ));
+
+    Ok(())
+}
+
+/// Best-effort persist of a USER's follow-up chat message into the session history
+/// (chat continuation), under the caller-supplied `user_item_id`. Logged + swallowed like
+/// the delta persistence — a DB hiccup must not block the follow-up turn. Shared by the
+/// codex `resume_turn` here and (via `pub(super)`) the claude `resume_review`, so both
+/// engines persist the user message through ONE helper with the same one-time-notice
+/// contract.
+pub(super) fn persist_user_message<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_id: &str,
+    thread_id: &str,
+    user_item_id: &str,
+    message: &str,
+) {
+    let db = app.state::<crate::db::Database>();
+    if let Err(e) = super::history_store::append_item(
+        db.inner(),
+        thread_id,
+        user_item_id,
+        HistoryItemKind::User,
+        message,
+    ) {
+        eprintln!(
+            "review 用户消息持久化失败（{thread_id}/{user_item_id}）：{}",
+            e.message
+        );
+        notify_persist_failure_once(app, project_id);
+    }
 }
 
 /// Interrupt a running review session. The terminal `turn/completed` (status
@@ -1573,6 +1820,90 @@ mod tests {
             reg.begin_interrupt("missing"),
             BeginInterrupt::NotFound
         ));
+    }
+
+    #[test]
+    fn begin_resume_only_proceeds_from_terminal() {
+        // Chat-continuation guard: only a TERMINAL (Done/Failed) session flips to Running and
+        // proceeds; an in-flight (Starting/Running/Interrupting) one is Busy (a concurrent
+        // double-send is rejected); a missing id is NotFound.
+        let reg = SessionRegistry::default();
+        let seed = |thread: &str, status| {
+            reg.insert(SessionInfo {
+                project_id: "p1".to_string(),
+                thread_id: thread.to_string(),
+                turn_id: "tn".to_string(),
+                pr_number: 7,
+                kind: "review".to_string(),
+                status,
+                created_at_epoch: 0,
+                comment_url: None,
+            });
+        };
+
+        // Done → Proceed, and the status flips to Running (the follow-up turn is now live).
+        seed("done", SessionStatus::Done);
+        assert!(matches!(reg.begin_resume("done"), BeginResume::Proceed));
+        assert_eq!(reg.get("done").unwrap().status, SessionStatus::Running);
+
+        // Failed → Proceed too (a failed session can be retried via a follow-up).
+        seed("failed", SessionStatus::Failed);
+        assert!(matches!(reg.begin_resume("failed"), BeginResume::Proceed));
+        assert_eq!(reg.get("failed").unwrap().status, SessionStatus::Running);
+
+        // In-flight statuses → Busy (no transition; a turn is already running).
+        for status in [
+            SessionStatus::Starting,
+            SessionStatus::Running,
+            SessionStatus::Interrupting,
+        ] {
+            seed("busy", status);
+            assert!(
+                matches!(reg.begin_resume("busy"), BeginResume::Busy),
+                "{status:?} must be Busy"
+            );
+            assert_eq!(reg.get("busy").unwrap().status, status, "no transition");
+        }
+
+        // Unknown id → NotFound.
+        assert!(matches!(reg.begin_resume("missing"), BeginResume::NotFound));
+    }
+
+    #[test]
+    fn rehydrate_inserts_durable_row_and_url_context() {
+        // After a restart the registry is empty; `rehydrate` re-inserts a durable terminal
+        // row (so `begin_resume` can accept it) AND a fresh `CommentUrlContext` (the first
+        // turn's `finalize_turn` consumed the original) for the follow-up turn's terminal.
+        let reg = SessionRegistry::default();
+        assert!(reg.get("th-1").is_none(), "registry empty pre-rehydrate");
+        let ctx = CommentUrlContext {
+            source_kind: crate::model::SourceKind::Azure,
+            repo: "the-repo".to_string(),
+            azure_org: "the-org".to_string(),
+            azure_project: "the-project".to_string(),
+        };
+        reg.rehydrate(
+            SessionInfo {
+                project_id: "p1".to_string(),
+                thread_id: "th-1".to_string(),
+                turn_id: String::new(),
+                pr_number: 7,
+                kind: "review".to_string(),
+                status: SessionStatus::Done,
+                created_at_epoch: 0,
+                comment_url: None,
+            },
+            ctx,
+        );
+        // The row is now live and terminal → a follow-up can Proceed.
+        let got = reg.get("th-1").expect("rehydrated row present");
+        assert_eq!(got.pr_number, 7);
+        assert_eq!(got.status, SessionStatus::Done);
+        assert!(matches!(reg.begin_resume("th-1"), BeginResume::Proceed));
+        // The fresh URL context is readable once at the terminal (remove-on-read).
+        let taken = reg.take_url_context("th-1").expect("fresh context present");
+        assert_eq!(taken.repo, "the-repo");
+        assert!(reg.take_url_context("th-1").is_none(), "consumed on read");
     }
 
     #[test]

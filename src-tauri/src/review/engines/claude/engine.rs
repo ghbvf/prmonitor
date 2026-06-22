@@ -46,6 +46,11 @@ pub struct ClaudeEngine<'a, R: tauri::Runtime> {
     /// `finalize_turn`'s URL resolve to the project the review ran against (not a mid-review
     /// config edit). `pub(crate)`: crate-internal context type, in-crate constructors only.
     pub(crate) url_ctx: CommentUrlContext,
+    /// The PR number for the FOLLOW-UP (`send_message`) path only — the `ReviewEngine`
+    /// trait's `send_message(session, message, user_item_id)` carries no `pr_number`, so the
+    /// command resolves it and sets it here. The `start`/`stop` paths take `pr_number` as a
+    /// method arg and ignore this field (set to 0 at those construction sites).
+    pub pr_number: u64,
 }
 
 impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
@@ -74,6 +79,30 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
         // engine-level stop against a gone session is a no-op.
         self.claude.stop(session);
         Ok(())
+    }
+
+    async fn send_message(
+        &self,
+        session: &SessionId,
+        message: &str,
+        user_item_id: &str,
+    ) -> AppResult<()> {
+        resume_review(
+            self.app,
+            self.claude,
+            self.registry,
+            self.claude_bin,
+            self.project_id,
+            self.repo_root,
+            self.claude_model,
+            self.pr_number,
+            session,
+            message,
+            user_item_id,
+            // `&self` can't move the field; clone the owned context for this follow-up turn.
+            self.url_ctx.clone(),
+        )
+        .await
     }
 }
 
@@ -121,8 +150,9 @@ async fn start_review<R: tauri::Runtime>(
     };
 
     // Spawn the one-shot child. `?` releases the reservation (guard Drop) on failure.
+    // `None` resume → a FRESH review (no `--resume`); the follow-up path is `resume_review`.
     let prompt = process::review_prompt(pr_number, kind);
-    let proc = process::spawn_claude(claude_bin, repo_root, claude_model, &prompt)?;
+    let proc = process::spawn_claude(claude_bin, repo_root, claude_model, &prompt, None)?;
     let process::ClaudeProcess {
         child,
         stdout,
@@ -203,6 +233,213 @@ async fn start_review<R: tauri::Runtime>(
     ));
 
     Ok(StartReviewOutcome::Started(session_id))
+}
+
+/// Continue an EXISTING claude session with a follow-up user `message` (chat continuation):
+/// spawn `claude -p --resume <thread_id>` with the RAW user message as the prompt, and
+/// stream the reply through the existing [`pump`] — reusing the whole `ReviewEvent`
+/// pipeline. Sibling of [`start_review`]. `--resume` is cross-restart capable: claude
+/// persists transcripts on disk, so a follow-up works even after an app restart (unlike
+/// codex, whose thread lives only in the resident process).
+///
+/// Differences from `start_review`:
+/// (a) the prompt is the RAW user `message`, NOT `/pr-review N`;
+/// (b) spawned with `Some(thread_id)` so `--resume <thread_id>` is appended;
+/// (c) the `claude -p --resume` `system/init` line emits a NEW session id which we
+///     read-and-DISCARD — we keep using the ORIGINAL `thread_id` for the pump's session
+///     stamping, history append, and registry keying (adopting the new id would orphan
+///     history/dedup/stop-routing);
+/// (d) a fresh cancel channel is registered (`claude.register(thread_id, …)`) so the
+///     follow-up turn is stoppable;
+/// (e) the user message is persisted (under `user_item_id`) BEFORE the spawn;
+/// (f) the existing `pump` is spawned with the ORIGINAL `thread_id`.
+#[allow(clippy::too_many_arguments)]
+async fn resume_review<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    claude: &ClaudeManager,
+    registry: &SessionRegistry,
+    claude_bin: &str,
+    project_id: &str,
+    repo_root: &str,
+    claude_model: &str,
+    pr_number: u64,
+    thread_id: &str,
+    message: &str,
+    user_item_id: &str,
+    url_ctx: CommentUrlContext,
+) -> AppResult<()> {
+    // Rehydrate a durable terminal row if the session isn't live (registry empty after a
+    // restart). The first turn's `finalize_turn` consumed the original URL context, so a
+    // fresh one is re-inserted for this follow-up turn's terminal resolve.
+    if registry.get(thread_id).is_none() {
+        let rehydrated = SessionInfo {
+            project_id: project_id.to_string(),
+            thread_id: thread_id.to_string(),
+            turn_id: thread_id.to_string(),
+            pr_number,
+            kind: String::new(),
+            status: SessionStatus::Done,
+            created_at_epoch: history_store::now_epoch(),
+            comment_url: None,
+        };
+        registry.rehydrate(rehydrated, url_ctx.clone());
+    }
+
+    // Atomic guard: only a TERMINAL session flips to `Running` and proceeds. A turn in
+    // flight (`Busy`) or a genuinely absent session is rejected before any spawn.
+    match registry.begin_resume(thread_id) {
+        crate::review::session::BeginResume::Proceed => {}
+        crate::review::session::BeginResume::Busy => {
+            return Err(AppError::new(format!(
+                "review 会话仍在进行中，无法续聊: {thread_id}"
+            )))
+        }
+        crate::review::session::BeginResume::NotFound => {
+            return Err(AppError::new(format!("未找到 review 会话: {thread_id}")))
+        }
+    }
+
+    // Spawn `claude -p --resume <thread_id>` with the RAW user message as the prompt (NOT a
+    // `/pr-review N`). On a spawn failure flip back to `Failed` (the session was set
+    // `Running` by `begin_resume`) so it isn't stuck, then surface the error.
+    let proc = match process::spawn_claude(
+        claude_bin,
+        repo_root,
+        claude_model,
+        message,
+        Some(thread_id),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            registry.set_status(thread_id, SessionStatus::Failed);
+            persist_session_status(
+                app,
+                registry,
+                project_id,
+                thread_id,
+                pr_number,
+                SessionStatus::Failed,
+            );
+            return Err(e);
+        }
+    };
+    let process::ClaudeProcess {
+        child,
+        stdout,
+        stderr,
+    } = proc;
+
+    tauri::async_runtime::spawn(process::drain_stderr(BufReader::new(stderr)));
+
+    // Read to the `system/init` line of the RESUMED run. `claude -p --resume` emits a NEW
+    // session id on this line, which we DISCARD: we keep the ORIGINAL `thread_id` for the
+    // pump's session stamping, history append, and registry keying. Adopting the new id
+    // would orphan this session's history / dedup / stop-routing (all keyed on the original).
+    let mut reader = process::stdout_reader(stdout);
+    let mut parser = ParserState::default();
+    match read_session_id(&mut reader, &mut parser).await {
+        // The new id is intentionally unused — we stamp everything with the original.
+        Ok(Some(_new_session_id)) => {}
+        Ok(None) => {
+            // EOF before any init line → claude exited without resuming (transcript gone /
+            // not logged in / bad flags). Mark failed so the session isn't stuck `Running`.
+            registry.set_status(thread_id, SessionStatus::Failed);
+            persist_session_status(
+                app,
+                registry,
+                project_id,
+                thread_id,
+                pr_number,
+                SessionStatus::Failed,
+            );
+            return Err(AppError::new(
+                "claude 未输出会话 init（续聊失败：transcript 不存在或未登录？）".to_string(),
+            ));
+        }
+        Err(e) => {
+            registry.set_status(thread_id, SessionStatus::Failed);
+            persist_session_status(
+                app,
+                registry,
+                project_id,
+                thread_id,
+                pr_number,
+                SessionStatus::Failed,
+            );
+            return Err(e);
+        }
+    }
+
+    // Persist the user's typed message to history BEFORE the pump streams the reply, under
+    // the CALLER-supplied `user_item_id` (so the optimistic bubble id == the persisted id,
+    // and reopen-dedup works). History is ordered by rowid (`ORDER BY h.id`), so inserting
+    // this row first places the user message before the reply. Reuses the shared
+    // `session::persist_user_message` helper (one source for both engines).
+    crate::review::session::persist_user_message(app, project_id, thread_id, user_item_id, message);
+
+    // The session is already `Running` (set by `begin_resume`); mirror it durably.
+    persist_session_status(
+        app,
+        registry,
+        project_id,
+        thread_id,
+        pr_number,
+        SessionStatus::Running,
+    );
+
+    // Register a FRESH cancel channel for this follow-up turn (BEFORE spawning the pump, so
+    // a `stop` can't race ahead of registration) — the prior turn's channel was deregistered
+    // by its `finish`. `register` for the (globally unique) id replaces any stale sender.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    claude.register(thread_id.to_string(), cancel_tx);
+
+    // Spawn the SAME pump as `start_review`, stamped with the ORIGINAL `thread_id`.
+    tauri::async_runtime::spawn(pump(
+        reader,
+        child,
+        parser,
+        cancel_rx,
+        project_id.to_string(),
+        pr_number,
+        thread_id.to_string(),
+        app.clone(),
+        registry.clone(),
+        claude.clone(),
+    ));
+
+    Ok(())
+}
+
+/// Best-effort durable mirror of a session STATUS transition on the follow-up path, where
+/// only the thread id (not a full live `SessionInfo`) is at hand. Reads the current
+/// in-memory row (via `registry`) to preserve its `pr_number`/`kind`/`created_at_epoch`,
+/// falling back to the resolved `pr_number` + empty kind if the row is absent. Logs +
+/// swallows like the other claude `persist_*` helpers (the in-memory registry stays the
+/// dedup/status authority). `upsert_session` keys `created_at` on first insert (ON CONFLICT
+/// preserves it), so a re-stamped `created_at_epoch` in the fallback is harmless for an
+/// already-persisted row.
+fn persist_session_status<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    registry: &SessionRegistry,
+    project_id: &str,
+    thread_id: &str,
+    pr_number: u64,
+    status: SessionStatus,
+) {
+    let info = registry
+        .get(thread_id)
+        .map(|info| SessionInfo { status, ..info })
+        .unwrap_or_else(|| SessionInfo {
+            project_id: project_id.to_string(),
+            thread_id: thread_id.to_string(),
+            turn_id: thread_id.to_string(),
+            pr_number,
+            kind: String::new(),
+            status,
+            created_at_epoch: history_store::now_epoch(),
+            comment_url: None,
+        });
+    persist_session(app, &info);
 }
 
 /// Read stdout until the first `system/init` line, returning its session id (or `None`
@@ -400,6 +637,11 @@ fn emit_and_persist<R: tauri::Runtime>(
             item_id: item_id.to_string(),
             text: text.clone(),
         },
+        // `User` is a stored-only kind (a follow-up message the user typed) — it is persisted
+        // directly by `session::persist_user_message`, NEVER streamed through this delta path.
+        // The pump only ever calls this with the two delta kinds above; this arm is
+        // unreachable by construction, so do nothing rather than emit a bogus delta event.
+        HistoryItemKind::User => return,
     };
     let _ = app.emit(REVIEW_EVENT, &event);
     let db = app.state::<crate::db::Database>();
