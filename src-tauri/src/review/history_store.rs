@@ -467,6 +467,34 @@ mod tests {
         assert_eq!(items[1].text, "Hello world");
     }
 
+    // User-before-reply ordering lock (chat-continuation): the follow-up flow persists the
+    // user's typed message (`HistoryItemKind::User`) BEFORE issuing the reply turn, relying on
+    // `get_history`'s `ORDER BY h.id` to render the user bubble ahead of the AI reply. This
+    // pins that insertion-order guarantee: a User item appended first, then a Message item
+    // (distinct item_ids), must read back as `[User, Message]`. A drift to a non-insertion
+    // order (e.g. sorting by item_id) would scramble the conversation and fails here.
+    #[test]
+    fn user_message_sorts_before_later_reply() {
+        let db = Database::open_in_memory().expect("open db");
+        upsert_session(&db, &info("th-1", 12, SessionStatus::Running)).expect("session");
+
+        // The user's follow-up is persisted first (as `resume_turn`/`resume_review` do), then
+        // the AI reply's first delta arrives under a different item id.
+        append_item(&db, "th-1", "u1", HistoryItemKind::User, "please re-check").expect("user");
+        append_item(&db, "th-1", "m1", HistoryItemKind::Message, "Re-checked.").expect("reply");
+
+        let items = get_history(&db, "alpha", 12, "th-1").expect("history");
+        let order: Vec<HistoryItemKind> = items.iter().map(|i| i.kind).collect();
+        assert_eq!(
+            order,
+            vec![HistoryItemKind::User, HistoryItemKind::Message],
+            "user message (persisted first) sorts before the AI reply (ORDER BY h.id)"
+        );
+        assert_eq!(items[0].item_id, "u1");
+        assert_eq!(items[0].text, "please re-check");
+        assert_eq!(items[1].item_id, "m1");
+    }
+
     // `HistoryItem` wire-shape lock (#70, Medium carrier): camelCase `itemId` present,
     // snake_case absent — keeps the Rust↔`src/review/types.ts` (`StreamItem`) contract.
     #[test]

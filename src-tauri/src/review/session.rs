@@ -761,6 +761,11 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
         Err(e) => {
             registry.set_status(thread_id, SessionStatus::Failed);
             persist_status(app, thread_id, SessionStatus::Failed);
+            // On a failure path `finalize_turn` never runs, so it never consumes the URL
+            // context the (possibly just-)`rehydrate`d session inserted — discard it so it
+            // doesn't leak in `url_contexts`. A no-op `None` when this run never rehydrated
+            // (the same-run path keeps the original until its own `finalize_turn` takes it).
+            let _ = registry.take_url_context(thread_id);
             return Err(e);
         }
     };
@@ -807,6 +812,9 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
         Err(_) => {
             registry.set_status(thread_id, SessionStatus::Failed);
             persist_status(app, thread_id, SessionStatus::Failed);
+            // No `finalize_turn` runs on this failure, so discard the rehydrated URL context
+            // to avoid leaking it in `url_contexts` (no-op `None` if never rehydrated).
+            let _ = registry.take_url_context(thread_id);
             return Err(AppError::new(
                 "codex 线程已失效（应用重启后无法续聊，请重新发起 review）".to_string(),
             ));

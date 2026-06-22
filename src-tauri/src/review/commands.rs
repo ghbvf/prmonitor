@@ -199,18 +199,31 @@ fn comment_url_ctx_from(project: &config_service::Project) -> CommentUrlContext 
 /// row persists). Errors if neither has it — a follow-up to a session we never knew about.
 /// A PR number is unique only within a project, so resolving it FROM the session row (not
 /// from a caller-supplied number) keeps the follow-up turn keyed to the exact session.
+///
+/// SCOPED by `project_id` (mirrors `get_session_history`'s F6 `AND s.project_id = ?`): BOTH
+/// the in-memory and the durable path verify the resolved session belongs to the caller's
+/// project. A `thread_id` is globally unique, so without this check a caller could supply
+/// another project's `thread_id` and resume that session under the wrong project (cross-tenant
+/// confusion). A project mismatch reports the SAME "未找到 review 会话（无法续聊）" error as a
+/// genuinely-absent session — an attacker learns nothing about another project's sessions.
 fn resolve_pr_number<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppState,
+    project_id: &str,
     thread_id: &str,
 ) -> AppResult<u64> {
     if let Some(info) = state.sessions.get(thread_id) {
+        if info.project_id != project_id {
+            return Err(AppError::new(format!(
+                "未找到 review 会话（无法续聊）: {thread_id}"
+            )));
+        }
         return Ok(info.pr_number);
     }
     let db = app.state::<Database>();
     match history_store::get_session(db.inner(), thread_id)? {
-        Some(info) => Ok(info.pr_number),
-        None => Err(AppError::new(format!(
+        Some(info) if info.project_id == project_id => Ok(info.pr_number),
+        _ => Err(AppError::new(format!(
             "未找到 review 会话（无法续聊）: {thread_id}"
         ))),
     }
@@ -242,11 +255,25 @@ pub async fn send_review_message<R: tauri::Runtime>(
     if message.trim().is_empty() {
         return Err(AppError::new("消息为空".to_string()));
     }
+    // An empty / whitespace-only `user_item_id` would collide on the history table's
+    // `UNIQUE(thread_id, item_id)` constraint and COALESCE every user message of the session
+    // into one row — reject it here so each follow-up persists as its own bubble.
+    if user_item_id.trim().is_empty() {
+        return Err(AppError::new("user_item_id 为空".to_string()));
+    }
+    // Cap the follow-up length: a huge message would be passed to `claude` as a process ARG,
+    // failing the spawn at `execve` ARG_MAX (typically ~256KB on macOS, ~2MB on Linux) with an
+    // opaque error. Reject oversized input here with a friendly message. 128 KiB (bytes, not
+    // chars — `len()` is the encoded byte count that hits ARG_MAX) leaves ample headroom.
+    if message.len() > 131072 {
+        return Err(AppError::new("消息过长（上限 128KB）".to_string()));
+    }
     // Resolve + validate the owning project (#35) — same per-project validation as
     // `start_review` (the review slice stays on `config::service`, never `config::model`).
     let project = config_service::project_validated(&app, &project_id)?;
-    // Resolve the session's PR number (in-memory live row, else the durable row).
-    let pr_number = resolve_pr_number(&app, &state, &thread_id)?;
+    // Resolve the session's PR number (in-memory live row, else the durable row), SCOPED to
+    // this project so a caller can't resume another project's session by raw `thread_id`.
+    let pr_number = resolve_pr_number(&app, &state, &project_id, &thread_id)?;
     let url_ctx = comment_url_ctx_from(&project);
     match project.engine_kind {
         EngineKind::Codex => {

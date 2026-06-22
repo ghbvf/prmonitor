@@ -320,6 +320,10 @@ async fn resume_review<R: tauri::Runtime>(
                 pr_number,
                 SessionStatus::Failed,
             );
+            // No `finalize_turn` runs on a failure path, so it never consumes the URL context
+            // the (possibly just-)`rehydrate`d session inserted — discard it so it doesn't leak
+            // in `url_contexts` (no-op `None` when this run never rehydrated).
+            let _ = registry.take_url_context(thread_id);
             return Err(e);
         }
     };
@@ -352,6 +356,9 @@ async fn resume_review<R: tauri::Runtime>(
                 pr_number,
                 SessionStatus::Failed,
             );
+            // No `finalize_turn` runs on this failure — discard the rehydrated URL context so
+            // it doesn't leak in `url_contexts` (no-op `None` when never rehydrated).
+            let _ = registry.take_url_context(thread_id);
             return Err(AppError::new(
                 "claude 未输出会话 init（续聊失败：transcript 不存在或未登录？）".to_string(),
             ));
@@ -366,6 +373,9 @@ async fn resume_review<R: tauri::Runtime>(
                 pr_number,
                 SessionStatus::Failed,
             );
+            // No `finalize_turn` runs on this failure — discard the rehydrated URL context so
+            // it doesn't leak in `url_contexts` (no-op `None` when never rehydrated).
+            let _ = registry.take_url_context(thread_id);
             return Err(e);
         }
     }
@@ -640,8 +650,15 @@ fn emit_and_persist<R: tauri::Runtime>(
         // `User` is a stored-only kind (a follow-up message the user typed) — it is persisted
         // directly by `session::persist_user_message`, NEVER streamed through this delta path.
         // The pump only ever calls this with the two delta kinds above; this arm is
-        // unreachable by construction, so do nothing rather than emit a bogus delta event.
-        HistoryItemKind::User => return,
+        // unreachable by construction. `debug_assert!(false)` trips a future regression that
+        // starts streaming a `User` kind in dev/test, while staying a no-op `return` in release.
+        HistoryItemKind::User => {
+            debug_assert!(
+                false,
+                "User kind must not reach emit_and_persist (persisted directly by persist_user_message)"
+            );
+            return;
+        }
     };
     let _ = app.emit(REVIEW_EVENT, &event);
     let db = app.state::<crate::db::Database>();
