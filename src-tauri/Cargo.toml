@@ -23,7 +23,10 @@ tauri-plugin-opener = "2"
 tauri-plugin-store = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["time", "sync", "macros", "process", "io-util", "net"] }
+# `rt` (current-thread runtime) is for the AB#1044 CLI client path: `prmonitor review …` builds
+# its own `tokio::runtime` to drive the `reqwest` trigger/poll BEFORE any Tauri (and its runtime)
+# exists. The GUI path keeps using `tauri::async_runtime`.
+tokio = { version = "1", features = ["rt", "time", "sync", "macros", "process", "io-util", "net"] }
 # Local webhook receiver (#9): a single `POST /webhook` endpoint bound to
 # 127.0.0.1, reached from the public internet via a Cloudflare Quick Tunnel
 # (`cloudflared` subprocess). axum is the idiomatic tokio HTTP server — its async
@@ -61,6 +64,17 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # `default-features = false` drops the default native-tls stack. Reuses the existing
 # tokio runtime (async reqwest), mirroring how gh/az run on tokio::process.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# CLI subcommand (`prmonitor review …`, AB#1044): `clap` parses the review args, then the same
+# binary acts as a thin HTTP client over the AB#1043 local API (reusing the resident `reqwest`).
+clap = { version = "4", features = ["derive"] }
+# Resolve the app-data dir (where `prmonitor.db` lives) from OUTSIDE a Tauri app, so the CLI
+# client can read the saved local-API port/token. Matches Tauri's `app_data_dir` convention
+# (platform data dir + bundle identifier); the identifier itself is golden-locked in `cli.rs`.
+dirs = "5"
+# Single-instance lock (AB#1044): a cold-start `prmonitor review` (app not running) becomes the
+# FIRST instance, boots the GUI + local API, then triggers in-process; it also dedups GUI
+# windows. Registered FIRST in the builder (before opener/store), per the ticket.
+tauri-plugin-single-instance = "2"
 
 # Pin: brotli 8.0.3 (pulled transitively by tauri-codegen/tauri-utils) requires
 # alloc-no-stdlib "^2.0", but alloc-stdlib/brotli-decompressor accept ">=2.0.4,<4"

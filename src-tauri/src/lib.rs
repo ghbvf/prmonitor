@@ -18,6 +18,7 @@
 // Modules are `pub` so forward-looking seams and shared types (e.g.
 // `pr::source::PrSource`, `review::engine::ReviewEngine`) count as reachable API
 // in this skeleton rather than tripping `dead_code` before their first use.
+pub mod cli;
 pub mod config;
 pub mod db;
 pub mod dispatch;
@@ -36,7 +37,31 @@ use tauri::{Emitter, Manager};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // AB#1044: branch on `argv` BEFORE building Tauri. `prmonitor review …` runs entirely as a thin
+    // HTTP client over the AB#1043 local API (the `code --wait` role) — including launching the app
+    // on a cold start and then connecting to it (see `cli::run_client_blocking`). It NEVER becomes
+    // the GUI. Anything else (no/unknown subcommand) is a normal GUI launch.
+    match cli::parse() {
+        cli::Invocation::Review(args) => std::process::exit(cli::run_client_blocking(&args)),
+        cli::Invocation::Gui => build_app(),
+    }
+}
+
+/// Build + run the Tauri GUI.
+fn build_app() {
     tauri::Builder::default()
+        // Single-instance MUST be the FIRST plugin (AB#1044): it claims the OS lock before any
+        // window work, so a second launch focuses the existing window instead of opening a
+        // duplicate (incl. when two cold-start CLIs each spawn the GUI — only one survives, and
+        // both CLIs then connect to its local API). The CLI never forwards a `review` request
+        // through this callback, so it only needs to resurface the window.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(AppState::default())

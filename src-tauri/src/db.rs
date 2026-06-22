@@ -19,9 +19,11 @@
 //! A command running before that manage would panic on `app.state::<Database>()`
 //! (fail-fast) — but `setup` completes before any command is served, so it never does.
 
+use std::path::Path;
 use std::sync::Mutex;
+use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use tauri::Manager;
 
 use crate::error::{AppError, AppResult};
@@ -59,6 +61,27 @@ impl Database {
         let conn =
             Connection::open(&path).map_err(|e| AppError::new(format!("打开 SQLite 失败: {e}")))?;
         Self::from_conn(conn)
+    }
+
+    /// Opens an EXISTING `prmonitor.db` READ-ONLY at `path`, WITHOUT running migrations — for an
+    /// out-of-app reader (the AB#1044 CLI client) that only needs the config blob while the
+    /// running app owns the file. Read-only + a bounded `busy_timeout` rides out the app's brief
+    /// write locks and GUARANTEES a second process never migrates / mutates the live store (a
+    /// stale CLI binary must not stamp the schema or write through `from_conn`). Errors if the
+    /// file is absent (= the app has never run / written config), letting the caller fall back.
+    pub fn open_readonly_at(path: &Path) -> AppResult<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY
+                | OpenFlags::SQLITE_OPEN_URI
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| AppError::new(format!("打开 SQLite（只读）失败: {e}")))?;
+        conn.busy_timeout(Duration::from_millis(2000))
+            .map_err(map_err)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// In-memory database — schema migrated, no legacy import. Used by store round-trip
@@ -379,5 +402,67 @@ mod tests {
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("read version");
         assert_eq!(version, SCHEMA_VERSION + 1, "future version untouched");
+    }
+
+    /// A unique on-disk path for the `open_readonly_at` tests (process-scoped, per-tag).
+    fn temp_db_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("prmonitor_ro_{}_{tag}.db", std::process::id()))
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// AB#1044: a missing file is an error (the app has never written config), so the CLI caller
+    /// can fall back to defaults rather than silently opening/creating a blank store.
+    #[test]
+    fn open_readonly_at_errors_on_missing_file() {
+        let path = temp_db_path("missing");
+        cleanup(&path);
+        assert!(Database::open_readonly_at(&path).is_err());
+    }
+
+    /// AB#1044: the read-only connection must REJECT writes — a second process reading the live
+    /// store can never mutate the app's data.
+    #[test]
+    fn open_readonly_at_rejects_writes() {
+        let path = temp_db_path("ro");
+        cleanup(&path);
+        {
+            let conn = Connection::open(&path).expect("create");
+            run_migrations(&conn).expect("migrate");
+        }
+        let db = Database::open_readonly_at(&path).expect("open ro");
+        let res = db.with_conn(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO config_blob (id, json) VALUES (1, '{}')",
+                [],
+            )
+        });
+        assert!(res.is_err(), "a read-only connection must reject writes");
+        cleanup(&path);
+    }
+
+    /// AB#1044 regression guard: `open_readonly_at` must NOT run migrations — a stale CLI binary
+    /// opening a v1 store must leave `user_version` at 1, never stamp/downgrade the app's schema.
+    /// (A normal `open` would migrate it to `SCHEMA_VERSION`.)
+    #[test]
+    fn open_readonly_at_does_not_migrate() {
+        let path = temp_db_path("nomig");
+        cleanup(&path);
+        {
+            let conn = Connection::open(&path).expect("create");
+            apply_v1(&conn).expect("seed v1");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("stamp v1");
+        }
+        let db = Database::open_readonly_at(&path).expect("open ro");
+        let version: i64 = db
+            .with_conn(|c| c.pragma_query_value(None, "user_version", |r| r.get(0)))
+            .expect("read version");
+        assert_eq!(version, 1, "open_readonly_at must not migrate the store");
+        cleanup(&path);
     }
 }

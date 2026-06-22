@@ -75,24 +75,28 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 /// both map to the trigger funnel's free-form `reference` (id-or-repo). Not
 /// `deny_unknown_fields`, so an extra key is ignored — but a snake_case `project_id` is NOT
 /// the camelCase `projectId` field, so it stays `None` (the wire-shape test locks this).
-#[derive(Debug, Deserialize)]
+// `pub(crate)` + both `Serialize` and `Deserialize` so the AB#1044 CLI client builds + SENDS the
+// very SAME struct the server RECEIVES — ONE definition, both sides (governance: Hard, zero
+// drift; the round-trip goldens below lock both directions). `skip_serializing_if` on the
+// optional project refs keeps the client's outbound body to the one ref it set.
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TriggerRequest {
-    #[serde(default)]
-    project_id: Option<String>,
-    #[serde(default)]
-    repo: Option<String>,
-    pr: u64,
-    kind: String,
+pub(crate) struct TriggerRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repo: Option<String>,
+    pub(crate) pr: u64,
+    pub(crate) kind: String,
 }
 
 /// `POST /reviews` success body → `202`. `statusUrl` is the absolute loopback URL the caller
 /// polls (`gh run watch` analogue).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TriggerResponse {
-    id: String,
-    status_url: String,
+pub(crate) struct TriggerResponse {
+    pub(crate) id: String,
+    pub(crate) status_url: String,
 }
 
 /// `GET /reviews/{id}` success body → `200`. `status` is the session state machine value
@@ -100,19 +104,19 @@ struct TriggerResponse {
 /// resolved pr-review comment link, present only at a `completed` terminal (omitted otherwise,
 /// matching `SessionInfo`'s `skip_serializing_if`). A poller waits for `status == "done"` with
 /// a non-empty `commentUrl`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct StatusResponse {
-    status: SessionStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    comment_url: Option<String>,
+pub(crate) struct StatusResponse {
+    pub(crate) status: SessionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) comment_url: Option<String>,
 }
 
 /// Uniform error envelope `{message}` (the same shape `AppError` serializes to, so the wire is
 /// consistent whether the message came from a gate or from the trigger funnel).
-#[derive(Debug, Serialize)]
-struct ErrorBody {
-    message: String,
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct ErrorBody {
+    pub(crate) message: String,
 }
 
 // ===========================================================================================
@@ -643,6 +647,56 @@ mod tests {
         .expect("serializes");
         assert_eq!(running["status"], "running");
         assert!(running.get("commentUrl").is_none());
+    }
+
+    // --- shared-struct round-trip goldens (AB#1044: the CLI client reuses these exact structs
+    //     in the OPPOSITE direction; lock both sides so the one definition cannot drift) -------
+
+    #[test]
+    fn trigger_request_serializes_camel_case_and_omits_none() {
+        // The CLI client BUILDS + serializes this struct as the POST body. Lock its outbound
+        // shape: camelCase keys, the unset project ref omitted (not sent as `null`).
+        let v = serde_json::to_value(&TriggerRequest {
+            project_id: Some("p1".to_string()),
+            repo: None,
+            pr: 9,
+            kind: "review".to_string(),
+        })
+        .expect("serializes");
+        assert_eq!(v["projectId"], "p1");
+        assert_eq!(v["pr"], 9);
+        assert_eq!(v["kind"], "review");
+        assert!(v.get("repo").is_none(), "unset repo is omitted");
+        assert!(v.get("project_id").is_none(), "snake_case absent");
+    }
+
+    #[test]
+    fn trigger_response_round_trips_from_camel_case() {
+        // The CLI client DESERIALIZES the 202 body. Lock its inbound parse.
+        let r: TriggerResponse = serde_json::from_value(
+            serde_json::json!({"id": "th-1", "statusUrl": "http://127.0.0.1:8788/reviews/th-1"}),
+        )
+        .expect("deserializes camelCase");
+        assert_eq!(r.id, "th-1");
+        assert_eq!(r.status_url, "http://127.0.0.1:8788/reviews/th-1");
+    }
+
+    #[test]
+    fn status_response_round_trips_from_camel_case() {
+        // Terminal-with-URL: the CLI client reads `commentUrl` (the `gh run watch` analogue).
+        let done: StatusResponse = serde_json::from_value(
+            serde_json::json!({"status": "done", "commentUrl": "https://x/c"}),
+        )
+        .expect("deserializes done+url");
+        assert_eq!(done.status, SessionStatus::Done);
+        assert_eq!(done.comment_url.as_deref(), Some("https://x/c"));
+
+        // `commentUrl` absent (the omitted-on-non-completed wire) → None via `serde(default)`.
+        let running: StatusResponse =
+            serde_json::from_value(serde_json::json!({"status": "running"}))
+                .expect("deserializes without commentUrl");
+        assert_eq!(running.status, SessionStatus::Running);
+        assert!(running.comment_url.is_none());
     }
 
     // --- resolve_session (codex F1: durable Err must not fold into 404) ----------------------
