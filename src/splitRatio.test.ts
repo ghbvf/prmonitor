@@ -4,6 +4,7 @@ import {
   clampRatio,
   DEFAULT_TOP_RATIO,
   MIN_RATIO,
+  normalizeMinRatio,
   ratioFromPointer,
 } from "./splitRatio";
 
@@ -50,6 +51,26 @@ describe("clampRatio", () => {
   it("treats a negative minRatio as 0 (full range usable)", () => {
     expect(clampRatio(0.5, -1)).toBe(0.5);
     expect(clampRatio(0.01, -1)).toBe(0.01);
+  });
+
+  it("normalizes a non-finite minRatio to MIN_RATIO instead of skipping the clamp", () => {
+    // Regression (F3): NaN minRatio used to escape the floor funnel, leaving ratio
+    // unclamped (lo became NaN, so both comparisons were false).
+    expect(clampRatio(0.99, Number.NaN)).toBeCloseTo(1 - MIN_RATIO);
+    expect(clampRatio(0.01, Number.NaN)).toBe(MIN_RATIO);
+  });
+});
+
+describe("normalizeMinRatio", () => {
+  it("clamps a finite value into [0, 0.5]", () => {
+    expect(normalizeMinRatio(0.15)).toBe(0.15);
+    expect(normalizeMinRatio(0.6)).toBe(0.5);
+    expect(normalizeMinRatio(-1)).toBe(0);
+  });
+
+  it("falls back to MIN_RATIO on non-finite input", () => {
+    expect(normalizeMinRatio(Number.NaN)).toBe(MIN_RATIO);
+    expect(normalizeMinRatio(Number.POSITIVE_INFINITY)).toBe(MIN_RATIO);
   });
 });
 

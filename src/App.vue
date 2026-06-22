@@ -440,6 +440,11 @@ body {
 
 .availability {
   flex-shrink: 0;
+  /* Cap the alert banner and let it scroll internally: with .content clipping its own
+     overflow, a tall banner (several config/CLI/dispatch warnings in a short window)
+     would otherwise crush the SplitPane below into an unreachable sliver. */
+  max-height: 40%;
+  overflow-y: auto;
   margin-bottom: var(--space-6);
   padding: var(--space-4) var(--space-6);
   border: 1px solid var(--color-warn-border);

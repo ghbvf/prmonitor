@@ -11,12 +11,21 @@ export const DEFAULT_TOP_RATIO = 0.35;
 // leaves both panes (and their scrollbars) usable instead of collapsing one to a sliver.
 export const MIN_RATIO = 0.15;
 
-// Clamp a top-pane ratio into the usable band [lo, 1 - lo]. NaN (bad input) falls back to
-// the smallest valid top rather than propagating into a style value. minRatio is itself
-// normalized into [0, 0.5] so a caller passing >= 0.5 (no room for both panes) collapses
-// to the 50/50 midpoint instead of an inverted band that returns inconsistent values.
+// Normalize a caller-supplied minRatio into the valid floor band [0, 0.5]: a value with
+// no room for both panes (>= 0.5) collapses to 0.5 (50/50), and non-finite input
+// (NaN / ±Infinity) routes back to the MIN_RATIO default instead of escaping the funnel
+// and yielding an out-of-range split. Single source shared by clampRatio AND SplitPane's
+// ARIA range, so the real and advertised bounds can't drift apart.
+export function normalizeMinRatio(minRatio: number): number {
+  if (!Number.isFinite(minRatio)) return MIN_RATIO;
+  return Math.min(Math.max(minRatio, 0), 0.5);
+}
+
+// Clamp a top-pane ratio into the usable band [lo, 1 - lo], where lo = normalizeMinRatio.
+// NaN ratio (bad input) falls back to the smallest valid top rather than propagating into
+// a style value.
 export function clampRatio(ratio: number, minRatio: number): number {
-  const lo = Math.min(Math.max(minRatio, 0), 0.5);
+  const lo = normalizeMinRatio(minRatio);
   const hi = 1 - lo;
   if (Number.isNaN(ratio) || ratio < lo) return lo;
   if (ratio > hi) return hi;

@@ -6,11 +6,12 @@
 // (StatusBar.vue), so App.vue stays the cross-slice arranger while the pointer-drag
 // interaction + its scoped styles are isolated here. The resize math is the
 // unit-tested splitRatio.ts, leaving this file as just pointer wiring + layout.
-import { ref } from "vue";
+import { computed, ref } from "vue";
 import {
   clampRatio,
   DEFAULT_TOP_RATIO,
   MIN_RATIO,
+  normalizeMinRatio,
   ratioFromPointer,
 } from "./splitRatio";
 
@@ -25,6 +26,11 @@ const props = withDefaults(
 const rootEl = ref<HTMLElement | null>(null);
 const topRatio = ref(clampRatio(props.initialTopRatio, props.minRatio));
 const dragging = ref(false);
+
+// ARIA bounds bind to the SAME normalization the clamp uses, so assistive tech announces
+// the real adjustable range (default 15–85) rather than a misleading 0–100.
+const minPct = computed(() => Math.round(normalizeMinRatio(props.minRatio) * 100));
+const maxPct = computed(() => 100 - minPct.value);
 
 // One arrow press nudges the split by 2% (a11y: the separator is keyboard-operable).
 const KEY_STEP = 0.02;
@@ -79,8 +85,8 @@ function onKeydown(e: KeyboardEvent) {
       aria-orientation="horizontal"
       aria-label="调整面板高度 / Resize panes"
       :aria-valuenow="Math.round(topRatio * 100)"
-      aria-valuemin="0"
-      aria-valuemax="100"
+      :aria-valuemin="minPct"
+      :aria-valuemax="maxPct"
       tabindex="0"
       @pointerdown="onPointerDown"
       @pointermove="onPointerMove"
