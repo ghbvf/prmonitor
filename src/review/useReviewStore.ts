@@ -327,11 +327,18 @@ async function sendMessage(projectId: string, threadId: string, message: string)
   try {
     await sendReviewMessage(projectId, threadId, message, userItemId);
   } catch (err) {
-    // Keep the user bubble (they should see what they tried to send); just clear the
-    // running freeze and surface the error so the composer unlocks.
-    running.value = false;
-    error.value = toMessage(err);
     console.error("发送对话消息失败", err);
+    // Guard against a focus switch during the await: only mutate this session's state
+    // if it's still the focused one (mirrors focus()/hydrateActiveSession). Otherwise
+    // clearing `running`/setting `error` would clobber the NEW session's state.
+    if (activeThreadId.value === threadId) {
+      // Keep the user bubble (they should see what they tried to send); clear the
+      // running freeze, mark the turn failed so the status line reads "已结束 / 失败"
+      // (not the stale "未开始"), and surface the error so the composer unlocks.
+      running.value = false;
+      finalStatus.value = "failed";
+      error.value = toMessage(err);
+    }
   }
 }
 

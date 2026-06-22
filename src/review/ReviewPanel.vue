@@ -2,7 +2,7 @@
 // Review streaming panel: starts/stops a review for the selected PR and renders
 // the streamed deltas. The selected PR is passed down by the composition root
 // (App.vue) so the pr slice and review slice stay decoupled.
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useProjects } from "../projects";
 import type { PullRequestView } from "../types";
 import ReviewStream from "./ReviewStream.vue";
@@ -31,6 +31,13 @@ const {
 // composer is collapsed to a thin header bar.
 const draft = ref("");
 const collapsed = ref(false);
+
+// When a session becomes focused (freshly started or picked from the list), auto-expand
+// the composer so its chat isn't hidden behind a prior manual collapse. Only on the
+// null → non-null edge — a manual collapse during an active session is preserved.
+watch(activeThreadId, (id) => {
+  if (id != null) collapsed.value = false;
+});
 
 // The composer is usable only when a session is focused, no turn is running (the
 // input FREEZES during a review/follow-up turn), and the event listener is attached
@@ -143,10 +150,12 @@ function onStart() {
       </div>
 
       <template v-if="!collapsed">
+        <!-- No focused session: show ONLY the hint. The disabled input row would be
+             visually redundant, so it isn't rendered until a session is focused. -->
         <p v-if="activeThreadId == null" class="muted hint">
           运行 review 后可对话 / Run a review to chat
         </p>
-        <div class="composer-body">
+        <div v-else class="composer-body">
           <textarea
             v-model="draft"
             class="composer-input"
