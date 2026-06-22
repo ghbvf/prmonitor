@@ -403,4 +403,66 @@ mod tests {
             .expect("read version");
         assert_eq!(version, SCHEMA_VERSION + 1, "future version untouched");
     }
+
+    /// A unique on-disk path for the `open_readonly_at` tests (process-scoped, per-tag).
+    fn temp_db_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("prmonitor_ro_{}_{tag}.db", std::process::id()))
+    }
+
+    fn cleanup(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// AB#1044: a missing file is an error (the app has never written config), so the CLI caller
+    /// can fall back to defaults rather than silently opening/creating a blank store.
+    #[test]
+    fn open_readonly_at_errors_on_missing_file() {
+        let path = temp_db_path("missing");
+        cleanup(&path);
+        assert!(Database::open_readonly_at(&path).is_err());
+    }
+
+    /// AB#1044: the read-only connection must REJECT writes — a second process reading the live
+    /// store can never mutate the app's data.
+    #[test]
+    fn open_readonly_at_rejects_writes() {
+        let path = temp_db_path("ro");
+        cleanup(&path);
+        {
+            let conn = Connection::open(&path).expect("create");
+            run_migrations(&conn).expect("migrate");
+        }
+        let db = Database::open_readonly_at(&path).expect("open ro");
+        let res = db.with_conn(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO config_blob (id, json) VALUES (1, '{}')",
+                [],
+            )
+        });
+        assert!(res.is_err(), "a read-only connection must reject writes");
+        cleanup(&path);
+    }
+
+    /// AB#1044 regression guard: `open_readonly_at` must NOT run migrations — a stale CLI binary
+    /// opening a v1 store must leave `user_version` at 1, never stamp/downgrade the app's schema.
+    /// (A normal `open` would migrate it to `SCHEMA_VERSION`.)
+    #[test]
+    fn open_readonly_at_does_not_migrate() {
+        let path = temp_db_path("nomig");
+        cleanup(&path);
+        {
+            let conn = Connection::open(&path).expect("create");
+            apply_v1(&conn).expect("seed v1");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("stamp v1");
+        }
+        let db = Database::open_readonly_at(&path).expect("open ro");
+        let version: i64 = db
+            .with_conn(|c| c.pragma_query_value(None, "user_version", |r| r.get(0)))
+            .expect("read version");
+        assert_eq!(version, 1, "open_readonly_at must not migrate the store");
+        cleanup(&path);
+    }
 }

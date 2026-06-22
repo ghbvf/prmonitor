@@ -44,7 +44,19 @@ pub fn run() {
     match cli::parse() {
         cli::Invocation::Review(args) => match cli::run_client_blocking(&args) {
             cli::ClientOutcome::Handled(code) => std::process::exit(code),
-            cli::ClientOutcome::AppNotRunning => build_app(Some(args)),
+            cli::ClientOutcome::AppNotRunning => {
+                // Cold start: tell the user the GUI is launching (so the trigger isn't "silent"),
+                // and that the blocking flags don't apply here — the full --watch/--exit-status
+                // contract is the app-running HTTP path. (Wiring those into the launched GUI is a
+                // separate, larger change.)
+                eprintln!("app 未运行：启动 GUI 并在后台触发 review。");
+                if args.watch || args.exit_status {
+                    eprintln!(
+                        "注意：--watch / --exit-status 在冷启动下不生效；app 运行后重试可获得阻塞 + 退出码。"
+                    );
+                }
+                build_app(Some(args))
+            }
         },
         cli::Invocation::Gui => build_app(None),
     }

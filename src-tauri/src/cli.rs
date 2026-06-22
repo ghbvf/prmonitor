@@ -35,7 +35,7 @@ use crate::review::session::SessionStatus;
 /// `dirs::data_dir()/{APP_IDENTIFIER}/prmonitor.db` (Tauri's own convention). Restating the
 /// identifier is the one unavoidable duplication — locked **Medium** by a golden test that
 /// reads `tauri.conf.json` and asserts equality, so a future identifier change fails CI here.
-pub(crate) const APP_IDENTIFIER: &str = "com.ghbvf.prmonitor";
+const APP_IDENTIFIER: &str = "com.ghbvf.prmonitor";
 
 /// `--watch` poll cadence (mirrors `gh run watch`'s steady low-frequency poll).
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(1500);
@@ -59,7 +59,9 @@ enum Command {
 
 /// `prmonitor review` arguments. Exactly one of `--repo` / `--project-id` identifies the project
 /// (the `target` group); the rest mirror `gh run watch` ergonomics.
-#[derive(Args, Debug, Clone)]
+// `Debug` is hand-written below (not derived) so the bearer `token` is REDACTED — a future
+// `{args:?}` log line must never spill the secret into stderr / a log file.
+#[derive(Args, Clone)]
 #[command(group = ArgGroup::new("target").required(true))]
 pub struct ReviewArgs {
     /// PR / MR number (must be > 0; the trigger funnel rejects 0).
@@ -123,6 +125,23 @@ impl ReviewArgs {
     }
 }
 
+/// Hand-written so the bearer `token` never appears in debug output (only whether one is set).
+impl std::fmt::Debug for ReviewArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReviewArgs")
+            .field("pr", &self.pr)
+            .field("repo", &self.repo)
+            .field("project_id", &self.project_id)
+            .field("check", &self.check)
+            .field("watch", &self.watch)
+            .field("json", &self.json)
+            .field("exit_status", &self.exit_status)
+            .field("port", &self.port)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
 /// What [`parse`] resolved the process invocation to.
 pub enum Invocation {
     /// `prmonitor review …` — run the CLI client (maybe falling through to a GUI cold start).
@@ -175,10 +194,19 @@ pub fn run_client_blocking(args: &ReviewArgs) -> ClientOutcome {
 async fn run_client(args: &ReviewArgs) -> ClientOutcome {
     let endpoint = resolve_endpoint(args);
     if endpoint.port == 0 {
+        // Single non-zero error code for every failure (gh: non-zero = failed); a CI `&&` chain
+        // only cares that it is not 0.
         eprintln!("本地 API 已禁用（端口为 0）；在设置中设置 localApiPort 后重试");
-        return ClientOutcome::Handled(2);
+        return ClientOutcome::Handled(1);
     }
-    let client = match reqwest::Client::builder().timeout(REQUEST_TIMEOUT).build() {
+    // `redirect(none)`: the local API only ever returns 2xx/4xx/5xx, never a redirect. Refusing to
+    // follow 3xx hardens the bearer-token requests — a rogue/hijacked listener cannot bounce the
+    // token to another host via `Location` (defense-in-depth alongside the loopback URL check).
+    let client = match reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             eprintln!("无法创建 HTTP 客户端: {e}");
@@ -223,7 +251,13 @@ async fn run_client(args: &ReviewArgs) -> ClientOutcome {
         return ClientOutcome::Handled(0);
     }
 
-    // 3) --watch: poll the server-provided status URL to a terminal state.
+    // 3) --watch: poll the server-provided status URL to a terminal state. The URL is
+    // server-provided, so before polling it WITH the bearer token, confirm it is loopback — a
+    // hijacked/rogue listener must never receive the token off-box.
+    if !is_loopback_http_url(&trigger.status_url) {
+        eprintln!("拒绝轮询非 loopback 的 statusUrl：{}", trigger.status_url);
+        return ClientOutcome::Handled(1);
+    }
     watch_to_terminal(&client, &endpoint.token, &trigger.status_url, args).await
 }
 
@@ -233,8 +267,12 @@ async fn watch_to_terminal(
     status_url: &str,
     args: &ReviewArgs,
 ) -> ClientOutcome {
+    // No overall deadline — INTENTIONAL, matching `gh run watch`: a review runs as long as it
+    // runs, and the caller's environment (a CI job timeout, or Ctrl-C) bounds the wait. The
+    // per-request `REQUEST_TIMEOUT` still prevents a single hung socket from blocking forever.
     loop {
-        tokio::time::sleep(WATCH_POLL_INTERVAL).await;
+        // Poll FIRST (so a review that finishes quickly returns without an initial idle wait),
+        // then sleep before the next round.
         let resp = match client.get(status_url).bearer_auth(token).send().await {
             Ok(r) => r,
             // Mid-watch connection loss (app quit) is a real error, NOT "never running" — report
@@ -262,6 +300,10 @@ async fn watch_to_terminal(
             });
             return ClientOutcome::Handled(exit_code(status.status, has_url, args.exit_status));
         }
+        // Progress feedback to stderr (stdout stays reserved for the final result), so the user
+        // can tell the command is waiting, not hung.
+        eprintln!("⏳ 等待 review 完成（当前：{:?}）", status.status);
+        tokio::time::sleep(WATCH_POLL_INTERVAL).await;
     }
 }
 
@@ -359,6 +401,21 @@ fn human_status(status: SessionStatus, comment_url: Option<&str>) -> String {
         // Unreachable: only Done/Failed are terminal, but stay total.
         _ => format!("review 状态：{status:?}"),
     }
+}
+
+/// Whether `url` is a plain-HTTP loopback URL — the ONLY shape the local API emits
+/// (`http://127.0.0.1:{port}/…`). Guards the bearer-token poll: a server-provided status URL
+/// pointing off-box (a rogue/hijacked listener) must never receive the token. Pure — unit-tested.
+pub(crate) fn is_loopback_http_url(url: &str) -> bool {
+    const LOOPBACK_PREFIXES: [&str; 6] = [
+        "http://127.0.0.1:",
+        "http://127.0.0.1/",
+        "http://localhost:",
+        "http://localhost/",
+        "http://[::1]:",
+        "http://[::1]/",
+    ];
+    LOOPBACK_PREFIXES.iter().any(|p| url.starts_with(p))
 }
 
 /// Terminal = the review reached an end state (`done` or `failed`); polling stops. Pure.
@@ -489,6 +546,18 @@ mod tests {
         assert_eq!(render_json(&v, "status"), "{\"status\":\"done\"}");
         // Absent field → null.
         assert_eq!(render_json(&v, "missing"), "{\"missing\":null}");
+        // All-empty field list (e.g. `--json ,`) → an empty object, not a crash.
+        assert_eq!(render_json(&v, ","), "{}");
+    }
+
+    #[test]
+    fn pr_zero_parses_at_cli_and_is_left_to_the_funnel() {
+        // clap accepts `--pr 0` (no value_parser bound) ON PURPOSE: pr>0 is validated by the
+        // single `trigger_review` funnel (`validate_pr_number`), so the CLI does not duplicate
+        // that rule. A 0 reaches the server, which rejects it with a 400 → non-zero exit.
+        let a =
+            parse_review(&["prmonitor", "review", "--pr", "0", "--repo", "o/n"]).expect("valid");
+        assert_eq!(a.pr, 0);
     }
 
     #[test]
@@ -510,6 +579,42 @@ mod tests {
         // Done without a URL = interrupted → non-zero.
         assert_eq!(exit_code(SessionStatus::Done, false, true), 1);
         assert_eq!(exit_code(SessionStatus::Failed, false, true), 1);
+        // Failed is non-zero even if a URL is somehow present (only `Done` can succeed).
+        assert_eq!(exit_code(SessionStatus::Failed, true, true), 1);
+    }
+
+    #[test]
+    fn debug_redacts_token() {
+        let a = parse_review(&[
+            "prmonitor",
+            "review",
+            "--pr",
+            "7",
+            "--repo",
+            "o/n",
+            "--token",
+            "supersecret",
+        ])
+        .expect("valid");
+        let dbg = format!("{a:?}");
+        assert!(
+            !dbg.contains("supersecret"),
+            "token must not appear in Debug: {dbg}"
+        );
+        assert!(dbg.contains("[REDACTED]"), "token field redacted: {dbg}");
+    }
+
+    #[test]
+    fn loopback_url_guard() {
+        assert!(is_loopback_http_url("http://127.0.0.1:8788/reviews/th-1"));
+        assert!(is_loopback_http_url("http://localhost:8788/reviews/th-1"));
+        assert!(is_loopback_http_url("http://[::1]:8788/reviews/th-1"));
+        // Off-box / scheme / lookalike hosts are rejected (the token must never go there).
+        assert!(!is_loopback_http_url("http://evil.com/reviews/th-1"));
+        assert!(!is_loopback_http_url("https://127.0.0.1:8788/reviews/th-1"));
+        assert!(!is_loopback_http_url(
+            "http://127.0.0.1.evil.com/reviews/th-1"
+        ));
     }
 
     /// **Medium** carrier: the restated bundle identifier must equal `tauri.conf.json`'s
