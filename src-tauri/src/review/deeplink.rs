@@ -169,7 +169,14 @@ async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
                 url.host_str(),
                 e.message
             );
-            notify_failure(&app, "prmonitor deeplink 无效", &e.message);
+            // Redacted FIXED text — never `e.message` (it echoes the raw `pr`/`kind` input). The
+            // detail stays in the stderr log above; the notification center is an exposed/persisted
+            // sink (codex --check 回归).
+            notify_failure(
+                &app,
+                "prmonitor deeplink 无效",
+                "链接格式或参数无效，未触发 review",
+            );
             return;
         }
     };
@@ -193,14 +200,20 @@ async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
     .await
     {
         Ok(id) => id,
-        // Dedup ("already in flight") / unknown project / validation: log + a user-visible toast
-        // (the `AppError` message names the specific cause).
+        // Dedup ("already in flight") / unknown project / validation: log the full reason, then a
+        // REDACTED user toast. `e.message` from project resolution embeds the external `reference`
+        // (`match_project_ref`: "找不到项目…: {reference}" / "repo 不唯一…: {reference}") — it must
+        // NOT reach the notification center (codex --check 回归). `pr_number` is safe to show.
         Err(e) => {
             eprintln!(
                 "deeplink 触发失败（pr={pr_number} kind={kind}）: {}",
                 e.message
             );
-            notify_failure(&app, "prmonitor 触发失败", &e.message);
+            notify_failure(
+                &app,
+                "prmonitor review 未触发",
+                &format!("PR #{pr_number}：项目无效或该 review 已在进行中"),
+            );
             return;
         }
     };
@@ -258,9 +271,13 @@ fn notify_completion<R: Runtime>(app: &AppHandle<R>, pr_number: u64, outcome: &C
 }
 
 /// Surface a deeplink FAILURE to the user (codex F3). A deeplink is fire-and-forget with no return
-/// channel, so a clicked link that can't run would otherwise be silent (only stderr). `reason` is
-/// the `AppError` message, which already distinguishes the cases the user cares about (link
-/// invalid / project not found / already in flight). Best-effort, like [`notify_completion`].
+/// channel, so a clicked link that can't run would otherwise be silent (only stderr). Best-effort,
+/// like [`notify_completion`].
+///
+/// `reason` MUST be pre-redacted fixed text — NEVER an `AppError::message`. Project-resolution
+/// errors embed the external `reference` (repo/projectId), so piping a raw error message here would
+/// leak it into the system notification center, a persisted/exposed sink unlike the stderr log
+/// (the codex `--check` regression this contract closes). Callers log the full reason to stderr.
 fn notify_failure<R: Runtime>(app: &AppHandle<R>, title: &str, reason: &str) {
     if let Err(e) = app
         .notification()
