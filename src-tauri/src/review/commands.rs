@@ -127,12 +127,7 @@ async fn dispatch_engine<R: tauri::Runtime>(
     // `finalize_turn` resolves the pr-review comment URL against the project the review ran
     // against — never a config edited mid-review. Both engines carry this owned context into
     // their `Starting` session; built once here since the fields are identical for either.
-    let url_ctx = CommentUrlContext {
-        source_kind: project.source_kind,
-        repo: project.repo.clone(),
-        azure_org: project.azure_org.clone(),
-        azure_project: project.azure_project.clone(),
-    };
+    let url_ctx = comment_url_ctx_from(project);
     let outcome = match project.engine_kind {
         EngineKind::Codex => {
             let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
@@ -154,6 +149,9 @@ async fn dispatch_engine<R: tauri::Runtime>(
                 skill_abs_path: &skill_abs,
                 codex_model: &project.codex_model,
                 url_ctx,
+                // `start` takes `pr_number` as a method arg; the field is the follow-up path's.
+                pr_number: 0,
+                session_info: None,
             };
             engine.start(pr_number, kind).await?
         }
@@ -168,6 +166,9 @@ async fn dispatch_engine<R: tauri::Runtime>(
                 repo_root: &project.repo_root,
                 claude_model: &project.claude_model,
                 url_ctx,
+                // `start` takes `pr_number` as a method arg; the field is the follow-up path's.
+                pr_number: 0,
+                session_info: None,
             };
             engine.start(pr_number, kind).await?
         }
@@ -177,6 +178,150 @@ async fn dispatch_engine<R: tauri::Runtime>(
         StartReviewOutcome::Deduped => Err(AppError::new(format!(
             "PR {pr_number} 的 {kind} review 已在进行中"
         ))),
+    }
+}
+
+/// Build the IMMUTABLE comment-URL source context (AB#1042) from a project — the SINGLE
+/// source shared by [`dispatch_engine`] (start path) and [`send_review_message`] (follow-up
+/// path), so both snapshot the same `(source_kind, repo, azure_org, azure_project)` fields
+/// the terminal `finalize_turn` resolves the pr-review comment URL against. Pinning one
+/// builder keeps the two paths from drifting on which project fields the URL is resolved from.
+fn comment_url_ctx_from(project: &config_service::Project) -> CommentUrlContext {
+    CommentUrlContext {
+        source_kind: project.source_kind,
+        repo: project.repo.clone(),
+        azure_org: project.azure_org.clone(),
+        azure_project: project.azure_project.clone(),
+    }
+}
+
+/// Resolve a session's `pr_number` for the follow-up (`send_review_message`) path: try the
+/// in-memory registry first (a session finished THIS app run is still live), else fall back
+/// to the durable `review_session` row (after a restart the registry is empty but a `Done`
+/// row persists). Errors if neither has it — a follow-up to a session we never knew about.
+/// A PR number is unique only within a project, so resolving it FROM the session row (not
+/// from a caller-supplied number) keeps the follow-up turn keyed to the exact session.
+///
+/// SCOPED by `project_id` (mirrors `get_session_history`'s F6 `AND s.project_id = ?`): BOTH
+/// the in-memory and the durable path verify the resolved session belongs to the caller's
+/// project. A `thread_id` is globally unique, so without this check a caller could supply
+/// another project's `thread_id` and resume that session under the wrong project (cross-tenant
+/// confusion). A project mismatch reports the SAME "未找到 review 会话（无法续聊）" error as a
+/// genuinely-absent session — an attacker learns nothing about another project's sessions.
+fn resolve_session_info<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    project_id: &str,
+    thread_id: &str,
+) -> AppResult<SessionInfo> {
+    if let Some(info) = state.sessions.get(thread_id) {
+        if info.project_id != project_id {
+            return Err(AppError::new(format!(
+                "未找到 review 会话（无法续聊）: {thread_id}"
+            )));
+        }
+        return Ok(info);
+    }
+    let db = app.state::<Database>();
+    match history_store::get_session(db.inner(), thread_id)? {
+        Some(info) if info.project_id == project_id => Ok(info),
+        _ => Err(AppError::new(format!(
+            "未找到 review 会话（无法续聊）: {thread_id}"
+        ))),
+    }
+}
+
+/// Continue an existing review session with a follow-up user `message` (chat continuation):
+/// after a session reaches a terminal status the user types a follow-up, the backend
+/// continues the SAME conversation with the AI and streams the reply back through the
+/// existing `review:event` pipeline (`MessageDelta` / `ReasoningDelta` / `TurnCompleted`).
+/// The user's typed message is persisted to the session history under the CALLER-supplied
+/// `user_item_id` (so the frontend's optimistic bubble id == the persisted id, and
+/// reopen-dedup works).
+///
+/// Engine selection mirrors [`dispatch_engine`]: an exhaustive `match project.engine_kind`
+/// over the sealed [`EngineKind`] (model.rs) — a new variant without an arm is a compile
+/// error (the **Hard** carrier), so a follow-up can never silently miss a new engine. The
+/// command routes through the `ReviewEngine::send_message` trait method (NOT a downcast).
+#[tauri::command]
+pub async fn send_review_message<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    thread_id: String,
+    message: String,
+    user_item_id: String,
+) -> AppResult<()> {
+    // Fail-fast at the boundary (parity with `validate_kind`): an empty / whitespace-only
+    // follow-up has nothing to send — reject it before any project resolve / engine dispatch.
+    if message.trim().is_empty() {
+        return Err(AppError::new("消息为空".to_string()));
+    }
+    // An empty / whitespace-only `user_item_id` would collide on the history table's
+    // `UNIQUE(thread_id, item_id)` constraint and COALESCE every user message of the session
+    // into one row — reject it here so each follow-up persists as its own bubble.
+    if user_item_id.trim().is_empty() {
+        return Err(AppError::new("user_item_id 为空".to_string()));
+    }
+    // Cap the follow-up length: a huge message would be passed to `claude` as a process ARG,
+    // failing the spawn at `execve` ARG_MAX (typically ~256KB on macOS, ~2MB on Linux) with an
+    // opaque error. Reject oversized input here with a friendly message. 128 KiB (bytes, not
+    // chars — `len()` is the encoded byte count that hits ARG_MAX) leaves ample headroom.
+    if message.len() > 131072 {
+        return Err(AppError::new("消息过长（上限 128KB）".to_string()));
+    }
+    // Resolve + validate the owning project (#35) — same per-project validation as
+    // `start_review` (the review slice stays on `config::service`, never `config::model`).
+    let project = config_service::project_validated(&app, &project_id)?;
+    // Resolve the session identity (in-memory live row, else the durable row), SCOPED to
+    // this project so a caller can't resume another project's session by raw `thread_id`.
+    // The session's `engine_kind` is authoritative: changing project config after the review
+    // must not route this existing conversation to a different engine.
+    let session_info = resolve_session_info(&app, &state, &project_id, &thread_id)?;
+    let pr_number = session_info.pr_number;
+    let url_ctx = comment_url_ctx_from(&project);
+    match session_info.engine_kind {
+        EngineKind::Codex => {
+            // MANUAL / explicit force-start (parity with `dispatch_engine`'s Codex arm): a
+            // follow-up is an explicit user action, so clear any prior `stop_codex` before
+            // the `connection()` funnel (which refuses when stopped).
+            state.codex.resume();
+            let engine = CodexEngine {
+                app: &app,
+                codex: &state.codex,
+                registry: &state.sessions,
+                codex_bin: CODEX_BIN,
+                project_id: &project.id,
+                repo: &project.repo,
+                repo_root: &project.repo_root,
+                skill_abs_path: "",
+                codex_model: &project.codex_model,
+                url_ctx,
+                pr_number,
+                session_info: Some(session_info.clone()),
+            };
+            engine
+                .send_message(&thread_id, &message, &user_item_id)
+                .await
+        }
+        EngineKind::Claude => {
+            let engine = ClaudeEngine {
+                app: &app,
+                claude: &state.claude,
+                registry: &state.sessions,
+                claude_bin: CLAUDE_BIN,
+                project_id: &project.id,
+                repo: &project.repo,
+                repo_root: &project.repo_root,
+                claude_model: &project.claude_model,
+                url_ctx,
+                pr_number,
+                session_info: Some(session_info.clone()),
+            };
+            engine
+                .send_message(&thread_id, &message, &user_item_id)
+                .await
+        }
     }
 }
 
@@ -272,6 +417,9 @@ pub async fn stop_review<R: tauri::Runtime>(
             azure_org: String::new(),
             azure_project: String::new(),
         },
+        // `stop` resolves purely by session id; pr_number is the follow-up path's field only.
+        pr_number: 0,
+        session_info: None,
     };
     engine.stop(&session_id).await
 }

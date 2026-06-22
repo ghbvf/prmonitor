@@ -15,6 +15,7 @@ import {
   getSessionHistory,
   listReviewSessions,
   onReviewEvent,
+  sendReviewMessage,
   startCodex,
   startReview,
   stopCodex,
@@ -74,6 +75,13 @@ const listenerError = ref<string | null>(null);
 // resolves, replay only our own (a concurrent session's events must not pollute
 // this panel). `null` means "not currently buffering".
 let inFlightBuffer: ReviewEvent[] | null = null;
+
+// Monotonic counter for optimistic user-bubble ids. The id is sent verbatim to
+// `send_review_message` so the backend persists the user turn under the SAME id —
+// reopen-history dedup (focus() merges history + live by itemId) then collapses the
+// optimistic bubble and its persisted twin into one. Counter + epoch keeps it
+// unique within and across sessions without a uuid dep.
+let userItemCounter = 0;
 
 // Hydrate codex availability. Tolerates a rejected command by surfacing an
 // unavailable status rather than throwing.
@@ -291,6 +299,49 @@ async function stop() {
   }
 }
 
+// Send a follow-up chat message into the focused session (#chat). The AI reply
+// streams back on the SAME thread, so `applyEvent` folds its `messageDelta` /
+// `reasoningDelta` into `items` exactly like the initial review — no `inFlightBuffer`
+// is needed because `activeThreadId` is already known, so attribution is unambiguous.
+async function sendMessage(projectId: string, threadId: string, message: string) {
+  // Freeze guard: no target, a turn already running, the listener not yet attached
+  // (a reply could be lost), or a focus switch made `threadId` stale. Mirrors the
+  // composer's `canChat` gate so a racing call can't double-send into a busy thread.
+  if (
+    !threadId ||
+    running.value ||
+    !listenerReady.value ||
+    activeThreadId.value !== threadId
+  ) {
+    return;
+  }
+  // Unique optimistic id, reused as the wire `userItemId` so the persisted user turn
+  // and this bubble dedup on reopen (see `userItemCounter`).
+  const userItemId = `user:${++userItemCounter}:${Date.now()}`;
+  // Optimistically render what the user sent (kept even on a send failure below so
+  // they still see their message). The reply will append after it.
+  items.value.push({ itemId: userItemId, kind: "user", text: message });
+  running.value = true;
+  finalStatus.value = null;
+  error.value = null;
+  try {
+    await sendReviewMessage(projectId, threadId, message, userItemId);
+  } catch (err) {
+    console.error("发送对话消息失败", err);
+    // Guard against a focus switch during the await: only mutate this session's state
+    // if it's still the focused one (mirrors focus()/hydrateActiveSession). Otherwise
+    // clearing `running`/setting `error` would clobber the NEW session's state.
+    if (activeThreadId.value === threadId) {
+      // Keep the user bubble (they should see what they tried to send); clear the
+      // running freeze, mark the turn failed so the status line reads "已结束 / 失败"
+      // (not the stale "未开始"), and surface the error so the composer unlocks.
+      running.value = false;
+      finalStatus.value = "failed";
+      error.value = toMessage(err);
+    }
+  }
+}
+
 // Reattach to a still-active backend review session (e.g. after the panel
 // remounts, or the app restarts, while codex streams on) so the UI doesn't show
 // "not started" over a live turn. Past deltas aren't replayed — the backend
@@ -443,6 +494,7 @@ export function useReviewStore() {
     applyEvent,
     start,
     stop,
+    sendMessage,
     init,
   };
 }

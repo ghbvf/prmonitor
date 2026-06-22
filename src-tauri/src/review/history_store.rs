@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::session::{SessionInfo, SessionStatus};
 use crate::db::Database;
 use crate::error::AppResult;
+use crate::model::EngineKind;
 
 /// The kind of a persisted history block (pr-review F7). The Rust write side can now ONLY
 /// express the two legal kinds, closing the gap where `kind: String` let `append_item`
@@ -27,6 +28,11 @@ use crate::error::AppResult;
 pub enum HistoryItemKind {
     Message,
     Reasoning,
+    /// A follow-up message the USER typed into the chat composer (the chat-continuation
+    /// feature). Persisted as a history item BEFORE the engine's reply turn is issued, so it
+    /// survives restart/reopen and renders inline with the conversation. Wire string `"user"`
+    /// — the frontend mirrors it as `StreamItem.kind` `"user"`.
+    User,
 }
 
 impl HistoryItemKind {
@@ -35,6 +41,7 @@ impl HistoryItemKind {
         match self {
             Self::Message => "message",
             Self::Reasoning => "reasoning",
+            Self::User => "user",
         }
     }
 
@@ -44,6 +51,7 @@ impl HistoryItemKind {
     fn from_wire(s: &str) -> Self {
         match s {
             "reasoning" => Self::Reasoning,
+            "user" => Self::User,
             _ => Self::Message,
         }
     }
@@ -95,6 +103,21 @@ fn status_from_wire(s: &str) -> SessionStatus {
         .unwrap_or(SessionStatus::Failed)
 }
 
+/// [`EngineKind`] → pinned DB wire string. The DB stores the same serde wire value the
+/// frontend mirrors (`"codex"` / `"claude"`).
+fn engine_kind_wire(engine_kind: EngineKind) -> String {
+    serde_json::to_value(engine_kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .expect("EngineKind serializes to a JSON string (unit enum, known variants)")
+}
+
+/// Wire string → [`EngineKind`]. Unknown/corrupt rows fail closed to Codex, the only
+/// historical engine before this column existed.
+fn engine_kind_from_wire(s: &str) -> EngineKind {
+    serde_json::from_value(serde_json::Value::String(s.to_string())).unwrap_or(EngineKind::Codex)
+}
+
 /// Per-PR cap on persisted review sessions (review F7). Beyond this, [`prune_pr_sessions`]
 /// drops the oldest on each upsert so `review_session` / `review_history_item` stay bounded
 /// (every dispatch adds a session; nothing else deleted them before this).
@@ -134,14 +157,15 @@ fn prune_pr_sessions(
 pub fn upsert_session(db: &Database, info: &SessionInfo) -> AppResult<()> {
     let now = now_epoch() as i64;
     let status = status_wire(info.status);
+    let engine_kind = engine_kind_wire(info.engine_kind);
     // upsert + prune are ONE lifecycle write: run them in a transaction so a prune failure
     // can't leave the new row with a half-applied prune, and the multi-statement prune
     // commits/rolls back atomically (pr-review F5).
     db.with_tx(|tx| {
         tx.execute(
             "INSERT INTO review_session \
-             (thread_id, project_id, pr_number, turn_id, kind, status, created_at, updated_at, comment_url) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8) \
+             (thread_id, project_id, pr_number, turn_id, kind, status, created_at, updated_at, comment_url, engine_kind) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9) \
              ON CONFLICT(thread_id) DO UPDATE SET \
                project_id = excluded.project_id, \
                pr_number  = excluded.pr_number, \
@@ -149,7 +173,8 @@ pub fn upsert_session(db: &Database, info: &SessionInfo) -> AppResult<()> {
                kind       = excluded.kind, \
                status     = excluded.status, \
                updated_at = excluded.updated_at, \
-               comment_url = COALESCE(excluded.comment_url, comment_url)",
+               comment_url = COALESCE(excluded.comment_url, comment_url), \
+               engine_kind = excluded.engine_kind",
             rusqlite::params![
                 info.thread_id,
                 info.project_id,
@@ -162,6 +187,7 @@ pub fn upsert_session(db: &Database, info: &SessionInfo) -> AppResult<()> {
                 // terminal URL is written by `set_status_and_comment_url`. COALESCE on conflict
                 // means a None upsert never clobbers an already-resolved URL.
                 info.comment_url,
+                engine_kind,
             ],
         )
         .map_err(crate::db::map_err)?;
@@ -278,12 +304,13 @@ pub fn get_pr_sessions(
 ) -> AppResult<Vec<SessionInfo>> {
     db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT thread_id, project_id, pr_number, turn_id, kind, status, created_at, comment_url \
+            "SELECT thread_id, project_id, pr_number, turn_id, kind, status, created_at, comment_url, engine_kind \
              FROM review_session \
              WHERE project_id = ?1 AND pr_number = ?2 ORDER BY created_at DESC, thread_id",
         )?;
         let rows = stmt.query_map(rusqlite::params![project_id, pr_number as i64], |r| {
             let status: String = r.get(5)?;
+            let engine_kind: String = r.get(8)?;
             Ok(SessionInfo {
                 thread_id: r.get(0)?,
                 project_id: r.get(1)?,
@@ -294,6 +321,7 @@ pub fn get_pr_sessions(
                 created_at_epoch: r.get::<_, i64>(6)? as u64,
                 // AB#1042: NULL (no comment) → None; a resolved terminal URL → Some.
                 comment_url: r.get::<_, Option<String>>(7)?,
+                engine_kind: engine_kind_from_wire(&engine_kind),
             })
         })?;
         rows.collect()
@@ -308,12 +336,13 @@ pub fn get_pr_sessions(
 pub fn get_session(db: &Database, thread_id: &str) -> AppResult<Option<SessionInfo>> {
     db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT thread_id, project_id, pr_number, turn_id, kind, status, created_at, comment_url \
+            "SELECT thread_id, project_id, pr_number, turn_id, kind, status, created_at, comment_url, engine_kind \
              FROM review_session \
              WHERE thread_id = ?1",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![thread_id], |r| {
             let status: String = r.get(5)?;
+            let engine_kind: String = r.get(8)?;
             Ok(SessionInfo {
                 thread_id: r.get(0)?,
                 project_id: r.get(1)?,
@@ -324,6 +353,7 @@ pub fn get_session(db: &Database, thread_id: &str) -> AppResult<Option<SessionIn
                 created_at_epoch: r.get::<_, i64>(6)? as u64,
                 // AB#1042: NULL (no comment) → None; a resolved terminal URL → Some.
                 comment_url: r.get::<_, Option<String>>(7)?,
+                engine_kind: engine_kind_from_wire(&engine_kind),
             })
         })?;
         rows.next().transpose()
@@ -358,6 +388,7 @@ mod tests {
             status,
             created_at_epoch: 0,
             comment_url: None,
+            engine_kind: EngineKind::Codex,
         }
     }
 
@@ -460,6 +491,34 @@ mod tests {
         assert_eq!(items[1].text, "Hello world");
     }
 
+    // User-before-reply ordering lock (chat-continuation): the follow-up flow persists the
+    // user's typed message (`HistoryItemKind::User`) BEFORE issuing the reply turn, relying on
+    // `get_history`'s `ORDER BY h.id` to render the user bubble ahead of the AI reply. This
+    // pins that insertion-order guarantee: a User item appended first, then a Message item
+    // (distinct item_ids), must read back as `[User, Message]`. A drift to a non-insertion
+    // order (e.g. sorting by item_id) would scramble the conversation and fails here.
+    #[test]
+    fn user_message_sorts_before_later_reply() {
+        let db = Database::open_in_memory().expect("open db");
+        upsert_session(&db, &info("th-1", 12, SessionStatus::Running)).expect("session");
+
+        // The user's follow-up is persisted first (as `resume_turn`/`resume_review` do), then
+        // the AI reply's first delta arrives under a different item id.
+        append_item(&db, "th-1", "u1", HistoryItemKind::User, "please re-check").expect("user");
+        append_item(&db, "th-1", "m1", HistoryItemKind::Message, "Re-checked.").expect("reply");
+
+        let items = get_history(&db, "alpha", 12, "th-1").expect("history");
+        let order: Vec<HistoryItemKind> = items.iter().map(|i| i.kind).collect();
+        assert_eq!(
+            order,
+            vec![HistoryItemKind::User, HistoryItemKind::Message],
+            "user message (persisted first) sorts before the AI reply (ORDER BY h.id)"
+        );
+        assert_eq!(items[0].item_id, "u1");
+        assert_eq!(items[0].text, "please re-check");
+        assert_eq!(items[1].item_id, "m1");
+    }
+
     // `HistoryItem` wire-shape lock (#70, Medium carrier): camelCase `itemId` present,
     // snake_case absent — keeps the Rust↔`src/review/types.ts` (`StreamItem`) contract.
     #[test]
@@ -474,6 +533,17 @@ mod tests {
         assert_eq!(v["kind"], "message");
         assert!(v.get("text").is_some());
         assert!(v.get("item_id").is_none());
+
+        // A `User` history item (chat-continuation) serializes `kind: "user"` — the wire
+        // string the frontend mirrors as `StreamItem.kind` `"user"`.
+        let user = HistoryItem {
+            item_id: "u1".to_string(),
+            kind: HistoryItemKind::User,
+            text: "follow-up".to_string(),
+        };
+        let uv = serde_json::to_value(&user).expect("serializes");
+        assert_eq!(uv["kind"], "user");
+        assert!(uv.get("itemId").is_some());
     }
 
     // `HistoryItemKind` lock (pr-review F7, Medium carrier): the DB-stored `as_wire` string
@@ -482,7 +552,14 @@ mod tests {
     // (or between the two Rust sources) fails here.
     #[test]
     fn history_item_kind_wire_matches_serde_and_round_trips() {
-        for kind in [HistoryItemKind::Message, HistoryItemKind::Reasoning] {
+        // `User` (chat-continuation) is a Medium serde golden carrier alongside Message /
+        // Reasoning: its DB-stored `as_wire` string MUST equal the serde form `"user"` the
+        // frontend mirrors as `StreamItem.kind` `"user"`, and `from_wire` must round-trip it.
+        for kind in [
+            HistoryItemKind::Message,
+            HistoryItemKind::Reasoning,
+            HistoryItemKind::User,
+        ] {
             let serde_wire = serde_json::to_value(kind).expect("serializes");
             assert_eq!(
                 serde_wire,
@@ -495,6 +572,9 @@ mod tests {
                 "round-trips"
             );
         }
+        // The user variant pins to the exact wire string `"user"` the frontend mirrors.
+        assert_eq!(HistoryItemKind::User.as_wire(), "user");
+        assert_eq!(HistoryItemKind::from_wire("user"), HistoryItemKind::User);
         // Unknown / corrupt stored value degrades to Message (content kept, not dropped).
         assert_eq!(HistoryItemKind::from_wire("???"), HistoryItemKind::Message);
     }
@@ -551,6 +631,22 @@ mod tests {
         for (thread, status) in cases {
             assert_eq!(by_thread.get(thread), Some(&status), "status for {thread}");
         }
+    }
+
+    #[test]
+    fn session_engine_kind_round_trips_through_storage() {
+        let db = Database::open_in_memory().expect("open db");
+        let mut claude = info("claude-session", 12, SessionStatus::Done);
+        claude.engine_kind = EngineKind::Claude;
+        upsert_session(&db, &claude).expect("upsert claude");
+
+        let got = get_session(&db, "claude-session")
+            .expect("read")
+            .expect("session exists");
+        assert_eq!(got.engine_kind, EngineKind::Claude);
+
+        let listed = get_pr_sessions(&db, "alpha", 12).expect("list");
+        assert_eq!(listed[0].engine_kind, EngineKind::Claude);
     }
 
     // FK to `review_session` was dropped (review F2): a best-effort `append_item` must

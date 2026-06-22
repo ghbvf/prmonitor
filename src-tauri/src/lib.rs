@@ -211,6 +211,7 @@ fn build_app() {
             review::commands::start_review,
             review::commands::trigger_review,
             review::commands::stop_review,
+            review::commands::send_review_message,
             review::commands::list_review_sessions,
             review::commands::get_session_history,
             review::commands::get_pr_sessions,
@@ -420,6 +421,10 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
                 skill_abs_path: &skill_abs,
                 codex_model: &project.codex_model,
                 url_ctx,
+                // Auto-dispatch only ever `start`s (which takes pr_number as a method arg);
+                // the field is the follow-up (`send_message`) path's.
+                pr_number: 0,
+                session_info: None,
             };
             dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
         }
@@ -434,6 +439,10 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
                 repo_root: &project.repo_root,
                 claude_model: &project.claude_model,
                 url_ctx,
+                // Auto-dispatch only ever `start`s (pr_number is a method arg); the field is
+                // the follow-up (`send_message`) path's.
+                pr_number: 0,
+                session_info: None,
             };
             dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
         }

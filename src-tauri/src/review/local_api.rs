@@ -708,6 +708,7 @@ mod tests {
             turn_id: String::new(),
             pr_number: 7,
             kind: "review".to_string(),
+            engine_kind: crate::model::EngineKind::Codex,
             status: SessionStatus::Done,
             created_at_epoch: 0,
             comment_url: None,

@@ -42,6 +42,25 @@ export function stopReview(sessionId: string): Promise<void> {
   return invoke<void>("stop_review", { sessionId });
 }
 
+// Send a follow-up chat message into an existing review thread (#chat). The AI
+// reply streams back out-of-band on the SAME session via `onReviewEvent` (so it
+// folds into `items` like the initial review). `userItemId` is the optimistic user
+// bubble's id — it MUST equal the id used for the local bubble so reopen-history
+// dedup (focus() merges history + live by itemId) doesn't double-render it.
+export function sendReviewMessage(
+  projectId: string,
+  threadId: string,
+  message: string,
+  userItemId: string,
+): Promise<void> {
+  return invoke<void>("send_review_message", {
+    projectId,
+    threadId,
+    message,
+    userItemId,
+  });
+}
+
 export function listReviewSessions(): Promise<ReviewSession[]> {
   return invoke<ReviewSession[]>("list_review_sessions");
 }
