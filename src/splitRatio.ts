@@ -3,13 +3,16 @@
 // while SplitPane.vue keeps only the pointer wiring — mirrors the repo's convention of
 // testing pure .ts logic (no @vue/test-utils dep for component tests).
 
-// Top pane's (会话清单) default share of the split height; the bottom pane (review)
-// takes the rest (≈65%).
-export const DEFAULT_TOP_RATIO = 0.35;
+// Top pane's (会话清单) default share of the split height; the bottom pane (review +
+// the chat composer) takes the rest (≈90%). Deliberately small: the session list is a
+// compact picker, the review/chat stream is the focus.
+export const DEFAULT_TOP_RATIO = 0.1;
 
 // Neither pane may shrink below this fraction of the container, so a drag to the edge
 // leaves both panes (and their scrollbars) usable instead of collapsing one to a sliver.
-export const MIN_RATIO = 0.15;
+// Set equal to DEFAULT_TOP_RATIO so the 10% default is the floor (the session list can
+// only be dragged larger, never below its default) and is not clamped up on mount.
+export const MIN_RATIO = 0.1;
 
 // Normalize a caller-supplied minRatio into the valid floor band [0, 0.5]: a value with
 // no room for both panes (>= 0.5) collapses to 0.5 (50/50), and non-finite input

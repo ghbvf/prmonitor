@@ -17,6 +17,15 @@ describe("splitRatio constants", () => {
     expect(DEFAULT_TOP_RATIO).toBeGreaterThanOrEqual(MIN_RATIO);
     expect(DEFAULT_TOP_RATIO).toBeLessThanOrEqual(1 - MIN_RATIO);
   });
+
+  it("会话清单 defaults to 10% and is not clamped up by the floor", () => {
+    // The session list defaults to a compact 10% of the split height. MIN_RATIO is set to
+    // the same 10% so the default is the floor and survives clampRatio on mount unchanged
+    // (a higher floor would silently raise the default — the regression this locks).
+    expect(DEFAULT_TOP_RATIO).toBe(0.1);
+    expect(MIN_RATIO).toBe(0.1);
+    expect(clampRatio(DEFAULT_TOP_RATIO, MIN_RATIO)).toBe(0.1);
+  });
 });
 
 describe("clampRatio", () => {
