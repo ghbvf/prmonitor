@@ -168,6 +168,15 @@ pub struct AppConfig {
     /// 非空则作为 `WebhookStatus.public_url`，UI 据此拼出 GitHub Payload URL；为空则 `None`。
     /// `quick` 模式忽略本字段（URL 从 cloudflared 日志抓取）。
     pub webhook_public_url: String,
+    /// 本地 REST API（AB#1043）监听端口（仅绑 `127.0.0.1`；给本机第三方 CLI/curl 调用方触发
+    /// review 用）。与 `webhook_port` 的公网接收端**严格分离**——本地 API 永不走隧道。`0` =
+    /// 不绑定（彻底关闭逃生口）；改端口需重启 app（端口在启动时绑定一次，与 webhook 一致）。
+    pub local_api_port: u16,
+    /// 本地 REST API 的 Bearer token（AB#1043）。**空 = fail-closed 禁用**：listener 仍绑定，但
+    /// handler 每个请求实时读取本字段做常量时间比较，空 token 一律 401。设 / 清即时生效、无需
+    /// 重启。loopback-only 仍是触发端点（本机任意进程 + DNS rebinding 可达），故非空时按
+    /// `LOCAL_API_TOKEN_MIN_LEN` 强制最小长度（与 `webhook_secret` 同理由）。
+    pub local_api_token: String,
 }
 
 impl Default for AppConfig {
@@ -182,6 +191,9 @@ impl Default for AppConfig {
             webhook_tunnel_mode: WebhookTunnelMode::default(),
             webhook_tunnel_command: String::new(),
             webhook_public_url: String::new(),
+            // AB#1043: 8788 = webhook 默认 8787 + 1，避免两端口同默认时冲突。
+            local_api_port: 8788,
+            local_api_token: String::new(),
         }
     }
 }
@@ -190,6 +202,13 @@ impl Default for AppConfig {
 /// secret is the SOLE gate on a public HMAC-SHA256 endpoint, so a 1–2 char value is
 /// brute-forceable; require a floor (GitHub recommends a long random secret).
 const WEBHOOK_SECRET_MIN_LEN: usize = 16;
+
+/// Minimum `local_api_token` length (trimmed chars) when the local REST API token is set
+/// (AB#1043). The local API binds loopback-only, but a low-entropy token is still
+/// brute-forceable by any local process (and reachable cross-site via DNS rebinding before
+/// the Host gate), so a non-empty token must clear the same floor as `webhook_secret`. An
+/// EMPTY token is the "disabled" sentinel (fail-closed 401), so it is exempt from this check.
+const LOCAL_API_TOKEN_MIN_LEN: usize = 16;
 
 /// Validates one [`Project`]'s fields (hard-reject on failure).
 ///
@@ -469,6 +488,18 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
         }
     }
 
+    // AB#1043 local REST API token: unlike webhook there is no enable flag — an EMPTY token
+    // is itself the "disabled" sentinel (the resident listener fail-closes 401), so blank is
+    // always valid. Only a NON-empty token is constrained: it must clear the same length
+    // floor as `webhook_secret` (a short token is brute-forceable by a local process). Message
+    // keeps the `localApiToken` field-token prefix for consistency with the other rules.
+    let local_token = config.local_api_token.trim();
+    if !local_token.is_empty() && local_token.chars().count() < LOCAL_API_TOKEN_MIN_LEN {
+        return Err(AppError::new(format!(
+            "localApiToken 太短（至少 {LOCAL_API_TOKEN_MIN_LEN} 个字符；请使用更长的随机串）"
+        )));
+    }
+
     // Per-project fields: validate each ENABLED project; disabled ones are skipped
     // (their fields may be intentionally incomplete). The id/repo of every project
     // (enabled or not) is a routing/dedup key, so duplicates are rejected regardless.
@@ -604,6 +635,8 @@ mod tests {
             webhook_tunnel_mode: WebhookTunnelMode::default(),
             webhook_tunnel_command: String::new(),
             webhook_public_url: String::new(),
+            local_api_port: 8788,
+            local_api_token: "local-api-token-0123456789".to_string(),
         };
 
         let v = serde_json::to_value(&config).expect("AppConfig serializes");
@@ -620,6 +653,9 @@ mod tests {
         assert_eq!(v["webhookTunnelMode"], "quick");
         assert!(v.get("webhookTunnelCommand").is_some());
         assert!(v.get("webhookPublicUrl").is_some());
+        // AB#1043: local REST API keys present (camelCase) at the top level.
+        assert!(v.get("localApiPort").is_some());
+        assert!(v.get("localApiToken").is_some());
 
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("active_project_id").is_none());
@@ -630,6 +666,8 @@ mod tests {
         assert!(v.get("webhook_tunnel_mode").is_none());
         assert!(v.get("webhook_tunnel_command").is_none());
         assert!(v.get("webhook_public_url").is_none());
+        assert!(v.get("local_api_port").is_none());
+        assert!(v.get("local_api_token").is_none());
 
         // The per-project fields must NOT have leaked back to the top level (they
         // moved into `Project` — a regression that re-flattened them surfaces here).

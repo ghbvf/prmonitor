@@ -65,6 +65,8 @@ const GLOBAL_FORM_KEYS: (keyof AppConfig)[] = [
   "webhookTunnelMode",
   "webhookTunnelCommand",
   "webhookPublicUrl",
+  "localApiPort",
+  "localApiToken",
 ];
 
 // `Project` identity fields managed by the project list/selector UI (not a field

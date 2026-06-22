@@ -25,4 +25,9 @@ pub struct AppState {
     /// on demand via the `start_webhook`/`stop_webhook` commands; killed on app
     /// shutdown. Methods take `&self`.
     pub webhook: crate::pr::webhook::WebhookManager,
+    /// The resident local REST API listener (AB#1043): a `127.0.0.1`-only axum server that
+    /// lets a third party (curl/CLI) trigger a review + poll for completion. Started once in
+    /// `lib.rs` `setup()`; NEVER tunneled (distinct from `webhook`); killed on app shutdown.
+    /// Methods take `&self`.
+    pub local_api: crate::review::local_api::LocalApiManager,
 }

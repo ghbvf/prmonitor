@@ -163,6 +163,8 @@ function composeConfig(): AppConfig {
     webhookTunnelMode: "quick",
     webhookTunnelCommand: "",
     webhookPublicUrl: "",
+    localApiPort: 8788,
+    localApiToken: "",
   };
 }
 

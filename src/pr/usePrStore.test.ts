@@ -141,6 +141,8 @@ beforeEach(() => {
     webhookTunnelMode: "quick",
     webhookTunnelCommand: "",
     webhookPublicUrl: "",
+    localApiPort: 8788,
+    localApiToken: "",
   });
 });
 
@@ -282,6 +284,8 @@ describe("usePrStore toggle()", () => {
       webhookTunnelMode: "quick",
       webhookTunnelCommand: "",
       webhookPublicUrl: "",
+      localApiPort: 8788,
+      localApiToken: "",
     });
     const store = usePrStore();
     // Start the active project paused so toggle() takes the resume branch.

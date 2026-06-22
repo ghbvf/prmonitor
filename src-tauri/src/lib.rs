@@ -119,6 +119,14 @@ pub fn run() {
             // valid config lands, running the same gate. The dispatcher hook above stays
             // installed, so the first tick after a later start already dispatches.
             let _ = pr::commands::start_if_config_valid(app.handle(), state.inner());
+            // Start the RESIDENT local REST API (AB#1043): a 127.0.0.1-only axum listener that
+            // lets a third party (curl/CLI) trigger a review + poll for completion + comment URL.
+            // NEVER tunneled — this is the inbound trigger control plane, strictly separate from
+            // the public `webhook` receiver. The bound PORT is read once here (a change needs an
+            // app restart, like the webhook port); the TOKEN is read live per request, so
+            // setting/clearing it in Settings takes effect without a restart. A bind failure is
+            // logged + swallowed inside the spawned task (a port clash must not crash the app).
+            state.local_api.start(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -164,6 +172,8 @@ pub fn run() {
                 // Kill the cloudflared tunnel + abort the receiver so neither outlives
                 // the app (same "软件关闭时一起关闭" contract as codex).
                 state.webhook.shutdown();
+                // Stop the resident local REST API listener (AB#1043): same shutdown contract.
+                state.local_api.shutdown();
             }
         });
 }

@@ -300,6 +300,36 @@ pub fn get_pr_sessions(
     })
 }
 
+/// One persisted session by its `thread_id` (AB#1043), or `None` when unknown. The local
+/// REST API's `GET /reviews/{id}` falls through to this DURABLE read when the in-memory
+/// registry no longer holds the session (finished long ago / after a restart). Reuses the
+/// same columns and row→`SessionInfo` mapping as [`get_pr_sessions`]; `thread_id` is the table
+/// PRIMARY KEY, so at most one row matches and the first is the answer.
+pub fn get_session(db: &Database, thread_id: &str) -> AppResult<Option<SessionInfo>> {
+    db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT thread_id, project_id, pr_number, turn_id, kind, status, created_at, comment_url \
+             FROM review_session \
+             WHERE thread_id = ?1",
+        )?;
+        let mut rows = stmt.query_map(rusqlite::params![thread_id], |r| {
+            let status: String = r.get(5)?;
+            Ok(SessionInfo {
+                thread_id: r.get(0)?,
+                project_id: r.get(1)?,
+                pr_number: r.get::<_, i64>(2)? as u64,
+                turn_id: r.get(3)?,
+                kind: r.get(4)?,
+                status: status_from_wire(&status),
+                created_at_epoch: r.get::<_, i64>(6)? as u64,
+                // AB#1042: NULL (no comment) → None; a resolved terminal URL → Some.
+                comment_url: r.get::<_, Option<String>>(7)?,
+            })
+        })?;
+        rows.next().transpose()
+    })
+}
+
 /// Reconciles sessions left non-terminal by a previous process (pr-review F1). A persisted
 /// `starting` / `running` / `interrupting` status means the prior run died mid-session: its
 /// live pump is gone, so the session is NOT actually running. Flip such rows to `failed` at
@@ -347,6 +377,27 @@ mod tests {
 
         // Scoped per (project, PR): a different PR sees nothing.
         assert!(get_pr_sessions(&db, "alpha", 99).expect("list").is_empty());
+    }
+
+    // AB#1043: the local REST API's GET /reviews/{id} durable lookup. By-thread_id read
+    // surfaces the right row (across projects/PRs), and an unknown id is None — not an error.
+    #[test]
+    fn get_session_roundtrips_by_thread_id() {
+        let db = Database::open_in_memory().expect("open db");
+        upsert_session(&db, &info("th-1", 12, SessionStatus::Running)).expect("insert th-1");
+        upsert_session(&db, &info("th-2", 34, SessionStatus::Done)).expect("insert th-2");
+
+        let got = get_session(&db, "th-2")
+            .expect("read")
+            .expect("th-2 exists");
+        assert_eq!(got.thread_id, "th-2");
+        assert_eq!(got.pr_number, 34);
+        assert_eq!(got.status, SessionStatus::Done);
+
+        assert!(
+            get_session(&db, "missing").expect("read").is_none(),
+            "unknown thread_id → None, not an error"
+        );
     }
 
     // AB#1042: the terminal write (`set_status_and_comment_url`) persists status + URL

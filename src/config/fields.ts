@@ -326,6 +326,26 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
       },
     ],
   },
+  {
+    // AB#1043: 本地 REST API（给本机 CLI/curl 触发 review 用）。与 webhook 严格分离、永不走隧道。
+    id: "localApi",
+    title: "本地 API (CLI)",
+    fields: [
+      {
+        key: "localApiPort",
+        label: "本地 API 端口",
+        kind: "number",
+        hint: "仅绑 127.0.0.1 的触发端点（curl/CLI 用）；改端口需重启 App。0=关闭不监听",
+      },
+      {
+        key: "localApiToken",
+        label: "本地 API Token",
+        kind: "text",
+        secret: true,
+        hint: "Bearer 鉴权：请求头 Authorization: Bearer <此 token>。留空=关闭该接口（一切请求 401）；即时生效、无需重启",
+      },
+    ],
+  },
 ];
 
 // Onboarding wizard step sequence. `done` is a confirm-only step; `source` is

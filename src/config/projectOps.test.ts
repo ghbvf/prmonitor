@@ -26,6 +26,8 @@ function draft(projects: Project[], activeProjectId: string): AppConfig {
     webhookTunnelMode: "quick",
     webhookTunnelCommand: "",
     webhookPublicUrl: "",
+    localApiPort: 8788,
+    localApiToken: "",
   };
 }
 
