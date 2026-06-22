@@ -246,7 +246,8 @@ pub enum EventType {
 pub struct Event {
     /// Idempotency key the inbox dedups on (AB#1065): the SAME logical delivery (a webhook
     /// retry, a tunnel re-delivery) yields the SAME key, so it is processed exactly once.
-    /// Composed by the normalizer from stable identity (e.g. `source:eventType:repo#number:action`).
+    /// Composed by the inbox normalizer from a delivery's stable identity; the exact key
+    /// format is defined by the inbox (AB#1065), not pinned here.
     pub dedupe_key: String,
     /// Which source produced the event (reuses the existing source discriminator).
     pub source: SourceKind,
