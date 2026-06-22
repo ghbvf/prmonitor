@@ -147,9 +147,8 @@ function statusLabel(status: SessionStatus): string {
 </template>
 
 <style scoped>
-.review-sessions {
-  margin-bottom: var(--space-8);
-}
+/* Sits in SplitPane's top pane (independent scroll); the splitter divider provides the
+   separation from the review pane, so no bottom margin here. */
 .head {
   display: flex;
   align-items: center;
