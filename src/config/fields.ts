@@ -36,6 +36,10 @@ export interface FieldDef<K extends FieldKey = FieldKey> {
   // value → human label); ConfigField falls back to the raw value when a label is absent.
   options?: readonly string[];
   optionLabels?: Record<string, string>;
+  // Only meaningful for kind "number": the DOM `min` constraint. Defaults to 1 in the
+  // renderer (`def.min ?? 1`) so ports/intervals stay ≥ 1; `localApiPort` sets `min: 0` so
+  // its "0 = 关闭不监听" config semantic is actually enterable (AB#1043, codex F3).
+  min?: number;
   // Reserved single-option enums (#11) are shown but not editable.
   readonly?: boolean;
   // text fields holding a credential (e.g. the webhook HMAC secret): rendered
@@ -335,6 +339,9 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
         key: "localApiPort",
         label: "本地 API 端口",
         kind: "number",
+        // 0 = 关闭不监听 (see backend `local_api_port` semantics); allow it as the min so the
+        // number input doesn't mark the documented "off" value as invalid (codex F3).
+        min: 0,
         hint: "仅绑 127.0.0.1 的触发端点（curl/CLI 用）；改端口需重启 App。0=关闭不监听",
       },
       {

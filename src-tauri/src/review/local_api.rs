@@ -50,6 +50,7 @@ use tauri::async_runtime::{spawn, JoinHandle};
 use tauri::Manager;
 use tokio::sync::oneshot;
 
+use super::session::{SessionInfo, SessionStatus};
 use crate::config::service as config_service;
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
@@ -102,7 +103,7 @@ struct TriggerResponse {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StatusResponse {
-    status: super::session::SessionStatus,
+    status: SessionStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     comment_url: Option<String>,
 }
@@ -306,6 +307,21 @@ async fn handle_create<R: tauri::Runtime>(
     }
 }
 
+/// GET status resolution (AB#1043, codex F1): an in-memory hit short-circuits (the durable
+/// thunk never runs); otherwise the durable read's result passes through UNCHANGED. A
+/// persistence `Err` (DB locked / IO / schema) must reach the caller as a `500`, NEVER be
+/// folded into a not-found `404` — a poller must not read "status service unavailable" as
+/// "this id does not exist". Pure; unit-tested (the prior `.ok().flatten()` swallowed the Err).
+fn resolve_session(
+    in_memory: Option<SessionInfo>,
+    durable: impl FnOnce() -> AppResult<Option<SessionInfo>>,
+) -> AppResult<Option<SessionInfo>> {
+    match in_memory {
+        Some(info) => Ok(Some(info)),
+        None => durable(),
+    }
+}
+
 async fn handle_status<R: tauri::Runtime>(
     State(ctx): State<Arc<Ctx<R>>>,
     headers: HeaderMap,
@@ -316,13 +332,11 @@ async fn handle_status<R: tauri::Runtime>(
     }
     // In-memory first (live / just-finished), then the durable by-id read (finished long ago /
     // after a restart). The POST's `id` is the codex thread id, so this key matches exactly.
-    let info = ctx.app.state::<AppState>().sessions.get(&id).or_else(|| {
+    let lookup = resolve_session(ctx.app.state::<AppState>().sessions.get(&id), || {
         super::history_store::get_session(ctx.app.state::<Database>().inner(), &id)
-            .ok()
-            .flatten()
     });
-    match info {
-        Some(info) => json_response(
+    match lookup {
+        Ok(Some(info)) => json_response(
             StatusCode::OK,
             &StatusResponse {
                 status: info.status,
@@ -332,7 +346,10 @@ async fn handle_status<R: tauri::Runtime>(
         // Do not echo the caller-supplied `id` back into the message (avoid reflecting
         // untrusted path input into a body a downstream tool might log/render); the caller
         // already knows which id it polled from the request line.
-        None => error_response(StatusCode::NOT_FOUND, "未找到指定的 review 会话"),
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "未找到指定的 review 会话"),
+        // A durable-lookup failure is "service unavailable", not "id absent" — surface 500
+        // (without echoing the internal error detail) so the poller doesn't misread it as 404.
+        Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "查询 review 会话失败"),
     }
 }
 
@@ -608,7 +625,6 @@ mod tests {
 
     #[test]
     fn status_response_wire_shape_and_optional_comment_url() {
-        use super::super::session::SessionStatus;
         // Terminal with a URL: camelCase `commentUrl` present, `status` is the camelCase enum.
         let done = serde_json::to_value(&StatusResponse {
             status: SessionStatus::Done,
@@ -627,5 +643,46 @@ mod tests {
         .expect("serializes");
         assert_eq!(running["status"], "running");
         assert!(running.get("commentUrl").is_none());
+    }
+
+    // --- resolve_session (codex F1: durable Err must not fold into 404) ----------------------
+
+    fn sample_info(thread: &str) -> SessionInfo {
+        SessionInfo {
+            project_id: "p1".to_string(),
+            thread_id: thread.to_string(),
+            turn_id: String::new(),
+            pr_number: 7,
+            kind: "review".to_string(),
+            status: SessionStatus::Done,
+            created_at_epoch: 0,
+            comment_url: None,
+        }
+    }
+
+    #[test]
+    fn resolve_session_in_memory_hit_short_circuits_durable() {
+        // An in-memory hit must NOT touch the durable store (the thunk panics if run).
+        let got = resolve_session(Some(sample_info("t1")), || {
+            panic!("durable lookup must not run on an in-memory hit")
+        });
+        assert!(matches!(got, Ok(Some(info)) if info.thread_id == "t1"));
+    }
+
+    #[test]
+    fn resolve_session_durable_error_is_not_folded_into_not_found() {
+        // The codex F1 regression lock: a durable-lookup Err must PROPAGATE (→ 500), never
+        // collapse to Ok(None) (→ 404). The prior `.ok().flatten()` swallowed it.
+        let got = resolve_session(None, || Err(AppError::new("db locked")));
+        assert!(got.is_err(), "durable Err must propagate, not fold to None");
+    }
+
+    #[test]
+    fn resolve_session_durable_some_and_none_pass_through() {
+        assert!(matches!(
+            resolve_session(None, || Ok(Some(sample_info("t2")))),
+            Ok(Some(_))
+        ));
+        assert!(matches!(resolve_session(None, || Ok(None)), Ok(None)));
     }
 }

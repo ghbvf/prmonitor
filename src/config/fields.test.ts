@@ -254,6 +254,14 @@ describe("GLOBAL_GROUPS", () => {
     const f = GLOBAL_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "localApiToken");
     expect(f?.secret).toBe(true);
   });
+
+  // AB#1043 codex F3: localApiPort documents "0 = 关闭" so it must carry a field-level min of 0
+  // (the renderer reads `def.min ?? 1`); webhookPort keeps the default (min undefined → ≥1).
+  it("lets localApiPort accept 0 via min, while webhookPort keeps the default min", () => {
+    const all = GLOBAL_GROUPS.flatMap((g) => g.fields);
+    expect(all.find((f) => f.key === "localApiPort")?.min).toBe(0);
+    expect(all.find((f) => f.key === "webhookPort")?.min).toBeUndefined();
+  });
 });
 
 describe("validateStep — repo", () => {
