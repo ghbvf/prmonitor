@@ -25,6 +25,7 @@
 //!   deeplink fails CI instead.
 
 use tauri::{AppHandle, Manager, Runtime};
+use tauri_plugin_notification::NotificationExt;
 use url::Url;
 
 use crate::error::{AppError, AppResult};
@@ -85,15 +86,21 @@ pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedTrigger> {
     let mut project_id: Option<String> = None;
     let mut kind: Option<String> = None;
     for (key, value) in url.query_pairs() {
-        match key.as_ref() {
-            "pr" => pr_raw = Some(value.into_owned()),
-            "repo" => repo = Some(value.into_owned()),
-            "projectId" => project_id = Some(value.into_owned()),
-            "kind" => kind = Some(value.into_owned()),
-            // Ignore unknown params: the validated fields above are the contract, and tolerating
+        let slot = match key.as_ref() {
+            "pr" => &mut pr_raw,
+            "repo" => &mut repo,
+            "projectId" => &mut project_id,
+            "kind" => &mut kind,
+            // Ignore unknown params: the validated fields below are the contract, and tolerating
             // extras keeps a future `?foo=` from hard-failing existing links.
-            _ => {}
+            _ => continue,
+        };
+        // Fail closed on a REPEATED key (codex F4): with `?pr=1&pr=2` a preview could show one
+        // value while the parser triggers the other — never silently last-wins on external input.
+        if slot.is_some() {
+            return Err(AppError::new(format!("deeplink 重复参数: {key}")));
         }
+        *slot = Some(value.into_owned());
     }
 
     // `pr`: required, must parse as u64, then the SAME `> 0` fail-closed check the funnel applies
@@ -162,6 +169,7 @@ async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
                 url.host_str(),
                 e.message
             );
+            notify_failure(&app, "prmonitor deeplink 无效", &e.message);
             return;
         }
     };
@@ -185,12 +193,14 @@ async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
     .await
     {
         Ok(id) => id,
-        // Dedup ("already in flight") / unknown project / validation: benign, just log.
+        // Dedup ("already in flight") / unknown project / validation: log + a user-visible toast
+        // (the `AppError` message names the specific cause).
         Err(e) => {
             eprintln!(
                 "deeplink 触发失败（pr={pr_number} kind={kind}）: {}",
                 e.message
             );
+            notify_failure(&app, "prmonitor 触发失败", &e.message);
             return;
         }
     };
@@ -224,8 +234,6 @@ async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
 /// collapse) distinguishes completed vs interrupted vs failed; the body carries the pr-review
 /// comment URL (the actionable artifact) when one was resolved.
 fn notify_completion<R: Runtime>(app: &AppHandle<R>, pr_number: u64, outcome: &CompletionOutcome) {
-    use tauri_plugin_notification::NotificationExt;
-
     // Whitelist the known terminal statuses; never reflect codex's raw `wire_status` (it comes from
     // the codex subprocess) into the notification title. An unexpected value gets a fixed label +
     // a diagnostic log rather than surfacing arbitrary content.
@@ -246,6 +254,22 @@ fn notify_completion<R: Runtime>(app: &AppHandle<R>, pr_number: u64, outcome: &C
 
     if let Err(e) = app.notification().builder().title(title).body(body).show() {
         eprintln!("deeplink 通知发送失败: {e}");
+    }
+}
+
+/// Surface a deeplink FAILURE to the user (codex F3). A deeplink is fire-and-forget with no return
+/// channel, so a clicked link that can't run would otherwise be silent (only stderr). `reason` is
+/// the `AppError` message, which already distinguishes the cases the user cares about (link
+/// invalid / project not found / already in flight). Best-effort, like [`notify_completion`].
+fn notify_failure<R: Runtime>(app: &AppHandle<R>, title: &str, reason: &str) {
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(reason)
+        .show()
+    {
+        eprintln!("deeplink 失败通知发送失败: {e}");
     }
 }
 
@@ -288,10 +312,15 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_pr_key_last_wins() {
-        // Documents the parser's "last value wins" for a repeated key (not first, not reject).
-        let p = parse("prmonitor://review?pr=1&repo=octo/app&pr=2").expect("ok");
-        assert_eq!(p.pr_number, 2);
+    fn rejects_duplicate_pr_key() {
+        // External input must fail closed on a repeated key (codex F4): a link with two `pr`
+        // values could show one in a preview and trigger the other. Reject, don't last-wins.
+        assert!(parse("prmonitor://review?pr=1&repo=octo/app&pr=2").is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_repo_key() {
+        assert!(parse("prmonitor://review?pr=7&repo=octo/app&repo=evil/app").is_err());
     }
 
     #[test]

@@ -174,6 +174,16 @@ fn build_app() {
                 app.deep_link().on_open_url(move |event| {
                     review::deeplink::handle_review_deeplink(handle.clone(), event.urls());
                 });
+                // Cold-start deeplink (codex F1): `on_open_url` ONLY fires while the app is running,
+                // so a link that LAUNCHED the app must be read here via `get_current` (the plugin's
+                // doc-prescribed "on app load" path). On Windows/Linux it returns the launch argv;
+                // on macOS the launch URL arrives later via `RunEvent::Opened` (which re-fires
+                // `on_open_url`), so `get_current` is empty at setup there — net single handling on
+                // every platform. A duplicate (if both paths ever fire) is dedup-safe via
+                // `trigger_review`'s `try_reserve_pair`.
+                if let Ok(Some(urls)) = app.deep_link().get_current() {
+                    review::deeplink::handle_review_deeplink(app.handle().clone(), urls);
+                }
             }
             Ok(())
         })
