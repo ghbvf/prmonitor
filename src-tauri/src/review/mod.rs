@@ -11,6 +11,11 @@ pub mod commands;
 /// the funnel in [`session`] calls it, so it is reachable as `super::comment_url` from
 /// `session.rs` while staying off the review slice's public surface.
 mod comment_url;
+/// Deeplink trigger transport (AB#1045): parses + validates a `prmonitor://review?pr=N&repo=R`
+/// URL and routes it into the [`commands::trigger_review`] funnel (the third transport beside the
+/// local API and CLI), then surfaces fire-and-forget completion as a desktop notification +
+/// window focus. The parser is pure (table-unit-tested); a golden locks the registered scheme.
+pub mod deeplink;
 pub mod engine;
 pub mod engines;
 pub mod history_store;

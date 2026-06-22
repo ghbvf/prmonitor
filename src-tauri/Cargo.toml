@@ -74,7 +74,23 @@ dirs = "5"
 # Single-instance lock (AB#1044): a cold-start `prmonitor review` (app not running) becomes the
 # FIRST instance, boots the GUI + local API, then triggers in-process; it also dedups GUI
 # windows. Registered FIRST in the builder (before opener/store), per the ticket.
-tauri-plugin-single-instance = "2"
+# `deep-link` feature (AB#1045): on Windows/Linux the OS hands a `prmonitor://…` deeplink to a
+# NEW process as argv; the feature makes single-instance forward that argv to the running
+# instance, where `tauri-plugin-deep-link`'s `on_open_url` fires — so a deeplink always reaches
+# the resident app, never cold-starts a duplicate. (macOS delivers via Info.plist, not argv.)
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+# Deeplink scheme `prmonitor://` (AB#1045): registers the scheme (static via Info.plist on macOS,
+# runtime on Windows/Linux) and surfaces opened URLs through `on_open_url`. Parsed + validated in
+# `review::deeplink`, then routed into the same `trigger_review` funnel the CLI/local-API use.
+tauri-plugin-deep-link = "2"
+# Desktop notification (AB#1045): a deeplink-triggered review is fire-and-forget (the OS returns no
+# result to the opener), so completion is surfaced as a desktop notification carrying the pr-review
+# comment URL. Sent from Rust (`NotificationExt`), so no frontend capability entry is needed.
+tauri-plugin-notification = "2"
+# Parse the `prmonitor://review?pr=N&repo=R&kind=review` deeplink (AB#1045): `on_open_url` already
+# hands us `url::Url`, so this is the same crate the plugin uses (already in the tree via reqwest);
+# promoted to a direct dep so the slice-internal parser names it explicitly.
+url = "2"
 
 # Pin: brotli 8.0.3 (pulled transitively by tauri-codegen/tauri-utils) requires
 # alloc-no-stdlib "^2.0", but alloc-stdlib/brotli-decompressor accept ">=2.0.4,<4"

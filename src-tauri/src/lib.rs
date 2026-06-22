@@ -62,6 +62,13 @@ fn build_app() {
                 let _ = w.set_focus();
             }
         }))
+        // Deeplink (AB#1045): registered AFTER single-instance (which must claim the OS lock /
+        // argv first) so a `prmonitor://…` opened while the app runs reaches the resident instance
+        // — `single-instance`'s `deep-link` feature forwards the argv on Windows/Linux, and the
+        // `on_open_url` hook wired in `.setup` parses + triggers it. `notification` backs the
+        // fire-and-forget completion toast (sent from Rust in `review::deeplink`).
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(AppState::default())
@@ -152,6 +159,25 @@ fn build_app() {
             // setting/clearing it in Settings takes effect without a restart. A bind failure is
             // logged + swallowed inside the spawned task (a port clash must not crash the app).
             state.local_api.start(app.handle().clone());
+
+            // Deeplink trigger (AB#1045): route opened `prmonitor://review?…` URLs into the
+            // `trigger_review` funnel. `register_all` is DEBUG-ONLY — it runtime-registers the
+            // scheme for Windows/Linux `tauri dev`; a release build relies solely on the static
+            // OS registration (Info.plist on macOS, installer on Windows), so production never
+            // honors a runtime-registered (forge-able) scheme. macOS can only test deeplinks from
+            // a packaged .app (scheme via Info.plist `CFBundleURLTypes`, not registrable at runtime).
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                #[cfg(debug_assertions)]
+                let _ = app.deep_link().register_all();
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    tauri::async_runtime::spawn(review::deeplink::handle_review_deeplink(
+                        handle.clone(),
+                        event.urls(),
+                    ));
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
