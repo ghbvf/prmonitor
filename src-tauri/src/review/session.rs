@@ -352,6 +352,15 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// Snapshot ONE in-memory session by its `thread_id` (AB#1043: the local REST API's
+    /// `GET /reviews/{id}` lookup). In-memory only — a session that finished before a
+    /// restart is no longer here; the caller falls through to the durable by-id read
+    /// (`history_store::get_session`). `pub` (sibling `local_api` module reads it, like
+    /// `list`). Synchronous: clones under the lock, no `.await`.
+    pub fn get(&self, thread_id: &str) -> Option<SessionInfo> {
+        self.inner.lock().unwrap().sessions.get(thread_id).cloned()
+    }
+
     /// The `(pr_number, kind)` of every in-flight session
     /// (`Starting`/`Running`/`Interrupting`) PLUS every RESERVED triple **belonging to
     /// `project_id`** — the auto-trigger registry guard's view, scoped to one project
@@ -1433,6 +1442,33 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn registry_get_by_thread_id() {
+        // AB#1043: the local REST API's GET /reviews/{id} resolves an in-memory session by
+        // its thread_id. A known id returns its snapshot; an unknown id is None (the caller
+        // then falls through to the durable by-id read).
+        let reg = SessionRegistry::default();
+        assert!(reg.try_reserve_pair("p1", 7, "review"));
+        reg.promote_reservation(
+            SessionInfo {
+                project_id: "p1".to_string(),
+                thread_id: "t1".to_string(),
+                turn_id: String::new(),
+                pr_number: 7,
+                kind: "review".to_string(),
+                status: SessionStatus::Starting,
+                created_at_epoch: 0,
+                comment_url: None,
+            },
+            test_url_ctx(),
+        );
+        let got = reg.get("t1").expect("known thread_id resolves");
+        assert_eq!(got.thread_id, "t1");
+        assert_eq!(got.pr_number, 7);
+        assert_eq!(got.status, SessionStatus::Starting);
+        assert!(reg.get("missing").is_none(), "unknown thread_id → None");
     }
 
     #[test]

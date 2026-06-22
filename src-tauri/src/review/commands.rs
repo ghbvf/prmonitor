@@ -37,6 +37,21 @@ fn validate_kind(kind: &str) -> AppResult<()> {
     }
 }
 
+/// Rejects a `pr_number` of 0 at the command boundary (AB#1043, codex F2). PR/MR numbers are
+/// 1-based, so 0 is never a real PR — but the trigger funnel accepts a free-form `u64` from an
+/// untrusted transport (the local REST API), and nothing downstream re-checks it, so a 0 would
+/// flow into the engine and start a bogus `/pr-review 0`. Fail-closed BEFORE any project resolve
+/// / engine dispatch (parity with [`validate_kind`]), shared by both [`start_review`] and
+/// [`trigger_review`] so the single funnel can't be bypassed. Pure (no `AppHandle`) so it is
+/// unit-testable.
+fn validate_pr_number(pr_number: u64) -> AppResult<()> {
+    if pr_number == 0 {
+        Err(AppError::new("pr 非法（PR 号必须大于 0）: 0"))
+    } else {
+        Ok(())
+    }
+}
+
 /// Reports codex app-server availability for the StatusBar. Ensures the resident
 /// connection (lazy start: first call spawns + handshakes, later calls reuse) and
 /// reports `available` + version. The probe never errors (failures map to a
@@ -170,6 +185,7 @@ pub async fn start_review<R: tauri::Runtime>(
     // `session.rs` treats every non-"check" value as a review, so an unvalidated kind
     // would run a full review under a bad registry key (see `validate_kind`).
     validate_kind(&kind)?;
+    validate_pr_number(pr_number)?;
     // Resolve the project being reviewed (#35) and re-check ITS filesystem-dependent
     // paths so an absent / escaping `skillRelPath` (e.g. a hand-edited config) fails
     // before we attach the skill path to the turn, rather than handing codex a bad path.
@@ -196,6 +212,7 @@ pub async fn trigger_review<R: tauri::Runtime>(
     // Reject a bogus `kind` BEFORE resolving the project / any side effect (parity with
     // `start_review`): an unvalidated kind would run a full review under a bad registry key.
     validate_kind(&kind)?;
+    validate_pr_number(pr_number)?;
     // Resolve by id-or-repo + validate the project's filesystem paths (the trigger funnel's
     // analogue of `project_validated`), keeping the review slice on `config::service` only.
     let project = config_service::project_by_ref_validated(&app, &reference)?;
@@ -315,6 +332,17 @@ mod tests {
                 validate_kind(bad).is_err(),
                 "expected kind {bad:?} rejected"
             );
+        }
+    }
+
+    #[test]
+    fn validate_pr_number_rejects_zero_only() {
+        // AB#1043 codex F2: 0 is never a real PR — reject it before any side effect so an
+        // untrusted transport can't push `/pr-review 0` into the engine. Every positive number
+        // is accepted (PR numbers are 1-based; there is no upper bound to enforce here).
+        assert!(validate_pr_number(0).is_err(), "pr=0 must be rejected");
+        for ok in [1, 7, 160, u64::MAX] {
+            assert!(validate_pr_number(ok).is_ok(), "pr={ok} must be accepted");
         }
     }
 }

@@ -73,4 +73,9 @@ export interface AppConfig {
   webhookTunnelMode: WebhookTunnelMode;
   webhookTunnelCommand: string;
   webhookPublicUrl: string;
+  // Local REST API (AB#1043): a resident 127.0.0.1-only trigger endpoint for a third-party
+  // CLI/curl. Distinct from the webhook (never tunneled). `localApiToken` empty = disabled
+  // (fail-closed 401). Mirror the Rust `AppConfig.localApiPort`/`localApiToken` wire fields.
+  localApiPort: number;
+  localApiToken: string;
 }

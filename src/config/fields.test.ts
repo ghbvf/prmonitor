@@ -65,6 +65,8 @@ const GLOBAL_FORM_KEYS: (keyof AppConfig)[] = [
   "webhookTunnelMode",
   "webhookTunnelCommand",
   "webhookPublicUrl",
+  "localApiPort",
+  "localApiToken",
 ];
 
 // `Project` identity fields managed by the project list/selector UI (not a field
@@ -244,6 +246,21 @@ describe("GLOBAL_GROUPS", () => {
   it("masks the webhook secret field", () => {
     const f = GLOBAL_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "webhookSecret");
     expect(f?.secret).toBe(true);
+  });
+
+  // AB#1043: the local API token is a bearer secret — it must render masked, same as the
+  // webhook secret. Locks the `secret: true` flag against a future refactor dropping it.
+  it("masks the localApiToken field", () => {
+    const f = GLOBAL_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "localApiToken");
+    expect(f?.secret).toBe(true);
+  });
+
+  // AB#1043 codex F3: localApiPort documents "0 = 关闭" so it must carry a field-level min of 0
+  // (the renderer reads `def.min ?? 1`); webhookPort keeps the default (min undefined → ≥1).
+  it("lets localApiPort accept 0 via min, while webhookPort keeps the default min", () => {
+    const all = GLOBAL_GROUPS.flatMap((g) => g.fields);
+    expect(all.find((f) => f.key === "localApiPort")?.min).toBe(0);
+    expect(all.find((f) => f.key === "webhookPort")?.min).toBeUndefined();
   });
 });
 

@@ -87,7 +87,7 @@ function onCheckbox(e: Event) {
     <input
       v-else-if="def.kind === 'number'"
       type="number"
-      min="1"
+      :min="def.min ?? 1"
       :value="modelValue"
       @input="onNumber"
     />

@@ -14,4 +14,8 @@ mod comment_url;
 pub mod engine;
 pub mod engines;
 pub mod history_store;
+/// Local REST API trigger transport (AB#1043): a resident `127.0.0.1`-only axum listener that
+/// wraps the [`commands::trigger_review`] funnel so a third party (curl/CLI) can trigger a
+/// review and poll for completion + comment URL. Token/Host/Origin fail-closed; never tunneled.
+pub mod local_api;
 pub mod session;

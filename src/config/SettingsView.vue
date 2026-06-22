@@ -42,6 +42,8 @@ const draft = reactive<AppConfig>({
   webhookTunnelMode: "quick",
   webhookTunnelCommand: "",
   webhookPublicUrl: "",
+  localApiPort: 8788,
+  localApiToken: "",
 });
 
 function hydrate(cfg: AppConfig) {
@@ -56,6 +58,8 @@ function hydrate(cfg: AppConfig) {
   draft.webhookTunnelMode = cfg.webhookTunnelMode;
   draft.webhookTunnelCommand = cfg.webhookTunnelCommand;
   draft.webhookPublicUrl = cfg.webhookPublicUrl;
+  draft.localApiPort = cfg.localApiPort;
+  draft.localApiToken = cfg.localApiToken;
 }
 
 // Populate the draft once the async config lands (and on any later replacement).
