@@ -151,6 +151,7 @@ async fn dispatch_engine<R: tauri::Runtime>(
                 url_ctx,
                 // `start` takes `pr_number` as a method arg; the field is the follow-up path's.
                 pr_number: 0,
+                session_info: None,
             };
             engine.start(pr_number, kind).await?
         }
@@ -167,6 +168,7 @@ async fn dispatch_engine<R: tauri::Runtime>(
                 url_ctx,
                 // `start` takes `pr_number` as a method arg; the field is the follow-up path's.
                 pr_number: 0,
+                session_info: None,
             };
             engine.start(pr_number, kind).await?
         }
@@ -206,23 +208,23 @@ fn comment_url_ctx_from(project: &config_service::Project) -> CommentUrlContext 
 /// another project's `thread_id` and resume that session under the wrong project (cross-tenant
 /// confusion). A project mismatch reports the SAME "未找到 review 会话（无法续聊）" error as a
 /// genuinely-absent session — an attacker learns nothing about another project's sessions.
-fn resolve_pr_number<R: tauri::Runtime>(
+fn resolve_session_info<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppState,
     project_id: &str,
     thread_id: &str,
-) -> AppResult<u64> {
+) -> AppResult<SessionInfo> {
     if let Some(info) = state.sessions.get(thread_id) {
         if info.project_id != project_id {
             return Err(AppError::new(format!(
                 "未找到 review 会话（无法续聊）: {thread_id}"
             )));
         }
-        return Ok(info.pr_number);
+        return Ok(info);
     }
     let db = app.state::<Database>();
     match history_store::get_session(db.inner(), thread_id)? {
-        Some(info) if info.project_id == project_id => Ok(info.pr_number),
+        Some(info) if info.project_id == project_id => Ok(info),
         _ => Err(AppError::new(format!(
             "未找到 review 会话（无法续聊）: {thread_id}"
         ))),
@@ -271,11 +273,14 @@ pub async fn send_review_message<R: tauri::Runtime>(
     // Resolve + validate the owning project (#35) — same per-project validation as
     // `start_review` (the review slice stays on `config::service`, never `config::model`).
     let project = config_service::project_validated(&app, &project_id)?;
-    // Resolve the session's PR number (in-memory live row, else the durable row), SCOPED to
+    // Resolve the session identity (in-memory live row, else the durable row), SCOPED to
     // this project so a caller can't resume another project's session by raw `thread_id`.
-    let pr_number = resolve_pr_number(&app, &state, &project_id, &thread_id)?;
+    // The session's `engine_kind` is authoritative: changing project config after the review
+    // must not route this existing conversation to a different engine.
+    let session_info = resolve_session_info(&app, &state, &project_id, &thread_id)?;
+    let pr_number = session_info.pr_number;
     let url_ctx = comment_url_ctx_from(&project);
-    match project.engine_kind {
+    match session_info.engine_kind {
         EngineKind::Codex => {
             // MANUAL / explicit force-start (parity with `dispatch_engine`'s Codex arm): a
             // follow-up is an explicit user action, so clear any prior `stop_codex` before
@@ -293,6 +298,7 @@ pub async fn send_review_message<R: tauri::Runtime>(
                 codex_model: &project.codex_model,
                 url_ctx,
                 pr_number,
+                session_info: Some(session_info.clone()),
             };
             engine
                 .send_message(&thread_id, &message, &user_item_id)
@@ -310,6 +316,7 @@ pub async fn send_review_message<R: tauri::Runtime>(
                 claude_model: &project.claude_model,
                 url_ctx,
                 pr_number,
+                session_info: Some(session_info.clone()),
             };
             engine
                 .send_message(&thread_id, &message, &user_item_id)
@@ -412,6 +419,7 @@ pub async fn stop_review<R: tauri::Runtime>(
         },
         // `stop` resolves purely by session id; pr_number is the follow-up path's field only.
         pr_number: 0,
+        session_info: None,
     };
     engine.stop(&session_id).await
 }

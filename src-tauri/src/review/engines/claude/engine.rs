@@ -15,6 +15,7 @@ use super::manager::ClaudeManager;
 use super::process::{self, ParsedEvent, ParserState};
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, REVIEW_EVENT};
+use crate::model::EngineKind;
 use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
 use crate::review::history_store::{self, HistoryItemKind};
 use crate::review::session::{CommentUrlContext, SessionInfo, SessionRegistry, SessionStatus};
@@ -51,6 +52,9 @@ pub struct ClaudeEngine<'a, R: tauri::Runtime> {
     /// command resolves it and sets it here. The `start`/`stop` paths take `pr_number` as a
     /// method arg and ignore this field (set to 0 at those construction sites).
     pub pr_number: u64,
+    /// Full persisted session identity for the FOLLOW-UP path. It pins the creating engine,
+    /// original kind, timestamp, and URL metadata across app restarts/config edits.
+    pub session_info: Option<SessionInfo>,
 }
 
 impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
@@ -96,6 +100,9 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
             self.repo_root,
             self.claude_model,
             self.pr_number,
+            self.session_info
+                .as_ref()
+                .expect("ClaudeEngine::send_message requires session_info"),
             session,
             message,
             user_item_id,
@@ -189,6 +196,7 @@ async fn start_review<R: tauri::Runtime>(
         turn_id: session_id.clone(),
         pr_number,
         kind: kind.to_string(),
+        engine_kind: EngineKind::Claude,
         status: SessionStatus::Starting,
         created_at_epoch,
         // No comment yet — filled by `session::finalize_turn` at a `completed` terminal (AB#1042).
@@ -263,6 +271,7 @@ async fn resume_review<R: tauri::Runtime>(
     repo_root: &str,
     claude_model: &str,
     pr_number: u64,
+    durable_info: &SessionInfo,
     thread_id: &str,
     message: &str,
     user_item_id: &str,
@@ -272,17 +281,7 @@ async fn resume_review<R: tauri::Runtime>(
     // restart). The first turn's `finalize_turn` consumed the original URL context, so a
     // fresh one is re-inserted for this follow-up turn's terminal resolve.
     if registry.get(thread_id).is_none() {
-        let rehydrated = SessionInfo {
-            project_id: project_id.to_string(),
-            thread_id: thread_id.to_string(),
-            turn_id: thread_id.to_string(),
-            pr_number,
-            kind: String::new(),
-            status: SessionStatus::Done,
-            created_at_epoch: history_store::now_epoch(),
-            comment_url: None,
-        };
-        registry.rehydrate(rehydrated, url_ctx.clone());
+        registry.rehydrate(durable_info.clone(), url_ctx.clone());
     }
 
     // Atomic guard: only a TERMINAL session flips to `Running` and proceeds. A turn in
@@ -299,16 +298,24 @@ async fn resume_review<R: tauri::Runtime>(
         }
     }
 
-    // Spawn `claude -p --resume <thread_id>` with the RAW user message as the prompt (NOT a
-    // `/pr-review N`). On a spawn failure flip back to `Failed` (the session was set
+    // Register a FRESH cancel channel before any potentially blocking spawn/init work. Unlike
+    // initial review, resume already knows the stable `thread_id`, so stop can be effective
+    // while `claude -p --resume` starts or emits its init line.
+    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    claude.register(thread_id.to_string(), cancel_tx);
+
+    // Spawn restricted `claude -p --resume <thread_id>` and send the RAW user message through
+    // stdin, not argv. On a spawn/write failure flip back to `Failed` (the session was set
     // `Running` by `begin_resume`) so it isn't stuck, then surface the error.
-    let proc = match process::spawn_claude(
+    let proc = match process::spawn_claude_stdin_chat(
         claude_bin,
         repo_root,
         claude_model,
         message,
-        Some(thread_id),
-    ) {
+        thread_id,
+    )
+    .await
+    {
         Ok(p) => p,
         Err(e) => {
             registry.set_status(thread_id, SessionStatus::Failed);
@@ -318,17 +325,19 @@ async fn resume_review<R: tauri::Runtime>(
                 project_id,
                 thread_id,
                 pr_number,
+                durable_info,
                 SessionStatus::Failed,
             );
             // No `finalize_turn` runs on a failure path, so it never consumes the URL context
             // the (possibly just-)`rehydrate`d session inserted — discard it so it doesn't leak
             // in `url_contexts` (no-op `None` when this run never rehydrated).
             let _ = registry.take_url_context(thread_id);
+            claude.deregister(thread_id);
             return Err(e);
         }
     };
     let process::ClaudeProcess {
-        child,
+        mut child,
         stdout,
         stderr,
     } = proc;
@@ -341,42 +350,62 @@ async fn resume_review<R: tauri::Runtime>(
     // would orphan this session's history / dedup / stop-routing (all keyed on the original).
     let mut reader = process::stdout_reader(stdout);
     let mut parser = ParserState::default();
-    match read_session_id(&mut reader, &mut parser).await {
-        // The new id is intentionally unused — we stamp everything with the original.
-        Ok(Some(_new_session_id)) => {}
-        Ok(None) => {
-            // EOF before any init line → claude exited without resuming (transcript gone /
-            // not logged in / bad flags). Mark failed so the session isn't stuck `Running`.
-            registry.set_status(thread_id, SessionStatus::Failed);
-            persist_session_status(
-                app,
+    tokio::select! {
+        changed = cancel_rx.changed() => {
+            let _ = changed;
+            let _ = child.start_kill();
+            finish(
                 registry,
+                claude,
+                app,
                 project_id,
-                thread_id,
                 pr_number,
-                SessionStatus::Failed,
-            );
-            // No `finalize_turn` runs on this failure — discard the rehydrated URL context so
-            // it doesn't leak in `url_contexts` (no-op `None` when never rehydrated).
-            let _ = registry.take_url_context(thread_id);
-            return Err(AppError::new(
-                "claude 未输出会话 init（续聊失败：transcript 不存在或未登录？）".to_string(),
-            ));
+                thread_id,
+                SessionStatus::Done,
+                "interrupted",
+                None,
+            )
+            .await;
+            let _ = child.wait().await;
+            return Ok(());
         }
-        Err(e) => {
-            registry.set_status(thread_id, SessionStatus::Failed);
-            persist_session_status(
-                app,
-                registry,
-                project_id,
-                thread_id,
-                pr_number,
-                SessionStatus::Failed,
-            );
-            // No `finalize_turn` runs on this failure — discard the rehydrated URL context so
-            // it doesn't leak in `url_contexts` (no-op `None` when never rehydrated).
-            let _ = registry.take_url_context(thread_id);
-            return Err(e);
+        init = read_session_id(&mut reader, &mut parser) => {
+            match init {
+                // The new id is intentionally unused — we stamp everything with the original.
+                Ok(Some(_new_session_id)) => {}
+                Ok(None) => {
+                    registry.set_status(thread_id, SessionStatus::Failed);
+                    persist_session_status(
+                        app,
+                        registry,
+                        project_id,
+                        thread_id,
+                        pr_number,
+                        durable_info,
+                        SessionStatus::Failed,
+                    );
+                    let _ = registry.take_url_context(thread_id);
+                    claude.deregister(thread_id);
+                    return Err(AppError::new(
+                        "claude 未输出会话 init（续聊失败：transcript 不存在或未登录？）".to_string(),
+                    ));
+                }
+                Err(e) => {
+                    registry.set_status(thread_id, SessionStatus::Failed);
+                    persist_session_status(
+                        app,
+                        registry,
+                        project_id,
+                        thread_id,
+                        pr_number,
+                        durable_info,
+                        SessionStatus::Failed,
+                    );
+                    let _ = registry.take_url_context(thread_id);
+                    claude.deregister(thread_id);
+                    return Err(e);
+                }
+            }
         }
     }
 
@@ -394,14 +423,9 @@ async fn resume_review<R: tauri::Runtime>(
         project_id,
         thread_id,
         pr_number,
+        durable_info,
         SessionStatus::Running,
     );
-
-    // Register a FRESH cancel channel for this follow-up turn (BEFORE spawning the pump, so
-    // a `stop` can't race ahead of registration) — the prior turn's channel was deregistered
-    // by its `finish`. `register` for the (globally unique) id replaces any stale sender.
-    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-    claude.register(thread_id.to_string(), cancel_tx);
 
     // Spawn the SAME pump as `start_review`, stamped with the ORIGINAL `thread_id`.
     tauri::async_runtime::spawn(pump(
@@ -434,6 +458,7 @@ fn persist_session_status<R: tauri::Runtime>(
     project_id: &str,
     thread_id: &str,
     pr_number: u64,
+    durable_info: &SessionInfo,
     status: SessionStatus,
 ) {
     let info = registry
@@ -444,10 +469,11 @@ fn persist_session_status<R: tauri::Runtime>(
             thread_id: thread_id.to_string(),
             turn_id: thread_id.to_string(),
             pr_number,
-            kind: String::new(),
+            kind: durable_info.kind.clone(),
+            engine_kind: durable_info.engine_kind,
             status,
-            created_at_epoch: history_store::now_epoch(),
-            comment_url: None,
+            created_at_epoch: durable_info.created_at_epoch,
+            comment_url: durable_info.comment_url.clone(),
         });
     persist_session(app, &info);
 }

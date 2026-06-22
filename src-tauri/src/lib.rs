@@ -424,6 +424,7 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
                 // Auto-dispatch only ever `start`s (which takes pr_number as a method arg);
                 // the field is the follow-up (`send_message`) path's.
                 pr_number: 0,
+                session_info: None,
             };
             dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
         }
@@ -441,6 +442,7 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
                 // Auto-dispatch only ever `start`s (pr_number is a method arg); the field is
                 // the follow-up (`send_message`) path's.
                 pr_number: 0,
+                session_info: None,
             };
             dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
         }

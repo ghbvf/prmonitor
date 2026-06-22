@@ -26,6 +26,7 @@ use super::engines::codex::CodexManager;
 use super::history_store::HistoryItemKind;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, REVIEW_EVENT};
+use crate::model::EngineKind;
 use crate::review::engine::StartReviewOutcome;
 
 /// A review session is identified by its codex `threadId`.
@@ -68,6 +69,9 @@ pub struct SessionInfo {
     pub pr_number: u64,
     /// `"review"` or `"check"` — the trigger-label mode the review was started in.
     pub kind: String,
+    /// Engine that created this session. Follow-up chat must route back to this engine even
+    /// if the project's current config changes later.
+    pub engine_kind: EngineKind,
     pub status: SessionStatus,
     /// Wall-clock epoch seconds when the session was created (#70, review F10): the
     /// newest-first sort key the UI orders sessions by. Stamped at construction for a
@@ -597,6 +601,7 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
         turn_id: String::new(),
         pr_number,
         kind: kind.to_string(),
+        engine_kind: EngineKind::Codex,
         status: SessionStatus::Starting,
         created_at_epoch: super::history_store::now_epoch(),
         // No comment yet — filled by `finalize_turn` at a `completed` terminal (AB#1042).
@@ -656,6 +661,7 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
             turn_id,
             pr_number,
             kind: kind.to_string(),
+            engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             // Same creation instant as the `Starting` row above — `upsert_session` keys
             // `created_at` on first insert (ON CONFLICT preserves it), so this only needs
@@ -711,6 +717,7 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
     codex_model: &str,
     project_id: &str,
     pr_number: u64,
+    durable_info: &SessionInfo,
     thread_id: &str,
     message: &str,
     user_item_id: &str,
@@ -726,17 +733,7 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
     // NotFound. The caller resolved `pr_number`/`project_id` from the same row, so the
     // rehydrated `SessionInfo` is consistent with the durable record.
     if registry.get(thread_id).is_none() {
-        let rehydrated = SessionInfo {
-            project_id: project_id.to_string(),
-            thread_id: thread_id.to_string(),
-            turn_id: String::new(),
-            pr_number,
-            kind: String::new(),
-            status: SessionStatus::Done,
-            created_at_epoch: super::history_store::now_epoch(),
-            comment_url: None,
-        };
-        registry.rehydrate(rehydrated, url_ctx.clone());
+        registry.rehydrate(durable_info.clone(), url_ctx.clone());
     }
 
     // Atomic guard: only a terminal session flips to `Running` and proceeds. A turn already
@@ -781,8 +778,10 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
     persist_user_message(app, project_id, thread_id, user_item_id, message);
 
     // Issue a SECOND turn on the EXISTING thread. The pr-review skill is NOT re-attached —
-    // it is already in this thread's context; we send only the raw user message. Same
-    // sandbox / approval / cwd / per-turn model as `start_review`.
+    // it is already in this thread's context; we send only the raw user message. This is a
+    // chat-answer turn, not an unattended code-action turn: keep the workspace read-only and
+    // network disabled so a follow-up cannot modify files or reach external services. If a
+    // user wants code changes, they should trigger the `/fix` workflow explicitly.
     let turn_id = match process::start_turn(
         &client,
         TurnStartParams {
@@ -792,9 +791,9 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
             }],
             approval_policy: "never".to_string(),
             sandbox_policy: SandboxPolicy {
-                kind: "workspaceWrite".to_string(),
-                network_access: true,
-                writable_roots: vec![repo_root.to_string()],
+                kind: "readOnly".to_string(),
+                network_access: false,
+                writable_roots: Vec::new(),
             },
             cwd: Some(repo_root.to_string()),
             model: (!codex_model.trim().is_empty()).then(|| codex_model.trim().to_string()),
@@ -836,10 +835,11 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
             thread_id: thread_id.to_string(),
             turn_id,
             pr_number,
-            kind: String::new(),
+            kind: durable_info.kind.clone(),
+            engine_kind: durable_info.engine_kind,
             status: SessionStatus::Running,
-            created_at_epoch: super::history_store::now_epoch(),
-            comment_url: None,
+            created_at_epoch: durable_info.created_at_epoch,
+            comment_url: durable_info.comment_url.clone(),
         });
     persist_session(app, &live);
 
@@ -1510,6 +1510,7 @@ mod tests {
             turn_id: "tn1".to_string(),
             pr_number: 7,
             kind: "review".to_string(),
+            engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 0,
             comment_url: None,
@@ -1535,6 +1536,7 @@ mod tests {
                 turn_id: String::new(),
                 pr_number: pr,
                 kind: kind.to_string(),
+                engine_kind: EngineKind::Codex,
                 status,
                 created_at_epoch: 0,
                 comment_url: None,
@@ -1592,6 +1594,7 @@ mod tests {
             turn_id: "tn".to_string(),
             pr_number: 7,
             kind: "review".to_string(),
+            engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 0,
             comment_url: None,
@@ -1637,6 +1640,7 @@ mod tests {
                 turn_id: String::new(),
                 pr_number: 9,
                 kind: "review".to_string(),
+                engine_kind: EngineKind::Codex,
                 status: SessionStatus::Running,
                 created_at_epoch: 0,
                 comment_url: None,
@@ -1679,6 +1683,7 @@ mod tests {
                 turn_id: String::new(),
                 pr_number: 7,
                 kind: "review".to_string(),
+                engine_kind: EngineKind::Codex,
                 status: SessionStatus::Starting,
                 created_at_epoch: 0,
                 comment_url: None,
@@ -1713,6 +1718,7 @@ mod tests {
                 turn_id: String::new(),
                 pr_number: 7,
                 kind: "review".to_string(),
+                engine_kind: EngineKind::Codex,
                 status: SessionStatus::Starting,
                 created_at_epoch: 0,
                 comment_url: None,
@@ -1748,6 +1754,7 @@ mod tests {
                 turn_id: String::new(),
                 pr_number: 7,
                 kind: "review".to_string(),
+                engine_kind: EngineKind::Codex,
                 status: SessionStatus::Starting,
                 created_at_epoch: 0,
                 comment_url: None,
@@ -1808,6 +1815,7 @@ mod tests {
             turn_id: "tn1".to_string(),
             pr_number: 7,
             kind: "review".to_string(),
+            engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 0,
             comment_url: None,
@@ -1843,6 +1851,7 @@ mod tests {
                 turn_id: "tn".to_string(),
                 pr_number: 7,
                 kind: "review".to_string(),
+                engine_kind: EngineKind::Codex,
                 status,
                 created_at_epoch: 0,
                 comment_url: None,
@@ -1897,6 +1906,7 @@ mod tests {
                 turn_id: String::new(),
                 pr_number: 7,
                 kind: "review".to_string(),
+                engine_kind: EngineKind::Codex,
                 status: SessionStatus::Done,
                 created_at_epoch: 0,
                 comment_url: None,
@@ -1923,6 +1933,7 @@ mod tests {
             turn_id: "tn1".to_string(),
             pr_number: 7,
             kind: "review".to_string(),
+            engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 0,
             comment_url: None,
@@ -1949,6 +1960,7 @@ mod tests {
             turn_id: "tn1".to_string(),
             pr_number: 7,
             kind: "review".to_string(),
+            engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 1_700_000_000,
             // AB#1042: a resolved comment URL must surface as camelCase `commentUrl`.
@@ -1966,6 +1978,7 @@ mod tests {
         // `ReviewSession.kind` in `src/review/types.ts`); pin it so a rename / drop
         // surfaces here in lockstep with the camelCase keys.
         assert_eq!(v["kind"], "review");
+        assert_eq!(v["engineKind"], "codex");
         assert_eq!(v["status"], "running");
         // AB#1042: `commentUrl` serializes camelCase; the snake_case form stays absent and
         // is mirrored by the optional `ReviewSession.commentUrl` on the TS side.
@@ -1973,6 +1986,7 @@ mod tests {
         assert!(v.get("comment_url").is_none());
         assert!(v.get("project_id").is_none());
         assert!(v.get("thread_id").is_none());
+        assert!(v.get("engine_kind").is_none());
         assert!(v.get("created_at_epoch").is_none());
 
         // `comment_url: None` OMITS the key (skip_serializing_if) so the wire matches the
@@ -1985,6 +1999,7 @@ mod tests {
                 turn_id: "tn1".to_string(),
                 pr_number: 7,
                 kind: "review".to_string(),
+                engine_kind: EngineKind::Codex,
                 status: SessionStatus::Running,
                 created_at_epoch: 1_700_000_000,
                 comment_url: None,
@@ -2020,6 +2035,7 @@ mod tests {
             turn_id: String::new(),
             pr_number: 7,
             kind: "review".to_string(),
+            engine_kind: EngineKind::Codex,
             status: SessionStatus::Starting,
             created_at_epoch: 0,
             comment_url: None,

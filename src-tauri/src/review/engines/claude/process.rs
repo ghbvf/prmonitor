@@ -15,7 +15,7 @@
 use std::process::Stdio;
 
 use serde::Serialize;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
 use crate::error::{AppError, AppResult};
@@ -292,6 +292,33 @@ fn claude_cli_args(model: &str, prompt: &str, resume: Option<&str>) -> Vec<Strin
     args
 }
 
+/// Build args for a follow-up chat turn. Unlike the initial `/pr-review` prompt, the user's
+/// free-form message is sensitive and must not be placed in argv; the caller writes it to
+/// stdin. Tools are disabled and permission mode is default because this is a read-only chat
+/// answer path, not an unattended code-action path.
+fn claude_stdin_chat_args(model: &str, resume: &str) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_string(),
+        "--input-format".to_string(),
+        "text".to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--include-partial-messages".to_string(),
+        "--permission-mode".to_string(),
+        "default".to_string(),
+        "--tools".to_string(),
+        String::new(),
+        "--resume".to_string(),
+        resume.to_string(),
+    ];
+    if !model.trim().is_empty() {
+        args.push("--model".to_string());
+        args.push(model.trim().to_string());
+    }
+    args
+}
+
 /// Spawn `claude -p "<prompt>" --output-format stream-json --verbose
 /// --include-partial-messages --permission-mode bypassPermissions [--model <name>]
 /// [--resume <id>]` in `repo_root`, with piped stdout/stderr and `kill_on_drop(true)`.
@@ -319,6 +346,55 @@ pub fn spawn_claude(
     let mut child = cmd
         .spawn()
         .map_err(|e| AppError::new(format!("无法启动 claude（未安装或不在 PATH？）: {e}")))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::new("claude stdout 不可用".to_string()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::new("claude stderr 不可用".to_string()))?;
+    Ok(ClaudeProcess {
+        child,
+        stdout,
+        stderr,
+    })
+}
+
+/// Spawn a restricted follow-up `claude -p --resume <id>` and send the user's message through
+/// stdin instead of argv. The returned stdout/stderr are ready for the normal stream parser.
+pub async fn spawn_claude_stdin_chat(
+    claude_bin: &str,
+    repo_root: &str,
+    model: &str,
+    prompt: &str,
+    resume: &str,
+) -> AppResult<ClaudeProcess> {
+    let mut cmd = Command::new(claude_bin);
+    cmd.args(claude_stdin_chat_args(model, resume))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if !repo_root.trim().is_empty() {
+        cmd.current_dir(repo_root);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| AppError::new(format!("无法启动 claude（未安装或不在 PATH？）: {e}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| AppError::new("claude stdin 不可用".to_string()))?;
+    stdin
+        .write_all(prompt.as_bytes())
+        .await
+        .map_err(|e| AppError::new(format!("写入 claude stdin 失败: {e}")))?;
+    stdin
+        .shutdown()
+        .await
+        .map_err(|e| AppError::new(format!("关闭 claude stdin 失败: {e}")))?;
     let stdout = child
         .stdout
         .take()
@@ -471,6 +547,25 @@ mod tests {
                 assert!(!p.contains(pat.as_str()), "{p:?} must not contain {pat:?}");
             }
         }
+    }
+
+    #[test]
+    fn stdin_chat_args_do_not_include_prompt_and_disable_tools() {
+        let args = claude_stdin_chat_args(" sonnet ", "sess-1");
+        assert!(args.contains(&"-p".to_string()));
+        assert!(args.contains(&"--input-format".to_string()));
+        assert!(args.contains(&"text".to_string()));
+        assert!(args.contains(&"--resume".to_string()));
+        assert!(args.contains(&"sess-1".to_string()));
+        assert!(args.contains(&"--permission-mode".to_string()));
+        assert!(args.contains(&"default".to_string()));
+        assert!(args.contains(&"--tools".to_string()));
+        assert!(
+            !args.contains(&"user secret prompt".to_string()),
+            "the chat prompt is written to stdin, never argv"
+        );
+        let model_pos = args.iter().position(|a| a == "--model").expect("model set");
+        assert_eq!(args[model_pos + 1], "sonnet");
     }
 
     // ── CLI arg builder (the --model injection seam — NO subprocess) ─────────────

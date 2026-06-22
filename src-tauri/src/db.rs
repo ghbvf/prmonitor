@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -176,6 +176,9 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 2 {
         apply_v2(conn)?;
     }
+    if version < 3 {
+        apply_v3(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -194,6 +197,16 @@ fn apply_v1(conn: &Connection) -> AppResult<()> {
 fn apply_v2(conn: &Connection) -> AppResult<()> {
     conn.execute_batch("ALTER TABLE review_session ADD COLUMN comment_url TEXT;")
         .map_err(map_err)?;
+    Ok(())
+}
+
+/// v3 (PR #176 fix): persist the engine that created each review session. Existing rows
+/// predate Claude, so the only valid historical default is `codex`.
+fn apply_v3(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(
+        "ALTER TABLE review_session ADD COLUMN engine_kind TEXT NOT NULL DEFAULT 'codex';",
+    )
+    .map_err(map_err)?;
     Ok(())
 }
 
@@ -321,12 +334,10 @@ mod tests {
         assert!(db.legacy_imported().expect("read guard"));
     }
 
-    /// v1 → v2 migration lock (AB#1042, Medium): a DB stamped at v1 (no `comment_url`)
-    /// must gain the column after `run_migrations` runs ONLY the v2 step (not re-running
-    /// v1, which would "duplicate column" had v1 carried it). Seed the v1 schema directly,
-    /// stamp `user_version = 1`, migrate, and assert the column now exists + version is 2.
+    /// v1 → current migration lock: a DB stamped at v1 (no post-v1 columns) must gain every
+    /// later review_session column and stamp to the current schema version.
     #[test]
-    fn migrate_v1_to_v2_adds_comment_url_column() {
+    fn migrate_v1_to_current_adds_review_session_columns() {
         let conn = rusqlite::Connection::open_in_memory().expect("open");
         // Replay v1 exactly as an existing v1 install has it (no `comment_url`), then stamp
         // the version so the runner sees a v1 DB and applies only the v2 delta.
@@ -339,25 +350,26 @@ mod tests {
             "v1 must not already have comment_url"
         );
 
-        run_migrations(&conn).expect("v1 → v2 migrates");
+        run_migrations(&conn).expect("v1 → current migrates");
 
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("read version");
-        assert_eq!(version, 2, "stamped to v2");
+        assert_eq!(version, SCHEMA_VERSION, "stamped to current schema");
         assert!(
             review_session_has_comment_url(&conn),
             "v2 added the comment_url column"
         );
+        assert!(
+            review_session_has_engine_kind(&conn),
+            "v3 added the engine_kind column"
+        );
     }
 
-    /// Fresh v0 → v2 migration lock (AB#1042, Medium): opening a brand-new DB replays ALL
-    /// migrations from `user_version = 0` (v1 then v2). Assert the runner lands on
-    /// `SCHEMA_VERSION` AND that the v2 `comment_url` column is present — so a fresh install
-    /// (the common case, distinct from the upgrade path in `migrate_v1_to_v2_*`) gets the
-    /// terminal-URL column, not just an upgraded one.
+    /// Fresh migration lock: opening a brand-new DB replays ALL migrations. Assert the runner
+    /// lands on `SCHEMA_VERSION` AND that every post-v1 column is present.
     #[test]
-    fn fresh_open_migrates_to_v2_with_comment_url_column() {
+    fn fresh_open_migrates_to_current_schema() {
         let db = Database::open_in_memory().expect("open");
         db.with_conn(|conn| {
             let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
@@ -365,18 +377,56 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 2, "current schema is v2");
+            assert_eq!(SCHEMA_VERSION, 3, "current schema is v3");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"
+            );
+            assert!(
+                review_session_has_engine_kind(conn),
+                "fresh v0 → v3 has the engine_kind column"
             );
             Ok(())
         })
         .expect("query");
     }
 
+    /// v2 → v3 migration lock: persisted review sessions must carry the engine that created
+    /// them, so a follow-up after config changes routes back to the original engine.
+    #[test]
+    fn migrate_v2_to_v3_adds_engine_kind_column() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        apply_v1(&conn).expect("seed v1");
+        apply_v2(&conn).expect("seed v2");
+        conn.pragma_update(None, "user_version", 2)
+            .expect("stamp v2");
+        assert!(
+            !review_session_has_engine_kind(&conn),
+            "v2 must not already have engine_kind"
+        );
+
+        run_migrations(&conn).expect("v2 -> v3 migrates");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read version");
+        assert_eq!(version, 3, "stamped to v3");
+        assert!(
+            review_session_has_engine_kind(&conn),
+            "v3 added the engine_kind column"
+        );
+    }
+
     /// Whether `review_session` has a `comment_url` column (via `PRAGMA table_info`).
     fn review_session_has_comment_url(conn: &Connection) -> bool {
+        review_session_has_column(conn, "comment_url")
+    }
+
+    fn review_session_has_engine_kind(conn: &Connection) -> bool {
+        review_session_has_column(conn, "engine_kind")
+    }
+
+    fn review_session_has_column(conn: &Connection, column: &str) -> bool {
         let mut stmt = conn
             .prepare("PRAGMA table_info(review_session)")
             .expect("table_info");
@@ -385,7 +435,7 @@ mod tests {
             .expect("query")
             .collect::<rusqlite::Result<_>>()
             .expect("collect");
-        names.iter().any(|n| n == "comment_url")
+        names.iter().any(|n| n == column)
     }
 
     /// Forward-compat guard (pr-review F3): a DB stamped with a HIGHER schema version than

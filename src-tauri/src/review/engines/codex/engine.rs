@@ -7,7 +7,7 @@
 use super::CodexManager;
 use crate::error::AppResult;
 use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
-use crate::review::session::{self, CommentUrlContext, SessionRegistry};
+use crate::review::session::{self, CommentUrlContext, SessionInfo, SessionRegistry};
 
 /// Per-request engine handle. Borrows the long-lived state from `AppState` plus
 /// the request's `AppHandle`; constructed fresh by each command (cheap — all
@@ -45,6 +45,9 @@ pub struct CodexEngine<'a, R: tauri::Runtime> {
     /// `start`/`stop` paths take `pr_number` as a method arg and ignore this field (set to 0
     /// at those construction sites).
     pub pr_number: u64,
+    /// Full persisted session identity for the FOLLOW-UP path. It pins the creating engine,
+    /// original kind, timestamp, and URL metadata across app restarts/config edits.
+    pub session_info: Option<SessionInfo>,
 }
 
 impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
@@ -93,6 +96,9 @@ impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
             self.codex_model,
             self.project_id,
             self.pr_number,
+            self.session_info
+                .as_ref()
+                .expect("CodexEngine::send_message requires session_info"),
             session,
             message,
             user_item_id,

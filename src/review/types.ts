@@ -30,6 +30,9 @@ export interface ReviewSession {
   turnId: string;
   prNumber: number;
   kind: string;
+  // Engine that created this session. Follow-up chat routes by this durable value, not
+  // by the project's current engine setting.
+  engineKind: "codex" | "claude";
   status: SessionStatus;
   // Wall-clock epoch seconds the session was created (#70, review F10): the newest-first
   // sort key for the session list. Mirrors `SessionInfo.created_at_epoch` (Rust) — a UUID
