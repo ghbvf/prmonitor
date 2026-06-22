@@ -12,6 +12,7 @@ import ProjectNav from "./pr/ProjectNav.vue";
 import WebhookPanel from "./pr/WebhookPanel.vue";
 import { usePrStore } from "./pr/usePrStore";
 import StatusBar from "./StatusBar.vue";
+import SplitPane from "./SplitPane.vue";
 import ReviewPanel from "./review/ReviewPanel.vue";
 import ReviewSessions from "./review/ReviewSessions.vue";
 import { useReviewStore } from "./review/useReviewStore";
@@ -335,11 +336,17 @@ watch(selectedNumber, (n) => {
             </button>
           </p>
         </div>
-        <ReviewSessions
-          :project-id="activeProjectId"
-          :pr-number="selectedPr?.number ?? null"
-        />
-        <ReviewPanel :selected-pr="selectedPr" />
+        <SplitPane>
+          <template #top>
+            <ReviewSessions
+              :project-id="activeProjectId"
+              :pr-number="selectedPr?.number ?? null"
+            />
+          </template>
+          <template #bottom>
+            <ReviewPanel :selected-pr="selectedPr" />
+          </template>
+        </SplitPane>
       </main>
     </div>
 
@@ -419,13 +426,25 @@ body {
   padding: var(--space-6);
 }
 
+/* Flex column so the banner stays pinned at top and the SplitPane below owns the rest
+   of the height. overflow:hidden (was overflow-y:auto) hands scrolling to each split
+   pane individually instead of one shared scrollbar over the whole content. */
 .content {
+  display: flex;
+  flex-direction: column;
   flex: 1;
-  overflow-y: auto;
+  min-height: 0;
+  overflow: hidden;
   padding: var(--space-6);
 }
 
 .availability {
+  flex-shrink: 0;
+  /* Cap the alert banner and let it scroll internally: with .content clipping its own
+     overflow, a tall banner (several config/CLI/dispatch warnings in a short window)
+     would otherwise crush the SplitPane below into an unreachable sliver. */
+  max-height: 40%;
+  overflow-y: auto;
   margin-bottom: var(--space-6);
   padding: var(--space-4) var(--space-6);
   border: 1px solid var(--color-warn-border);
