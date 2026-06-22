@@ -172,10 +172,7 @@ fn build_app() {
                 let _ = app.deep_link().register_all();
                 let handle = app.handle().clone();
                 app.deep_link().on_open_url(move |event| {
-                    tauri::async_runtime::spawn(review::deeplink::handle_review_deeplink(
-                        handle.clone(),
-                        event.urls(),
-                    ));
+                    review::deeplink::handle_review_deeplink(handle.clone(), event.urls());
                 });
             }
             Ok(())

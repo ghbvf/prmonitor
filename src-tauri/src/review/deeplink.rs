@@ -40,6 +40,11 @@ pub(crate) const SCHEME: &str = "prmonitor";
 /// be added here + routed in [`parse_review_deeplink`]; an unknown action is rejected.
 const ACTION_REVIEW: &str = "review";
 
+/// Default `kind` when the deeplink omits `?kind=` (parity with the CLI, where the absence of
+/// `--check` means a review). Kept distinct from [`ACTION_REVIEW`]: they coincide as `"review"`
+/// today, but the URL action and the review-turn kind are separate concepts.
+const DEFAULT_KIND: &str = "review";
+
 /// A validated deeplink trigger: the funnel inputs ([`commands::trigger_review`] takes the same
 /// `(reference, pr_number, kind)`). `reference` is a project `id` OR a `repo` (resolved downstream
 /// by `project_by_ref_validated`); exactly one of `repo` / `projectId` produced it.
@@ -59,6 +64,8 @@ pub(crate) struct ParsedTrigger {
 /// means a review). Unknown query keys are ignored (forward-compat) — only the validated fields
 /// are the contract.
 pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedTrigger> {
+    // `Url` ASCII-lowercases the scheme (WHATWG URL), so an OS that hands us `PRMONITOR://…`
+    // still matches the lowercase `SCHEME` (locked by `tests::accepts_uppercase_scheme_*`).
     if url.scheme() != SCHEME {
         return Err(AppError::new(format!(
             "deeplink scheme 非法（期望 {SCHEME}://）: {:?}",
@@ -108,12 +115,16 @@ pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedTrigger> {
         }
         (None, None) => return Err(AppError::new("deeplink 缺少 repo 或 projectId")),
     };
-    if reference.trim().is_empty() {
+    // Trim like `local_api::resolve_reference` so `?repo=%20octo/app` resolves identically across
+    // transports, and a whitespace-only reference fails closed HERE rather than deep in project
+    // lookup. Use the trimmed value downstream (not the raw one).
+    let reference = reference.trim().to_string();
+    if reference.is_empty() {
         return Err(AppError::new("deeplink repo/projectId 为空"));
     }
 
     // `kind`: default "review"; otherwise the SAME whitelist the funnel enforces.
-    let kind = kind.unwrap_or_else(|| ACTION_REVIEW.to_string());
+    let kind = kind.unwrap_or_else(|| DEFAULT_KIND.to_string());
     validate_kind(&kind)?;
 
     Ok(ParsedTrigger {
@@ -126,8 +137,9 @@ pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedTrigger> {
 /// Handle a batch of opened deeplink URLs (the `on_open_url` payload). Pulls the window forward
 /// immediately (GitButler's show/focus on open), then triggers each URL on its OWN task so a
 /// long-running review for `urls[0]` never blocks triggering `urls[1]` (multiple URLs in one
-/// event is rare, but serial `.await` would stall behind a full review).
-pub(crate) async fn handle_review_deeplink<R: Runtime>(app: AppHandle<R>, urls: Vec<Url>) {
+/// event is rare, but serial `.await` would stall behind a full review). Synchronous: it only
+/// fans out spawns and returns, so the `on_open_url` callback calls it directly (no outer spawn).
+pub(crate) fn handle_review_deeplink<R: Runtime>(app: AppHandle<R>, urls: Vec<Url>) {
     focus_main_window(&app);
     for url in urls {
         tauri::async_runtime::spawn(handle_one(app.clone(), url));
@@ -139,9 +151,17 @@ async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
     let trigger = match parse_review_deeplink(&url) {
         Ok(t) => t,
         // Malformed / forged URL: reject — no trigger, no panic (acceptance ③). Fire-and-forget
-        // has no return channel, so a stderr line is the only surface.
+        // has no return channel, so a stderr line is the only surface. Log structured fields only
+        // (scheme + action), NOT the full URL: its `repo`/`projectId` query values are
+        // percent-decoded and may name private projects — kept symmetric with the trigger-failure
+        // log below (pr/kind only).
         Err(e) => {
-            eprintln!("deeplink 拒绝（{url}）: {}", e.message);
+            eprintln!(
+                "deeplink 拒绝（scheme={} action={:?}）: {}",
+                url.scheme(),
+                url.host_str(),
+                e.message
+            );
             return;
         }
     };
@@ -177,7 +197,11 @@ async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
 
     // Subscribe AFTER trigger: `subscribe_completion` is get-or-create and RETAINS the last value,
     // so even if the turn finalized between trigger and here, the receiver reads the retained
-    // `Some(outcome)` — there is no "subscribed too late" race (see `session.rs`).
+    // `Some(outcome)` — there is no "subscribed too late" race (proven by
+    // `session.rs::tests::signal_completion_carries_each_terminal_status` + the get-or-create doc).
+    // This task owns NO subprocess (the engine's child is tracked by codex/claude `shutdown` on
+    // `RunEvent::Exit`); on app exit the registry's watch senders drop, `rx.changed()` errors, and
+    // the loop returns — so it needs no explicit abort registration.
     let mut rx = app
         .state::<AppState>()
         .sessions
@@ -202,11 +226,17 @@ async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
 fn notify_completion<R: Runtime>(app: &AppHandle<R>, pr_number: u64, outcome: &CompletionOutcome) {
     use tauri_plugin_notification::NotificationExt;
 
+    // Whitelist the known terminal statuses; never reflect codex's raw `wire_status` (it comes from
+    // the codex subprocess) into the notification title. An unexpected value gets a fixed label +
+    // a diagnostic log rather than surfacing arbitrary content.
     let status_label = match outcome.wire_status.as_str() {
         "completed" => "完成",
         "interrupted" => "已中断",
         "failed" => "失败",
-        other => other,
+        other => {
+            eprintln!("deeplink 通知：未知 wire_status {other:?}");
+            "结束"
+        }
     };
     let title = format!("PR #{pr_number} review {status_label}");
     let body = outcome
@@ -234,7 +264,8 @@ mod tests {
     use super::*;
 
     fn parse(s: &str) -> AppResult<ParsedTrigger> {
-        parse_review_deeplink(&Url::parse(s).expect("test url parses"))
+        let url = Url::parse(s).unwrap_or_else(|e| panic!("test url {s:?} is malformed: {e}"));
+        parse_review_deeplink(&url)
     }
 
     #[test]
@@ -254,6 +285,34 @@ mod tests {
     fn kind_defaults_to_review_when_absent() {
         let p = parse("prmonitor://review?pr=7&repo=octo/app").expect("ok");
         assert_eq!(p.kind, "review");
+    }
+
+    #[test]
+    fn duplicate_pr_key_last_wins() {
+        // Documents the parser's "last value wins" for a repeated key (not first, not reject).
+        let p = parse("prmonitor://review?pr=1&repo=octo/app&pr=2").expect("ok");
+        assert_eq!(p.pr_number, 2);
+    }
+
+    #[test]
+    fn trims_surrounding_whitespace_in_reference() {
+        // `%20…%20` decodes to " octo/app " → trimmed to "octo/app" (parity with local_api).
+        let p = parse("prmonitor://review?pr=7&repo=%20octo/app%20").expect("ok");
+        assert_eq!(p.reference, "octo/app");
+    }
+
+    #[test]
+    fn rejects_whitespace_only_reference() {
+        // `?repo=%20%20` decodes to "  " → trimmed empty → rejected (not handed to project lookup).
+        assert!(parse("prmonitor://review?pr=7&repo=%20%20").is_err());
+    }
+
+    #[test]
+    fn accepts_uppercase_scheme_normalized_by_url_crate() {
+        // The `url` crate ASCII-lowercases the scheme (WHATWG URL), so an OS that hands us
+        // `PRMONITOR://…` still matches `SCHEME`. Locks that assumption (see parser comment).
+        let p = parse("PRMONITOR://review?pr=7&repo=octo/app").expect("ok");
+        assert_eq!(p.pr_number, 7);
     }
 
     #[test]
