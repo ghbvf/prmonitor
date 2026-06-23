@@ -1,4 +1,4 @@
-//! Azure DevOps [`super::source::PrSource`] implementation via the `az` CLI (#818).
+//! Azure DevOps [`super::source::EventSourceProvider`] implementation via the `az` CLI (#818).
 //!
 //! `discover_rows` shells out to ONE `az repos pr list --organization
 //! https://dev.azure.com/<org> --project <project> --repository <repo> --status
@@ -21,10 +21,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::error::{AppError, AppResult};
-use crate::model::{Candidate, LabelSource};
+use crate::model::{Candidate, Event, EventType, LabelSource, SourceKind};
 
 use super::labels;
-use super::source::PrSource;
+use super::source::{pr_dedupe_key, DiscoveredEvent, EventSourceProvider};
 
 /// Wall-clock budget for the single `az` invocation. A hung subprocess (network
 /// stall, auth prompt) is bounded here; `kill_on_drop(true)` means dropping the
@@ -178,12 +178,12 @@ struct RawPr {
 /// marks a PR that carried BOTH trigger labels — kept (not dropped) here and surfaced
 /// with a skip reason by `commands::build_view`, exactly like the gh path.
 #[derive(Debug, Clone)]
-pub struct AzRow {
-    pub candidate: Candidate,
-    pub title: String,
-    pub labels: Vec<String>,
-    pub url: String,
-    pub conflict: bool,
+struct AzRow {
+    candidate: Candidate,
+    title: String,
+    labels: Vec<String>,
+    url: String,
+    conflict: bool,
 }
 
 /// Parses `az repos pr list --output json` output (a JSON array) into display-ready
@@ -211,7 +211,7 @@ pub struct AzRow {
 ///
 /// Pure (no `az` call) so the classify / conflict / field-mapping / url-build semantics
 /// are unit-tested without a live Azure DevOps connection.
-pub fn parse_rows(
+fn parse_rows(
     json: &str,
     org: &str,
     project: &str,
@@ -297,10 +297,12 @@ pub fn parse_rows(
 }
 
 /// The gating projection of discovered rows (#818 F10): the [`Candidate`]s, EXCLUDING
-/// conflict rows (mirrors gh.rs `PrSource::discover`, which filters `conflict` before
-/// dispatch). The SINGLE canonical "rows → dispatch candidates" step shared by both the
-/// trait [`PrSource::discover`] (over live `discover_rows`) and [`parse_pr_list`] (over a
-/// parsed JSON string), so the conflict-drop logic lives in exactly one place.
+/// conflict rows (mirrors gh.rs, which filters `conflict` before dispatch). `#[cfg(test)]`:
+/// the live path now produces normalized [`DiscoveredEvent`]s (AB#1070) and applies the
+/// conflict gate downstream in `commands::build_view_parts`, so this gating projection
+/// survives ONLY as the convenience [`parse_pr_list`] uses to exercise the conflict drop in
+/// unit tests.
+#[cfg(test)]
 fn rows_into_candidates(rows: Vec<AzRow>) -> Vec<Candidate> {
     rows.into_iter()
         .filter(|row| !row.conflict)
@@ -311,8 +313,9 @@ fn rows_into_candidates(rows: Vec<AzRow>) -> Vec<Candidate> {
 /// Gating-only view over [`parse_rows`]: the [`Candidate`]s, EXCLUDING conflict rows (via
 /// [`rows_into_candidates`]). The url args don't affect the candidate shape, so callers
 /// that only want candidates pass the project's org/project/repo. `#[cfg(test)]`: the live
-/// path goes through `discover_rows` → trait `discover` → [`rows_into_candidates`], so this
-/// string-input convenience exists ONLY to exercise the gating projection in unit tests.
+/// path goes through `discover_rows` → `discover_events` (which keeps every row and gates
+/// `conflict` downstream in `commands`), so this string-input convenience exists ONLY to
+/// exercise the gating/conflict-drop projection in unit tests.
 #[cfg(test)]
 fn parse_pr_list(
     json: &str,
@@ -452,7 +455,7 @@ impl AzureDevOpsCli {
     /// so the `pr` slice's view path treats both sources identically. ONE `az` call (vs
     /// gh's two), then [`parse_rows`] (passing the org/project/repo so the row url is
     /// constructed).
-    pub async fn discover_rows(&self) -> AppResult<Vec<AzRow>> {
+    async fn discover_rows(&self) -> AppResult<Vec<AzRow>> {
         let json = self.run_pr_list().await?;
         parse_rows(
             &json,
@@ -466,12 +469,47 @@ impl AzureDevOpsCli {
     }
 }
 
-impl PrSource for AzureDevOpsCli {
-    /// Trait view: gating [`Candidate`]s only, excluding conflict PRs (mirrors gh.rs's
-    /// `discover`, which drops both-label PRs before dispatch). The list UI uses
-    /// [`Self::discover_rows`] for the full display fields.
-    async fn discover(&self) -> AppResult<Vec<Candidate>> {
-        Ok(rows_into_candidates(self.discover_rows().await?))
+/// Builds a [`DiscoveredEvent`] from one display-ready [`AzRow`] (AB#1070): the normalized
+/// AB#1079 [`Event`] is constructed from the SAME already-parsed locals the row holds,
+/// alongside the row's gating [`Candidate`] and `conflict` flag. `repo` is the impl's bare
+/// monitored repo name. `project_id` / `received_at_epoch` are left at zero/empty values for
+/// the future inbox (AB#1065) to stamp on ingest. Always a `PullRequest` event (the only class
+/// a PR source emits).
+fn row_into_event(row: AzRow, repo: &str) -> DiscoveredEvent {
+    let event = Event {
+        // Wire literal "azure" matches `SourceKind::Azure`'s serde string (format single-sourced).
+        dedupe_key: pr_dedupe_key("azure", repo, row.candidate.number, &row.candidate.head_sha),
+        source: SourceKind::Azure,
+        event_type: EventType::PullRequest,
+        project_id: String::new(),
+        repo: repo.to_string(),
+        number: Some(row.candidate.number),
+        title: row.title.clone(),
+        // body 抓取留待 AB#1068（rule engine）
+        body: String::new(),
+        labels: row.labels.clone(),
+        url: row.url.clone(),
+        received_at_epoch: 0,
+    };
+    DiscoveredEvent {
+        event,
+        candidate: row.candidate,
+        conflict: row.conflict,
+    }
+}
+
+impl EventSourceProvider for AzureDevOpsCli {
+    /// Discovers active PRs (conflict rows included, marked) as normalized AB#1079
+    /// [`DiscoveredEvent`]s (AB#1070): the live producer. The display-ready rows from
+    /// [`Self::discover_rows`] are each mapped to a `PullRequest` [`Event`] + gating
+    /// [`Candidate`] via [`row_into_event`].
+    async fn discover_events(&self) -> AppResult<Vec<DiscoveredEvent>> {
+        Ok(self
+            .discover_rows()
+            .await?
+            .into_iter()
+            .map(|row| row_into_event(row, &self.repo))
+            .collect())
     }
 }
 
@@ -602,6 +640,27 @@ mod tests {
             "https://dev.azure.com/myorg/myproject/_git/myrepo/pullrequest/12"
         );
         assert!(!row.conflict);
+
+        // AB#1070: the same row maps to a normalized `Event` (PullRequest) on a
+        // `DiscoveredEvent`, built from the SAME parsed locals, while the gating
+        // `Candidate` rides along unchanged.
+        let de = row_into_event(r[0].clone(), REPO);
+        assert_eq!(de.event.source, SourceKind::Azure);
+        assert_eq!(de.event.event_type, EventType::PullRequest);
+        assert_eq!(de.event.number, Some(de.candidate.number));
+        assert_eq!(de.event.title, "Add widget");
+        assert_eq!(
+            de.event.url,
+            "https://dev.azure.com/myorg/myproject/_git/myrepo/pullrequest/12"
+        );
+        assert_eq!(
+            de.event.labels,
+            vec![REVIEW.to_string(), "area/ui".to_string()]
+        );
+        assert_eq!(de.event.body, "");
+        // dedupe_key is the exact inbox idempotency-key seed (format single-sourced).
+        assert_eq!(de.event.dedupe_key, "azure:pullRequest:myrepo#12@abc123");
+        assert!(!de.conflict);
     }
 
     // #124 F5: the backend allows spaces / unicode in Azure project & repo names (separate

@@ -13,8 +13,8 @@
 //! - `listener`: bind only, spawn NO child; the tunnel is fully external; the public
 //!   URL comes from config.
 //!
-//! **Push, not pull — so it does NOT implement [`super::source::PrSource`].** That
-//! trait's `discover()` is pull-shaped (the scheduler asks `gh` for the current
+//! **Push, not pull — so it does NOT implement [`super::source::EventSourceProvider`].** That
+//! trait's `discover_events()` is pull-shaped (the scheduler asks `gh` for the current
 //! list); a webhook is push-shaped (GitHub hands us one event). Per the
 //! [`crate::dispatch`] doc, "a future webhook trigger calls the same `auto_dispatch`
 //! with the candidates a push event yields" — that is exactly this module: the

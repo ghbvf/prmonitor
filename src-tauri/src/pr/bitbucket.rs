@@ -1,5 +1,5 @@
-//! Bitbucket Server / Data Center [`super::source::PrSource`] implementation via the
-//! REST API v1.0 over HTTP (`reqwest`) (AB#717).
+//! Bitbucket Server / Data Center [`super::source::EventSourceProvider`] implementation via
+//! the REST API v1.0 over HTTP (`reqwest`) (AB#717).
 //!
 //! `discover_rows` GETs `{host}/rest/api/1.0/projects/{project}/repos/{repo}/pull-requests
 //! ?state=OPEN` (paginated `start`/`limit` until `isLastPage`), authenticating with
@@ -16,10 +16,10 @@
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
-use crate::model::{Candidate, LabelSource};
+use crate::model::{Candidate, Event, EventType, LabelSource, SourceKind};
 
 use super::labels;
-use super::source::PrSource;
+use super::source::{pr_dedupe_key, DiscoveredEvent, EventSourceProvider};
 
 /// Wall-clock budget for any single Bitbucket REST request (parity with gh/az's 30s).
 /// Applied by the `reqwest` client builder; a hung request is bounded here.
@@ -136,12 +136,12 @@ struct BbPage {
 /// fields, same `conflict` semantics) so the `pr` slice's view path treats all sources
 /// identically.
 #[derive(Debug, Clone)]
-pub struct BbRow {
-    pub candidate: Candidate,
-    pub title: String,
-    pub labels: Vec<String>,
-    pub url: String,
-    pub conflict: bool,
+struct BbRow {
+    candidate: Candidate,
+    title: String,
+    labels: Vec<String>,
+    url: String,
+    conflict: bool,
 }
 
 /// The trailing `BB_ERR_BODY_TAIL_CHARS` chars of an error body (char-counted so it never
@@ -279,8 +279,10 @@ fn map_rows(
 
 /// Parses ONE page of `pull-requests` JSON (a `{ "values": [...] }` object) into
 /// display-ready [`BbRow`]s. Pure (no HTTP) so the field-mapping / classify / url-build
-/// semantics are unit-tested with golden Server JSON.
-pub fn parse_rows(
+/// semantics are unit-tested with golden Server JSON. `#[cfg(test)]`: the live path
+/// (`discover_rows`) calls [`map_rows`] directly; this string-input wrapper is test-only.
+#[cfg(test)]
+fn parse_rows(
     page_json: &str,
     host: &str,
     project: &str,
@@ -303,8 +305,11 @@ pub fn parse_rows(
 }
 
 /// The gating projection of discovered rows: the [`Candidate`]s, EXCLUDING conflict rows
-/// (mirrors gh.rs / azure.rs, which drop both-label PRs before dispatch). The single
-/// "rows → dispatch candidates" step.
+/// (mirrors gh.rs / azure.rs). `#[cfg(test)]`: the live path now produces normalized
+/// [`DiscoveredEvent`]s (AB#1070) and applies the conflict gate downstream in
+/// `commands::build_view_parts`, so this gating projection survives ONLY for the unit-test
+/// `candidates` helper.
+#[cfg(test)]
 fn rows_into_candidates(rows: Vec<BbRow>) -> Vec<Candidate> {
     rows.into_iter()
         .filter(|row| !row.conflict)
@@ -408,7 +413,7 @@ impl BitbucketServer {
     /// Discovers all open PRs as display-ready [`BbRow`]s (conflict rows included, marked).
     /// Follows pagination (`start`/`nextPageStart` until `isLastPage`), bounded by
     /// [`BB_MAX_PAGES`] / [`BB_MAX_PRS`], then maps via [`map_rows`].
-    pub async fn discover_rows(&self) -> AppResult<Vec<BbRow>> {
+    async fn discover_rows(&self) -> AppResult<Vec<BbRow>> {
         let client = reqwest::Client::builder()
             .timeout(BB_TIMEOUT)
             // Defense-in-depth alongside the config-time `https://` check: never send the
@@ -465,11 +470,53 @@ impl BitbucketServer {
     }
 }
 
-impl PrSource for BitbucketServer {
-    /// Trait view: gating [`Candidate`]s only, excluding conflict PRs (mirrors gh.rs /
-    /// azure.rs). The list UI uses [`Self::discover_rows`] for the full display fields.
-    async fn discover(&self) -> AppResult<Vec<Candidate>> {
-        Ok(rows_into_candidates(self.discover_rows().await?))
+/// Builds a [`DiscoveredEvent`] from one display-ready [`BbRow`] (AB#1070): the normalized
+/// AB#1079 [`Event`] is constructed from the SAME already-parsed locals the row holds,
+/// alongside the row's gating [`Candidate`] and `conflict` flag. `repo` is the impl's bare
+/// monitored repo slug. `project_id` / `received_at_epoch` are left at zero/empty values —
+/// the source produces the content envelope; the future inbox (AB#1065) stamps the ingress
+/// context (it can't be known here). Always a `PullRequest` event (the only class a PR source
+/// emits).
+fn row_into_event(row: BbRow, repo: &str) -> DiscoveredEvent {
+    let event = Event {
+        // Wire literal "bitbucket" matches `SourceKind::Bitbucket`'s serde string (format single-sourced).
+        dedupe_key: pr_dedupe_key(
+            "bitbucket",
+            repo,
+            row.candidate.number,
+            &row.candidate.head_sha,
+        ),
+        source: SourceKind::Bitbucket,
+        event_type: EventType::PullRequest,
+        project_id: String::new(),
+        repo: repo.to_string(),
+        number: Some(row.candidate.number),
+        title: row.title.clone(),
+        // body 抓取留待 AB#1068（rule engine）
+        body: String::new(),
+        labels: row.labels.clone(),
+        url: row.url.clone(),
+        received_at_epoch: 0,
+    };
+    DiscoveredEvent {
+        event,
+        candidate: row.candidate,
+        conflict: row.conflict,
+    }
+}
+
+impl EventSourceProvider for BitbucketServer {
+    /// Discovers open PRs (conflict rows included, marked) as normalized AB#1079
+    /// [`DiscoveredEvent`]s (AB#1070): the live producer. The display-ready rows from
+    /// [`Self::discover_rows`] are each mapped to a `PullRequest` [`Event`] + gating
+    /// [`Candidate`] via [`row_into_event`].
+    async fn discover_events(&self) -> AppResult<Vec<DiscoveredEvent>> {
+        Ok(self
+            .discover_rows()
+            .await?
+            .into_iter()
+            .map(|row| row_into_event(row, &self.repo))
+            .collect())
     }
 }
 
@@ -533,6 +580,24 @@ mod tests {
             "https://bitbucket.example.com/projects/GOCELL/repos/myrepo/pull-requests/12/overview"
         );
         assert!(!row.conflict);
+
+        // AB#1070: the same row maps to a normalized `Event` (PullRequest) on a
+        // `DiscoveredEvent`, built from the SAME parsed locals, while the gating
+        // `Candidate` rides along unchanged.
+        let de = row_into_event(r[0].clone(), REPO);
+        assert_eq!(de.event.source, SourceKind::Bitbucket);
+        assert_eq!(de.event.event_type, EventType::PullRequest);
+        assert_eq!(de.event.number, Some(de.candidate.number));
+        assert_eq!(de.event.title, row.title);
+        assert_eq!(de.event.url, row.url);
+        assert_eq!(de.event.labels, row.labels);
+        assert_eq!(de.event.body, "");
+        // dedupe_key is the exact inbox idempotency-key seed (format single-sourced).
+        assert_eq!(
+            de.event.dedupe_key,
+            "bitbucket:pullRequest:myrepo#12@abc123"
+        );
+        assert!(!de.conflict);
     }
 
     #[test]

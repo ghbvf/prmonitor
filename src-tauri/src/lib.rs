@@ -16,7 +16,7 @@
 //! composition layer does.
 
 // Modules are `pub` so forward-looking seams and shared types (e.g.
-// `pr::source::PrSource`, `review::engine::ReviewEngine`) count as reachable API
+// `pr::source::EventSourceProvider`, `review::engine::ReviewEngine`) count as reachable API
 // in this skeleton rather than tripping `dead_code` before their first use.
 pub mod cli;
 pub mod config;

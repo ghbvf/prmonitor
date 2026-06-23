@@ -8,9 +8,9 @@
 
 本章程**仅**适用于「新增 / 修改约束 enforcement 机制」，锚定 prmonitor 的真实治理面：
 
-- **垂直切片边界**：三切片 `config` / `pr` / `review` 自包含，跨切片契约只走 `src-tauri/src/model.rs`（`Candidate` / `PullRequestView`）。其中 `Candidate` 是 cross-Rust-slice 契约但 backend-internal（由 `PrSource::discover` 返回、未经 Tauri command 暴露给前端），故 `src/types.ts` 不镜像它属设计预期、非契约缺口；只有 `PullRequestView` 是前后端契约类型
-- **trait seam**：PR 来源 `pr/source.rs` 的 `PrSource`、review 引擎 `review/engine.rs` 的 `ReviewEngine`——新增实现而非改调用方
-- **serde camelCase 契约**：所有序列化给前端的 Rust 类型 ↔ TS 的 wire 形状对齐——`model.rs`（`PullRequestView`）、`events.rs`（`ReviewEvent`）↔ `src/types.ts`（共享跨切片契约），`config/model.rs`（`AppConfig`）↔ `src/config/types.ts`（切片私有）
+- **垂直切片边界**：三切片 `config` / `pr` / `review` 自包含，跨切片契约只走 `src-tauri/src/model.rs`。`PullRequestView`、`Event` / `EventType` 是前后端契约类型，必须在 `src/types.ts` 镜像；`Candidate`、`Notification` 是 cross-Rust-slice 契约但 backend-internal（`Candidate` 经 `EventSourceProvider::discover_events` 的 `DiscoveredEvent` 返回，`Notification` 由 `NotificationProvider` 消费，二者均未经 Tauri command 暴露给前端），故 `src/types.ts` 不镜像它们属设计预期、非契约缺口
+- **trait seam**：PR 来源 `pr/source.rs` 的 `EventSourceProvider`、review 引擎 `review/engine.rs` 的 `ReviewEngine`——新增实现而非改调用方
+- **serde camelCase 契约**：所有序列化给前端的 Rust 类型 ↔ TS 的 wire 形状对齐——`model.rs`（`PullRequestView` / `Event` / `EventType`）、`events.rs`（`ReviewEvent`）↔ `src/types.ts`（共享跨切片契约），`config/model.rs`（`AppConfig`）↔ `src/config/types.ts`（切片私有）
 - **Tauri command 注册**：组装根 `src-tauri/src/lib.rs` 的 command 暴露面
 - **错误漏斗**：`AppError` / `AppResult`（`src-tauri/src/error.rs`）的统一错误出口
 - **事件 union**：`events.rs` 的 `ReviewEvent`（tagged `kind` camelCase）与 `src/types.ts` 的 discriminated union

@@ -25,11 +25,12 @@
 //!   deeplink fails CI instead.
 
 use tauri::{AppHandle, Manager, Runtime};
-use tauri_plugin_notification::NotificationExt;
 use url::Url;
 
 use crate::error::{AppError, AppResult};
+use crate::model::{Notification, NotificationKind, NotificationLevel, RedactedNotificationBody};
 use crate::review::commands::{self, validate_kind, validate_pr_number};
+use crate::review::notify;
 use crate::review::session::CompletionOutcome;
 use crate::state::AppState;
 
@@ -175,8 +176,9 @@ async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
             notify_failure(
                 &app,
                 "prmonitor deeplink 无效",
-                "链接格式或参数无效，未触发 review",
-            );
+                RedactedNotificationBody::fixed("链接格式或参数无效，未触发 review"),
+            )
+            .await;
             return;
         }
     };
@@ -212,8 +214,9 @@ async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
             notify_failure(
                 &app,
                 "prmonitor review 未触发",
-                &format!("PR #{pr_number}：项目无效或该 review 已在进行中"),
-            );
+                RedactedNotificationBody::review_trigger_rejected(pr_number),
+            )
+            .await;
             return;
         }
     };
@@ -239,33 +242,47 @@ async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
         }
     };
 
-    notify_completion(&app, pr_number, &outcome);
+    notify_completion(&app, pr_number, &outcome).await;
     focus_main_window(&app);
 }
 
 /// Send the fire-and-forget completion notification. `wire_status` (not the `Done`/`Failed`
 /// collapse) distinguishes completed vs interrupted vs failed; the body carries the pr-review
 /// comment URL (the actionable artifact) when one was resolved.
-fn notify_completion<R: Runtime>(app: &AppHandle<R>, pr_number: u64, outcome: &CompletionOutcome) {
+async fn notify_completion<R: Runtime>(
+    app: &AppHandle<R>,
+    pr_number: u64,
+    outcome: &CompletionOutcome,
+) {
     // Whitelist the known terminal statuses; never reflect codex's raw `wire_status` (it comes from
     // the codex subprocess) into the notification title. An unexpected value gets a fixed label +
     // a diagnostic log rather than surfacing arbitrary content.
-    let status_label = match outcome.wire_status.as_str() {
-        "completed" => "完成",
-        "interrupted" => "已中断",
-        "failed" => "失败",
+    let (status_label, no_link_body) = match outcome.wire_status.as_str() {
+        "completed" => ("完成", "本次 review 完成（无评论链接）"),
+        "interrupted" => ("已中断", "本次 review 已中断（无评论链接）"),
+        "failed" => ("失败", "本次 review 失败（无评论链接）"),
         other => {
             eprintln!("deeplink 通知：未知 wire_status {other:?}");
-            "结束"
+            ("结束", "本次 review 结束（无评论链接）")
         }
     };
-    let title = format!("PR #{pr_number} review {status_label}");
-    let body = outcome
-        .comment_url
-        .clone()
-        .unwrap_or_else(|| format!("本次 review {status_label}（无评论链接）"));
+    // Normalized AB#1070 payload through the `NotificationProvider` seam. `body` keeps the prior
+    // displayed text (comment URL when present, else the no-link fallback); `url` carries the same
+    // comment URL so the seam knows the actionable artifact (the desktop notifier folds them so the
+    // shown text is unchanged).
+    let body = match outcome.comment_url.clone() {
+        Some(url) => RedactedNotificationBody::action_url(url),
+        None => RedactedNotificationBody::fixed(no_link_body),
+    };
+    let note = Notification::new(
+        NotificationLevel::Info,
+        format!("PR #{pr_number} review {status_label}"),
+        outcome.comment_url.clone().unwrap_or_default(),
+        body,
+        String::new(),
+    );
 
-    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+    if let Err(e) = notify::deliver(app, NotificationKind::Desktop, &note).await {
         eprintln!("deeplink 通知发送失败: {e}");
     }
 }
@@ -274,18 +291,23 @@ fn notify_completion<R: Runtime>(app: &AppHandle<R>, pr_number: u64, outcome: &C
 /// channel, so a clicked link that can't run would otherwise be silent (only stderr). Best-effort,
 /// like [`notify_completion`].
 ///
-/// `reason` MUST be pre-redacted fixed text — NEVER an `AppError::message`. Project-resolution
-/// errors embed the external `reference` (repo/projectId), so piping a raw error message here would
-/// leak it into the system notification center, a persisted/exposed sink unlike the stderr log
-/// (the codex `--check` regression this contract closes). Callers log the full reason to stderr.
-fn notify_failure<R: Runtime>(app: &AppHandle<R>, title: &str, reason: &str) {
-    if let Err(e) = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(reason)
-        .show()
-    {
+/// `body` is a [`RedactedNotificationBody`], so callers cannot pass an arbitrary
+/// `AppError::message` directly. Project-resolution errors embed the external `reference`
+/// (repo/projectId), so the full reason stays in stderr and only a typed safe body reaches
+/// the notification center.
+async fn notify_failure<R: Runtime>(
+    app: &AppHandle<R>,
+    title: &str,
+    body: RedactedNotificationBody,
+) {
+    let note = Notification::new(
+        NotificationLevel::Warning,
+        title.to_string(),
+        String::new(),
+        body,
+        String::new(),
+    );
+    if let Err(e) = notify::deliver(app, NotificationKind::Desktop, &note).await {
         eprintln!("deeplink 失败通知发送失败: {e}");
     }
 }

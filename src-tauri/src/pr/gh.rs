@@ -1,4 +1,4 @@
-//! GitHub [`super::source::PrSource`] implementation via the `gh` CLI.
+//! GitHub [`super::source::EventSourceProvider`] implementation via the `gh` CLI.
 //!
 //! `discover` shells out to `gh pr list --repo <repo> --state open ... --json ...`
 //! and maps the JSON into [`Candidate`]s (gating) plus the display fields the PR
@@ -16,10 +16,10 @@ use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
 use crate::error::{AppError, AppResult};
-use crate::model::{Candidate, LabelSource};
+use crate::model::{Candidate, Event, EventType, LabelSource, SourceKind};
 
 use super::labels;
-use super::source::PrSource;
+use super::source::{pr_dedupe_key, DiscoveredEvent, EventSourceProvider};
 
 /// Wall-clock budget for any single `gh` invocation. A hung subprocess (network
 /// stall, auth prompt) is bounded here; `kill_on_drop(true)` means dropping the
@@ -41,12 +41,12 @@ const PR_LIST_FIELDS: &str =
 /// shows. `conflict` marks a PR that carried BOTH trigger labels — `router.py`
 /// drops these from dispatch; we surface them with a skip reason instead.
 #[derive(Debug, Clone)]
-pub struct GhRow {
-    pub candidate: Candidate,
-    pub title: String,
-    pub url: String,
-    pub labels: Vec<String>,
-    pub conflict: bool,
+struct GhRow {
+    candidate: Candidate,
+    title: String,
+    url: String,
+    labels: Vec<String>,
+    conflict: bool,
 }
 
 /// gh `--json author` shape (`{ "login": "octocat", ... }`, or null).
@@ -179,6 +179,41 @@ fn merge_rows(review: Vec<GhRow>, check: Vec<GhRow>) -> Vec<GhRow> {
     by_pr.into_values().collect()
 }
 
+/// Builds a [`DiscoveredEvent`] from one display-ready [`GhRow`] (AB#1070): the
+/// normalized AB#1079 [`Event`] is constructed from the SAME already-parsed locals the
+/// row holds, alongside the row's gating [`Candidate`] and `conflict` flag. `repo` is the
+/// impl's monitored repo (`owner/name`). `project_id` / `received_at_epoch` are left at
+/// zero/empty values for the future inbox (AB#1065) to stamp on ingest (the source can't know
+/// the matched project id or the receive time). Always a `PullRequest` event (the only class a
+/// PR source emits).
+fn row_into_event(row: GhRow, repo: &str) -> DiscoveredEvent {
+    let event = Event {
+        // Wire literal "github" matches `SourceKind::Github`'s serde string (format single-sourced).
+        dedupe_key: pr_dedupe_key(
+            "github",
+            repo,
+            row.candidate.number,
+            &row.candidate.head_sha,
+        ),
+        source: SourceKind::Github,
+        event_type: EventType::PullRequest,
+        project_id: String::new(),
+        repo: repo.to_string(),
+        number: Some(row.candidate.number),
+        title: row.title.clone(),
+        // body 抓取留待 AB#1068（rule engine）
+        body: String::new(),
+        labels: row.labels.clone(),
+        url: row.url.clone(),
+        received_at_epoch: 0,
+    };
+    DiscoveredEvent {
+        event,
+        candidate: row.candidate,
+        conflict: row.conflict,
+    }
+}
+
 /// `gh` CLI auth status reported to the StatusBar (pr-slice-private wire type;
 /// not a cross-slice contract, so it lives here and is mirrored in
 /// `src/pr/types.ts`, not `model.rs` / `src/types.ts`).
@@ -263,7 +298,7 @@ impl GithubCli {
     ///   with server-side `--label` filtering, merged by PR number.
     /// - [`LabelSource::Title`]: ONE `gh` call for all open PRs, then client-side
     ///   classify from bracketed title segments (`--label` can't match a title tag).
-    pub async fn discover_rows(&self) -> AppResult<Vec<GhRow>> {
+    async fn discover_rows(&self) -> AppResult<Vec<GhRow>> {
         match self.label_source {
             LabelSource::Native => {
                 let review = parse_pr_list(&self.run_pr_list(Some(&self.review_label)).await?)?
@@ -296,17 +331,18 @@ impl GithubCli {
     }
 }
 
-impl PrSource for GithubCli {
-    /// Trait view: gating [`Candidate`]s only, excluding conflict PRs (mirrors
-    /// `router.py`, which drops both-label PRs before dispatch). The PR4
-    /// scheduler depends on this; the PR3 list UI uses [`Self::discover_rows`].
-    async fn discover(&self) -> AppResult<Vec<Candidate>> {
+impl EventSourceProvider for GithubCli {
+    /// Discovers open PRs (conflict rows included, marked) as normalized AB#1079
+    /// [`DiscoveredEvent`]s (AB#1070): the live producer. The display-ready rows from
+    /// [`Self::discover_rows`] are each mapped to a `PullRequest` [`Event`] + gating
+    /// [`Candidate`] via [`row_into_event`], so the event pipeline (epic AB#1078) is fed
+    /// directly WITHOUT losing the review-gating candidate.
+    async fn discover_events(&self) -> AppResult<Vec<DiscoveredEvent>> {
         Ok(self
             .discover_rows()
             .await?
             .into_iter()
-            .filter(|row| !row.conflict)
-            .map(|row| row.candidate)
+            .map(|row| row_into_event(row, &self.repo))
             .collect())
     }
 }
@@ -387,6 +423,24 @@ mod tests {
         assert_eq!(row.url, "https://github.com/o/r/pull/12");
         assert_eq!(row.labels, vec!["pr-status/needs-review-again", "area/ui"]);
         assert!(!row.conflict);
+
+        // AB#1070: the same row maps to a normalized `Event` (PullRequest) on a
+        // `DiscoveredEvent`, built from the SAME parsed locals, while the gating
+        // `Candidate` rides along unchanged.
+        let de = row_into_event(rows[0].clone(), "o/r");
+        assert_eq!(de.event.source, SourceKind::Github);
+        assert_eq!(de.event.event_type, EventType::PullRequest);
+        assert_eq!(de.event.number, Some(de.candidate.number));
+        assert_eq!(de.event.title, "Add widget");
+        assert_eq!(de.event.url, "https://github.com/o/r/pull/12");
+        assert_eq!(
+            de.event.labels,
+            vec!["pr-status/needs-review-again", "area/ui"]
+        );
+        assert_eq!(de.event.body, "");
+        // dedupe_key is the exact inbox idempotency-key seed (format single-sourced).
+        assert_eq!(de.event.dedupe_key, "github:pullRequest:o/r#12@abc123");
+        assert!(!de.conflict);
     }
 
     #[test]

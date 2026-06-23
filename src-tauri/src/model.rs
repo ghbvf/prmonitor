@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// A PR discovered by a [`crate::pr::source::PrSource`] that may need review.
+/// A PR discovered by a [`crate::pr::source::EventSourceProvider`] that may need review.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Candidate {
@@ -271,6 +271,121 @@ pub struct Event {
     pub url: String,
     /// When the event was received (epoch seconds), stamped by the ingress.
     pub received_at_epoch: u64,
+}
+
+/// User-visible body text that is safe to send to a notification center or external
+/// notification channel.
+///
+/// **Hard carrier** for the deeplink redaction rule: callers cannot place a raw
+/// `String` into [`Notification::body`]. They must choose one of the typed constructors
+/// below, making the safety decision explicit at the call site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RedactedNotificationBody(String);
+
+impl RedactedNotificationBody {
+    /// Fixed text authored by prmonitor, never derived from an external error message.
+    pub fn fixed(text: &'static str) -> Self {
+        Self(text.to_string())
+    }
+
+    /// Action URL already intended to be visible to the user.
+    pub fn action_url(url: String) -> Self {
+        Self(url)
+    }
+
+    /// Fixed deeplink failure text whose only dynamic component is the validated PR number.
+    pub fn review_trigger_rejected(pr_number: u64) -> Self {
+        Self(format!("PR #{pr_number}：项目无效或该 review 已在进行中"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_only(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// The normalized OUTBOUND payload (AB#1070): what the core hands a
+/// [`crate::review::notify::NotificationProvider`], the output-side mirror of the
+/// inbound [`Event`]. **Backend-internal** cross-Rust-slice contract (like
+/// [`Candidate`], NOT [`PullRequestView`]): consumed only by Rust providers — today
+/// the review slice's desktop notifier; a future outbox (AB#1066) drives it — so per
+/// the charter it is intentionally NOT mirrored in `src/types.ts` (the funnel has no
+/// open TS end). The serde golden (`notification_wire_shape_is_camel_case`) is the
+/// **Medium** carrier locking the camelCase wire shape, so a future channel that
+/// (de)serializes it (an email/webhook outbox queue) sees a stable shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Notification {
+    /// Severity, for channels that render it (email subject prefix, log level, icon).
+    pub level: NotificationLevel,
+    /// Short headline.
+    pub title: String,
+    /// The actionable URL (the pr-review comment URL today), or `""` when absent.
+    pub url: String,
+    /// Body text that is safe for persisted/exposed notification sinks. The private
+    /// inner field on [`RedactedNotificationBody`] prevents raw `AppError::message`
+    /// strings from being placed here by accident.
+    pub body: RedactedNotificationBody,
+    /// Routing key for a future multi-project / multi-channel outbox (AB#1066); `""` today.
+    pub project_id: String,
+}
+
+impl Notification {
+    pub fn new(
+        level: NotificationLevel,
+        title: String,
+        url: String,
+        body: RedactedNotificationBody,
+        project_id: String,
+    ) -> Self {
+        Self {
+            level,
+            title,
+            url,
+            body,
+            project_id,
+        }
+    }
+}
+
+/// Severity of a [`Notification`] (AB#1070). Sealed enum; the serde golden
+/// (`notification_enums_serialize_to_pinned_wire_strings`) is the **Medium** carrier
+/// pinning the camelCase wire strings. Default `Info`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum NotificationLevel {
+    #[default]
+    Info,
+    Warning,
+    Error,
+}
+
+/// Which channel a [`Notification`] is delivered through (AB#1070).
+///
+/// **Hard carrier** (sealed enum): the outbound dispatch ([`crate::review::notify::deliver`]
+/// today; a future outbox, AB#1066) branches on an exhaustive `match NotificationKind { ... }`,
+/// so adding a variant without an arm is a compile error — the missing channel cannot be
+/// expressed. Today ONE variant (`Desktop`), already load-bearing at the review-completion
+/// call site (the only outbound today), mirroring how [`SourceKind`] / [`EngineKind`] dispatch.
+///
+/// AB#1070 design reservation: future channels slot in as `Email` → `"email"`, `Feishu` →
+/// `"feishu"`, `Telegram` → `"telegram"`, `WeChatWork` → `"weChatWork"` (NOT implemented).
+/// Wire string pinned camelCase; the serde golden locks it (Medium carrier).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum NotificationKind {
+    #[default]
+    Desktop,
+    // future AB#1070: Email, Feishu, Telegram, WeChatWork
 }
 
 /// Serde wire-shape locks for `model.rs`'s cross-slice types.
@@ -609,5 +724,77 @@ mod tests {
         };
         let gv = serde_json::to_value(&generic).expect("Event serializes");
         assert_eq!(gv["number"], serde_json::Value::Null);
+    }
+
+    // Backend-internal cross-slice lock for the AB#1070 normalized `Notification` (Medium
+    // carrier per ai-robust.md): the output-side mirror of `Event`. Like `Candidate` it is
+    // NOT mirrored in `src/types.ts` (consumed only by Rust providers / a future outbox), so
+    // this lock guards the camelCase wire shape the producer/consumer rely on — the funnel has
+    // no open TS end. Locks camelCase keys present + snake_case absent + the nested level string.
+    #[test]
+    fn notification_wire_shape_is_camel_case() {
+        let note = Notification::new(
+            NotificationLevel::Info,
+            "PR #7 review 完成".to_string(),
+            "https://example.com/pr/7".to_string(),
+            RedactedNotificationBody::action_url("https://example.com/pr/7".to_string()),
+            "p1".to_string(),
+        );
+
+        let v = serde_json::to_value(&note).expect("Notification serializes");
+
+        // camelCase keys present.
+        assert!(v.get("level").is_some());
+        assert!(v.get("title").is_some());
+        assert!(v.get("url").is_some());
+        assert!(v.get("body").is_some());
+        assert!(v.get("projectId").is_some());
+
+        // snake_case form absent — a rename of the multi-word field surfaces here.
+        assert!(v.get("project_id").is_none());
+
+        // The nested level enum serializes to its pinned wire string.
+        assert_eq!(v["level"], "info");
+        // The body newtype is serde-transparent, preserving the outbound wire shape.
+        assert_eq!(v["body"], "https://example.com/pr/7");
+
+        // Roundtrips back (a future outbox queue deserializes it) — exercises `Deserialize`.
+        let back: Notification = serde_json::from_value(v).expect("Notification deserializes");
+        assert_eq!(back.level, NotificationLevel::Info);
+        assert_eq!(back.body.as_str(), "https://example.com/pr/7");
+        assert_eq!(back.project_id, "p1");
+    }
+
+    // Cross-Rust-slice wire contract lock for `NotificationLevel` / `NotificationKind`
+    // (AB#1070, Medium carrier): a variant rename or `rename_all` change surfaces here. The
+    // exhaustive `match NotificationKind` in `review::notify::deliver` is the Hard carrier.
+    #[test]
+    fn notification_enums_serialize_to_pinned_wire_strings() {
+        assert_eq!(
+            serde_json::to_value(NotificationLevel::Info).expect("NotificationLevel serializes"),
+            "info"
+        );
+        assert_eq!(
+            serde_json::to_value(NotificationLevel::Warning).expect("NotificationLevel serializes"),
+            "warning"
+        );
+        assert_eq!(
+            serde_json::to_value(NotificationLevel::Error).expect("NotificationLevel serializes"),
+            "error"
+        );
+        assert_eq!(
+            serde_json::to_value(NotificationLevel::default())
+                .expect("NotificationLevel serializes"),
+            "info"
+        );
+        // Today ONE channel; future channels (email / feishu / telegram / weChatWork) pin here.
+        assert_eq!(
+            serde_json::to_value(NotificationKind::Desktop).expect("NotificationKind serializes"),
+            "desktop"
+        );
+        assert_eq!(
+            serde_json::to_value(NotificationKind::default()).expect("NotificationKind serializes"),
+            "desktop"
+        );
     }
 }

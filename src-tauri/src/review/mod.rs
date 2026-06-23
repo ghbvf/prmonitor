@@ -23,4 +23,9 @@ pub mod history_store;
 /// wraps the [`commands::trigger_review`] funnel so a third party (curl/CLI) can trigger a
 /// review and poll for completion + comment URL. Token/Host/Origin fail-closed; never tunneled.
 pub mod local_api;
+/// Outbound notification seam (AB#1070): the [`notify::NotificationProvider`] trait + the
+/// reference desktop notifier, dispatched by channel via an exhaustive `match NotificationKind`
+/// ([`notify::deliver`], the Hard carrier). The output-side mirror of `pr::source`; the
+/// deeplink completion/failure path delivers through it.
+pub mod notify;
 pub mod session;

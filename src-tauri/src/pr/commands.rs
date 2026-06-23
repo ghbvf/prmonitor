@@ -9,9 +9,10 @@ use crate::model::{Candidate, PullRequestView, SourceKind, UpdateMode};
 use super::azure::{az_auth_status, AzStatus, AzureDevOpsCli};
 use super::bitbucket::BitbucketServer;
 use super::discover::{self, MonitorParams};
-use super::gh::{gh_auth_status, GhRow, GhStatus, GithubCli};
+use super::gh::{gh_auth_status, GhStatus, GithubCli};
 use super::ledger::{now_epoch, Ledger};
 use super::scheduler::{PollStatus, ProjectDispatcher};
+use super::source::{DiscoveredEvent, EventSourceProvider};
 use super::webhook::{DeliveryStatus, IngestIntent, WebhookDelivery, WebhookEvent, WebhookStatus};
 
 /// Which registry write `ingest_webhook` performs for a parsed intent: `Upsert` is the
@@ -23,28 +24,32 @@ enum WriteKind {
     UpdatePresent,
 }
 
-/// Annotates one discovered row for the PR list and surfaces its dispatchable
-/// [`Candidate`] when nothing gates it. Conflict (both trigger labels) skips
-/// first, matching `router.py`'s discovery-stage drop; otherwise static gates
+/// Annotates one discovered [`DiscoveredEvent`] for the PR list and surfaces its
+/// dispatchable [`Candidate`] when nothing gates it. Conflict (both trigger labels)
+/// skips first, matching `router.py`'s discovery-stage drop; otherwise static gates
 /// then cooldown. The live gate is reserved dead code (no second `gh` call per
 /// poll), so a `None` skip reason here *is* the dispatch decision: the candidate
 /// is returned for auto-trigger.
+///
+/// AB#1070: source-agnostic — every source arm feeds the same [`DiscoveredEvent`]
+/// here, taking the display fields from its normalized [`Event`] (`title` / `labels`
+/// / `url`) and the gating fields from its [`Candidate`].
 ///
 /// Returns `(view, Some(candidate))` for a clean row, `(view, None)` for a skipped
 /// one — so the caller partitions the cycle's rows into the emit list (all views)
 /// and the dispatch list (clean candidates) in one pass.
 fn build_view(
-    row: GhRow,
+    de: DiscoveredEvent,
     params: &MonitorParams,
     ledger: &Ledger,
     now: u64,
 ) -> (PullRequestView, Option<Candidate>) {
     build_view_parts(
-        row.candidate,
-        row.title,
-        row.labels,
-        row.url,
-        row.conflict,
+        de.candidate,
+        de.event.title,
+        de.event.labels,
+        de.event.url,
+        de.conflict,
         params,
         ledger,
         now,
@@ -58,11 +63,9 @@ fn build_view(
 /// static (`should_skip`) then cooldown (`cooldown_skip`) — and surfaces the dispatchable
 /// candidate only when nothing gates it (`skip_reason` None).
 ///
-/// All three source arms feed this: the GitHub arm via [`build_view`] (`GhRow`), and the
-/// Azure / Bitbucket arms directly from an [`super::azure::AzRow`] / [`super::bitbucket::BbRow`].
-/// Extracting it gives every source FULL display + gating parity (title / url / all labels /
-/// kept-conflict), so the only difference between sources is how the rows are fetched, not
-/// how they are shown or
+/// All three source arms feed this via [`build_view`] (over a normalized [`DiscoveredEvent`]),
+/// giving every source FULL display + gating parity (title / url / all labels / kept-conflict),
+/// so the only difference between sources is how the rows are fetched, not how they are shown or
 /// gated. Pure (no `AppHandle`) so the gate composition is unit-tested.
 #[allow(clippy::too_many_arguments)]
 fn build_view_parts(
@@ -93,6 +96,28 @@ fn build_view_parts(
         skip_reason,
     };
     (view, dispatchable)
+}
+
+/// Projects a source's discovered events into the cycle's `(views, dispatchable candidates)`:
+/// every [`DiscoveredEvent`] yields a view; a clean (non-gated) one also yields a dispatch
+/// [`Candidate`]. The shared per-source body of [`discover`]'s three arms (AB#1070) — so the
+/// only difference between sources is how the events are fetched, not how they are gated/shown.
+fn partition_events(
+    events: Vec<DiscoveredEvent>,
+    params: &MonitorParams,
+    ledger: &Ledger,
+    now: u64,
+) -> (Vec<PullRequestView>, Vec<Candidate>) {
+    let mut views = Vec::with_capacity(events.len());
+    let mut dispatchable = Vec::new();
+    for de in events {
+        let (view, cand) = build_view(de, params, ledger, now);
+        if let Some(cand) = cand {
+            dispatchable.push(cand);
+        }
+        views.push(view);
+    }
+    (views, dispatchable)
 }
 
 /// Discovers `project_id`'s monitored repo's open trigger-labelled PRs now (#35),
@@ -141,9 +166,10 @@ pub(crate) async fn discover<R: tauri::Runtime>(
 
     // Source selection (#818): branch on `source_kind` via an EXHAUSTIVE match (no
     // wildcard, no `dyn`) so a new `SourceKind` variant fails to compile here until it is
-    // wired. Both sources expose a `discover_rows` returning display-ready rows (gating
-    // `Candidate` + title / url / all-labels + a both-label `conflict` flag), so the view
-    // path is IDENTICAL across sources — each arm just feeds its rows to `build_view_parts`.
+    // wired. Each source's `discover_events` (AB#1070) returns normalized `DiscoveredEvent`s
+    // (an `Event` carrying title / url / all-labels + the gating `Candidate` + a both-label
+    // `conflict` flag), so the view path is IDENTICAL across sources — each arm just feeds
+    // its events to `build_view`.
     let (views, dispatchable) = match source_kind {
         SourceKind::Github => {
             let source = GithubCli::new(
@@ -152,17 +178,7 @@ pub(crate) async fn discover<R: tauri::Runtime>(
                 params.check_label.clone(),
                 label_source,
             );
-            let rows = source.discover_rows().await?;
-            let mut views = Vec::with_capacity(rows.len());
-            let mut dispatchable = Vec::new();
-            for row in rows {
-                let (view, cand) = build_view(row, &params, &ledger, now);
-                if let Some(cand) = cand {
-                    dispatchable.push(cand);
-                }
-                views.push(view);
-            }
-            (views, dispatchable)
+            partition_events(source.discover_events().await?, &params, &ledger, now)
         }
         SourceKind::Azure => {
             // Defense-in-depth (#818 F2): the reschedule/reconcile path reaches here via the
@@ -183,27 +199,7 @@ pub(crate) async fn discover<R: tauri::Runtime>(
                 params.check_label.clone(),
                 label_source,
             );
-            let rows = source.discover_rows().await?;
-            let mut views = Vec::with_capacity(rows.len());
-            let mut dispatchable = Vec::new();
-            for row in rows {
-                // Structurally identical to the GitHub arm — full display + gating parity.
-                let (view, disp) = build_view_parts(
-                    row.candidate,
-                    row.title,
-                    row.labels,
-                    row.url,
-                    row.conflict,
-                    &params,
-                    &ledger,
-                    now,
-                );
-                if let Some(disp) = disp {
-                    dispatchable.push(disp);
-                }
-                views.push(view);
-            }
-            (views, dispatchable)
+            partition_events(source.discover_events().await?, &params, &ledger, now)
         }
         SourceKind::Bitbucket => {
             // Defense-in-depth (parity with the Azure arm): the reschedule/reconcile path
@@ -229,27 +225,7 @@ pub(crate) async fn discover<R: tauri::Runtime>(
                 check_label: params.check_label.clone(),
                 label_source,
             });
-            let rows = source.discover_rows().await?;
-            let mut views = Vec::with_capacity(rows.len());
-            let mut dispatchable = Vec::new();
-            for row in rows {
-                // Structurally identical to the other arms — full display + gating parity.
-                let (view, disp) = build_view_parts(
-                    row.candidate,
-                    row.title,
-                    row.labels,
-                    row.url,
-                    row.conflict,
-                    &params,
-                    &ledger,
-                    now,
-                );
-                if let Some(disp) = disp {
-                    dispatchable.push(disp);
-                }
-                views.push(view);
-            }
-            (views, dispatchable)
+            partition_events(source.discover_events().await?, &params, &ledger, now)
         }
     };
     Ok((views, dispatchable))
@@ -1043,20 +1019,34 @@ mod tests {
         }
     }
 
-    fn row(number: u64, kind: &str, conflict: bool) -> GhRow {
-        GhRow {
-            candidate: Candidate {
-                number,
-                head_sha: "sha".to_string(),
-                head_ref: "ref".to_string(),
-                author: "octocat".to_string(),
-                is_cross_repository: false,
-                is_draft: false,
-                kind: kind.to_string(),
+    // AB#1070: the source-agnostic discovered row is now a `DiscoveredEvent` (normalized
+    // `Event` + gating `Candidate`). `.candidate` still surfaces for the gating-only tests.
+    fn row(number: u64, kind: &str, conflict: bool) -> DiscoveredEvent {
+        use crate::model::{Event, EventType};
+        let candidate = Candidate {
+            number,
+            head_sha: "sha".to_string(),
+            head_ref: "ref".to_string(),
+            author: "octocat".to_string(),
+            is_cross_repository: false,
+            is_draft: false,
+            kind: kind.to_string(),
+        };
+        DiscoveredEvent {
+            event: Event {
+                dedupe_key: format!("github:pullRequest:o/r#{number}@sha"),
+                source: SourceKind::Github,
+                event_type: EventType::PullRequest,
+                project_id: String::new(),
+                repo: "o/r".to_string(),
+                number: Some(number),
+                title: format!("PR {number}"),
+                body: String::new(),
+                labels: vec!["review-label".to_string()],
+                url: format!("https://x/{number}"),
+                received_at_epoch: 0,
             },
-            title: format!("PR {number}"),
-            url: format!("https://x/{number}"),
-            labels: vec!["review-label".to_string()],
+            candidate,
             conflict,
         }
     }
@@ -1183,7 +1173,11 @@ mod tests {
         let (view, cand) = build_view(row(1, "review", false), &params(), &Ledger::default(), 0);
         assert_eq!(view.number, 1);
         assert_eq!(view.kind, "review");
+        // AB#1070: display fields (title / url / labels) come from the `DiscoveredEvent.event`,
+        // not the `Candidate` (which has no title/url/labels) — locks the event-as-display source.
         assert_eq!(view.title, "PR 1");
+        assert_eq!(view.url, "https://x/1");
+        assert_eq!(view.labels, vec!["review-label".to_string()]);
         assert_eq!(view.skip_reason, None);
         // Clean row (skip_reason None) → surfaced as a dispatchable candidate.
         let cand = cand.expect("clean row yields a dispatchable candidate");
