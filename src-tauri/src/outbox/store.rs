@@ -158,8 +158,13 @@ pub fn enqueue(
 /// skipped). The schema-version forward-compat guard ([`crate::db`]) means an older binary refuses
 /// to open a newer DB, so a `kind` this binary can't parse is genuine corruption/tampering, never a
 /// legitimate future kind — dead-lettering it is correct (it becomes terminal `dead`, visible in the
-/// panel, and stops being re-selected + re-logged every cycle). Returns only the well-formed actions.
-pub fn claim_due(db: &Database, now: u64) -> AppResult<Vec<OutboxAction>> {
+/// panel, and stops being re-selected + re-logged every cycle).
+///
+/// Returns `(actions, quarantined_ids)`: the well-formed actions to execute, plus the ids of rows
+/// just dead-lettered as corrupt. The caller ([`super::service::run_due_once`]) emits
+/// `outbox:updated` for the quarantined ids too, so an open panel sees the `dead` transition (the
+/// store has no `AppHandle` to emit itself — all persisted transitions surface through the service).
+pub fn claim_due(db: &Database, now: u64) -> AppResult<(Vec<OutboxAction>, Vec<i64>)> {
     let rows: Vec<(i64, String, String, String, i64)> = db.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id, project_id, kind, payload, attempt_count FROM action_outbox \
@@ -181,6 +186,7 @@ pub fn claim_due(db: &Database, now: u64) -> AppResult<Vec<OutboxAction>> {
     }
 
     let mut actions = Vec::with_capacity(rows.len());
+    let mut quarantined = Vec::new();
     for (id, project_id, kind, payload, attempt_count) in rows {
         let attempt_count = attempt_count.max(0) as u32;
         match kind_from_wire(&kind) {
@@ -195,25 +201,34 @@ pub fn claim_due(db: &Database, now: u64) -> AppResult<Vec<OutboxAction>> {
                 // Quarantine: dead-letter the corrupt row so it terminalizes (panel-visible) instead
                 // of being re-skipped + re-logged forever. Best-effort — a write failure here just
                 // leaves it `pending` to retry the quarantine next cycle, never a false `done`.
-                if let Err(mark_err) = mark_dead(db, id, attempt_count, &e.message, now) {
-                    eprintln!(
+                match mark_dead(db, id, attempt_count, &e.message, now) {
+                    Ok(()) => quarantined.push(id),
+                    Err(mark_err) => eprintln!(
                         "outbox: 死信 kind 损坏的行失败（id={id}）：{}",
                         mark_err.message
-                    );
+                    ),
                 }
             }
         }
     }
-    Ok(actions)
+    Ok((actions, quarantined))
 }
 
-/// Mark an outbox row `done` (AB#1066), stamping `updated_at` and clearing any prior `last_error`.
-/// A no-op if the id doesn't exist.
-pub fn mark_done(db: &Database, id: i64, now: u64) -> AppResult<()> {
+/// Mark an outbox row `done` (AB#1066), recording the FINAL `attempt_count` (the attempt that
+/// succeeded — so a done row reflects its real execution count, consistent with the failure paths
+/// that also write `attempt_count`), stamping `updated_at`, and clearing any prior `last_error`. A
+/// no-op if the id doesn't exist.
+pub fn mark_done(db: &Database, id: i64, attempt_count: u32, now: u64) -> AppResult<()> {
     db.with_conn(|conn| {
         conn.execute(
-            "UPDATE action_outbox SET status = ?2, last_error = NULL, updated_at = ?3 WHERE id = ?1",
-            rusqlite::params![id, status_as_wire(ActionStatus::Done), now as i64],
+            "UPDATE action_outbox SET status = ?2, attempt_count = ?3, last_error = NULL, \
+             updated_at = ?4 WHERE id = ?1",
+            rusqlite::params![
+                id,
+                status_as_wire(ActionStatus::Done),
+                attempt_count as i64,
+                now as i64
+            ],
         )
         .map(|_| ())
     })
@@ -271,19 +286,59 @@ pub fn mark_dead(
     })
 }
 
-/// Re-queue a row for another run (AB#1066) — the `outbox_retry` command's write. Flips the row back
-/// to `pending` with a FRESH retry budget (`attempt_count = 0`) due now, so a manual retry of a
-/// dead-lettered action gets the full attempt allowance again. `last_error` is KEPT (the user still
-/// sees why it last failed until the next attempt clears it on success). Returns whether a row was
-/// actually updated (`false` = unknown id → the command maps it to an error).
-pub fn reset_for_retry(db: &Database, id: i64, now: u64) -> AppResult<bool> {
+/// The outcome of a [`reset_for_retry`] attempt (AB#1066): the row was re-queued, the id is unknown,
+/// or the row exists but is NOT in a retryable terminal state. The command maps each to a distinct
+/// response (a precise error for the latter two).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RetryReset {
+    /// A `dead` row was reset to `pending` for another run.
+    Requeued,
+    /// No row with this id exists.
+    Unknown,
+    /// The row exists but is not `dead` (only a dead-lettered action may be manually retried).
+    NotDead,
+}
+
+/// Re-queue a DEAD-LETTERED row for another run (AB#1066) — the `outbox_retry` command's write.
+/// Flips a `dead` row back to `pending` with a FRESH retry budget (`attempt_count = 0`) due now, so a
+/// manual retry gets the full attempt allowance again. `last_error` is KEPT (the user still sees why
+/// it last failed until the next attempt clears it on success).
+///
+/// **Guards to `status = 'dead'` (backend invariant, not UI-only).** Only a dead-lettered action may
+/// be manually retried — re-queuing a `done` row would re-run an already-succeeded side effect, and a
+/// `pending` row is already queued. The UI only renders the retry button on `dead` rows, but this SQL
+/// guard makes the invariant hold at the command boundary regardless of caller. Distinguishes
+/// [`RetryReset::Unknown`] (no such id) from [`RetryReset::NotDead`] (wrong state).
+pub fn reset_for_retry(db: &Database, id: i64, now: u64) -> AppResult<RetryReset> {
     db.with_conn(|conn| {
-        conn.execute(
+        let updated = conn.execute(
             "UPDATE action_outbox SET status = ?2, attempt_count = 0, next_attempt_at = ?3, \
-             updated_at = ?3 WHERE id = ?1",
-            rusqlite::params![id, status_as_wire(ActionStatus::Pending), now as i64],
-        )
-        .map(|n| n == 1)
+             updated_at = ?3 WHERE id = ?1 AND status = ?4",
+            rusqlite::params![
+                id,
+                status_as_wire(ActionStatus::Pending),
+                now as i64,
+                status_as_wire(ActionStatus::Dead)
+            ],
+        )?;
+        if updated == 1 {
+            return Ok(RetryReset::Requeued);
+        }
+        // No dead row updated — distinguish a missing id from a wrong-state (non-dead) row so the
+        // command can return a precise error.
+        let exists = conn
+            .query_row(
+                "SELECT 1 FROM action_outbox WHERE id = ?1",
+                [id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(if exists {
+            RetryReset::NotDead
+        } else {
+            RetryReset::Unknown
+        })
     })
 }
 
@@ -420,13 +475,13 @@ mod tests {
         let future = enqueue_notif(&db, "p1", "future", 100);
         mark_retry(&db, future, 1, 10_000, "later", 100).expect("reschedule future");
         let done = enqueue_notif(&db, "p1", "done", 100);
-        mark_done(&db, done, 100).expect("done");
+        mark_done(&db, done, 1, 100).expect("done");
         // A terminal `dead` row (due now) must also be excluded — the claim predicate is
         // `status = 'pending'`, so a dead-lettered row is never re-claimed.
         let dead = enqueue_notif(&db, "p1", "dead", 100);
         mark_dead(&db, dead, 5, "final boom", 100).expect("dead");
 
-        let claimed = claim_due(&db, 5_000).expect("claim");
+        let (claimed, quarantined) = claim_due(&db, 5_000).expect("claim");
         let ids: Vec<i64> = claimed.iter().map(|x| x.id).collect();
         assert_eq!(
             ids,
@@ -434,9 +489,10 @@ mod tests {
             "only due pending rows, oldest id first (done/dead excluded)"
         );
         assert!(claimed.iter().all(|x| x.attempt_count == 0));
+        assert!(quarantined.is_empty(), "no corrupt rows here");
 
         // Advancing now past the future row's schedule makes it claimable too.
-        let later = claim_due(&db, 10_000).expect("claim later");
+        let (later, _q) = claim_due(&db, 10_000).expect("claim later");
         assert!(later.iter().any(|x| x.id == future));
     }
 
@@ -460,33 +516,58 @@ mod tests {
         assert_eq!(d.attempt_count, 5);
         assert_eq!(d.last_error.as_deref(), Some("final boom"));
 
-        mark_done(&db, id, 300).expect("done");
+        mark_done(&db, id, 6, 300).expect("done");
         let done = get_entry(&db, id).expect("get").expect("exists");
         assert_eq!(done.status, ActionStatus::Done);
+        assert_eq!(
+            done.attempt_count, 6,
+            "mark_done records the succeeding attempt count"
+        );
         assert_eq!(done.last_error, None, "mark_done clears the error");
     }
 
-    // `reset_for_retry` re-queues a dead row with a fresh budget (AB#1066): status → pending,
-    // attempt_count → 0, due now; an unknown id returns false (→ the command errors).
+    // `reset_for_retry` re-queues a DEAD row with a fresh budget (AB#1066 F2): status → pending,
+    // attempt_count → 0, due now → Requeued. An unknown id → Unknown; a non-dead row → NotDead
+    // (the backend invariant: only a dead-lettered action may be manually retried — a `done` row
+    // must NOT be re-runnable from the command boundary, regardless of UI).
     #[test]
-    fn reset_for_retry_requeues_dead_row() {
+    fn reset_for_retry_only_requeues_dead_rows() {
         let db = Database::open_in_memory().expect("open db");
         let id = enqueue_notif(&db, "p1", "a", 100);
         mark_dead(&db, id, 5, "final boom", 200).expect("dead");
 
-        assert!(reset_for_retry(&db, id, 500).expect("reset"));
+        assert_eq!(
+            reset_for_retry(&db, id, 500).expect("reset"),
+            RetryReset::Requeued
+        );
         let r = get_entry(&db, id).expect("get").expect("exists");
         assert_eq!(r.status, ActionStatus::Pending);
         assert_eq!(r.attempt_count, 0, "fresh retry budget");
         assert_eq!(r.next_attempt_at, 500);
-        assert!(claim_due(&db, 500)
-            .expect("claim")
-            .iter()
-            .any(|x| x.id == id));
+        let (due, _q) = claim_due(&db, 500).expect("claim");
+        assert!(due.iter().any(|x| x.id == id));
 
-        assert!(
-            !reset_for_retry(&db, 99_999, 500).expect("unknown"),
-            "unknown id is false"
+        // Unknown id → Unknown.
+        assert_eq!(
+            reset_for_retry(&db, 99_999, 500).expect("unknown"),
+            RetryReset::Unknown
+        );
+
+        // A `done` (non-dead) row must NOT be re-queued — guard rejects it as NotDead, leaving it done.
+        let done_id = enqueue_notif(&db, "p1", "done", 100);
+        mark_done(&db, done_id, 1, 100).expect("done");
+        assert_eq!(
+            reset_for_retry(&db, done_id, 600).expect("non-dead"),
+            RetryReset::NotDead,
+            "a done row is not retryable from the command boundary"
+        );
+        assert_eq!(
+            get_entry(&db, done_id)
+                .expect("get")
+                .expect("exists")
+                .status,
+            ActionStatus::Done,
+            "done row left untouched"
         );
     }
 
@@ -588,12 +669,18 @@ mod tests {
             })
             .expect("insert corrupt-kind row");
 
-        let claimed = claim_due(&db, 500).expect("claim does not crash");
+        let (claimed, quarantined) = claim_due(&db, 500).expect("claim does not crash");
         let ids: Vec<i64> = claimed.iter().map(|x| x.id).collect();
         assert_eq!(
             ids,
             vec![good],
             "corrupt-kind row excluded, good row claimed"
+        );
+        // The corrupt row's id is returned as quarantined so the service emits its `dead` transition.
+        assert_eq!(
+            quarantined,
+            vec![corrupt],
+            "corrupt-kind id reported as quarantined"
         );
 
         // The corrupt row was dead-lettered (terminal), carrying the parse error, and is not
@@ -608,12 +695,10 @@ mod tests {
             entry.last_error.is_some(),
             "carries the unrecognized-kind error"
         );
+        let (reclaimed, requarantined) = claim_due(&db, 500).expect("re-claim");
         assert!(
-            claim_due(&db, 500)
-                .expect("re-claim")
-                .iter()
-                .all(|x| x.id != corrupt),
-            "dead-lettered corrupt row is not re-claimed"
+            reclaimed.iter().all(|x| x.id != corrupt) && requarantined.is_empty(),
+            "dead-lettered corrupt row is neither re-claimed nor re-quarantined"
         );
     }
 

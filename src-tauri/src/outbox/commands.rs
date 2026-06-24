@@ -39,18 +39,28 @@ pub async fn outbox_get_raw<R: tauri::Runtime>(
         .ok_or_else(|| AppError::new(format!("outbox 条目不存在（id={id}）")))
 }
 
-/// Re-queue a (typically dead-lettered) outbox entry for another run (AB#1066): reset it to
-/// `pending` with a fresh retry budget due now, emit `outbox:updated` for the `pending` flip (so the
-/// panel reflects it immediately, symmetric with `service::enqueue`), and WAKE the worker so it
-/// re-executes promptly (the worker re-emits again as it transitions the row to done/dead). Errors
-/// when the id is unknown (the analog of `inbox_replay`'s "err if unknown"). The store's `refresh()`
-/// after this command resolves is the belt-and-suspenders deterministic reconcile.
+/// Re-queue a DEAD-LETTERED outbox entry for another run (AB#1066): reset it to `pending` with a
+/// fresh retry budget due now, emit `outbox:updated` for the `pending` flip (so the panel reflects it
+/// immediately, symmetric with `service::enqueue`), and WAKE the worker so it re-executes promptly
+/// (the worker re-emits again as it transitions the row to done/dead). Only a `dead` row is
+/// retryable: an unknown id errors ("不存在"), and a non-`dead` row errors ("仅 dead 行可重试") rather
+/// than re-running an already-succeeded / still-queued action (the backend invariant behind the
+/// UI's dead-only retry button). The store's `refresh()` after this resolves is the belt-and-
+/// suspenders deterministic reconcile.
 #[tauri::command]
 pub async fn outbox_retry<R: tauri::Runtime>(app: tauri::AppHandle<R>, id: i64) -> AppResult<()> {
     let db = app.state::<Database>();
     let now = store::now_epoch();
-    if !store::reset_for_retry(db.inner(), id, now)? {
-        return Err(AppError::new(format!("outbox 条目不存在（id={id}）")));
+    match store::reset_for_retry(db.inner(), id, now)? {
+        store::RetryReset::Requeued => {}
+        store::RetryReset::Unknown => {
+            return Err(AppError::new(format!("outbox 条目不存在（id={id}）")))
+        }
+        store::RetryReset::NotDead => {
+            return Err(AppError::new(format!(
+                "outbox 条目 {id} 非 dead 状态，仅 dead（最终失败）行可重试"
+            )))
+        }
     }
     super::service::announce_updated(&app, db.inner(), id);
     app.state::<AppState>().outbox.wake();

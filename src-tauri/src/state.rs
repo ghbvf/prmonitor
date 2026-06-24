@@ -39,4 +39,9 @@ pub struct AppState {
     /// spawned task handle. Started once in `lib.rs` `setup()`; killed on app shutdown. Methods
     /// take `&self`.
     pub outbox: crate::outbox::manager::OutboxManager,
+    /// The review slice's durable-notification producer seam (AB#1066): holds the composition-root-
+    /// injected sink that enqueues a `model::Notification` into the action outbox. Lets `review`
+    /// produce durable notifications WITHOUT naming the `outbox` slice (the sink closure, installed in
+    /// `lib.rs`, is the only place that bridges review→outbox). Methods take `&self`.
+    pub notify_outbox: crate::review::notify::NotificationOutbox,
 }

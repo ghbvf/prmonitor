@@ -31,6 +31,10 @@ pub mod pr;
 pub mod review;
 pub mod state;
 
+/// Rust slice-boundary enforcement test (AB#1066 F1, Medium carrier) — test-only module.
+#[cfg(test)]
+mod slice_boundary_test;
+
 use std::sync::Arc;
 
 use model::{Candidate, EngineKind};
@@ -254,6 +258,29 @@ fn build_app() {
             // backoff, dead-letters at the attempt cap. Its first sweep is immediate, so any rows
             // persisted before a previous exit resume now (restart-resume). Killed on app shutdown.
             state.outbox.start(app.handle().clone(), outbox_executor);
+
+            // Install the review→outbox notification sink (AB#1066) — the ONLY bridge from the review
+            // slice's notification producer to the outbox slice. `review::deeplink` builds a
+            // `model::Notification` and calls `state.notify_outbox.enqueue(note)`; THIS closure (the
+            // sole place naming both the producer and `crate::outbox`) serializes it as the action
+            // payload and enqueues it. Keeps `review` decoupled — it names neither `crate::outbox` nor
+            // `ActionKind` (the Rust slice-boundary test locks this).
+            state.notify_outbox.set_sink(Arc::new({
+                let app = app.handle().clone();
+                move |note: model::Notification| {
+                    let summary = note.title.clone();
+                    let payload = serde_json::to_string(&note)
+                        .map_err(|e| error::AppError::new(format!("outbox 通知序列化失败：{e}")))?;
+                    outbox::service::enqueue(
+                        &app,
+                        &note.project_id,
+                        model::ActionKind::Notification,
+                        &summary,
+                        &payload,
+                    )
+                    .map(|_id| ())
+                }
+            }));
 
             // Auto-start the poll loop only when the persisted config is valid, via the
             // shared start_if_config_valid gate — the SINGLE funnel point (PR #41 F1) the

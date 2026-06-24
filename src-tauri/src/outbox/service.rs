@@ -92,40 +92,62 @@ pub fn enqueue<R: Runtime>(
     Ok(id)
 }
 
+/// Persist one action's execution outcome (AB#1066): given the row's PRIOR `attempt_count` and the
+/// executor `result`, bump the count, [`decide_outcome`], and write the matching terminal/retry state
+/// (`mark_done` records the succeeding attempt's count too — consistent with the failure paths).
+/// Returns the [`Outcome`] applied. AppHandle-free + db-only, so the worker's full claim→execute→record
+/// state machine is unit-testable with a fake result (no Tauri runtime) — the IO wrapper
+/// [`run_due_once`] only adds the executor call + the emit around it.
+fn record_action_result(
+    db: &Database,
+    id: i64,
+    prev_attempt_count: u32,
+    now: u64,
+    result: &AppResult<()>,
+) -> AppResult<Outcome> {
+    let new_attempt_count = prev_attempt_count.saturating_add(1);
+    let error = result
+        .as_ref()
+        .err()
+        .map(|e| e.message.clone())
+        .unwrap_or_default();
+    let outcome = decide_outcome(new_attempt_count, now, result.is_err());
+    match &outcome {
+        Outcome::Done => store::mark_done(db, id, new_attempt_count, now)?,
+        Outcome::Retry { next_attempt_at } => {
+            store::mark_retry(db, id, new_attempt_count, *next_attempt_at, &error, now)?
+        }
+        Outcome::Dead => store::mark_dead(db, id, new_attempt_count, &error, now)?,
+    }
+    Ok(outcome)
+}
+
 /// Run ONE worker cycle (AB#1066): claim the due `pending` rows and, for each, execute the injected
-/// closure and record the outcome (done / reschedule / dead-letter), re-emitting `outbox:updated`.
-/// Best-effort throughout — a claim or record error is logged, not propagated (the next tick
-/// retries). Concrete [`tauri::AppHandle`] (the executor's signature is concrete, like the inbox's
-/// injected hooks).
+/// closure and record the outcome (done / reschedule / dead-letter) via [`record_action_result`],
+/// re-emitting `outbox:updated`. Also emits for any rows `claim_due` dead-lettered as corrupt-kind
+/// (so an open panel sees that transition). Best-effort throughout — a claim or record error is
+/// logged, not propagated (the next tick retries). Concrete [`tauri::AppHandle`] (the executor's
+/// signature is concrete, like the inbox's injected hooks).
 pub async fn run_due_once(app: &tauri::AppHandle, db: &Database, executor: &ActionExecutor) {
-    let due = match store::claim_due(db, store::now_epoch()) {
+    let (due, quarantined) = match store::claim_due(db, store::now_epoch()) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("outbox: claim_due 失败：{}", e.message);
             return;
         }
     };
+    // Announce the corrupt-kind rows claim_due just dead-lettered (their `dead` transition).
+    for id in quarantined {
+        announce_updated(app, db, id);
+    }
     for action in due {
         let id = action.id;
-        let new_attempt_count = action.attempt_count.saturating_add(1);
+        let prev_attempt_count = action.attempt_count;
 
         // The executor RESULT is authoritative: Ok → done, Err → retry/dead (no false `done`).
         let result = executor(app.clone(), action).await;
         let now = store::now_epoch();
-        let error = result
-            .as_ref()
-            .err()
-            .map(|e| e.message.clone())
-            .unwrap_or_default();
-
-        let recorded = match decide_outcome(new_attempt_count, now, result.is_err()) {
-            Outcome::Done => store::mark_done(db, id, now),
-            Outcome::Retry { next_attempt_at } => {
-                store::mark_retry(db, id, new_attempt_count, next_attempt_at, &error, now)
-            }
-            Outcome::Dead => store::mark_dead(db, id, new_attempt_count, &error, now),
-        };
-        if let Err(e) = recorded {
+        if let Err(e) = record_action_result(db, id, prev_attempt_count, now, &result) {
             eprintln!("outbox: 记录动作终态失败（id={id}）：{}", e.message);
         }
         announce_updated(app, db, id);
@@ -210,10 +232,11 @@ mod tests {
         assert_eq!(decide_outcome(MAX_ATTEMPTS + 1, 1_000, true), Outcome::Dead);
     }
 
-    // End-to-end retry → dead-letter walk over the REAL store (AB#1066 acceptance), driven without
-    // an AppHandle by sequencing the same db-only seam `run_due_once` uses (claim_due →
-    // decide_outcome → mark_retry/mark_dead). An always-failing action climbs attempt_count across
-    // retries (staying `pending`, rescheduled forward) and finally dead-letters at MAX_ATTEMPTS.
+    // End-to-end retry → dead-letter walk over the REAL store (AB#1066 acceptance), driven through
+    // the SAME `record_action_result` seam `run_due_once` uses (claim_due → record_action_result),
+    // without an AppHandle (the executor result is a fake `Err`). An always-failing action climbs
+    // attempt_count across retries (staying `pending`, rescheduled forward) and finally dead-letters
+    // at MAX_ATTEMPTS — locking the worker's real record state machine (F5), not just `decide_outcome`.
     #[test]
     fn always_failing_action_retries_then_dead_letters() {
         let db = Database::open_in_memory().expect("open db");
@@ -226,23 +249,13 @@ mod tests {
         // Simulate the worker draining the row until it dead-letters. Bound the loop well above
         // MAX_ATTEMPTS so a regression (never dead-lettering) fails loudly instead of looping.
         for _ in 0..(MAX_ATTEMPTS + 3) {
-            let due = store::claim_due(&db, now).expect("claim");
+            let (due, _q) = store::claim_due(&db, now).expect("claim");
             let Some(action) = due.into_iter().find(|a| a.id == id) else {
                 break; // no longer claimable (dead) — stop
             };
-            let new_attempt_count = action.attempt_count + 1;
-            match decide_outcome(new_attempt_count, now, err.is_err()) {
+            match record_action_result(&db, id, action.attempt_count, now, &err).expect("record") {
                 Outcome::Done => unreachable!("the action always fails"),
                 Outcome::Retry { next_attempt_at } => {
-                    store::mark_retry(
-                        &db,
-                        id,
-                        new_attempt_count,
-                        next_attempt_at,
-                        "always boom",
-                        now,
-                    )
-                    .expect("retry");
                     retries_seen += 1;
                     // The increment is exact each step, not just at the terminal state: after N
                     // retries the row reads attempt_count == N (catches an off-by-one in the bump).
@@ -258,10 +271,7 @@ mod tests {
                     );
                     now = next_attempt_at; // advance the clock to the next schedule
                 }
-                Outcome::Dead => {
-                    store::mark_dead(&db, id, new_attempt_count, "always boom", now).expect("dead");
-                    break;
-                }
+                Outcome::Dead => break,
             }
         }
         // MAX_ATTEMPTS total attempts = (MAX_ATTEMPTS - 1) retries then the final dead-letter.
@@ -283,31 +293,57 @@ mod tests {
         );
         assert_eq!(entry.last_error.as_deref(), Some("always boom"));
         // A dead row is no longer claimable.
-        assert!(store::claim_due(&db, now + 1_000_000)
-            .expect("claim")
-            .is_empty());
+        let (due, _q) = store::claim_due(&db, now + 1_000_000).expect("claim");
+        assert!(due.is_empty());
     }
 
-    // A succeeding action on its first attempt is marked `done` (AB#1066), via the same seam.
+    // A succeeding action on its first attempt is `done` AND records attempt_count = 1 (AB#1066 F3:
+    // the success path now writes the attempt count, consistent with the failure paths — a done row
+    // reflects its real execution count). Driven through `record_action_result` (F5).
     #[test]
     fn succeeding_action_is_done_first_attempt() {
         let db = Database::open_in_memory().expect("open db");
         let id =
             store::enqueue(&db, "p1", ActionKind::Notification, "s", "{}", 0).expect("enqueue");
-        let action = store::claim_due(&db, 0).expect("claim").remove(0);
-        let new_attempt_count = action.attempt_count + 1;
+        let (mut due, _q) = store::claim_due(&db, 0).expect("claim");
+        let action = due.remove(0);
         let ok: AppResult<()> = Ok(());
         assert_eq!(
-            decide_outcome(new_attempt_count, 0, ok.is_err()),
+            record_action_result(&db, id, action.attempt_count, 0, &ok).expect("record"),
             Outcome::Done
         );
-        store::mark_done(&db, id, 0).expect("done");
 
         let entry = store::get_entry(&db, id).expect("get").expect("exists");
         assert_eq!(entry.status, crate::model::ActionStatus::Done);
-        assert!(
-            store::claim_due(&db, 0).expect("claim").is_empty(),
-            "done is not re-claimed"
+        assert_eq!(
+            entry.attempt_count, 1,
+            "done records the succeeding attempt (F3)"
         );
+        let (due, _q) = store::claim_due(&db, 0).expect("claim");
+        assert!(due.is_empty(), "done is not re-claimed");
+    }
+
+    // A success AFTER prior failures records the cumulative attempt_count (AB#1066 F3): an action
+    // that failed twice then succeeds on attempt 3 ends `done` with attempt_count = 3, not 0/1.
+    #[test]
+    fn success_after_retries_records_cumulative_attempt_count() {
+        let db = Database::open_in_memory().expect("open db");
+        let id =
+            store::enqueue(&db, "p1", ActionKind::Notification, "s", "{}", 0).expect("enqueue");
+        let err: AppResult<()> = Err(AppError::new("transient"));
+        let ok: AppResult<()> = Ok(());
+
+        // Two failures (attempt_count → 1 then 2), then a success on attempt 3.
+        record_action_result(&db, id, 0, 0, &err).expect("fail 1");
+        record_action_result(&db, id, 1, 100, &err).expect("fail 2");
+        record_action_result(&db, id, 2, 200, &ok).expect("succeed");
+
+        let entry = store::get_entry(&db, id).expect("get").expect("exists");
+        assert_eq!(entry.status, crate::model::ActionStatus::Done);
+        assert_eq!(
+            entry.attempt_count, 3,
+            "done reflects all attempts, not just the last"
+        );
+        assert_eq!(entry.last_error, None, "success clears the prior error");
     }
 }

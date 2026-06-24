@@ -10,7 +10,24 @@ import { assertNever, outboxKindLabel, outboxStatusLabel } from "../types";
 import type { OutboxStatus } from "../types";
 import { useOutboxStore } from "./useOutboxStore";
 
+// The active project (#35), passed by App.vue so the panel can scope its listing to it. The
+// outbox already supports a `projectId` filter end-to-end (store → `outbox_list`); this prop wires
+// that capability to the UI without the panel reaching into the project store itself.
+const props = defineProps<{ activeProjectId?: string }>();
+
 const store = useOutboxStore();
+
+// Project scope: "all" lists every project's actions (DEFAULT — deeplink notifications are global /
+// project-less, so they always show); "current" scopes to `activeProjectId`. Sets the store's
+// `projectId` filter (also honored by the push listener) and re-reads the snapshot.
+const scope = ref<"all" | "current">("all");
+function onScopeChange(event: Event) {
+  scope.value =
+    (event.target as HTMLSelectElement).value === "current" ? "current" : "all";
+  store.projectId =
+    scope.value === "current" && props.activeProjectId ? props.activeProjectId : null;
+  void store.refresh();
+}
 
 // Which entries have their raw payload disclosed; toggled per id.
 const rawOpen = ref<Set<number>>(new Set());
@@ -62,6 +79,19 @@ onUnmounted(() => unlisten?.());
   <section class="outbox-panel">
     <header class="head">
       <h2>Outbox</h2>
+      <!-- Project scope (#35 / AB#1066 F7): "all" (default) shows every project's actions plus the
+           project-less global notifications; "current" scopes to the active project. -->
+      <select
+        class="scope"
+        :value="scope"
+        aria-label="项目范围 / project scope"
+        @change="onScopeChange"
+      >
+        <option value="all">全部项目 / All</option>
+        <option value="current" :disabled="!props.activeProjectId">
+          当前项目 / Current
+        </option>
+      </select>
       <button
         type="button"
         class="refresh"
@@ -117,9 +147,14 @@ onUnmounted(() => unlisten?.());
                explicit "通用 / Global" chip rather than a blank one. -->
           <span class="badge project">{{ entry.projectId || "通用 / Global" }}</span>
           <span class="attempts">尝试 {{ entry.attemptCount }} 次</span>
+          <!-- Timeline (AB#1066 F8): created always; a pending row shows its next retry time, a
+               terminal (done/dead) row shows when it last transitioned — so done/dead rows carry a
+               diagnosable completion/failure time, not just the attempt count. -->
+          <span class="ts">创建 {{ fmtTime(entry.createdAt) }}</span>
           <span v-if="entry.status === 'pending'" class="next-attempt">
             下次 {{ fmtTime(entry.nextAttemptAt) }}
           </span>
+          <span v-else class="ts">更新 {{ fmtTime(entry.updatedAt) }}</span>
         </div>
 
         <p v-if="entry.lastError" class="error fail-reason">

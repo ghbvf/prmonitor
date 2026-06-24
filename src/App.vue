@@ -311,7 +311,11 @@ watch(selectedNumber, (n) => {
     <!-- Outbox view (AB#1066): the symmetric full-width listing of outbound actions.
          OutboxPanel self-manages its `outbox:updated` listener (onMounted/onUnmounted), so
          the composition root only routes to it — no central listener wiring here. -->
-    <OutboxPanel v-else-if="currentView === 'outbox'" class="view" />
+    <OutboxPanel
+      v-else-if="currentView === 'outbox'"
+      class="view"
+      :active-project-id="activeProjectId"
+    />
 
     <div v-else class="layout">
       <!-- Unified project → PR navigation (#67): one column (ProjectNav merges the old
