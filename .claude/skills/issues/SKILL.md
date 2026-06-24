@@ -1,171 +1,196 @@
 ---
 name: issues
-description: "GitHub Issue / PR / 评论 / label 的 gh 命令编排单源（ship/fix/pr-review 共用）：建/改/关 issue、贴 PR 评论并回显 comment URL、PR 双轴状态 label 流转、PR 冲突预检 + CI watch。另含「非任务 issue 状态核查」：查代码判断 issue 是否仍成立，只判不修，建议 /ship 或 close。当用户要建/改 issue、给 PR 留评论、切 PR 状态 label、核一个 issue 是否还成立时使用。"
-argument-hint: "<#issue（状态核查）| create-issue | edit-issue | comment | pr-status | pr-precheck> [...]"
+description: "激活 forge 的 issue/work-item tracker + 看板项目管理单源技能（GitHub Issues+Project v2 / Azure Boards / GitLab issues，经 forge.sh 适配）。Part A：epic 拆解 + wave 实施顺序评论（找子任务 → blocked-by DAG → wave 1-4 容量装箱排序：每 wave ≤4、pri 优先、wave 内切并行组/串行链、OPEN 重排、已完成不动、装箱溢出顺延下一 wave、仅超窗(Wave 4 后仍未分配)单列 → 只追加 epic 评论；不写 Project 字段、不改 epic body）。Part B：issue/PR 原子操作（建/改 backlog issue、area/type/pri label、PR 双轴状态 label 流转、统一 PR 评论格式 + 冲突预检/CI watch 跟进，ship/fix 共用）。非 epic issue 号 → 查代码判状态（只判不修，建议 /ship 或 close）。当用户要整理 epic 排 wave、建/改 backlog issue、贴 label、切 PR 状态、给 PR 留评论、核一个 issue 是否还成立时使用。"
+argument-hint: "<epic #N | #issue（非epic→状态核查）| create-issue | edit-labels | pr-status | comment> [...]"
 allowed-tools: [Read, Grep, Bash, Agent, AskUserQuestion]
 ---
 
-# issues — Issue / PR / 评论 gh 编排单源
+# issues — 项目管理单源（Epic/Wave + Issue/PR/Label/评论）
 
-> 本技能是 issue/PR/评论**固定 gh 命令形态的单源**——ship / fix / pr-review 引用本文，不重印命令。
-> 仓库：`ghbvf/prmonitor`，base 分支 `develop`。
-> 输入分派：**普通 issue 号** → 「非任务 issue 状态核查」；**动词**（create / edit / comment / pr-status / pr-precheck）→ 对应原子操作。
-> create issue 前先 `gh issue list --search` 查重（幂等）。
+> 真源 = 激活 forge 的 issue 系统（GitHub Issues / Azure Boards / GitLab Issues）+ 激活 forge 的看板（Azure Boards / GitHub Project / GitLab）。**内容/结构 + 治理全在 `.github/project-template/`**：issue body → `backlog.md`/`epic.md`，PR body → `pull_request_template.md`，PR 评论 → `pr-comment.md`，label/字段/评级/流程 → `PROJECT.md`（索引见 `README.md`）。本技能只负责编排，不复制模版内容。
+> 输入分派：**`epic #N` / 带 `epic` label 的 issue** → Part A（拆解 + wave 调度）；**普通 issue 号（无 `epic` label）** → 下方「非 epic issue 状态核查」；**动词**（create / edit / pr-status / comment）→ Part B 原子操作。
+> create issue 前先 search 查重（幂等）。
+> repo 标识经 `bash hack/automation/forge.sh repo-slug` 取得；看板经激活 forge 的看板机制管理，不写死平台路径。
 
 ---
 
-## 非任务 issue 状态核查（查代码判状态，只判不修）
+## 非 epic issue 状态核查（查代码判状态，只判不修）
 
-输入一个 issue 号、要核它是否仍成立时：
+输入普通 issue 号（无 `epic` label）时，不排 wave，而是查代码判断该 issue 是否仍成立：
 
-1. `gh issue view <N> --json title,body,labels` 读问题描述 + body 的 Files。
+1. `bash hack/automation/forge.sh issue-view <N>` 读问题描述 + body 的 Files。
 2. 按 Files / 关键字 Read/Grep 定位代码；跨 3+ 文件时并行派 `Agent(Explore)` 核查。
 3. 判状态（**只判不修**）：**存在** / **已修复**（给证据：哪行 / 哪 PR）/ **已变更**（形态变化）/ **无法确认**。
-4. 输出状态 + 证据 + 建议：需修 → 建议 `/ship #<N>`（或定位到 file:line 后 `/fix`）；已修复 / 过期 → 建议关闭（`gh issue close --reason ...`）。
+4. 输出状态 + 证据 + 建议：需修 → 建议 `/ship #<N>`（或定位到 file:line 后 `/fix`）；已修复 / 过期 → 建议 Part B 关闭（`forge.sh issue-close`）。
 
 ---
 
-## B1. 新建 issue
+# Part A — Epic 拆解 + Wave 实施顺序评论
 
-简单 issue（标题 + body，可选一个朴素 label，无四轴强制门）：
+> 负责 epic 级「找子任务 → 排 wave → 追加 epic 评论」。不写 Project 字段，不改 epic body；issue/label/评论原子操作见 Part B。
 
-```bash
-gh issue create --title "<简短标题>" --body-file <填好的 body.md>
-# 可选：--label <name>（仓库已有的朴素 label，无则省略）
+## A1. 读 epic → 关键字查找相关 issues → 关联 → 汇总子 issues
+
+1. **读 epic**：`bash hack/automation/forge.sh issue-view <epic#>`（确认 epic label；从 title + 目标/范围提取关键字）。
+2. **关键字查找相关 issues**：`bash hack/automation/forge.sh issue-list "<关键字>" open`，挑出属于本 epic 的候选；用 AskUserQuestion 确认候选集（不擅自全关联）。
+3. **关联到 epic**（建父子关系，已关联的跳过）：
+   ```bash
+   bash hack/automation/forge.sh subissue-link <epic#> <child#>
+   ```
+4. **汇总子 issues**：经 forge 列出 epic 子任务（`bash hack/automation/forge.sh issue-list "" open` 结合父子关系过滤，或激活 forge 的父子关系 API）；对每个 OPEN 子任务读 label（area/type/pri）+ body 的 `Blocked-by: #NNN`（多行/逗号分隔，无声明=无前置）。
+
+> 子任务跨 3+ 包或描述模糊时，用 `Agent(Explore)` 核实归属 / 状态 / `Blocked-by` 再汇总（**wave 内冲突分区 + 实施顺序的分析在 A2 第 6 步，见下**）。
+
+## A2. 建 blocked-by DAG + wave 容量装箱排序（每 wave ≤4，Wave 1-4 有界）
+
+**滚动 + 有界 + 容量装箱算法**（每次更新 epic 都重跑；作用域 = epic 的 **OPEN** 子任务）。wave 不再纯=依赖深度，而是「依赖约束 + 每 wave ≤4 容量」的贪心 list-scheduling——**pri 决定容量受限时谁进早 wave**：
+
+1. **节点 = OPEN 子任务**；CLOSED（已完成）子任务**排除**——不参与排序，仅在评论中单列为已完成。
+2. 有向边 `blocker → dependent`（来自 `Blocked-by`），**仅当 blocker 也 OPEN**；blocker 已 close = 依赖已满足 → 删该边。**这是「滚动」的来源**：前置完成后 dependent 自动前移到更早 wave。
+3. 检测环：若有环，AskUserQuestion 让用户裁定断哪条边（不静默）。
+4. **逐 wave w=1..4 贪心装箱**（每 wave 至多 **4** 个 issue）：
+   - `ready 集` = 全部 blocker 都已分到**更早** wave 的未分配 OPEN 节点（无 blocker 的节点天然 ready）。
+   - ready 集按 `pri`(p0>p1>p2>p3) → **基础性产出先** → `Cx`(小先，由 `cx-X` label 提供) → issue# 排序，取前 **≤4** 入 wave w。
+   - 其余（含同深度溢出、blocker 刚入本 wave 而本轮未 ready 的）**留待下一 wave**（溢出顺延）。
+5. **有界 cap = Wave 4**：装箱到 Wave 4 仍未分配的节点标记 **超窗**，在评论中单列，不写任何 Project 字段。
+6. **wave 内冲突分区**（确认「真并行」vs「须串行」）：对每个 wave（成员 ≥2）**并行**派 `Agent(Explore)` 分析其中每个任务的 scope / 触碰文件 / 产出↔消费 / 风险，主 agent 汇总后切：
+   - **并行组**：两两**无文件重叠 + 无隐式产出↔消费 + 无资源冲突** → 可同时跑（≤4 并行 agent）。「可并行」= 经冲突分析确认无冲突，**非**仅「无 `Blocked-by`」。
+   - **串行链**：有上述任一冲突 → 须串行，链内按 `pri` → 基础性产出先 → `Cx` → issue# 定序，并注明冲突原因（如「同改 foo.rs」）。
+   - 单任务 wave 跳过分析。
+7. 输出每个 OPEN 子任务的 `(wave, 并行组/串行链, 链内序)` 或「超窗」。
+
+呈现给用户的 dry-run 表（只列 OPEN；超窗与已完成单列）：
+
+```
+Wave 1（依赖深度1，取 pri 前4）:
+  并行组 A（零冲突，可同时）: #a(p0·Cx1)  #b(p0·Cx2)
+  串行链 B（#c→#d 同改 foo.rs，按 pri）: [1] #c(p1·Cx2)  [2] #d(p2·Cx1)
+Wave 2（深度1溢出 + 依赖 Wave 1）:
+  并行组 A: #e(p3·Cx1 深度1溢出)  #g(p1·Cx2 ←blocked-by #a)
+超窗(Wave 4 之后，评论单列): #z(依赖链/装箱越 W4)
+已完成(不动): #y
 ```
 
-> 由 review/fix finding 派生成文时，body **无损**写入：现状（证据代码片段 + 三维根因 + 影响）/ 修复方向（最小/彻底/重构 三级方案种子）/ Files（file:line 全集）/ Source（`PR #<N> finding <Fk>`，派生注明 `Discovered via /ship|/fix #<N>`）。不得一句话带过——否则后续无法据此修复。
-
-## B2. 编辑 / 关闭 issue
+## A3. 追加 epic 实施顺序评论
 
 ```bash
-gh issue edit <N> --add-label <name> --remove-label <name>            # 改 label
-gh issue close <N> --reason completed --comment "Fixed in PR #<NNN>"   # 修复闭合
-gh issue close <N> --reason "not planned" --comment "<理由>"          # wontfix
+# 只追加评论；不编辑 epic body，不写 Project 字段。
+# 把评论正文写入临时文件，再经 forge 贴出。
+# ⚠ Azure work-item 评论服务端强制 HTML 消毒（?format=markdown 也拦不住）：HTML 注释 <!-- --> 被整段剥离、
+#   裸 < / > 被编码成 &lt; / &gt;（代码围栏里显示字面量）。故 marker 用可见 token `pm:epic-wave`（不再用
+#   HTML 注释），正文全程不写裸尖括号 / 行首 blockquote（用「之后 / 越 W4」等措辞替代）。
+#   marker 现仅作可见锚点：就地更新去重是后续 forge upsert 能力（暂未接，评论仍 append）。
+cat > /tmp/epic-wave-comment.md <<'C'
+`pm:epic-wave`
+🌊 Epic 实施顺序更新：每 wave ≤4 容量装箱，OPEN 按 pri 排 Wave 1-4；wave 内标明并行组 / 串行链；已完成与超窗(Wave 4 之后)单列。排序结果只写在本评论中，不写 Project 字段，不改 epic body。
+
+粘贴 A2 dry-run 表（不带尖括号占位符）
+C
+bash hack/automation/forge.sh issue-comment <epic#> /tmp/epic-wave-comment.md
 ```
 
-## B3. PR 评论（编排）
+## A4. 沟通规则
 
-> 评论格式分两类：**单 skill 专属模板**（`pm:ship` / `pm:fix` / `pm:pr-review`）内联在各自技能里；**跨 skill 共享模板**（`pm:oos` / `pm:ci`，ship+fix 共用）见本节末「共享评论模板」，引用方不重印。本节是**贴评论命令 + 回显 comment id** 的单源（ship/fix/pr-review 引用本节，不重印）：
+- 环检测命中：停下 AskUserQuestion。
+- DAG 排序结果先 dry-run 呈现，确认后只追加 epic 评论。
+- 不改子任务代码 / 不关 issue / 不改 area-type-pri label（那是 Part B / `fix` 职责）。
+
+---
+
+# Part B — Issue / PR / Label / 评论
+
+> issue/PR 的 forge 编排，是 issue/PR/label/评论**固定命令形态的单源**——ship/fix/pr-review 引用本部分，不重印命令。body 骨架见 `.github/project-template/` 的 `backlog.md` / `epic.md` / `pull_request_template.md`；PR 评论格式见 `pr-comment.md`；label / 字段 / 评级 rubric 见 `PROJECT.md`。本部分不复制模版内容。
+
+## B1. 新建 backlog issue（PBI 叶子）
+
+> B1 建的是 **PBI 叶子**（Work Item Type = Product Backlog Item，≈ 一个 PR），validate 默认 `--tier pbi` 守四轴。容器层 Epic / Feature 走 §1.1 三层映射（Azure UI 手工建、不贴 `cx` / `type`）；脚本化建容器时校验用 `issue-labels.sh validate --tier feature|epic`（要求 area+pri、禁止 type/cx）。
+
+四轴 label 齐全（area + type + pri + cx）+ `backlog`，全部 CLI 显式贴（pri/cx 必填，cx 无 unknown sentinel）：
 
 ```bash
-URL=$(gh pr comment <N> --body-file <填好的评论 body>)   # stdout = https://github.com/ghbvf/prmonitor/pull/<N>#issuecomment-<id>
-echo "✅ 已贴评论：$URL"                                   # 必须回显给用户；comment id = URL 尾段 #issuecomment-<id>
+# 建单前强制门：校验 area/type/pri/cx 四轴完整（exit 0 才执行 create；下游 selftest-locked，见 PROJECT.md §2.6）
+bash hack/automation/issue-labels.sh validate --labels "backlog,pri-p2,area-review,type-bug,cx-2"
+bash hack/automation/forge.sh issue-create \
+  "[<ID>] <简短标题>" <填好的 backlog.md> \
+  "backlog,pri-p2,area-review,type-bug,cx-2"
+# body 骨架单源 = .github/project-template/backlog.md（现状 / 修复方向 / Files / Trigger / Source）——本技能不复制其结构
 ```
 
-- stdout 即评论 URL（含 `#issuecomment-<id>`）——**贴完必须捕获并回显**，便于跳转 / 引用。
+> **由 review/fix finding（OUT_OF_SCOPE / 派生）成文时**：body 按 `backlog.md` 顶部的字段映射**无损**填充，不得一句话带过——否则后续无法据此修复；并从 finding 的 `[…Cx…]` tag 取 `cx-X` label 一并贴。
+
+- **area-XX**（1 个，8 选）：见 `.github/project-template/PROJECT.md` §2.1。
+- **type-XX**（1 个，8 选）：见 §2.2。
+- **pri-pX**：评级 rubric 见 `.github/project-template/PROJECT.md` §3。`/fix` 派生默认 `pri-p2`；`pri-p0` 仅 incident-driven，停下 AskUserQuestion 确认。
+- **cx-X**（必填）：复杂度 rubric 见 `.github/project-template/PROJECT.md` §3.2 / §2.6。建单前必须定级并显式指定 `cx-X` label（与 pri 对称，无 unknown sentinel——定不到级也要就近取一档）；finding 派生从 `[…Cx…]` tag 取。epic / feature 容器例外（不贴 cx / type，§1.1）。
+- **flag-cond**（可选）：条件延后型加此 label + body 写 `## Trigger`。
+
+> P0 红线不得默认贴。area/type/cx 漏贴时用 `bash hack/automation/forge.sh issue-edit-labels <N> --add "area-X" --remove ""` 补；建单前 `issue-labels.sh validate` 强制门正常会先拦截，此为绕过门（raw web UI）后的补救。
+
+## B2. 编辑 label / 关闭 issue
+
+```bash
+bash hack/automation/forge.sh issue-edit-labels <N> --add "area-data" --remove "area-review"     # 改领域
+bash hack/automation/forge.sh issue-edit-labels <N> --add "type-debt" --remove ""               # 加类型
+bash hack/automation/forge.sh issue-close <N> "completed" "Fixed in PR <NNN>"                    # 修复闭合
+bash hack/automation/forge.sh issue-close <N> "not planned" "<理由>"                            # wontfix
+```
+
+容器层 Epic / Feature（§1.1 三层映射）= 原生 Work Item Type + `forge.sh subissue-link` 写原生父子（不手写 body task list）；Epic 另贴 `epic` label。父子链 Epic→Feature→PBI：`bash hack/automation/forge.sh subissue-link <epic#> <feature#>` / `subissue-link <feature#> <pbi#>`。wave 排序见 Part A。
+
+## B3. PR 状态 label 流转（编排）
+
+> 两正交轴（pr-status 流转 / pr-review 结论）的取值与「何时切」语义见 `.github/project-template/PROJECT.md` §2.5 + §5（单源，不在此复制表）。**两轴各自互斥**：pr-status 恰好一个；pr-review `approved` XOR `changes-requested`——**切一侧必 `--remove` 同轴对侧**。本节只给切换命令。
+
+```bash
+# ship 后：待再审（首次交接，唯一使用 needs-review-again 的地方）
+bash hack/automation/forge.sh pr-set-labels <N> --add "pr-status/needs-review-again" --remove "pr-status/in-progress"
+# review 轮结论（默认 /pr-review 或 codex；review 轴互斥）
+# 有 finding → changes-requested + needs-fix（5-state：review 轮 changes-requested 始终切 needs-fix）
+bash hack/automation/forge.sh pr-set-labels <N> --add "pr-review/changes-requested,pr-status/needs-fix" --remove "pr-review/approved,pr-status/needs-review-again"
+# 无 finding → approved + pr-status/ready（无需 fix/check 的终态）
+bash hack/automation/forge.sh pr-set-labels <N> --add "pr-review/approved,pr-status/ready" --remove "pr-review/changes-requested,pr-status/needs-review-again"
+# fix 后：待 --check 验证（fix 不直接到 ready）
+bash hack/automation/forge.sh pr-set-labels <N> --add "pr-status/needs-check-fix" --remove "pr-status/needs-fix"
+# --check 全修复：可合并（清 pr-status 前态 + review 轴对侧）
+bash hack/automation/forge.sh pr-set-labels <N> --add "pr-status/ready,pr-review/approved" --remove "pr-status/needs-check-fix,pr-review/changes-requested"
+# --check 有未修/回归：回 fix（清 pr-status 前态 + review 轴对侧）
+bash hack/automation/forge.sh pr-set-labels <N> --add "pr-review/changes-requested,pr-status/needs-fix" --remove "pr-status/needs-check-fix,pr-review/approved"
+```
+
+## B4. PR 评论（编排）
+
+留痕约定 / 标记规则见 `.github/project-template/PROJECT.md` §5；评论格式（`pm:ship` / `pm:fix` / `pm:pr-review` 三模板 + footer）见 `.github/project-template/pr-comment.md`。本节是贴评论命令 + **回显 comment URL** 的单源（ship/fix/pr-review 引用本节，不重印）：
+
+```bash
+URL=$(bash hack/automation/forge.sh pr-comment <N> <填好的 pr-comment.md 模板>)   # stdout = 评论 URL（含定位锚点，成功 exit 0）
+echo "已贴评论：$URL"                                            # 必须回显给用户；comment 锚点含于 URL 尾段
+```
+
+- stdout 即评论 URL（含锚点）——**贴完必须捕获并回显**，便于用户跳转 / 引用该评论。
 - 命令非 0 退出 → 报错退出，不静默跳过。
-- footer 由贴评论方自填（PR#/工具/head 分支/worktree 路径/session id，拿不到填 `—`）。
+- footer 格式见 `.github/project-template/pr-comment.md`（PR#/工具/分支/worktree/session，AI 自填）。
 
-### 共享评论模板（`pm:oos` / `pm:ci`，无机器块）
+## B5. PR 冲突预检 + CI 跟进（ship/fix 共用）
 
-**`pm:oos`**（OUT_OF_SCOPE findings 从主评论分离的无损存档；每条已建 issue 或显式 deferred）：
+push 后流程分**两阶段**：① 冲突预检（阻塞，贴评论前必过）→ 立即收尾（贴评论 + 切 label，不等 CI）→ ② CI 异步收敛（收尾后再跑，结果贴独立 pm:ci 评论）。
 
-```markdown
-<!-- pm:oos -->
-## 🚦 Out-of-Scope Findings
+**① 冲突预检**（阻塞，必须先于收尾）：`bash hack/automation/forge.sh pr-mergeable <N>`。`mergeable` 由 forge 异步计算，刚 push 常返回 `UNKNOWN`——**轮询几次（~5-10s 间隔）直到落定** `MERGEABLE` / `CONFLICTING`，单查 UNKNOWN 无效。`CONFLICTING` → 先解冲突：`REMOTE=$(bash hack/automation/forge.sh remote); git -C <wt> fetch "$REMOTE" && git -C <wt> merge "$REMOTE/develop" --no-edit`（解冲突 → commit → push）→ 回本步重检。`MERGEABLE` → 立即进行收尾（贴评论 + 切 label），**不等 CI**。
 
-**OOS Findings** <k> 条（已从 pm:ship/pm:fix 主评论分离，本评论为无损存档；每条已建 issue 或显式 deferred）
-
-**F3** [P2·small·可靠性] `path/to/z.rs:64`（🚦 OUT_OF_SCOPE）
-- 证据：`<code 片段>`
-- 三维根因：代码 <…> / 架构 <1 处局部｜Grep N 处系统性> / 历史 <git log 同类>
-- 三级方案种子：最小 <…> / 彻底 <…> / 重构 <…>
-- Files：`path/to/z.rs:64`
-- 处置：✅ 已建 issue **#<N>** <url>（body 按 B1 无损填）｜🟡 deferred:<原因>
-
----
-🤖 PR #<N> · Generated with Claude Code · branch <head 分支> · worktree <路径|—> · session <会话id|—>
-```
-
-**`pm:ci`**（CI 收敛结果，独立评论）：
-
-```markdown
-<!-- pm:ci -->
-## CI 检查结果
-
-**状态**：<通过 / 失败>（已通过 <n> / 共 <total> 个检查）
-
-<若有失败>
-**失败检查**：
-- `<check-name>` — <url>
-
----
-🤖 PR #<N> · Generated with Claude Code · branch <head 分支> · worktree <路径|—> · session <会话id|—>
-```
-
-> 两模板均**无机器块**（无尾部结构化块）。`pm:oos` 建单走 B1（朴素 title+body，无四轴 label）；incident/红线/归属不清 → 停下 AskUserQuestion，不静默自动建。新增**跨 skill 共享模板**（ship+fix+pr-review 共用）加本小节作单源；**单 skill 专属模板**（`pm:ship`/`pm:fix`/`pm:pr-review`）保持各自技能内联。
-
-## B4. PR 冲突预检 + CI 跟进（ship/fix 共用）
-
-push 后流程分**两阶段**：① 冲突预检（阻塞，贴评论前必过）→ 立即收尾（贴评论，不等 CI）→ ② CI 异步收敛（收尾后再跑）。
-
-**① 冲突预检**（阻塞，必须先于收尾）：`gh pr view <N> --json mergeable,mergeStateStatus`。`mergeable` 由 GitHub **异步计算**，刚 push 常返回 `UNKNOWN`——**轮询几次（~5-10s 间隔）直到落定** `MERGEABLE` / `CONFLICTING`。`CONFLICTING`（或 `mergeStateStatus=DIRTY`）→ 先解冲突：`git -C <wt> fetch origin && git -C <wt> merge origin/develop --no-edit`（解冲突 → commit → push）→ 回本步重检。`MERGEABLE` → 进行收尾。
-
-**② CI 异步收敛**（收尾之后再跑）：本仓 CI 两个 job（frontend：vue-tsc + vite build；rust：cargo fmt + clippy + build），typically 几分钟。
+**② CI 异步收敛**（收尾评论 + label 切换之后再跑）：**激活 forge（azure）无 CI** 时，`ci-*` 命令返回 `no-ci` 哨兵，此阶段降级为本地 `pnpm build && pnpm test` + cargo build/test/fmt/clippy，不贴 `pm:ci` 评论；以下 watch 逻辑作为**有 CI forge**（如 GitHub Actions）的路径保留。
 
 ```bash
-# 阻塞轮询直到所有 check 完成（exit 0=全绿 / 8=pending / 非0=有失败）
-gh pr checks <N> --watch --interval 30 --fail-fast       # Bash timeout 设 ~600000ms（10min 工具上限）
-# 失败 → 列失败 check + run 链接
-gh pr checks <N> --json name,bucket,link --jq '.[] | select(.bucket=="fail") | [.name,.link] | @tsv'
-gh run view <run-id> --job <job-id> --log-failed         # link 末段 job-id、中段 run-id
+# 阻塞轮询直到所有 check 完成（exit 0=全绿 / 8=pending / 非0=有失败；--fail-fast 见首个失败即退）
+bash hack/automation/forge.sh ci-watch <N>    # Bash timeout 设 ~600000ms（10min 工具上限）；预计 6min 内返回
+# 失败 → 列失败 check（精确到 PR head）+ run 链接
+bash hack/automation/forge.sh ci-failed <N>
+bash hack/automation/forge.sh ci-logs <run-id> <job-id>   # run-id/job-id 从 ci-failed 输出中提取
 ```
 
-- 失败 → 回 `fix` 修复循环（定位 → 修 → commit → push → 重新预检），**最多 3 轮**；**3 轮仍红 → 停下交人工**（不无限等、不静默）。
-- CI 收敛后在窗口报告结果（全绿 / 仍红 + 失败 check 摘要 + run 链接）。
-
-## B5. PR 状态 label 流转（编排）
-
-> 两正交轴的**切换命令单源**——ship/fix/pr-review 引用本节，不重印。**不变式**：PR 始终**恰好一个** `pr-status/*`；`pr-review` 轴 `approved` **XOR** `changes-requested`——**切一侧必 `--remove-label` 同轴对侧**（命令对对侧无条件 `--remove-label`，幂等：`gh` 移除不存在的 label 是无害空操作，故无需先查当前状态）。`/fix` 不能直接到 `ready`，必过 `/pr-review --check` 验证。`needs-review-again` 仅 ship 首审一次用；后续 review→changes-requested 始终切 `needs-fix`（5-state）。
->
-> **入口前置**：full `/pr-review` 仅从 `needs-review-again`（首审）或 `needs-fix`（重审）发起；`needs-check-fix` 后的验证**一律走 `--check`**（其命令 remove `needs-check-fix`，full-review 命令不 remove 它 → 防同时挂两个 `pr-status/*`）。
-
-| 轴 | label | 何时 |
-|----|-------|------|
-| pr-status（互斥） | `in-progress` | ship 创建 PR 时 |
-| | `needs-review-again` | ship 收尾交接（首审唯一使用点） |
-| | `needs-fix` | review 出 changes-requested |
-| | `needs-check-fix` | /fix 修完，待 --check 验证 |
-| | `ready` | --check 全修复（终态） |
-| pr-review（XOR） | `approved` / `changes-requested` | review / --check 结论 |
-
-```bash
-# ship 创建 PR 后
-gh pr edit <N> --add-label pr-status/in-progress
-# ship 收尾交接（首审唯一使用点）
-gh pr edit <N> --add-label pr-status/needs-review-again --remove-label pr-status/in-progress
-# review 有 findings（5-state：始终切 needs-fix）
-gh pr edit <N> --add-label pr-review/changes-requested --add-label pr-status/needs-fix \
-  --remove-label pr-review/approved --remove-label pr-status/needs-review-again
-# review 无 findings → 终态（撤两种合法入口 needs-review-again/needs-fix，保恰好一个 pr-status/*）
-gh pr edit <N> --add-label pr-review/approved --add-label pr-status/ready \
-  --remove-label pr-review/changes-requested --remove-label pr-status/needs-review-again --remove-label pr-status/needs-fix
-# /fix 修完 → 待验证（fix 不能直接 ready）
-gh pr edit <N> --add-label pr-status/needs-check-fix --remove-label pr-status/needs-fix
-# --check 全修复 → 终态
-gh pr edit <N> --add-label pr-status/ready --add-label pr-review/approved \
-  --remove-label pr-status/needs-check-fix --remove-label pr-review/changes-requested
-# --check 有未修/回归 → 回 fix
-gh pr edit <N> --add-label pr-review/changes-requested --add-label pr-status/needs-fix \
-  --remove-label pr-status/needs-check-fix --remove-label pr-review/approved
-```
-
-### round / 熔断（无机器块的确定性来源）
-
-review↔fix 轮次 = 数 `pm:fix` 评论（每轮 fix 贴一条），机器可数，不靠人记：
-
-```bash
-gh pr view <N> --json comments --jq '[.comments[]|select(.body|contains("<!-- pm:fix -->"))]|length'
-```
-
-`round >= 3` → 窗口提示「review↔fix 已达 3 轮，建议转人工」。
-
-> 这是**行为说明，不是 enforcement 机制、不立项**——ai-robust 章程约束的是代码治理面（切片/契约/错误漏斗等），不含 workflow 工具。本仓人工驱动、无自动 dispatch 循环，无机器失控可言，故不设机器级熔断门。round 计数（上方命令）是机器可数的**数据来源**（Medium）；是否转人工由人按此数据判断。
+- **等待上限 ~12-15 min**（~2.5× 典型，吸收 runner 排队）。超 Bash 10min 上限用后台轮询兜底（`run_in_background` 跑 `ci-watch`，或循环 `bash hack/automation/forge.sh pr-state <N>` 间隔 30-60s 判 CI 完成）；超上限仍 pending → 停下报告，不无限等。
+- 失败 → 回 `fix` 修复循环（定位 → 修 → commit → push → 重新预检），**最多 3 轮**；**3 轮仍红 → 停下交人工，不 AskUserQuestion**。
+- CI 收敛后（全绿或 3 轮红）贴独立 `pm:ci` 评论（`verdict=ci-green` 或 `verdict=ci-failed`），不合并进主 pm:ship / pm:fix 评论。
 
 ## B6. 沟通规则
 
-- issue 编辑 / 评论 / label 流转 / 冲突预检 / CI watch：按流程自动执行，不逐条问。
-- create issue 前查重；状态核查只判不修。
-- 切 label 必同轴互斥（切一侧撤对侧）；round 由数 pm:fix 评论派生。
-- CI 修复 3 轮仍红 → 停下交人工。
+- label 编辑 / PR 状态切换 / 评论：按流程自动执行，不逐条问。
+- CI watch / 取失败日志：自动执行；CI 修复 3 轮仍红 → 贴 PR 评论留痕 + 停下交人工（不 AskUserQuestion）。
