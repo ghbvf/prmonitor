@@ -30,4 +30,8 @@ pub struct AppState {
     /// `lib.rs` `setup()`; NEVER tunneled (distinct from `webhook`); killed on app shutdown.
     /// Methods take `&self`.
     pub local_api: crate::review::local_api::LocalApiManager,
+    /// The event inbox's replay-time hooks (AB#1065): the dispatcher + Azure refresh the
+    /// `inbox_replay` command re-uses (installed once by the composition root in `setup()`,
+    /// like the webhook ingestor/refresher). Methods take `&self`.
+    pub inbox: crate::inbox::manager::InboxManager,
 }

@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -179,6 +179,9 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 3 {
         apply_v3(conn)?;
     }
+    if version < 4 {
+        apply_v4(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -207,6 +210,16 @@ fn apply_v3(conn: &Connection) -> AppResult<()> {
         "ALTER TABLE review_session ADD COLUMN engine_kind TEXT NOT NULL DEFAULT 'codex';",
     )
     .map_err(map_err)?;
+    Ok(())
+}
+
+/// v4 (AB#1065): the event inbox. Persists every inbound webhook delivery (GitHub ingest +
+/// Azure audit), deduped by delivery identity, for listing / raw inspection / replay. A
+/// FRESH `CREATE TABLE` batch (like [`SCHEMA_V1`]), NOT an `ALTER` — it adds a brand-new
+/// table, so a fresh DB (version 0) runs v1..v4 and an existing v3 install runs ONLY this
+/// step (the `CREATE TABLE IF NOT EXISTS` is also idempotent under replay).
+fn apply_v4(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(SCHEMA_V4).map_err(map_err)?;
     Ok(())
 }
 
@@ -284,6 +297,46 @@ CREATE TABLE IF NOT EXISTS review_history_item (
 CREATE INDEX IF NOT EXISTS idx_history_thread ON review_history_item(thread_id, id);
 "#;
 
+/// v4 schema — the event inbox (AB#1065). One row per inbound webhook delivery.
+///
+/// `dedupe_key` carries the inbox's **Hard** ingress-idempotency carrier: the `UNIQUE`
+/// constraint makes a double-insert of the SAME delivery identity (a webhook retry / tunnel
+/// re-delivery) UNEXPRESSIBLE at the storage layer — `insert_dedup`'s
+/// `INSERT … ON CONFLICT(dedupe_key) DO NOTHING` relies on it to process each delivery
+/// exactly once (the upstream of the inbox funnel; the downstream authoritative gate stays
+/// the existing `dispatch_key` + `try_reserve_pair`, UNCHANGED — see `inbox::service`).
+///
+/// `event_json` stores the serialized normalized [`crate::model::Event`] (the wire envelope
+/// the panel renders + replay reads back). `raw_payload` is the verbatim delivery body (the
+/// `inbox_get_raw` audit source). `webhook_event_json` stores the parsed
+/// `pr::webhook::WebhookEvent` JSON for GitHub entries so a GitHub replay re-feeds the SAME
+/// classified event through the vetted `ingest_webhook` path WITHOUT re-running the
+/// route-dependent `parse_delivery` (which needs the live route snapshot, absent at replay
+/// time); `NULL` for Azure audit entries (replay re-invokes the refresher instead).
+const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS inbox_event (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedupe_key         TEXT    NOT NULL UNIQUE,
+    source             TEXT    NOT NULL,
+    event_type         TEXT    NOT NULL,
+    project_id         TEXT    NOT NULL,
+    repo               TEXT    NOT NULL,
+    number             INTEGER,
+    event_json         TEXT    NOT NULL,
+    raw_payload        TEXT    NOT NULL,
+    -- The parsed `pr::webhook::WebhookEvent` JSON, ONLY for replay reconstruction: a GitHub
+    -- replay re-feeds this through `ingest_webhook` instead of re-running `parse_delivery`
+    -- (which is private + needs the live route snapshot, so it is not standalone-callable at
+    -- replay time). NULL for Azure audit rows (replay re-invokes the refresher).
+    webhook_event_json TEXT,
+    status             TEXT    NOT NULL,
+    received_at_epoch  INTEGER NOT NULL,
+    processed_at_epoch INTEGER,
+    error              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_inbox_event_project ON inbox_event(project_id, id DESC);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +360,7 @@ mod tests {
                 "config_blob",
                 "dispatch_event",
                 "dispatch_key",
+                "inbox_event",
                 "meta",
                 "review_history_item",
                 "review_session",
@@ -377,7 +431,7 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 3, "current schema is v3");
+            assert_eq!(SCHEMA_VERSION, 4, "current schema is v4");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"
@@ -386,15 +440,19 @@ mod tests {
                 review_session_has_engine_kind(conn),
                 "fresh v0 → v3 has the engine_kind column"
             );
+            assert!(
+                table_exists(conn, "inbox_event"),
+                "fresh v0 → v4 has the inbox_event table"
+            );
             Ok(())
         })
         .expect("query");
     }
 
-    /// v2 → v3 migration lock: persisted review sessions must carry the engine that created
+    /// v2 → current migration lock: persisted review sessions must carry the engine that created
     /// them, so a follow-up after config changes routes back to the original engine.
     #[test]
-    fn migrate_v2_to_v3_adds_engine_kind_column() {
+    fn migrate_v2_to_current_adds_engine_kind_column() {
         let conn = rusqlite::Connection::open_in_memory().expect("open");
         apply_v1(&conn).expect("seed v1");
         apply_v2(&conn).expect("seed v2");
@@ -405,16 +463,82 @@ mod tests {
             "v2 must not already have engine_kind"
         );
 
-        run_migrations(&conn).expect("v2 -> v3 migrates");
+        // `run_migrations` replays ALL pending steps, so a v2 DB lands on the CURRENT schema
+        // (v3's engine_kind AND every later step); this test's job is to lock that the v3 step
+        // (engine_kind) runs on that path.
+        run_migrations(&conn).expect("v2 -> current migrates");
 
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("read version");
-        assert_eq!(version, 3, "stamped to v3");
+        assert_eq!(version, SCHEMA_VERSION, "stamped to the current schema");
         assert!(
             review_session_has_engine_kind(&conn),
             "v3 added the engine_kind column"
         );
+    }
+
+    /// v3 → v4 migration lock (AB#1065): a DB stamped at v3 (no `inbox_event` table) must gain
+    /// the inbox table and stamp to v4. Mirrors `migrate_v2_to_v3_…`: a missing table here means
+    /// the inbox store's first query fails at runtime, not compile time, so pin the table's
+    /// arrival on the existing-install upgrade path (the fresh-open path is covered by
+    /// `migrations_create_all_tables_and_stamp_version`).
+    #[test]
+    fn migrate_v3_to_v4_adds_inbox_event_table() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        apply_v1(&conn).expect("seed v1");
+        apply_v2(&conn).expect("seed v2");
+        apply_v3(&conn).expect("seed v3");
+        conn.pragma_update(None, "user_version", 3)
+            .expect("stamp v3");
+        assert!(
+            !table_exists(&conn, "inbox_event"),
+            "v3 must not already have inbox_event"
+        );
+
+        run_migrations(&conn).expect("v3 -> v4 migrates");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read version");
+        assert_eq!(version, 4, "stamped to v4");
+        assert!(
+            table_exists(&conn, "inbox_event"),
+            "v4 added the inbox_event table"
+        );
+        // The replay-reconstruction column must be present too — `inbox::store::insert_dedup` /
+        // `get_replayable` bind it by name, so a missing column fails at runtime, not compile
+        // time. Pin it on the migration path alongside the table itself.
+        assert!(
+            table_has_column(&conn, "inbox_event", "webhook_event_json"),
+            "v4 inbox_event has the webhook_event_json (replay) column"
+        );
+    }
+
+    /// Whether a table of the given name exists (via `sqlite_master`).
+    fn table_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?1",
+            [name],
+            |_| Ok(()),
+        )
+        .optional()
+        .expect("query sqlite_master")
+        .is_some()
+    }
+
+    /// Whether `table` has a column named `column` (via `PRAGMA table_info`). Generic over the
+    /// table (vs `review_session_has_column`) so the inbox migration test can pin its columns.
+    fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("table_info");
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1)) // col 1 = name
+            .expect("query")
+            .collect::<rusqlite::Result<_>>()
+            .expect("collect");
+        names.iter().any(|n| n == column)
     }
 
     /// Whether `review_session` has a `comment_url` column (via `PRAGMA table_info`).

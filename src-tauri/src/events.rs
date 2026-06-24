@@ -5,7 +5,7 @@
 
 use serde::Serialize;
 
-use crate::model::TrackedPrView;
+use crate::model::{InboxEntry, TrackedPrView};
 
 /// Tauri event name carrying a [`PrEvent`] (scheduled/manual PR-list refresh).
 pub const PRS_UPDATED_EVENT: &str = "prs:updated";
@@ -13,6 +13,11 @@ pub const PRS_UPDATED_EVENT: &str = "prs:updated";
 /// Tauri event name carrying a [`ReviewEvent`] (one streamed unit of a review
 /// session). Mirrored by `REVIEW_EVENT` in `src/review/api.ts`.
 pub const REVIEW_EVENT: &str = "review:event";
+
+/// Tauri event name carrying an [`InboxEvent`] (AB#1065): one inbox row was added or
+/// re-processed (a webhook delivery persisted / replayed). Mirrored by
+/// `INBOX_UPDATED_EVENT` in `src/inbox/api.ts`.
+pub const INBOX_UPDATED_EVENT: &str = "inbox:updated";
 
 /// Payload emitted on [`PRS_UPDATED_EVENT`] each poll cycle (scheduled or manual).
 ///
@@ -36,6 +41,27 @@ pub enum PrEvent {
     /// error to the offending project (#35).
     #[serde(rename_all = "camelCase")]
     Error { project_id: String, message: String },
+}
+
+/// Payload emitted on [`INBOX_UPDATED_EVENT`] (AB#1065) when an inbox row is added (a new
+/// deduped webhook delivery) or re-processed (a replay). The frontend's event-inbox panel
+/// upserts the carried [`InboxEntry`] into the list it keys by `project_id` (the routing key,
+/// mirroring [`PrEvent`]).
+///
+/// Like [`PrEvent`] / [`ReviewEvent`], the container `rename_all` camelCases the *variant*
+/// name into the `kind` tag and each struct variant carries its own `rename_all` (serde does
+/// not propagate the container rule to a variant's fields).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum InboxEvent {
+    /// An inbox row was added or re-processed. `entry` is the full current row (so the
+    /// frontend can upsert it without a follow-up `inbox_list`); `project_id` is the routing
+    /// key the panel scopes the upsert to.
+    #[serde(rename_all = "camelCase")]
+    Updated {
+        project_id: String,
+        entry: InboxEntry,
+    },
 }
 
 /// A single streamed unit of a review session, forwarded to the frontend.
@@ -118,7 +144,9 @@ pub enum ReviewEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PrPresence, PullRequestView, TrackedPrView};
+    use crate::model::{
+        Event, EventType, InboxStatus, PrPresence, PullRequestView, SourceKind, TrackedPrView,
+    };
 
     fn sample_view() -> TrackedPrView {
         TrackedPrView {
@@ -182,6 +210,60 @@ mod tests {
     #[test]
     fn prs_updated_event_name_is_pinned() {
         assert_eq!(PRS_UPDATED_EVENT, "prs:updated");
+    }
+
+    #[test]
+    fn inbox_updated_event_name_is_pinned() {
+        // Mirrored by `INBOX_UPDATED_EVENT` in `src/inbox/api.ts`; a drift breaks the frontend's
+        // `listen` registration for the event-inbox panel.
+        assert_eq!(INBOX_UPDATED_EVENT, "inbox:updated");
+    }
+
+    // Serde wire-shape lock for the AB#1065 `InboxEvent` discriminated union (Medium carrier
+    // per ai-robust.md): the `kind` tag is camelCase, `projectId` is the camelCase routing key,
+    // and the NESTED `entry` carries the full `InboxEntry` wire shape (a drift in `InboxEntry` /
+    // `Event` surfaces here too). The downstream `src/types.ts` `InboxEvent` union must be synced
+    // in lockstep (the open end of this funnel; future Hard path = codegen from `events.rs`).
+    #[test]
+    fn inbox_updated_wire_shape_is_camel_case() {
+        let event = InboxEvent::Updated {
+            project_id: "p1".to_string(),
+            entry: InboxEntry {
+                id: 7,
+                event: Event {
+                    dedupe_key: "github:abc-123".to_string(),
+                    source: SourceKind::Github,
+                    event_type: EventType::PullRequest,
+                    project_id: "p1".to_string(),
+                    repo: "owner/repo".to_string(),
+                    number: Some(7),
+                    title: "Add feature".to_string(),
+                    body: String::new(),
+                    labels: vec!["pr-review".to_string()],
+                    url: "https://example.com/pr/7".to_string(),
+                    received_at_epoch: 1_700_000_000,
+                },
+                status: InboxStatus::Received,
+                processed_at_epoch: None,
+                error: None,
+            },
+        };
+
+        let v = serde_json::to_value(&event).expect("InboxEvent serializes");
+
+        assert_eq!(v["kind"], "updated");
+        assert!(v.get("projectId").is_some());
+        assert!(v.get("project_id").is_none());
+
+        // The nested `entry` carries the `InboxEntry` wire shape: camelCase keys, a nested
+        // `event` object, and the pinned `status` string.
+        let entry = &v["entry"];
+        assert!(entry.get("id").is_some());
+        assert!(entry.get("processedAtEpoch").is_some());
+        assert!(entry.get("processed_at_epoch").is_none());
+        assert_eq!(entry["status"], "received");
+        assert!(entry["event"].is_object());
+        assert!(entry["event"].get("dedupeKey").is_some());
     }
 
     #[test]

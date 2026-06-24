@@ -15,6 +15,7 @@ import StatusBar from "./StatusBar.vue";
 import SplitPane from "./SplitPane.vue";
 import ReviewPanel from "./review/ReviewPanel.vue";
 import ReviewSessions from "./review/ReviewSessions.vue";
+import InboxPanel from "./inbox/InboxPanel.vue";
 import { useReviewStore } from "./review/useReviewStore";
 import { reschedule, startPolling } from "./pr/api";
 import { useAppView } from "./useAppView";
@@ -28,7 +29,8 @@ const booting = ref(true);
 
 const prStore = usePrStore();
 const configStore = useConfigStore();
-const { currentView, goMonitor, goSettings, goOnboarding } = useAppView();
+const { currentView, goMonitor, goSettings, goOnboarding, goInbox } =
+  useAppView();
 // Active project (#35): the switcher rail flips it; the PR + review views below
 // resolve their data against it. Persisted via useProjects().setActive.
 const { activeProjectId } = useProjects();
@@ -245,12 +247,20 @@ watch(selectedNumber, (n) => {
         v-if="!booting && currentView === 'monitor'"
         type="button"
         class="nav-btn"
+        @click="goInbox"
+      >
+        Inbox
+      </button>
+      <button
+        v-if="!booting && currentView === 'monitor'"
+        type="button"
+        class="nav-btn"
         @click="goSettings"
       >
         设置
       </button>
       <button
-        v-else-if="currentView === 'settings'"
+        v-else-if="currentView === 'settings' || currentView === 'inbox'"
         type="button"
         class="nav-btn"
         @click="goMonitor"
@@ -283,6 +293,11 @@ watch(selectedNumber, (n) => {
         />
       </template>
     </SettingsView>
+
+    <!-- Inbox view (AB#1065): a dedicated full-width listing of inbound webhook events.
+         InboxPanel self-manages its `inbox:updated` listener (onMounted/onUnmounted), so
+         the composition root only routes to it — no central listener wiring here. -->
+    <InboxPanel v-else-if="currentView === 'inbox'" class="view" />
 
     <div v-else class="layout">
       <!-- Unified project → PR navigation (#67): one column (ProjectNav merges the old

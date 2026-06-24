@@ -76,7 +76,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::Router;
 use hmac::{Hmac, Mac};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use tauri::async_runtime::{spawn, JoinHandle};
@@ -88,7 +88,7 @@ use subtle::ConstantTimeEq;
 
 use super::ledger;
 use crate::error::{AppError, AppResult};
-use crate::model::{Candidate, LabelSource, SourceKind, WebhookTunnelMode};
+use crate::model::{Candidate, Event, EventType, LabelSource, SourceKind, WebhookTunnelMode};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -101,8 +101,29 @@ type HmacSha256 = Hmac<Sha256>;
 /// the same lifecycle convention as [`super::scheduler::ProjectDispatcher`] (their
 /// signatures differ: this takes a [`WebhookEvent`], `ProjectDispatcher` takes
 /// `(String, Vec<Candidate>)`).
-pub type WebhookIngestor =
-    Arc<dyn Fn(WebhookEvent) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+///
+/// **AB#1065 seam widening (single seam, no dual path).** The signature carries
+/// `(raw: String, guid: Option<String>, WebhookEvent)`: the verbatim delivery body and the
+/// `X-GitHub-Delivery` GUID the inbox needs to persist + dedup the delivery, alongside the
+/// already-parsed event the dispatch path consumes. The composition root installs ONE
+/// closure (the inbox `ingest_github`) here — it persists/dedups, then re-feeds the SAME
+/// `WebhookEvent` through `pr::commands::ingest_webhook`. The `WebhookEvent` struct itself is
+/// unchanged; the Routable arm calls this one seam (there is no second parallel ingestor).
+///
+/// **Returns [`AppResult`] = DURABLE PERSIST success (AB#1065 F1).** The handler AWAITS this and
+/// gates the HTTP ACK on it: `Ok` → 200 (the delivery is durably persisted), `Err` → 500 (the
+/// platform retries, so no delivery is lost between ACK and the SQLite commit). The closure
+/// returns AFTER the durable insert, having SPAWNED the post-ACK processing (refeed/dispatch);
+/// the persist gates the ACK, the processing does not.
+pub type WebhookIngestor = Arc<
+    dyn Fn(
+            String,
+            Option<String>,
+            WebhookEvent,
+        ) -> Pin<Box<dyn Future<Output = AppResult<()>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// The Azure refresh hook the composition root installs (AB#822). Called with one routed
 /// `project_id` when an Azure DevOps Service Hook PR event arrives. Azure PR Service Hooks
@@ -112,8 +133,22 @@ pub type WebhookIngestor =
 /// re-runs `az repos pr list` discovery for that project — reading the AUTHORITATIVE current
 /// labels — and upserts + dispatches via the same poll path. Same `Arc<dyn Fn>` lifecycle as
 /// [`WebhookIngestor`]; keeps the axum handler runtime-agnostic.
-pub type WebhookRefresher =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+///
+/// **AB#1065 seam widening.** The signature carries `(raw: String, project_id: String,
+/// repo: String)`: the verbatim delivery body + the routed identity the inbox needs to
+/// persist an Azure audit entry, alongside the `project_id` the existing refresh consumes.
+/// The composition root installs ONE closure (the inbox `ingest_azure_refresh`) here — it
+/// persists an audit entry, then invokes the SAME `az` re-discovery it holds internally. The
+/// Azure refresh arm calls this one seam (no second parallel hook).
+///
+/// **Returns [`AppResult`] = DURABLE PERSIST success (AB#1065 F1).** Like [`WebhookIngestor`], the
+/// handler awaits this and gates the ACK on it (`Err` → 500 → platform retry). The audit-entry
+/// persist gates the ACK; the spawned `az` re-discovery runs post-ACK.
+pub type WebhookRefresher = Arc<
+    dyn Fn(String, String, String) -> Pin<Box<dyn Future<Output = AppResult<()>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Cap on the retained webhook-delivery diagnostics ring (#62). Old deliveries are
 /// popped from the front once the buffer is full — the panel only ever needs a recent
@@ -204,7 +239,20 @@ pub enum ParseResult {
 /// One parsed + routed webhook event (#61): the metadata the ingest needs to upsert the
 /// PR list row, emit `prs:updated`, and (when the intent yields a candidate) dispatch.
 /// Built purely by [`parse_delivery`]; consumed by `commands::ingest_webhook`.
-#[derive(Debug)]
+///
+/// `Serialize` + `Deserialize` (AB#1065): the inbox persists the parsed event as JSON in
+/// `inbox_event.webhook_event_json` so a GitHub replay re-feeds the SAME classified event
+/// through `ingest_webhook` WITHOUT re-running the route-dependent [`parse_delivery`] (which
+/// needs the live route snapshot, unavailable at replay time).
+///
+/// **PERSISTED REPLAY CONTRACT (AB#1065 F3).** Because `webhook_event_json` lives in long-term
+/// SQLite, this struct's serde shape is a durable contract: a stored row from an OLD app version
+/// must still deserialize on a NEW one, so a field rename / removal would silently break replay of
+/// already-persisted deliveries. The serde golden `webhook_event_replay_json_round_trips_and_shape_is_pinned`
+/// (Medium carrier) locks the field/key set + round-trip. (Possible future STRUCTURAL follow-up:
+/// relocate `WebhookEvent` to `model.rs` as a versioned cross-slice contract; out of scope here —
+/// the proportionate fix is the golden lock.)
+#[derive(Debug, Serialize, Deserialize)]
 pub struct WebhookEvent {
     /// The routing key (the matched [`ProjectRoute::id`]).
     pub project_id: String,
@@ -235,8 +283,58 @@ pub struct WebhookEvent {
     pub intent: IngestIntent,
 }
 
+/// Normalize a GitHub [`WebhookEvent`] into the cross-slice [`Event`] envelope (AB#1065). Lives
+/// HERE (not in the `inbox` slice) because `pr` OWNS `WebhookEvent` — the inbox depends only on the
+/// neutral [`crate::model::Event`], never on this pr-internal type. The composition root calls this
+/// at the webhook seam and hands the resulting `Event` to `inbox::service::ingest_github`.
+///
+/// PURE (no `AppHandle`); the only IO is the `now` fallback clock. The event class is always
+/// [`EventType::PullRequest`] (the only class the GitHub webhook path emits today); `dedupe_key` is
+/// [`event_dedupe_key`]; the display fields mirror the `WebhookEvent`; `body` is `""` (the PR
+/// webhook carries no body the inbox needs); `received_at_epoch` is the handler-stamped receipt
+/// time, falling back to `now` when the pure parser left it `0`.
+pub(crate) fn event_from_webhook(ev: &WebhookEvent, guid: Option<&str>, raw: &str) -> Event {
+    Event {
+        dedupe_key: event_dedupe_key(guid, raw),
+        source: SourceKind::Github,
+        event_type: EventType::PullRequest,
+        project_id: ev.project_id.clone(),
+        repo: ev.repo.clone(),
+        number: Some(ev.number),
+        title: ev.title.clone(),
+        body: String::new(),
+        labels: ev.labels.clone(),
+        url: ev.url.clone(),
+        received_at_epoch: if ev.received_at > 0 {
+            ev.received_at
+        } else {
+            ledger::now_epoch()
+        },
+    }
+}
+
+/// The inbox dedupe key for a GitHub delivery (AB#1065): `github:{guid}` when the
+/// `X-GitHub-Delivery` GUID is present (GitHub's own per-delivery identity — a retry of the SAME
+/// delivery carries the SAME guid), else a body-hash fallback `github:sha256:{hash}` so a
+/// guid-less delivery (a malformed / replayed request) still dedups on identical content. Pure.
+fn event_dedupe_key(guid: Option<&str>, raw: &str) -> String {
+    match guid {
+        Some(g) if !g.is_empty() => format!("github:{g}"),
+        _ => format!("github:sha256:{}", sha256_hex(raw.as_bytes())),
+    }
+}
+
+/// Lowercase hex SHA-256 of `bytes` — the GitHub guid-less dedupe-key fallback. Reuses the `sha2`
+/// crate already pulled in for the HMAC verify (no new dependency).
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
 /// What an ingest should do with a [`WebhookEvent`] (#61).
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub enum IngestIntent {
     /// An OPEN PR with a clean single trigger label (`candidate: Some`) — upsert + maybe
     /// dispatch — or BOTH trigger labels (`conflict: true`, `candidate: None`) — upsert as
@@ -260,7 +358,7 @@ pub enum IngestIntent {
 /// cross-function string protocol — fragile, Soft). A new status-only case must add a
 /// variant here and the compiler forces both [`Self::reason`] and
 /// [`Self::delivery_status`] to handle it, making a reason/status mismatch unexpressible.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum StatusOnlyKind {
     /// The PR is not open (closed / merged) — list row reflects it, never dispatched.
     ClosedOrMerged,
@@ -960,7 +1058,7 @@ async fn handle_webhook(
     // Azure branch (which fail-closes on its own Bearer check if it isn't a real Azure POST).
     match headers.get("x-github-event").map(|v| v.to_str()) {
         Some(Ok(event)) if !event.is_empty() => {
-            handle_github_delivery(&ctx, received_at, event.to_string(), &headers, &body)
+            handle_github_delivery(&ctx, received_at, event.to_string(), &headers, &body).await
         }
         Some(Err(_)) => {
             record_into(
@@ -978,7 +1076,7 @@ async fn handle_webhook(
             );
             StatusCode::BAD_REQUEST
         }
-        _ => handle_azure_delivery(&ctx, received_at, &headers, &body),
+        _ => handle_azure_delivery(&ctx, received_at, &headers, &body).await,
     }
 }
 
@@ -986,7 +1084,7 @@ async fn handle_webhook(
 /// `X-Hub-Signature-256` HMAC over the raw body, require a `pull_request` event, then parse +
 /// route via [`parse_delivery`]. Records the early-exit diagnostics; a `Routable` is handed to
 /// the ingestor and recorded by `ingest_webhook`.
-fn handle_github_delivery(
+async fn handle_github_delivery(
     ctx: &Arc<WebhookCtx>,
     received_at: u64,
     event: String,
@@ -1062,13 +1160,29 @@ fn handle_github_delivery(
     match parse_delivery(&payload, &ctx.routes) {
         ParseResult::Routable(mut ev) => {
             // Stamp the receipt time so the terminal diagnostic matches the early-exit records
-            // (the pure parser leaves it 0). Detached: the ingestor future is `Send + 'static`;
-            // the upsert / emit / dispatch run independently of this response. `ingest_webhook`
-            // records the terminal delivery status itself (it owns the gate/dispatch decision).
+            // (the pure parser leaves it 0).
             ev.received_at = received_at;
+            // AB#1065: carry the verbatim body + the `X-GitHub-Delivery` GUID through the
+            // widened seam so the inbox can persist + dedup this delivery before re-feeding the
+            // SAME parsed `WebhookEvent` to `ingest_webhook`. A non-UTF-8 / absent GUID → None
+            // (the inbox falls back to a body-hash dedupe key). The raw body is already bounded
+            // by the request body limit, so cloning it to an owned String is safe.
+            let raw = String::from_utf8_lossy(body).into_owned();
+            let guid = headers
+                .get("x-github-delivery")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
             let ingestor = ctx.ingestor.clone();
-            drop(spawn(ingestor(*ev)));
-            StatusCode::OK
+            // AB#1065 F1: AWAIT the DURABLE PERSIST and gate the ACK on it. `Ok` = the delivery is
+            // persisted (the ingestor has SPAWNED the post-ACK processing — refeed/dispatch — and
+            // returned); `Err` = the durable insert failed → 500 so the platform RETRIES (a 2xx is
+            // never retried, so persisting before ACK is what stops a crash from losing a delivery).
+            // The terminal processing status (Processed/Failed) is recorded by the spawned task,
+            // independently of this ACK.
+            match ingestor(raw, guid, *ev).await {
+                Ok(()) => StatusCode::OK,
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            }
         }
         ParseResult::WrongRepo { repo } => {
             record_into(
@@ -1123,7 +1237,7 @@ fn handle_github_delivery(
 /// low-latency "PR activity happened, re-check now" nudge; the poll path remains the backstop
 /// for a pure label-add (which fires no hook). The list/dispatch outcome is recorded by
 /// `PollStatus`; here we only record `Refreshed` (or the early-exit drops).
-fn handle_azure_delivery(
+async fn handle_azure_delivery(
     ctx: &Arc<WebhookCtx>,
     received_at: u64,
     headers: &HeaderMap,
@@ -1198,24 +1312,31 @@ fn handle_azure_delivery(
 
     match route_azure_delivery(&payload, &ctx.routes) {
         AzureRoute::Refresh { project_id, repo } => {
-            // Detached: re-discovery (the refresher) runs off the request path so Azure gets a
-            // fast 2xx; `discover_once` coalesces concurrent refreshes per project.
+            // AB#1065 F1: the widened seam carries the verbatim body + routed identity so the inbox
+            // persists an Azure AUDIT entry (AWAITED — gates the ACK) BEFORE the `az` re-discovery
+            // (spawned post-ACK inside the closure; `discover_once` coalesces per project). `Err` =
+            // the durable audit insert failed → 500 so the platform retries (no lost delivery).
+            let raw = String::from_utf8_lossy(body).into_owned();
             let refresher = ctx.refresher.clone();
-            drop(spawn(refresher(project_id)));
-            record_into(
-                &ctx.deliveries,
-                WebhookDelivery {
-                    received_at_epoch: received_at,
-                    event: event_type,
-                    action: None,
-                    repo: Some(repo),
-                    pr_number: None,
-                    kind: None,
-                    status: DeliveryStatus::Refreshed,
-                    message: Some("已触发 az 重新发现（读取当前标签）".to_string()),
-                },
-            );
-            StatusCode::OK
+            match refresher(raw, project_id, repo.clone()).await {
+                Ok(()) => {
+                    record_into(
+                        &ctx.deliveries,
+                        WebhookDelivery {
+                            received_at_epoch: received_at,
+                            event: event_type,
+                            action: None,
+                            repo: Some(repo),
+                            pr_number: None,
+                            kind: None,
+                            status: DeliveryStatus::Refreshed,
+                            message: Some("已触发 az 重新发现（读取当前标签）".to_string()),
+                        },
+                    );
+                    StatusCode::OK
+                }
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            }
         }
         AzureRoute::WrongRepo { repo } => {
             record_into(
@@ -1775,6 +1896,152 @@ mod tests {
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(body);
         format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    /// A minimal `WebhookEvent` for the `event_from_webhook` normalization tests (AB#1065). The
+    /// `intent` is irrelevant to normalization (it maps the display/identity fields only).
+    fn sample_webhook_event(project_id: &str, number: u64) -> WebhookEvent {
+        WebhookEvent {
+            project_id: project_id.to_string(),
+            received_at: 1_700_000_000,
+            event: "pull_request".to_string(),
+            action: Some("labeled".to_string()),
+            repo: "owner/repo".to_string(),
+            number,
+            title: "Add feature".to_string(),
+            labels: vec!["pr-review".to_string()],
+            url: "https://example.com/pr/7".to_string(),
+            intent: IngestIntent::StatusOnly {
+                kind: StatusOnlyKind::ClosedOrMerged,
+            },
+        }
+    }
+
+    // `event_from_webhook` (AB#1065): a present guid keys `github:{guid}`; the class is
+    // PullRequest; the display fields mirror the WebhookEvent; the handler-stamped receipt time is
+    // preserved. The inbox depends only on the resulting `model::Event`, not on `WebhookEvent`.
+    #[test]
+    fn event_from_webhook_uses_guid_key_and_mirrors_fields() {
+        let ev = sample_webhook_event("p1", 7);
+        let event = event_from_webhook(&ev, Some("abc-123"), "{\"raw\":1}");
+        assert_eq!(event.dedupe_key, "github:abc-123");
+        assert_eq!(event.source, SourceKind::Github);
+        assert_eq!(event.event_type, EventType::PullRequest);
+        assert_eq!(event.project_id, "p1");
+        assert_eq!(event.number, Some(7));
+        assert_eq!(event.labels, vec!["pr-review".to_string()]);
+        // received_at (1_700_000_000) > 0, so it wins over the `now` fallback.
+        assert_eq!(event.received_at_epoch, 1_700_000_000);
+    }
+
+    // `event_from_webhook` guid-less fallback (AB#1065): an absent / empty guid hashes the body, so
+    // the SAME body yields the SAME key (dedups) and a DIFFERENT body a different key.
+    #[test]
+    fn event_from_webhook_falls_back_to_body_hash_without_guid() {
+        let ev = sample_webhook_event("p1", 7);
+        let a = event_from_webhook(&ev, None, "body-A");
+        let a2 = event_from_webhook(&ev, Some(""), "body-A");
+        let b = event_from_webhook(&ev, None, "body-B");
+        assert!(a.dedupe_key.starts_with("github:sha256:"));
+        assert_eq!(
+            a.dedupe_key, a2.dedupe_key,
+            "empty guid == no guid (body hash)"
+        );
+        assert_ne!(a.dedupe_key, b.dedupe_key, "different body → different key");
+    }
+
+    // `event_from_webhook` with received_at == 0 (AB#1065): the pure parser leaves received_at 0;
+    // normalization falls back to `now` (a non-zero wall clock) so a row never stamps epoch 0.
+    #[test]
+    fn event_from_webhook_falls_back_to_now_when_received_at_is_zero() {
+        let mut ev = sample_webhook_event("p1", 7);
+        ev.received_at = 0; // the pure parser leaves it 0
+        let event = event_from_webhook(&ev, Some("g1"), "raw");
+        assert!(
+            event.received_at_epoch > 0,
+            "received_at == 0 falls back to a non-zero now"
+        );
+    }
+
+    // PERSISTED REPLAY CONTRACT lock (AB#1065 F3, Medium carrier): `WebhookEvent`'s serde shape is
+    // written into long-term SQLite (`inbox_event.webhook_event_json`) and read back on a LATER app
+    // version to replay an old delivery, so a field rename/removal would silently break replay of
+    // already-stored rows. This (a) round-trips a `WebhookEvent` through serde_json (the replay
+    // contract) and (b) pins the top-level key SET + the nested `intent` tag, so a drift fails here.
+    // (Possible future structural follow-up: relocate WebhookEvent to model.rs as a versioned
+    // cross-slice contract — out of scope; the golden is the proportionate lock.)
+    #[test]
+    fn webhook_event_replay_json_round_trips_and_shape_is_pinned() {
+        // Use the dispatch-candidate Track variant so the round-trip exercises the richest payload
+        // (a nested `Candidate`), the one a real GitHub PR delivery persists.
+        let ev = WebhookEvent {
+            project_id: "p1".to_string(),
+            received_at: 1_700_000_000,
+            event: "pull_request".to_string(),
+            action: Some("labeled".to_string()),
+            repo: "owner/repo".to_string(),
+            number: 7,
+            title: "Add feature".to_string(),
+            labels: vec!["pr-review".to_string()],
+            url: "https://example.com/pr/7".to_string(),
+            intent: IngestIntent::Track {
+                candidate: Some(Candidate {
+                    number: 7,
+                    head_sha: "abc123".to_string(),
+                    head_ref: "feature/x".to_string(),
+                    author: "octocat".to_string(),
+                    is_cross_repository: false,
+                    is_draft: false,
+                    kind: "review".to_string(),
+                }),
+                conflict: false,
+            },
+        };
+
+        // (a) Replay contract: serialize → deserialize must reconstruct the same key fields.
+        let json = serde_json::to_string(&ev).expect("WebhookEvent serializes");
+        let back: WebhookEvent = serde_json::from_str(&json).expect("WebhookEvent deserializes");
+        assert_eq!(back.project_id, ev.project_id);
+        assert_eq!(back.number, ev.number);
+        assert_eq!(back.received_at, ev.received_at);
+        assert_eq!(back.labels, ev.labels);
+        assert!(matches!(
+            back.intent,
+            IngestIntent::Track {
+                candidate: Some(_),
+                conflict: false
+            }
+        ));
+
+        // (b) Pinned shape: the EXACT top-level field set (a rename/removal/addition surfaces here,
+        // breaking old persisted-row replay). `WebhookEvent` has no `rename_all`, so keys are the
+        // field names verbatim.
+        let v = serde_json::to_value(&ev).expect("to_value");
+        let obj = v.as_object().expect("WebhookEvent is a JSON object");
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "action",
+                "event",
+                "intent",
+                "labels",
+                "number",
+                "project_id",
+                "received_at",
+                "repo",
+                "title",
+                "url",
+            ],
+            "WebhookEvent persisted-replay key set is pinned"
+        );
+
+        // The `intent` is externally tagged (no rename): the Track variant key is pinned.
+        assert!(
+            obj["intent"].get("Track").is_some(),
+            "intent Track variant tag pinned"
+        );
     }
 
     #[test]
@@ -2377,8 +2644,8 @@ mod tests {
     #[tokio::test]
     async fn command_mode_start_reports_configured_public_url() {
         let mgr = WebhookManager::default();
-        mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
-        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
+        mgr.set_ingestor(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
+        mgr.set_refresher(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
 
         // port 0 → OS picks a free port; `{port}` substitutes into the (harmless) sleep
         // args. cloudflared_bin is bogus on purpose — command mode must NOT require it.
@@ -2422,8 +2689,8 @@ mod tests {
     #[tokio::test]
     async fn command_mode_self_heals_when_child_exits() {
         let mgr = WebhookManager::default();
-        mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
-        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
+        mgr.set_ingestor(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
+        mgr.set_refresher(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
 
         let s = mgr
             .start(
@@ -2477,8 +2744,8 @@ mod tests {
     #[tokio::test]
     async fn listener_mode_has_no_child_and_does_not_self_heal() {
         let mgr = WebhookManager::default();
-        mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
-        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
+        mgr.set_ingestor(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
+        mgr.set_refresher(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
 
         let s = mgr
             .start(
@@ -2535,8 +2802,8 @@ mod tests {
     #[tokio::test]
     async fn stop_kills_and_reaps_tunnel_child() {
         let mgr = WebhookManager::default();
-        mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
-        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
+        mgr.set_ingestor(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
+        mgr.set_refresher(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
 
         let s = mgr
             .start(
@@ -2601,8 +2868,8 @@ mod tests {
     #[tokio::test]
     async fn listener_mode_empty_public_url_reports_none() {
         let mgr = WebhookManager::default();
-        mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
-        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
+        mgr.set_ingestor(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
+        mgr.set_refresher(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
 
         let s = mgr
             .start(
@@ -2679,8 +2946,8 @@ mod tests {
     #[tokio::test]
     async fn command_mode_blank_command_errs() {
         let mgr = WebhookManager::default();
-        mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
-        mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
+        mgr.set_ingestor(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
+        mgr.set_refresher(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
 
         let r = mgr
             .start(
@@ -2903,8 +3170,8 @@ mod tests {
 
         tauri::async_runtime::block_on(async move {
             let mgr = WebhookManager::default();
-            mgr.set_ingestor(Arc::new(|_| Box::pin(async {})));
-            mgr.set_refresher(Arc::new(|_| Box::pin(async {})));
+            mgr.set_ingestor(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
+            mgr.set_refresher(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
 
             for i in 0..3 {
                 let s = mgr

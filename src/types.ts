@@ -239,3 +239,79 @@ export interface Event {
   url: string;
   receivedAtEpoch: number;
 }
+
+// A human-readable label for an EventType, rendered as the inbox row's type tag (AB#1065).
+// THIS is the FIRST frontend consumer of `event.eventType`: before it, the EVENT_TYPES `as
+// const` set (Hard — the literal set can't drift) had no downstream switch, so adding an
+// EventType arm was un-enforced past the array (Soft, eyeball-only). This switch closes that
+// gap — its `default` arm is `assertNever(t)` (Medium — `assertNever`穷尽, same carrier as
+// `pollingEnabledForMode` above): adding a new EventType without a label arm here is a COMPILE
+// error, so the wire enum and the inbox's rendered labels can never silently fall out of sync.
+export function eventTypeLabel(t: EventType): string {
+  switch (t) {
+    case "pullRequest":
+      return "拉取请求 / Pull Request";
+    case "issue":
+      return "议题 / Issue";
+    case "comment":
+      return "评论 / Comment";
+    case "label":
+      return "标签 / Label";
+    case "generic":
+      return "通用 / Generic";
+    default:
+      return assertNever(t);
+  }
+}
+
+// ── Event inbox contracts (AB#1065, epic AB#1078) ─────────────────────────────────
+// The inbox is the first persistence layer for normalized events: it retains each inbound
+// `Event` with a processing `status`, the (optional) processed timestamp, and any error.
+
+// The lifecycle status of an inbox entry — mirrors the Rust `InboxStatus` enum's camelCase
+// serde form (locked by the model.rs golden test). Single-sourced as an `as const` array
+// (mirrors EVENT_TYPES / SOURCE_KINDS): the type is DERIVED from the array, so the literal
+// set is Hard — a value outside `["received","processed","failed"]` is un-expressible. The
+// `inboxStatusLabel` switch below is the Medium `assertNever`穷尽 carrier on top of it.
+export const INBOX_STATUSES = ["received", "processed", "failed"] as const;
+export type InboxStatus = (typeof INBOX_STATUSES)[number];
+
+// A human-readable label for an InboxStatus, rendered as the inbox row's status badge.
+// `default: assertNever(s)` (Medium — `assertNever`穷尽, second carrier next to
+// `eventTypeLabel`): adding an InboxStatus without a label arm here is a COMPILE error, so the
+// status set and the rendered badges can't drift.
+export function inboxStatusLabel(s: InboxStatus): string {
+  switch (s) {
+    case "received":
+      return "已接收 / Received";
+    case "processed":
+      return "已处理 / Processed";
+    case "failed":
+      return "失败 / Failed";
+    default:
+      return assertNever(s);
+  }
+}
+
+// A retained inbox entry (AB#1065) — mirrors `model.rs::InboxEntry` (serde camelCase; locked
+// by the model.rs golden test). The inbound `event` is NESTED (not flattened): the inbox wraps
+// the normalized `Event` contract with its own lifecycle fields. `processedAtEpoch` is null
+// until the entry leaves the `received` state; `error` is non-null only for a `failed` entry.
+export interface InboxEntry {
+  id: number;
+  event: Event;
+  status: InboxStatus;
+  processedAtEpoch: number | null;
+  error: string | null;
+}
+
+// Mirrors the `inbox:updated` Tauri event payload (AB#1065) — the downstream end of the
+// event-name funnel for the inbox push stream (the upstream `INBOX_UPDATED_EVENT` name lives
+// in `inbox/api.ts`). A single-arm tagged union (discriminant `kind`) mirroring the `PrEvent`
+// / `ReviewEvent` shape, so it can widen later without churning the call sites. `projectId`
+// (#35) routes each upsert to its monitored project.
+export type InboxEvent = {
+  kind: "updated";
+  projectId: string;
+  entry: InboxEntry;
+};

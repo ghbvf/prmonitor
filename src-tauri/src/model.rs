@@ -273,6 +273,62 @@ pub struct Event {
     pub received_at_epoch: u64,
 }
 
+/// The processing state of one persisted inbox delivery (AB#1065, epic AB#1078): the
+/// inbox's per-entry status, surfaced to the frontend's event-inbox panel.
+///
+/// **Hard carrier** (sealed enum): the inbox store branches on an exhaustive
+/// `match InboxStatus { ... }` ([`crate::inbox::store::status_as_wire`]), so adding a
+/// variant without an arm is a compile error — the missing case cannot be expressed.
+/// Already load-bearing: the store's `as_wire` is the DB column source and the service's
+/// `mark_processed` / `mark_failed` transitions read it back.
+///
+/// Wire strings are pinned camelCase (`"received" | "processed" | "failed"`) — a
+/// cross-agent contract the frontend's `INBOX_STATUSES` (`src/types.ts`) mirrors; the
+/// serde golden below (`inbox_status_serializes_to_pinned_wire_strings`) is the
+/// **Medium** carrier locking them against a `rename_all` / variant drift. `Default` is
+/// [`Received`](Self::Received) — the state every delivery starts in before processing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum InboxStatus {
+    /// The delivery was persisted (deduped) but not yet processed.
+    #[default]
+    Received,
+    /// The delivery was re-fed through the dispatch path successfully.
+    Processed,
+    /// Processing raised an error (carried in [`InboxEntry::error`]); replayable.
+    Failed,
+}
+
+/// One persisted inbox delivery row (AB#1065, epic AB#1078): a normalized [`Event`] plus
+/// its processing state, surfaced to the frontend's event-inbox panel and the source of a
+/// replay.
+///
+/// `Serialize`: a front/back contract mirrored in `src/types.ts` (`InboxEntry`); a field
+/// change must be synced there in lockstep (the open end of this funnel — future Hard path
+/// = codegen `types.ts` from `model.rs` + `git diff --exit-code`). The serde golden below
+/// (`inbox_entry_wire_shape_is_camel_case`) is the **Medium** carrier locking the camelCase
+/// wire shape.
+///
+/// The [`Event`] is NESTED (a real `event` object), NOT flattened — the panel renders the
+/// envelope as a unit and the wire stays `{ id, event: { … }, status, processedAtEpoch,
+/// error }`, distinct from [`TrackedPrView`]'s flatten.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InboxEntry {
+    /// The inbox row id (the `inbox_event` table PRIMARY KEY) — the replay / get-raw key.
+    pub id: i64,
+    /// The normalized delivery envelope (nested, not flattened).
+    pub event: Event,
+    /// The processing state of this delivery.
+    pub status: InboxStatus,
+    /// When processing finished (epoch seconds), or `None` while still `Received`.
+    /// Serializes to JSON `null` (not omitted) so the TS mirror's `processedAtEpoch:
+    /// number | null` stays a closed contract.
+    pub processed_at_epoch: Option<u64>,
+    /// The failure message when `status` is `Failed`, else `None` (→ JSON `null`).
+    pub error: Option<String>,
+}
+
 /// User-visible body text that is safe to send to a notification center or external
 /// notification channel.
 ///
@@ -724,6 +780,102 @@ mod tests {
         };
         let gv = serde_json::to_value(&generic).expect("Event serializes");
         assert_eq!(gv["number"], serde_json::Value::Null);
+    }
+
+    // Cross-agent wire contract lock for the AB#1065 inbox status (Medium carrier per
+    // ai-robust.md): the frontend's `INBOX_STATUSES` (`src/types.ts`) mirrors these exact
+    // camelCase strings. A variant rename or a `rename_all` change surfaces here (the
+    // exhaustive `match InboxStatus` in `inbox::store::status_as_wire` is the Hard carrier).
+    // Default is `Received` (the state every delivery starts in).
+    #[test]
+    fn inbox_status_serializes_to_pinned_wire_strings() {
+        assert_eq!(
+            serde_json::to_value(InboxStatus::Received).expect("InboxStatus serializes"),
+            "received"
+        );
+        assert_eq!(
+            serde_json::to_value(InboxStatus::Processed).expect("InboxStatus serializes"),
+            "processed"
+        );
+        assert_eq!(
+            serde_json::to_value(InboxStatus::Failed).expect("InboxStatus serializes"),
+            "failed"
+        );
+        assert_eq!(
+            serde_json::to_value(InboxStatus::default()).expect("InboxStatus serializes"),
+            "received"
+        );
+    }
+
+    // Front/back contract lock for the AB#1065 `InboxEntry` row (Medium carrier per
+    // ai-robust.md): mirrored in `src/types.ts` (`InboxEntry`); a field change must be synced
+    // there in lockstep (the open end of the funnel — future Hard path = codegen from
+    // `model.rs` + `git diff --exit-code`). Locks camelCase keys present + snake_case absent,
+    // the NESTED `event` object (not flattened — its own camelCase keys surface under `event`),
+    // the nested `status` wire string, and that an absent `processedAtEpoch` / `error`
+    // serializes as JSON null (not omitted) so the TS mirror's `… | null` stays closed.
+    #[test]
+    fn inbox_entry_wire_shape_is_camel_case() {
+        let entry = InboxEntry {
+            id: 7,
+            event: Event {
+                dedupe_key: "github:abc-123".to_string(),
+                source: SourceKind::Github,
+                event_type: EventType::PullRequest,
+                project_id: "p1".to_string(),
+                repo: "owner/repo".to_string(),
+                number: Some(7),
+                title: "Add feature".to_string(),
+                body: String::new(),
+                labels: vec!["pr-review".to_string()],
+                url: "https://example.com/pr/7".to_string(),
+                received_at_epoch: 1_700_000_000,
+            },
+            status: InboxStatus::Processed,
+            processed_at_epoch: Some(1_700_000_005),
+            error: None,
+        };
+
+        let v = serde_json::to_value(&entry).expect("InboxEntry serializes");
+
+        // camelCase keys present at the top level.
+        assert!(v.get("id").is_some());
+        assert!(v.get("event").is_some());
+        assert!(v.get("status").is_some());
+        assert!(v.get("processedAtEpoch").is_some());
+        assert!(v.get("error").is_some());
+
+        // snake_case form absent — a rename of the multi-word field surfaces here.
+        assert!(v.get("processed_at_epoch").is_none());
+
+        // The event is NESTED (a real object), NOT flattened — its camelCase keys live
+        // UNDER `event`, and do not leak to the top level (the contrast with `TrackedPrView`).
+        let ev = &v["event"];
+        assert!(ev.is_object(), "event is a nested object, not flattened");
+        assert!(ev.get("dedupeKey").is_some());
+        assert!(ev.get("eventType").is_some());
+        assert!(ev.get("receivedAtEpoch").is_some());
+        assert!(
+            v.get("dedupeKey").is_none(),
+            "nested event keys must not hoist to the top level"
+        );
+
+        // The nested `status` enum serializes to its pinned wire string.
+        assert_eq!(v["status"], "processed");
+
+        // An absent `processedAtEpoch` / `error` serializes as JSON null (not omitted),
+        // keeping the TS mirror's `processedAtEpoch: number | null` / `error: string | null`
+        // a closed contract.
+        let received = InboxEntry {
+            status: InboxStatus::Received,
+            processed_at_epoch: None,
+            error: None,
+            ..entry
+        };
+        let rv = serde_json::to_value(&received).expect("InboxEntry serializes");
+        assert_eq!(rv["status"], "received");
+        assert_eq!(rv["processedAtEpoch"], serde_json::Value::Null);
+        assert_eq!(rv["error"], serde_json::Value::Null);
     }
 
     // Backend-internal cross-slice lock for the AB#1070 normalized `Notification` (Medium

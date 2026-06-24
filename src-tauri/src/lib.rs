@@ -24,6 +24,7 @@ pub mod db;
 pub mod dispatch;
 pub mod error;
 pub mod events;
+pub mod inbox;
 pub mod model;
 pub mod pr;
 pub mod review;
@@ -100,36 +101,51 @@ fn build_app() {
             state
                 .scheduler
                 .set_dispatcher(make_dispatcher(app.handle().clone()));
-            // Install the WEBHOOK trigger's ingest hook (#9 / #61). The webhook is a
-            // second auto-trigger source: its axum handler parses + routes a push payload
-            // into a `WebhookEvent` and hands it here. The ingest (`pr::commands::ingest_webhook`)
-            // upserts the persisted PR list + emits `prs:updated` (so webhook PRs enter the
-            // list even when autoReview is OFF — the #61 fix), applies that project's
-            // static/cooldown gates (`webhook_view`) + the SAME per-project `autoReview`
-            // gate the scheduler uses, and dispatches the clean candidate by reusing the
-            // very same `run_auto_dispatch` via the shared `make_dispatcher` helper (the
-            // SAME `ProjectDispatcher` the scheduler gets). Keeping all this in the ingest (not the handler) is
-            // what lets `pr::webhook` stay runtime-agnostic (never names AppHandle); the
-            // ingest also records the terminal delivery diagnostic (#62).
+            // Install the WEBHOOK trigger hooks (#9 / #61 / AB#822) — now FRONTED BY THE EVENT
+            // INBOX (AB#1065). The webhook is a second auto-trigger source: its axum handler
+            // parses + routes a push payload into a `WebhookEvent` and hands the verbatim body +
+            // delivery GUID + event here through the WIDENED ingestor seam. The inbox
+            // (`inbox::service::ingest_github`) PERSISTS + DEDUPS the delivery
+            // (`UNIQUE(dedupe_key)` — the Hard ingress-idempotency carrier), then re-feeds the
+            // SAME `WebhookEvent` through the UNCHANGED `pr::commands::ingest_webhook` (which
+            // upserts the list + emits `prs:updated` + applies the per-project gates + the
+            // downstream `dispatch_key` gate + dispatches). The inbox is ADDITIVE: it adds durable
+            // persistence + replay in front of the vetted path, it does NOT replace the
+            // authoritative dispatch dedup. Holding the concrete AppHandle + the shared
+            // dispatcher here keeps `pr::webhook` runtime-agnostic.
             let webhook_dispatcher = make_dispatcher(app.handle().clone());
-            state.webhook.set_ingestor(Arc::new({
-                let app = app.handle().clone();
-                move |ev| {
-                    let app = app.clone();
-                    let dispatcher = webhook_dispatcher.clone();
+            // The GitHub RE-FEED hook (AB#1065 decoupling): the ONLY place that names
+            // `pr::webhook::WebhookEvent` / the `ProjectDispatcher`. Given the AppHandle + the
+            // stored parsed-`WebhookEvent` JSON, it deserializes the event and re-feeds it through
+            // the UNCHANGED `pr::commands::ingest_webhook` (which upserts the list + emits
+            // `prs:updated` + applies the per-project gates + the downstream `dispatch_key` gate +
+            // dispatches). Built ONCE and shared by the live GitHub ingestor AND the inbox replay
+            // hook, so a replay re-feeds identically. The inbox slice holds this only as the OPAQUE
+            // `GithubRefeed` closure — it never names a `pr` type.
+            let github_refeed: inbox::GithubRefeed = Arc::new({
+                let dispatcher = webhook_dispatcher.clone();
+                move |app: tauri::AppHandle, webhook_event_json: String| {
+                    let dispatcher = dispatcher.clone();
                     Box::pin(async move {
+                        // F2: a deser failure of the persisted replay JSON now PROPAGATES as Err so
+                        // the inbox marks the row Failed (not falsely Processed) and surfaces it on
+                        // replay — it is no longer just logged.
+                        let ev: pr::webhook::WebhookEvent =
+                            serde_json::from_str(&webhook_event_json).map_err(|e| {
+                                error::AppError::new(format!(
+                                    "重放/再投递时 WebhookEvent 反序列化失败：{e}"
+                                ))
+                            })?;
                         pr::commands::ingest_webhook(&app, &dispatcher, ev).await;
+                        Ok(())
                     })
                 }
-            }));
-            // Install the AZURE refresh hook (AB#822). Azure DevOps PR Service Hooks carry no
-            // labels and don't fire on label changes, so an Azure webhook can't classify a
-            // candidate from its payload — it's a refresh SIGNAL. The handler routes the event
-            // to a `project_id` and hands it here; this re-runs the SAME `az` discovery the
-            // poll path uses (`SchedulerSet::discover_once`, in-flight-coalesced), reading the
-            // authoritative current labels and dispatching via the shared dispatcher. Keeps
-            // `pr::webhook` runtime-agnostic (the closure holds the concrete AppHandle).
-            state.webhook.set_refresher(Arc::new({
+            });
+            // The original `az` re-discovery hook the inbox's Azure path wraps (AB#822): re-run
+            // `discover_once` (in-flight-coalesced) for the routed project. Built ONCE here and
+            // shared by the webhook Azure refresher AND the inbox replay hook (so a replayed Azure
+            // entry re-runs the SAME discovery).
+            let azure_refresh: inbox::AzureRefresh = Arc::new({
                 let app = app.handle().clone();
                 move |project_id: String| {
                     let app = app.clone();
@@ -139,6 +155,69 @@ fn build_app() {
                             .scheduler
                             .discover_once(&app, &project_id)
                             .await;
+                        // `discover_once` is best-effort (emits its own PrEvent::Error on failure)
+                        // and returns (); the refresh "succeeding" here means it ran, so Ok(()).
+                        Ok(())
+                    })
+                }
+            });
+            // Install the inbox replay hooks (AB#1065) so the `inbox_replay` command re-uses the
+            // SAME re-feed + Azure re-discovery as the live ingress (it has no live route snapshot /
+            // in-flight dispatcher of its own).
+            state
+                .inbox
+                .set_hooks(github_refeed.clone(), azure_refresh.clone());
+            // The GitHub ingestor: normalize the `WebhookEvent` → neutral `model::Event` HERE (pr
+            // owns `WebhookEvent`), then hand the inbox the neutral event + the verbatim body + the
+            // parsed JSON. The inbox persists+dedups and re-feeds via the injected `github_refeed` —
+            // it never sees a `pr` type.
+            state.webhook.set_ingestor(Arc::new({
+                let app = app.handle().clone();
+                let github_refeed = github_refeed.clone();
+                move |raw: String, guid: Option<String>, ev: pr::webhook::WebhookEvent| {
+                    let app = app.clone();
+                    let github_refeed = github_refeed.clone();
+                    Box::pin(async move {
+                        use tauri::Manager;
+                        // Normalize at the seam (the composition root owns the pr↔inbox boundary):
+                        // `WebhookEvent` → neutral `model::Event`, and serialize the parsed event
+                        // for replay BEFORE handing it off.
+                        let event = pr::webhook::event_from_webhook(&ev, guid.as_deref(), &raw);
+                        let webhook_event_json = serde_json::to_string(&ev).unwrap_or_default();
+                        let db = app.state::<db::Database>();
+                        // F1: return the DURABLE-PERSIST Result so the handler gates the ACK on it.
+                        inbox::service::ingest_github(
+                            &app,
+                            db.inner(),
+                            &github_refeed,
+                            event,
+                            raw,
+                            webhook_event_json,
+                        )
+                        .await
+                    })
+                }
+            }));
+            // The Azure refresher: persist an audit entry, then invoke the original re-discovery.
+            state.webhook.set_refresher(Arc::new({
+                let app = app.handle().clone();
+                let azure_refresh = azure_refresh.clone();
+                move |raw, project_id, repo| {
+                    let app = app.clone();
+                    let azure_refresh = azure_refresh.clone();
+                    Box::pin(async move {
+                        use tauri::Manager;
+                        let db = app.state::<db::Database>();
+                        // F1: return the DURABLE-PERSIST Result so the handler gates the ACK on it.
+                        inbox::service::ingest_azure_refresh(
+                            &app,
+                            db.inner(),
+                            &azure_refresh,
+                            raw,
+                            project_id,
+                            repo,
+                        )
+                        .await
                     })
                 }
             }));
@@ -204,6 +283,9 @@ fn build_app() {
             pr::commands::webhook_status,
             pr::commands::webhook_deliveries,
             pr::commands::poll_status,
+            inbox::commands::inbox_list,
+            inbox::commands::inbox_get_raw,
+            inbox::commands::inbox_replay,
             review::commands::get_codex_status,
             review::commands::get_claude_status,
             review::commands::start_codex,
