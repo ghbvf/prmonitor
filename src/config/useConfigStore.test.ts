@@ -54,6 +54,8 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
   webhookPublicUrl: "",
   localApiPort: 8788,
   localApiToken: "",
+  listeners: [],
+  tunnels: [],
   ...over,
 });
 

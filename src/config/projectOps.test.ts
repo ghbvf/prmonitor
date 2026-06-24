@@ -28,6 +28,8 @@ function draft(projects: Project[], activeProjectId: string): AppConfig {
     webhookPublicUrl: "",
     localApiPort: 8788,
     localApiToken: "",
+    listeners: [],
+    tunnels: [],
   };
 }
 

@@ -6,7 +6,8 @@
 // Multi-project (#35): coverage is split into PROJECT_GROUPS (per-project `Project`
 // keys) and GLOBAL_GROUPS (global webhook `AppConfig` keys).
 import { describe, expect, it } from "vitest";
-import type { AppConfig, Project } from "./types";
+import type { AppConfig, Listener, Project, Tunnel } from "./types";
+import { LISTENER_KINDS, LISTENER_AUTH_MODES, WEBHOOK_TUNNEL_MODES } from "./types";
 import {
   UPDATE_MODES,
   ENGINE_KINDS,
@@ -18,6 +19,8 @@ import {
 import {
   PROJECT_GROUPS,
   GLOBAL_GROUPS,
+  LISTENER_GROUPS,
+  TUNNEL_GROUPS,
   STEPS,
   STEP_FIELDS,
   visibleStepFields,
@@ -72,6 +75,41 @@ const GLOBAL_FORM_KEYS: (keyof AppConfig)[] = [
 // `Project` identity fields managed by the project list/selector UI (not a field
 // group), so PROJECT_GROUPS deliberately omits them.
 const PROJECT_IDENTITY_KEYS: (keyof Project)[] = ["id", "name", "enabled"];
+
+// A fully-valid listener fixture (AB#1064), used to enumerate the Listener key set the
+// LISTENER_GROUPS coverage test asserts against.
+function validListener(): Listener {
+  return {
+    id: "lis-1",
+    name: "Local API",
+    kind: "local-api",
+    bindHost: "127.0.0.1",
+    port: 8788,
+    enabled: false,
+    auth: "none",
+    allowedOrigins: [],
+    publicUrl: "",
+  };
+}
+
+// A fully-valid tunnel fixture (AB#1064), used to enumerate the Tunnel key set the
+// TUNNEL_GROUPS coverage test asserts against.
+function validTunnel(): Tunnel {
+  return {
+    id: "tun-1",
+    name: "Web",
+    mode: "quick",
+    targetListenerId: "lis-1",
+    publicUrl: "",
+    enabled: false,
+  };
+}
+
+// `Listener`/`Tunnel` identity fields managed by the RemoteAccess list/card header (a
+// per-row name input + add/delete controls), not a field group — so LISTENER_GROUPS /
+// TUNNEL_GROUPS deliberately omit them (mirrors PROJECT_IDENTITY_KEYS).
+const LISTENER_IDENTITY_KEYS: (keyof Listener)[] = ["id", "name"];
+const TUNNEL_IDENTITY_KEYS: (keyof Tunnel)[] = ["id", "name"];
 
 describe("PROJECT_GROUPS", () => {
   it("covers every Project key (except identity fields) exactly once across groups", () => {
@@ -272,6 +310,76 @@ describe("GLOBAL_GROUPS", () => {
     const all = GLOBAL_GROUPS.flatMap((g) => g.fields);
     expect(all.find((f) => f.key === "localApiPort")?.min).toBe(0);
     expect(all.find((f) => f.key === "webhookPort")?.min).toBeUndefined();
+  });
+});
+
+describe("LISTENER_GROUPS (AB#1064)", () => {
+  it("covers every Listener key (except identity fields) exactly once across groups", () => {
+    const keys = LISTENER_GROUPS.flatMap((g) => g.fields.map((f) => f.key)).sort();
+    const expected = (Object.keys(validListener()) as (keyof Listener)[])
+      .filter((k) => !LISTENER_IDENTITY_KEYS.includes(k))
+      .sort();
+    expect(keys).toEqual(expected);
+  });
+
+  it("kind is a select single-sourced from LISTENER_KINDS (can't drift from the type)", () => {
+    const f = LISTENER_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "kind");
+    expect(f?.kind).toBe("select");
+    expect(f?.options).toEqual(LISTENER_KINDS);
+  });
+
+  it("auth is a select single-sourced from LISTENER_AUTH_MODES", () => {
+    const f = LISTENER_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "auth");
+    expect(f?.kind).toBe("select");
+    expect(f?.options).toEqual(LISTENER_AUTH_MODES);
+  });
+
+  it("allowedOrigins is a csv field (string[] round-trip, like authors)", () => {
+    const f = LISTENER_GROUPS.flatMap((g) => g.fields).find(
+      (f) => f.key === "allowedOrigins",
+    );
+    expect(f?.kind).toBe("csv");
+  });
+
+  it("enabled is a checkbox and port is a number", () => {
+    const byKey = new Map(
+      LISTENER_GROUPS.flatMap((g) => g.fields).map((f) => [f.key, f]),
+    );
+    expect(byKey.get("enabled")?.kind).toBe("checkbox");
+    expect(byKey.get("port")?.kind).toBe("number");
+  });
+
+  // The port field carries `min: 0` so the documented "0 = 未设置/不绑定" value isn't flagged
+  // invalid by the number input (the renderer reads `def.min ?? 1`, which would otherwise mark
+  // a 0 port red). Locks the regression that produced the red number-input state.
+  it("port field has min 0 (so 0 = 未设置 isn't flagged invalid)", () => {
+    const port = LISTENER_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "port");
+    expect(port?.min).toBe(0);
+  });
+});
+
+describe("TUNNEL_GROUPS (AB#1064)", () => {
+  it("covers every Tunnel key (except identity fields) exactly once across groups", () => {
+    const keys = TUNNEL_GROUPS.flatMap((g) => g.fields.map((f) => f.key)).sort();
+    const expected = (Object.keys(validTunnel()) as (keyof Tunnel)[])
+      .filter((k) => !TUNNEL_IDENTITY_KEYS.includes(k))
+      .sort();
+    expect(keys).toEqual(expected);
+  });
+
+  it("mode is a select single-sourced from WEBHOOK_TUNNEL_MODES (reused, no drift)", () => {
+    const f = TUNNEL_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "mode");
+    expect(f?.kind).toBe("select");
+    expect(f?.options).toEqual(WEBHOOK_TUNNEL_MODES);
+  });
+
+  it("enabled is a checkbox; targetListenerId and publicUrl are text", () => {
+    const byKey = new Map(
+      TUNNEL_GROUPS.flatMap((g) => g.fields).map((f) => [f.key, f]),
+    );
+    expect(byKey.get("enabled")?.kind).toBe("checkbox");
+    expect(byKey.get("targetListenerId")?.kind).toBe("text");
+    expect(byKey.get("publicUrl")?.kind).toBe("text");
   });
 });
 

@@ -165,6 +165,10 @@ function composeConfig(): AppConfig {
     webhookPublicUrl: "",
     localApiPort: 8788,
     localApiToken: "",
+    // Remote-access resources (AB#1064) start empty — onboarding only seeds the first
+    // project + webhook defaults; listeners/tunnels are added later in Settings.
+    listeners: [],
+    tunnels: [],
   };
 }
 

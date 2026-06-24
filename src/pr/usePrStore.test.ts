@@ -143,6 +143,8 @@ beforeEach(() => {
     webhookPublicUrl: "",
     localApiPort: 8788,
     localApiToken: "",
+    listeners: [],
+    tunnels: [],
   });
 });
 
@@ -286,6 +288,8 @@ describe("usePrStore toggle()", () => {
       webhookPublicUrl: "",
       localApiPort: 8788,
       localApiToken: "",
+      listeners: [],
+      tunnels: [],
     });
     const store = usePrStore();
     // Start the active project paused so toggle() takes the resume branch.

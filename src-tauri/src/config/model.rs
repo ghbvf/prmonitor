@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::error::{AppError, AppResult};
 use crate::model::{EngineKind, LabelSource, SourceKind, UpdateMode, WebhookTunnelMode};
@@ -177,6 +178,10 @@ pub struct AppConfig {
     /// 重启。loopback-only 仍是触发端点（本机任意进程 + DNS rebinding 可达），故非空时按
     /// `LOCAL_API_TOKEN_MIN_LEN` 强制最小长度（与 `webhook_secret` 同理由）。
     pub local_api_token: String,
+    /// Declarative Remote Access listeners (AB#1064). Config-only this round; no runtime consumer yet.
+    pub listeners: Vec<Listener>,
+    /// Declarative Remote Access tunnels (AB#1064). `mode` reuses WebhookTunnelMode.
+    pub tunnels: Vec<Tunnel>,
 }
 
 impl Default for AppConfig {
@@ -194,8 +199,59 @@ impl Default for AppConfig {
             // AB#1043: 8788 = webhook 默认 8787 + 1，避免两端口同默认时冲突。
             local_api_port: 8788,
             local_api_token: String::new(),
+            listeners: Vec::new(),
+            tunnels: Vec::new(),
         }
     }
+}
+
+/// Listener kind (AB#1064). kebab-case wire values mirror the work item's literal naming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ListenerKind {
+    #[default]
+    LocalApi, // "local-api"
+    RemoteWeb,    // "remote-web"
+    EventIngress, // "event-ingress"
+    Terminal,     // "terminal"
+}
+
+/// Per-listener auth mode (AB#1064). Minimal; not validated this round (1073 = simplest validation only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ListenerAuthMode {
+    #[default]
+    None, // "none"
+    Bearer, // "bearer"
+}
+
+/// A declarative network listener descriptor (AB#1064). Config-only this round:
+/// no runtime binds these yet (deferred, tracked by the still-open AB#1064).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Listener {
+    pub id: String,
+    pub name: String,
+    pub kind: ListenerKind,
+    pub bind_host: String,
+    pub port: u16,
+    pub enabled: bool,
+    pub auth: ListenerAuthMode,
+    pub allowed_origins: Vec<String>,
+    pub public_url: String,
+}
+
+/// A declarative tunnel descriptor (AB#1064). Reuses WebhookTunnelMode (quick/command/listener).
+/// Config-only this round (status/logs/restart deferred).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Tunnel {
+    pub id: String,
+    pub name: String,
+    pub mode: WebhookTunnelMode,
+    pub target_listener_id: String,
+    pub public_url: String,
+    pub enabled: bool,
 }
 
 /// Minimum `webhook_secret` length (trimmed chars) when the receiver is enabled. The
@@ -573,6 +629,130 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
         )));
     }
 
+    // Remote Access (AB#1073) — config-save fail-fast runtime guard (Medium carrier). Scope is
+    // intentionally the two SIMPLEST checks only (HTTPS-only public URLs + no enabled-port
+    // collisions); per-listener auth/origin semantics are deferred with the runtime (AB#1064).
+    //
+    // 1. HTTPS-only publicUrl: every listener/tunnel `public_url`, when set, must be an
+    //    `https://` URL with NO embedded credentials — a remote ingress over plaintext HTTP
+    //    would expose tokens/traffic, and a `https://user:pass@host` URL would stash a
+    //    plaintext credential in the config (same precedent as the `bitbucketHost` `@`-rejection
+    //    above; and thin-orchestrator: the app must never hold credentials — see
+    //    `[[app-thin-orchestrator-decouple]]`). An empty value is "unset" → skipped (mirrors
+    //    webhook fields being unconstrained when unset). The label names the offending resource
+    //    (监听器/隧道 + name) so the message points at WHICH entry failed; the message still
+    //    starts with the `publicUrl` field-token prefix (golden/routing contract).
+    for (src, url) in config
+        .listeners
+        .iter()
+        .map(|l| (format!("监听器「{}」", l.name), &l.public_url))
+        .chain(
+            config
+                .tunnels
+                .iter()
+                .map(|t| (format!("隧道「{}」", t.name), &t.public_url)),
+        )
+    {
+        let url = url.trim();
+        if url.is_empty() {
+            continue;
+        }
+        // Reject non-https schemes AND embedded credentials. `url` crate v2: `.username()`
+        // returns `&str` (empty when absent), `.password()` returns `Option<&str>`.
+        let is_https_no_creds = Url::parse(url)
+            .map(|u| u.scheme() == "https" && u.username().is_empty() && u.password().is_none())
+            .unwrap_or(false);
+        if !is_https_no_creds {
+            return Err(AppError::new(format!(
+                "publicUrl 必须是 https:// 开头的 URL（{src}，远程入口不能走明文 HTTP/不能内嵌凭据）: {url}"
+            )));
+        }
+    }
+
+    // 2. Port conflict: every ENABLED listening port must be unique. Sources are the webhook
+    //    receiver (when enabled), the local REST API (when its port is non-zero — `0` = disabled
+    //    sentinel), and each enabled listener with a non-zero port. The label (port → human
+    //    name) makes the first collision's message name both occupants.
+    // Claim order is fixed (webhook → localApi → listeners in declared order), so the first
+    // collision — and thus the conflict error message — is deterministic despite HashMap being
+    // an unordered container (we only ever read `insert`'s returned prior value, never iterate).
+    let mut ports: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
+    let mut claim = |port: u16, label: String| -> AppResult<()> {
+        if let Some(existing) = ports.insert(port, label.clone()) {
+            return Err(AppError::new(format!(
+                "port 冲突：端口 {port} 被 {existing} 与 {label} 同时占用（启用的监听端口必须互不相同）"
+            )));
+        }
+        Ok(())
+    };
+    if config.webhook_enabled {
+        claim(config.webhook_port, "webhookPort".to_string())?;
+    }
+    if config.local_api_port != 0 {
+        claim(config.local_api_port, "localApiPort".to_string())?;
+    }
+    for listener in &config.listeners {
+        if !listener.enabled {
+            continue;
+        }
+        // An enabled listener with `port == 0` is unbindable (`0` = unset/won't-bind
+        // sentinel), so reject it before the conflict claim (which intentionally skips
+        // `port == 0`). The message keeps the `port` field-token prefix.
+        if listener.port == 0 {
+            return Err(AppError::new(format!(
+                "port 必须大于 0（监听器「{}」已启用但端口为 0/未设置）",
+                listener.name
+            )));
+        }
+        // Label the occupant by its user-facing name, falling back to a short id when the
+        // name is empty (so the conflict message points at WHICH listener a human recognizes,
+        // not the internal id). webhook/localApi labels stay as their field tokens above.
+        let label = if listener.name.trim().is_empty() {
+            format!("监听器 {}", listener.id.chars().take(8).collect::<String>())
+        } else {
+            format!("监听器「{}」", listener.name.trim())
+        };
+        claim(listener.port, label)?;
+    }
+
+    // 3. Reference integrity for ENABLED tunnels (AB#1064 declarative wiring): an enabled
+    //    tunnel's `target_listener_id` must (a) be non-empty, (b) match some listener's `id`,
+    //    and (c) point at an ENABLED listener — a tunnel that exposes a missing/disabled
+    //    listener can never carry traffic, so the config is incoherent. Disabled tunnels are
+    //    unconstrained (skipped). The message keeps the `targetListenerId` field-token prefix.
+    let listener_enabled_by_id: std::collections::HashMap<&str, bool> = config
+        .listeners
+        .iter()
+        .map(|l| (l.id.as_str(), l.enabled))
+        .collect();
+    for tunnel in &config.tunnels {
+        if !tunnel.enabled {
+            continue;
+        }
+        let target = tunnel.target_listener_id.trim();
+        if target.is_empty() {
+            return Err(AppError::new(format!(
+                "targetListenerId 不能为空（隧道「{}」已启用，需指定目标监听器）",
+                tunnel.name
+            )));
+        }
+        match listener_enabled_by_id.get(target) {
+            None => {
+                return Err(AppError::new(format!(
+                    "targetListenerId 不指向任何监听器（隧道「{}」: {target}）",
+                    tunnel.name
+                )));
+            }
+            Some(false) => {
+                return Err(AppError::new(format!(
+                    "targetListenerId 指向未启用的监听器（隧道「{}」→ 目标未启用）",
+                    tunnel.name
+                )));
+            }
+            Some(true) => {}
+        }
+    }
+
     Ok(())
 }
 
@@ -637,6 +817,8 @@ mod tests {
             webhook_public_url: String::new(),
             local_api_port: 8788,
             local_api_token: "local-api-token-0123456789".to_string(),
+            listeners: Vec::new(),
+            tunnels: Vec::new(),
         };
 
         let v = serde_json::to_value(&config).expect("AppConfig serializes");
@@ -656,6 +838,9 @@ mod tests {
         // AB#1043: local REST API keys present (camelCase) at the top level.
         assert!(v.get("localApiPort").is_some());
         assert!(v.get("localApiToken").is_some());
+        // AB#1064: Remote Access collections present at the top level.
+        assert!(v.get("listeners").is_some());
+        assert!(v.get("tunnels").is_some());
 
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("active_project_id").is_none());
@@ -771,6 +956,163 @@ mod tests {
     fn default_has_no_projects() {
         assert!(AppConfig::default().projects.is_empty());
         assert_eq!(AppConfig::default().active_project_id, "");
+    }
+
+    /// A fully-populated [`Listener`] for the wire-shape lock.
+    fn sample_listener() -> Listener {
+        Listener {
+            id: "l1".to_string(),
+            name: "Local API".to_string(),
+            kind: ListenerKind::LocalApi,
+            bind_host: "127.0.0.1".to_string(),
+            port: 8788,
+            enabled: true,
+            auth: ListenerAuthMode::Bearer,
+            allowed_origins: vec!["https://app.example.com".to_string()],
+            public_url: "https://api.example.com".to_string(),
+        }
+    }
+
+    /// Serde wire-shape lock for [`Listener`] (AB#1064, **Medium carrier**): locks the
+    /// camelCase wire shape (same spirit as `app_config_wire_shape_is_camel_case`).
+    #[test]
+    fn listener_wire_shape_is_camel_case() {
+        let v = serde_json::to_value(sample_listener()).expect("Listener serializes");
+
+        // camelCase keys present.
+        assert!(v.get("id").is_some());
+        assert!(v.get("name").is_some());
+        assert!(v.get("kind").is_some());
+        assert!(v.get("bindHost").is_some());
+        assert!(v.get("port").is_some());
+        assert!(v.get("enabled").is_some());
+        assert!(v.get("auth").is_some());
+        assert!(v.get("allowedOrigins").is_some());
+        assert!(v.get("publicUrl").is_some());
+
+        // snake_case forms absent — a rename would surface here.
+        assert!(v.get("bind_host").is_none());
+        assert!(v.get("allowed_origins").is_none());
+        assert!(v.get("public_url").is_none());
+    }
+
+    /// Serde wire-shape lock for [`Tunnel`] (AB#1064, **Medium carrier**): locks the
+    /// camelCase wire shape (same spirit as `app_config_wire_shape_is_camel_case`).
+    #[test]
+    fn tunnel_wire_shape_is_camel_case() {
+        let tunnel = Tunnel {
+            id: "t1".to_string(),
+            name: "Quick".to_string(),
+            mode: WebhookTunnelMode::default(),
+            target_listener_id: "l1".to_string(),
+            public_url: "https://t.example.com".to_string(),
+            enabled: true,
+        };
+
+        let v = serde_json::to_value(&tunnel).expect("Tunnel serializes");
+
+        // camelCase keys present.
+        assert!(v.get("id").is_some());
+        assert!(v.get("name").is_some());
+        assert!(v.get("mode").is_some());
+        assert!(v.get("targetListenerId").is_some());
+        assert!(v.get("publicUrl").is_some());
+        assert!(v.get("enabled").is_some());
+
+        // snake_case forms absent — a rename would surface here.
+        assert!(v.get("target_listener_id").is_none());
+        assert!(v.get("public_url").is_none());
+    }
+
+    /// [`ListenerKind`] kebab-case wire-value lock (AB#1064, **Medium carrier**): the
+    /// literal wire strings mirror the work item's naming and are the cross-end contract.
+    #[test]
+    fn listener_kind_wire_values_are_kebab() {
+        use serde_json::json;
+        assert_eq!(
+            serde_json::to_value(ListenerKind::LocalApi).unwrap(),
+            json!("local-api")
+        );
+        assert_eq!(
+            serde_json::to_value(ListenerKind::RemoteWeb).unwrap(),
+            json!("remote-web")
+        );
+        assert_eq!(
+            serde_json::to_value(ListenerKind::EventIngress).unwrap(),
+            json!("event-ingress")
+        );
+        assert_eq!(
+            serde_json::to_value(ListenerKind::Terminal).unwrap(),
+            json!("terminal")
+        );
+    }
+
+    /// First-launch marker lock (AB#1064, Medium): a fresh config has no Remote Access
+    /// listeners/tunnels, so nothing is exposed until the user adds one.
+    #[test]
+    fn default_has_no_listeners_or_tunnels() {
+        assert!(AppConfig::default().listeners.is_empty());
+        assert!(AppConfig::default().tunnels.is_empty());
+    }
+
+    /// AB#1073 HTTPS-only publicUrl (Medium runtime guard): a plaintext `http://` public URL
+    /// is rejected; the message keeps the `publicUrl` field-token prefix.
+    #[test]
+    fn validate_rejects_http_public_url() {
+        let config = AppConfig {
+            listeners: vec![Listener {
+                public_url: "http://example.com".to_string(),
+                ..sample_listener()
+            }],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("publicUrl"), "{err}");
+    }
+
+    /// AB#1073 HTTPS-only publicUrl (Medium runtime guard): an `https://` public URL with
+    /// distinct ports validates.
+    #[test]
+    fn validate_accepts_https_public_url() {
+        let config = AppConfig {
+            // Isolate the HTTPS guard: localApiPort 0 = off so the port-conflict check can't
+            // mask/fire — only the HTTPS path is exercised here.
+            local_api_port: 0,
+            listeners: vec![Listener {
+                port: 9100,
+                public_url: "https://example.com".to_string(),
+                ..sample_listener()
+            }],
+            ..AppConfig::default()
+        };
+        assert!(validate(&config).is_ok());
+    }
+
+    /// AB#1073 port-conflict (Medium runtime guard): two enabled listeners on the same
+    /// non-zero port are rejected; the message keeps the `port` prefix.
+    #[test]
+    fn validate_rejects_port_conflict() {
+        let config = AppConfig {
+            // No projects + no local API (port 0) so ONLY the listener port check can fire.
+            local_api_port: 0,
+            listeners: vec![
+                Listener {
+                    id: "a".to_string(),
+                    port: 9000,
+                    enabled: true,
+                    ..Listener::default()
+                },
+                Listener {
+                    id: "b".to_string(),
+                    port: 9000,
+                    enabled: true,
+                    ..Listener::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("port"), "{err}");
     }
 
     /// Default-manual-review lock (Medium). A fresh project must NOT auto-dispatch
@@ -1546,6 +1888,260 @@ mod tests {
         let expected = Project {
             id: "p1".to_string(),
             ..Project::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&parsed).expect("parsed serializes"),
+            serde_json::to_value(&expected).expect("expected serializes")
+        );
+    }
+
+    /// [`ListenerAuthMode`] lowercase wire-value lock (AB#1064, **Medium carrier**): the
+    /// literal wire strings are the cross-end contract with the TS `LISTENER_AUTH_MODES`
+    /// `as const` array (same spirit as `listener_kind_wire_values_are_kebab`).
+    #[test]
+    fn listener_auth_mode_wire_values_are_lowercase() {
+        use serde_json::json;
+        assert_eq!(
+            serde_json::to_value(ListenerAuthMode::None).unwrap(),
+            json!("none")
+        );
+        assert_eq!(
+            serde_json::to_value(ListenerAuthMode::Bearer).unwrap(),
+            json!("bearer")
+        );
+    }
+
+    /// AB#1073 HTTPS-only publicUrl (Medium runtime guard): a plaintext `http://` public URL on
+    /// a TUNNEL is rejected too (the guard chains listeners AND tunnels); the message keeps the
+    /// `publicUrl` field-token prefix.
+    #[test]
+    fn validate_rejects_tunnel_http_public_url() {
+        let config = AppConfig {
+            // No conflicting listeners + local API off so ONLY the HTTPS path can fire.
+            local_api_port: 0,
+            tunnels: vec![Tunnel {
+                id: "t1".to_string(),
+                public_url: "http://example.com".to_string(),
+                ..Tunnel::default()
+            }],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("publicUrl"), "{err}");
+    }
+
+    /// AB#1073 publicUrl (Medium runtime guard): an https URL with embedded userinfo
+    /// (`https://user:pass@host`) is rejected — the app must not stash plaintext credentials in
+    /// config (mirrors the `bitbucketHost` `@`-rejection precedent). Message keeps the
+    /// `publicUrl` prefix.
+    #[test]
+    fn validate_rejects_userinfo_in_public_url() {
+        let config = AppConfig {
+            // Distinct listener port + local API off so ONLY the HTTPS/userinfo path can fire.
+            local_api_port: 0,
+            listeners: vec![Listener {
+                port: 9100,
+                public_url: "https://user:pass@example.com".to_string(),
+                ..sample_listener()
+            }],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("publicUrl"), "{err}");
+    }
+
+    /// AB#1073 port-conflict (Medium runtime guard): an enabled listener colliding with the
+    /// (enabled) webhook receiver port is rejected; the message keeps the `port` prefix. The
+    /// webhook block must pass first, so the secret is long enough and the mode is the default
+    /// `quick` (no tunnel command required) to reach the port-conflict check.
+    #[test]
+    fn validate_rejects_webhook_listener_port_conflict() {
+        let config = AppConfig {
+            webhook_enabled: true,
+            webhook_port: 9000,
+            webhook_secret: "webhook-secret-0123456789".to_string(),
+            // local API off so the only collision is webhook ↔ listener.
+            local_api_port: 0,
+            listeners: vec![Listener {
+                id: "l1".to_string(),
+                port: 9000,
+                enabled: true,
+                ..Listener::default()
+            }],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("port"), "{err}");
+    }
+
+    /// AB#1073 port-conflict (Medium runtime guard): an enabled listener colliding with the
+    /// local REST API port is rejected; the message keeps the `port` prefix.
+    #[test]
+    fn validate_rejects_local_api_listener_port_conflict() {
+        let config = AppConfig {
+            local_api_port: 9000,
+            listeners: vec![Listener {
+                id: "l1".to_string(),
+                port: 9000,
+                enabled: true,
+                ..Listener::default()
+            }],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("port"), "{err}");
+    }
+
+    /// AB#1073 port-conflict (Medium runtime guard): a DISABLED listener is excluded from the
+    /// port-conflict check — only enabled listeners claim a port, so a disabled one sharing the
+    /// local API port is fine.
+    #[test]
+    fn validate_disabled_listener_excluded_from_port_conflict() {
+        let config = AppConfig {
+            local_api_port: 9000,
+            listeners: vec![Listener {
+                id: "l1".to_string(),
+                port: 9000,
+                enabled: false,
+                ..Listener::default()
+            }],
+            ..AppConfig::default()
+        };
+        assert!(validate(&config).is_ok());
+    }
+
+    /// AB#1064 port-0 reject (Medium runtime guard): an ENABLED listener with `port == 0`
+    /// (the unset/won't-bind sentinel) is unbindable, so it is rejected; the message keeps the
+    /// `port` prefix. local_api_port: 0 isolates this from the local-API claim.
+    #[test]
+    fn validate_rejects_enabled_listener_zero_port() {
+        let config = AppConfig {
+            // local API off so ONLY the listener port-0 check can fire.
+            local_api_port: 0,
+            listeners: vec![Listener {
+                id: "l1".to_string(),
+                port: 0,
+                enabled: true,
+                ..Listener::default()
+            }],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("port"), "{err}");
+    }
+
+    /// AB#1064 reference integrity (Medium runtime guard): an ENABLED tunnel with an empty
+    /// `target_listener_id` is rejected (an enabled tunnel must name its target); the message
+    /// keeps the `targetListenerId` prefix.
+    #[test]
+    fn validate_rejects_enabled_tunnel_empty_target() {
+        let config = AppConfig {
+            local_api_port: 0,
+            tunnels: vec![Tunnel {
+                id: "t1".to_string(),
+                enabled: true,
+                target_listener_id: String::new(),
+                ..Tunnel::default()
+            }],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("targetListenerId"), "{err}");
+    }
+
+    /// AB#1064 reference integrity (Medium runtime guard): an ENABLED tunnel pointing at a
+    /// `target_listener_id` that matches no listener is rejected; the message keeps the
+    /// `targetListenerId` prefix.
+    #[test]
+    fn validate_rejects_enabled_tunnel_dangling_target() {
+        let config = AppConfig {
+            local_api_port: 0,
+            tunnels: vec![Tunnel {
+                id: "t1".to_string(),
+                enabled: true,
+                target_listener_id: "nope".to_string(),
+                ..Tunnel::default()
+            }],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("targetListenerId"), "{err}");
+    }
+
+    /// AB#1064 reference integrity (Medium runtime guard): an ENABLED tunnel pointing at a
+    /// DISABLED listener is rejected (the tunnel could never carry traffic); the message keeps
+    /// the `targetListenerId` prefix.
+    #[test]
+    fn validate_rejects_enabled_tunnel_disabled_target() {
+        let config = AppConfig {
+            local_api_port: 0,
+            listeners: vec![Listener {
+                id: "l1".to_string(),
+                port: 9000,
+                enabled: false,
+                ..Listener::default()
+            }],
+            tunnels: vec![Tunnel {
+                id: "t1".to_string(),
+                enabled: true,
+                target_listener_id: "l1".to_string(),
+                ..Tunnel::default()
+            }],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("targetListenerId"), "{err}");
+    }
+
+    /// AB#1064 reference integrity (Medium runtime guard): an ENABLED tunnel pointing at an
+    /// existing ENABLED listener validates. The listener gets a non-zero port (so the port-0
+    /// reject does not fire) distinct from any other claim, and local_api_port: 0 isolates it.
+    #[test]
+    fn validate_accepts_enabled_tunnel_valid_target() {
+        let config = AppConfig {
+            local_api_port: 0,
+            listeners: vec![Listener {
+                id: "l1".to_string(),
+                port: 9000,
+                enabled: true,
+                ..Listener::default()
+            }],
+            tunnels: vec![Tunnel {
+                id: "t1".to_string(),
+                enabled: true,
+                target_listener_id: "l1".to_string(),
+                ..Tunnel::default()
+            }],
+            ..AppConfig::default()
+        };
+        assert!(validate(&config).is_ok());
+    }
+
+    /// Forward-compat lock for [`Listener`] (AB#1064): a listener object missing fields fills
+    /// them from `Listener::default()` (same `#[serde(default)]` contract as `Project`).
+    #[test]
+    fn listener_partial_object_fills_rest_from_default() {
+        let parsed: Listener = serde_json::from_value(serde_json::json!({"id": "l1"}))
+            .expect("partial listener deserializes via serde(default)");
+        let expected = Listener {
+            id: "l1".to_string(),
+            ..Listener::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&parsed).expect("parsed serializes"),
+            serde_json::to_value(&expected).expect("expected serializes")
+        );
+    }
+
+    /// Forward-compat lock for [`Tunnel`] (AB#1064): a tunnel object missing fields fills them
+    /// from `Tunnel::default()` (same `#[serde(default)]` contract as `Project`).
+    #[test]
+    fn tunnel_partial_object_fills_rest_from_default() {
+        let parsed: Tunnel = serde_json::from_value(serde_json::json!({"id": "t1"}))
+            .expect("partial tunnel deserializes via serde(default)");
+        let expected = Tunnel {
+            id: "t1".to_string(),
+            ..Tunnel::default()
         };
         assert_eq!(
             serde_json::to_value(&parsed).expect("parsed serializes"),

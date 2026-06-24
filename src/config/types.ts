@@ -14,6 +14,58 @@ import type { SourceKind, EngineKind, UpdateMode, LabelSource } from "../types";
 export const WEBHOOK_TUNNEL_MODES = ["quick", "command", "listener"] as const;
 export type WebhookTunnelMode = (typeof WEBHOOK_TUNNEL_MODES)[number];
 
+// Remote-access listener kind (AB#1064), config slice-private — mirrors the Rust
+// `ListenerKind` enum's kebab-case wire values. local-api = the resident 127.0.0.1
+// trigger endpoint; remote-web = the panel served over a tunnel; event-ingress = an
+// inbound event/webhook receiver; terminal = a remote shell/PTY listener. Default
+// "local-api".
+//
+// Single-sourced as an `as const` array (same #50 review G9 pattern as
+// WEBHOOK_TUNNEL_MODES): the type is DERIVED from the array, and fields.ts feeds the
+// same array into the select `options`, so the type and the UI's option list can never
+// drift. (The Rust↔TS mirror remains a separate, golden-locked contract.)
+export const LISTENER_KINDS = [
+  "local-api",
+  "remote-web",
+  "event-ingress",
+  "terminal",
+] as const;
+export type ListenerKind = (typeof LISTENER_KINDS)[number];
+
+// Listener auth mode (AB#1064): none = no credential (loopback only); bearer = an
+// Authorization: Bearer <token> gate. Mirrors the Rust `ListenerAuthMode` wire values.
+// Default "none". Same single-sourced `as const`-array pattern as LISTENER_KINDS.
+export const LISTENER_AUTH_MODES = ["none", "bearer"] as const;
+export type ListenerAuthMode = (typeof LISTENER_AUTH_MODES)[number];
+
+// One declarative listener (AB#1064): a named bind endpoint the app exposes. Mirrors
+// the Rust `Listener` struct's camelCase wire shape (golden-locked on the Rust side).
+// `id` is the stable handle a Tunnel's `targetListenerId` points at.
+export interface Listener {
+  id: string;
+  name: string;
+  kind: ListenerKind;
+  bindHost: string;
+  port: number;
+  enabled: boolean;
+  auth: ListenerAuthMode;
+  allowedOrigins: string[];
+  publicUrl: string;
+}
+
+// One declarative tunnel (AB#1064): publishes a listener over a public URL. Mirrors the
+// Rust `Tunnel` struct's camelCase wire shape (golden-locked on the Rust side). `mode`
+// reuses WebhookTunnelMode (quick/command/listener); `targetListenerId` names the
+// `Listener.id` this tunnel fronts.
+export interface Tunnel {
+  id: string;
+  name: string;
+  mode: WebhookTunnelMode;
+  targetListenerId: string;
+  publicUrl: string;
+  enabled: boolean;
+}
+
 // One monitored project (#35): the per-project slice of what used to be the flat
 // AppConfig. Mirrors the Rust `Project` struct's camelCase wire shape (golden-locked
 // on the Rust side). `id` is the stable handle used by `activeProjectId` and the
@@ -78,4 +130,9 @@ export interface AppConfig {
   // (fail-closed 401). Mirror the Rust `AppConfig.localApiPort`/`localApiToken` wire fields.
   localApiPort: number;
   localApiToken: string;
+  // Remote-access resources (AB#1064): declarative lists of listeners (bind endpoints)
+  // and tunnels (public publishers) edited by the Remote Access settings page. Mirror
+  // the Rust `AppConfig.listeners`/`tunnels` wire fields (golden-locked on the Rust side).
+  listeners: Listener[];
+  tunnels: Tunnel[];
 }

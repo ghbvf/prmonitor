@@ -12,6 +12,7 @@ import type { AppConfig } from "./types";
 import { GLOBAL_GROUPS, type FieldDef, type GlobalFieldKey } from "./fields";
 import ConfigField from "./ConfigField.vue";
 import ProjectsManager from "./ProjectsManager.vue";
+import RemoteAccessManager from "./RemoteAccessManager.vue";
 // The webhook control panel lives in the `pr` slice; mounting it here would be a
 // config→pr edge. Instead we expose a `webhook` scoped slot (saved config + live
 // draft + saving flag) and let the composition root (App.vue) fill it — keeping
@@ -29,6 +30,11 @@ const emit = defineEmits<{ saved: [] }>();
 // no longer carries a top-level authorsInput.
 const PROJECTS_NAV_ID = "projects";
 
+// The synthetic nav id for the Remote Access section (AB#1064; not a GLOBAL_GROUPS id).
+// Like PROJECTS_NAV_ID it routes to a dedicated array-of-objects editor
+// (RemoteAccessManager) instead of the scalar GLOBAL_GROUPS ConfigField path.
+const REMOTE_ACCESS_NAV_ID = "remoteAccess";
+
 // Editable draft (decoupled from the store). The full multi-project AppConfig:
 // `projects`/`activeProjectId` are edited by ProjectsManager; the webhook fields by
 // the GLOBAL_GROUPS form below.
@@ -44,6 +50,8 @@ const draft = reactive<AppConfig>({
   webhookPublicUrl: "",
   localApiPort: 8788,
   localApiToken: "",
+  listeners: [],
+  tunnels: [],
 });
 
 function hydrate(cfg: AppConfig) {
@@ -60,6 +68,14 @@ function hydrate(cfg: AppConfig) {
   draft.webhookPublicUrl = cfg.webhookPublicUrl;
   draft.localApiPort = cfg.localApiPort;
   draft.localApiToken = cfg.localApiToken;
+  // Deep-copy the remote-access resources (AB#1064) so card edits never mutate the store's
+  // config object before a save — same reason as the projects deep-copy above. A listener's
+  // allowedOrigins is a string[], so clone it too (mirrors the authors clone).
+  draft.listeners = cfg.listeners.map((l) => ({
+    ...l,
+    allowedOrigins: [...l.allowedOrigins],
+  }));
+  draft.tunnels = cfg.tunnels.map((t) => ({ ...t }));
 }
 
 // Populate the draft once the async config lands (and on any later replacement).
@@ -106,8 +122,24 @@ async function onSave() {
   await store.save({
     ...draft,
     projects: draft.projects.map((p) => ({ ...p, authors: [...p.authors] })),
+    // Detach the remote-access resources too (AB#1064): clone each object and the
+    // listener's allowedOrigins array so the store snapshot isn't the live reactive draft.
+    listeners: draft.listeners.map((l) => ({
+      ...l,
+      allowedOrigins: [...l.allowedOrigins],
+    })),
+    tunnels: draft.tunnels.map((t) => ({ ...t })),
   });
   if (store.savedOk) emit("saved");
+  // On a failed save, route to the page that owns the offending field. The Remote Access
+  // validations (AB#1073) emit messages prefixed `publicUrl` / `port`, so land the user on
+  // that page (mirrors the wizard's errorToStep field-token routing).
+  else if (
+    store.error &&
+    (store.error.startsWith("publicUrl") || store.error.startsWith("port"))
+  ) {
+    activeGroupId.value = REMOTE_ACCESS_NAV_ID;
+  }
 }
 </script>
 
@@ -131,6 +163,14 @@ async function onSave() {
           项目
         </button>
         <button
+          type="button"
+          class="nav-item"
+          :class="{ active: activeGroupId === REMOTE_ACCESS_NAV_ID }"
+          @click="activeGroupId = REMOTE_ACCESS_NAV_ID"
+        >
+          远程访问
+        </button>
+        <button
           v-for="g in GLOBAL_GROUPS"
           :key="g.id"
           type="button"
@@ -145,6 +185,13 @@ async function onSave() {
       <form class="pane" @submit.prevent="onSave">
         <div v-if="activeGroupId === PROJECTS_NAV_ID" class="group projects-group">
           <ProjectsManager :draft="draft" @edit="onEdit" />
+        </div>
+
+        <div
+          v-if="activeGroupId === REMOTE_ACCESS_NAV_ID"
+          class="group projects-group"
+        >
+          <RemoteAccessManager :draft="draft" @edit="onEdit" />
         </div>
 
         <template v-for="g in GLOBAL_GROUPS" :key="g.id">
