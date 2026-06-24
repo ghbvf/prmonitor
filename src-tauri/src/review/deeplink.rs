@@ -307,8 +307,13 @@ fn notify_completion<R: Runtime>(app: &AppHandle<R>, pr_number: u64, outcome: &C
 }
 
 /// Surface a deeplink FAILURE to the user (codex F3). A deeplink is fire-and-forget with no return
-/// channel, so a clicked link that can't run would otherwise be silent (only stderr). Best-effort,
-/// like [`notify_completion`].
+/// channel, so a clicked link that can't run would otherwise be silent (only stderr).
+///
+/// Delivers INLINE via `notify::deliver` (NOT through the outbox, unlike `notify_completion` which
+/// enqueues for durable + retried delivery). This is deliberate: a failure notice is transient
+/// immediate feedback on a bad click BEFORE any session exists — there is nothing durable to resume,
+/// and a retried "link invalid" toast minutes later would be noise. If the inline delivery fails it
+/// is logged, not retried.
 ///
 /// `body` is a [`RedactedNotificationBody`], so callers cannot pass an arbitrary
 /// `AppError::message` directly. Project-resolution errors embed the external `reference`

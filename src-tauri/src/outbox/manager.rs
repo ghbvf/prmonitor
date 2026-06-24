@@ -63,8 +63,14 @@ impl OutboxManager {
     /// Stop the worker (app shutdown). Signals the loop AND aborts the task as the hard backstop
     /// (the loop only `.await`s between DB transactions, so an abort can't tear a transaction). A
     /// no-op if never started.
+    ///
+    /// Uses `notify_one` (NOT `notify_waiters`): `notify_one` STORES a permit when no waiter is
+    /// currently parked, so a stop that fires while the loop is BETWEEN its two `select!` blocks is
+    /// consumed by the next `stop.notified()` rather than lost — the same permit-storing stop the
+    /// `pr::scheduler` loop relies on. (The `abort` is still the hard backstop, but the graceful
+    /// path is now reliable on its own.)
     pub fn shutdown(&self) {
-        self.stop.notify_waiters();
+        self.stop.notify_one();
         if let Some(handle) = self.task.lock().unwrap().take() {
             handle.abort();
         }

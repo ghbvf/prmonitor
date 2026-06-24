@@ -137,7 +137,7 @@ pub async fn run_due_once(app: &tauri::AppHandle, db: &Database, executor: &Acti
 /// `project_id` (no external threading — unlike the inbox, `OutboxEntry` carries `projectId` at the
 /// top level). A gone row (e.g. pruned) is silently skipped; a store ERROR is logged (not swallowed)
 /// so a persistent read failure stays diagnosable.
-fn announce_updated<R: Runtime>(app: &tauri::AppHandle<R>, db: &Database, id: i64) {
+pub(crate) fn announce_updated<R: Runtime>(app: &tauri::AppHandle<R>, db: &Database, id: i64) {
     match store::get_entry(db, id) {
         Ok(Some(entry)) => {
             let _ = app.emit(
@@ -164,6 +164,10 @@ mod tests {
     // Exponential backoff is monotonic non-decreasing and capped (AB#1066).
     #[test]
     fn next_backoff_grows_then_caps() {
+        // `attempt` is documented 1-based; `0` is never passed in practice (the caller uses
+        // `attempt_count + 1`, min 1), but pin that `0` and `1` coincide so a future 0-based refactor
+        // can't silently change the first-retry delay.
+        assert_eq!(next_backoff(0), 30);
         assert_eq!(next_backoff(1), 30);
         assert_eq!(next_backoff(2), 60);
         assert_eq!(next_backoff(3), 120);
@@ -217,6 +221,7 @@ mod tests {
             store::enqueue(&db, "p1", ActionKind::Notification, "s", "{}", 0).expect("enqueue");
 
         let mut now = 0u64;
+        let mut retries_seen = 0u32;
         let err: AppResult<()> = Err(AppError::new("always boom"));
         // Simulate the worker draining the row until it dead-letters. Bound the loop well above
         // MAX_ATTEMPTS so a regression (never dead-lettering) fails loudly instead of looping.
@@ -238,6 +243,19 @@ mod tests {
                         now,
                     )
                     .expect("retry");
+                    retries_seen += 1;
+                    // The increment is exact each step, not just at the terminal state: after N
+                    // retries the row reads attempt_count == N (catches an off-by-one in the bump).
+                    let mid = store::get_entry(&db, id).expect("get").expect("exists");
+                    assert_eq!(
+                        mid.status,
+                        crate::model::ActionStatus::Pending,
+                        "retry stays pending"
+                    );
+                    assert_eq!(
+                        mid.attempt_count, retries_seen,
+                        "attempt_count increments by 1/retry"
+                    );
                     now = next_attempt_at; // advance the clock to the next schedule
                 }
                 Outcome::Dead => {
@@ -246,6 +264,12 @@ mod tests {
                 }
             }
         }
+        // MAX_ATTEMPTS total attempts = (MAX_ATTEMPTS - 1) retries then the final dead-letter.
+        assert_eq!(
+            retries_seen,
+            MAX_ATTEMPTS - 1,
+            "retried up to the budget, then dead-lettered"
+        );
 
         let entry = store::get_entry(&db, id).expect("get").expect("exists");
         assert_eq!(

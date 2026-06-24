@@ -26,11 +26,9 @@ function toggleRaw(id: number) {
   rawOpen.value = new Set(rawOpen.value);
 }
 
-// Map a status to a tone class for the badge — drives the design-token color below. The
-// visible TEXT comes from `outboxStatusLabel` (the types.ts carrier); this only picks the
-// tone, but it is itself an `assertNever`-exhaustive switch (Medium — `assertNever`穷尽,
-// same carrier class as `outboxStatusLabel`): adding an OutboxStatus without a tone arm
-// here is a COMPILE error, so a new status can't silently render with no badge color.
+// Map a status to a tone class for the badge — drives the design-token color below. The visible
+// TEXT comes from `outboxStatusLabel` (the types.ts carrier). `assertNever` exhaustiveness: adding
+// an OutboxStatus without a tone arm here is a compile error, so a new status can't render colorless.
 function statusTone(s: OutboxStatus): string {
   switch (s) {
     case "done":
@@ -99,12 +97,13 @@ onUnmounted(() => unlisten?.());
         <div class="row-head">
           <span class="badge type">{{ outboxKindLabel(entry.kind) }}</span>
           <span class="badge status" :class="statusTone(entry.status)">
-            <!-- A `pending` entry that has already failed at least once is actively
-                 retrying; surface the attempt count so the row reads as "in retry" rather
-                 than a fresh queue. Terminal/first-pass states show the plain label. -->
+            <!-- A `pending` entry that has already failed at least once is WAITING for its next
+                 retry (not running right now); surface the attempt count so the row reads as
+                 "awaiting retry" rather than a fresh queue. Terminal/first-pass states show the
+                 plain label. -->
             {{
               entry.status === "pending" && entry.attemptCount > 0
-                ? `重试中 (${entry.attemptCount})`
+                ? `等待重试 (${entry.attemptCount})`
                 : outboxStatusLabel(entry.status)
             }}
           </span>
@@ -113,8 +112,10 @@ onUnmounted(() => unlisten?.());
 
         <div class="meta">
           <!-- The outbox is cross-project by design (it lists every project's outbound
-               actions), so surface which project each row belongs to (mirrors InboxPanel). -->
-          <span class="badge project">{{ entry.projectId }}</span>
+               actions), so surface which project each row belongs to (mirrors InboxPanel). A
+               deeplink-triggered notification has no project scope (empty projectId): show an
+               explicit "通用 / Global" chip rather than a blank one. -->
+          <span class="badge project">{{ entry.projectId || "通用 / Global" }}</span>
           <span class="attempts">尝试 {{ entry.attemptCount }} 次</span>
           <span v-if="entry.status === 'pending'" class="next-attempt">
             下次 {{ fmtTime(entry.nextAttemptAt) }}

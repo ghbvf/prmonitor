@@ -604,6 +604,23 @@ mod tests {
                 "v5 action_outbox has the {col} retry column"
             );
         }
+        // The worker's claim (`status, next_attempt_at`) and the panel's listing (`project_id, id`)
+        // rely on these indexes; a typo in the DDL would only fail at runtime. Pin them here.
+        for idx in ["idx_action_outbox_due", "idx_action_outbox_project"] {
+            assert!(index_exists(&conn, idx), "v5 created the {idx} index");
+        }
+    }
+
+    /// Whether an index of the given name exists (via `sqlite_master`).
+    fn index_exists(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name = ?1",
+            [name],
+            |_| Ok(()),
+        )
+        .optional()
+        .expect("query sqlite_master")
+        .is_some()
     }
 
     /// Whether a table of the given name exists (via `sqlite_master`).

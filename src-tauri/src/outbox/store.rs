@@ -32,6 +32,27 @@ const CLAIM_LIMIT: i64 = 100;
 /// on the live queue.
 const MAX_OUTBOX_TERMINAL: i64 = 5000;
 
+/// Cap on a stored `last_error` (AB#1066, security review): the error is persisted and surfaced to
+/// the frontend panel, so an unbounded message (a giant serde error, or a crafted value echoed
+/// through `kind_from_wire`) is truncated at this byte budget. Defense-in-depth — the action
+/// `payload` (a `Notification` today) must itself carry no secret, since both it and `last_error`
+/// are panel-visible.
+const MAX_LAST_ERROR_LEN: usize = 512;
+
+/// Truncate a `last_error` to [`MAX_LAST_ERROR_LEN`] on a char boundary (never mid-UTF-8), appending
+/// an ellipsis marker when cut. Applied at every `last_error` write so no path can persist an
+/// unbounded message.
+fn clamp_error(error: &str) -> String {
+    if error.len() <= MAX_LAST_ERROR_LEN {
+        return error.to_string();
+    }
+    let mut end = MAX_LAST_ERROR_LEN;
+    while end > 0 && !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &error[..end])
+}
+
 /// Wall-clock seconds for the outbox timestamps. Slice-local (each slice keeps its own `now_epoch`
 /// to stay self-contained). Degrades to 0 on a pre-epoch clock rather than panicking.
 pub(crate) fn now_epoch() -> u64 {
@@ -79,8 +100,8 @@ pub(crate) fn kind_as_wire(kind: ActionKind) -> String {
 
 /// [`ActionKind`] from its DB wire string (reverse of [`kind_as_wire`]), STRICT. The worker routes
 /// the side effect on this kind, so it must NOT silently default an unparseable stored value to a
-/// concrete kind. An unknown / corrupt value is an explicit [`AppError`]; [`claim_due`] SKIPS such a
-/// row (best-effort — a corrupt row must not blank the batch or crash the worker).
+/// concrete kind. An unknown / corrupt value is an explicit [`AppError`]; [`claim_due`] DEAD-LETTERS
+/// such a row (quarantine — a corrupt row must not blank the batch or crash the worker, nor linger).
 fn kind_from_wire(s: &str) -> AppResult<ActionKind> {
     serde_json::from_value(serde_json::Value::String(s.to_string()))
         .map_err(|_| crate::error::AppError::new(format!("outbox 行的 kind 无法识别：{s:?}")))
@@ -131,42 +152,59 @@ pub fn enqueue(
 
 /// Claim the due actions (AB#1066): `pending` rows whose `next_attempt_at <= now`, OLDEST FIRST
 /// (`ORDER BY id`), bounded to [`CLAIM_LIMIT`]. The `idx_action_outbox_due` index serves the
-/// predicate. A row whose stored `kind` is corrupt is SKIPPED (best-effort — one bad row must not
-/// crash the worker or blank the batch), not surfaced as an error.
+/// predicate.
+///
+/// A row whose stored `kind` is unrecognized is QUARANTINED — dead-lettered in place (not just
+/// skipped). The schema-version forward-compat guard ([`crate::db`]) means an older binary refuses
+/// to open a newer DB, so a `kind` this binary can't parse is genuine corruption/tampering, never a
+/// legitimate future kind — dead-lettering it is correct (it becomes terminal `dead`, visible in the
+/// panel, and stops being re-selected + re-logged every cycle). Returns only the well-formed actions.
 pub fn claim_due(db: &Database, now: u64) -> AppResult<Vec<OutboxAction>> {
-    db.with_conn(|conn| {
+    let rows: Vec<(i64, String, String, String, i64)> = db.with_conn(|conn| {
         let mut stmt = conn.prepare(
             "SELECT id, project_id, kind, payload, attempt_count FROM action_outbox \
              WHERE status = 'pending' AND next_attempt_at <= ?1 ORDER BY id LIMIT ?2",
         )?;
-        let rows: Vec<(i64, String, String, String, i64)> = stmt
+        let rows = stmt
             .query_map(rusqlite::params![now as i64, CLAIM_LIMIT], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
-    })
-    .map(|rows| {
-        rows.into_iter()
-            .filter_map(|(id, project_id, kind, payload, attempt_count)| {
-                // Skip a corrupt-kind row (best-effort): the worker can't route it, and resurrecting
-                // it would just re-skip every cycle — a forward-incompatible / tampered value.
-                match kind_from_wire(&kind) {
-                    Ok(kind) => Some(OutboxAction {
-                        id,
-                        project_id,
-                        kind,
-                        payload,
-                        attempt_count: attempt_count.max(0) as u32,
-                    }),
-                    Err(e) => {
-                        eprintln!("outbox: 跳过 kind 损坏的行（id={id}）：{}", e.message);
-                        None
-                    }
+    })?;
+
+    // Observability (AB#1066): a full page means the pending queue depth is ≥ CLAIM_LIMIT — the
+    // worker is draining a backlog a page at a time. Surface it so an unexpectedly deep queue (a
+    // producer outpacing the worker) is diagnosable rather than silent.
+    if rows.len() as i64 >= CLAIM_LIMIT {
+        eprintln!("outbox: claim 批次已达上限 {CLAIM_LIMIT}，pending 队列可能积压（下个周期续清）");
+    }
+
+    let mut actions = Vec::with_capacity(rows.len());
+    for (id, project_id, kind, payload, attempt_count) in rows {
+        let attempt_count = attempt_count.max(0) as u32;
+        match kind_from_wire(&kind) {
+            Ok(kind) => actions.push(OutboxAction {
+                id,
+                project_id,
+                kind,
+                payload,
+                attempt_count,
+            }),
+            Err(e) => {
+                // Quarantine: dead-letter the corrupt row so it terminalizes (panel-visible) instead
+                // of being re-skipped + re-logged forever. Best-effort — a write failure here just
+                // leaves it `pending` to retry the quarantine next cycle, never a false `done`.
+                if let Err(mark_err) = mark_dead(db, id, attempt_count, &e.message, now) {
+                    eprintln!(
+                        "outbox: 死信 kind 损坏的行失败（id={id}）：{}",
+                        mark_err.message
+                    );
                 }
-            })
-            .collect()
-    })
+            }
+        }
+    }
+    Ok(actions)
 }
 
 /// Mark an outbox row `done` (AB#1066), stamping `updated_at` and clearing any prior `last_error`.
@@ -200,7 +238,7 @@ pub fn mark_retry(
                 id,
                 attempt_count as i64,
                 next_attempt_at as i64,
-                error,
+                clamp_error(error),
                 now as i64
             ],
         )
@@ -225,7 +263,7 @@ pub fn mark_dead(
                 id,
                 status_as_wire(ActionStatus::Dead),
                 attempt_count as i64,
-                error,
+                clamp_error(error),
                 now as i64
             ],
         )
@@ -311,10 +349,14 @@ pub fn get_raw(db: &Database, id: i64) -> AppResult<Option<String>> {
     })
 }
 
-/// Map one queried row to an [`OutboxEntry`]. The `kind` / `status` columns degrade leniently
-/// (`kind` defaults to the only kind on a corrupt value via serde; `status_from_wire` defaults a
-/// corrupt value to `Dead`) so a tampered row still LISTS rather than failing the whole page —
-/// the strict `kind_from_wire` only guards the side-effectful [`claim_due`] path.
+/// Map one queried row to an [`OutboxEntry`]. The `kind` / `status` columns degrade leniently so a
+/// tampered row still LISTS rather than failing the whole page: `status_from_wire` defaults a
+/// corrupt value to `Dead`, and `kind` falls back to `ActionKind::default()` (currently
+/// `Notification`) — a diagnostic lie for an unrecognized kind, but acceptable for a read-only list
+/// (the strict `kind_from_wire` on the side-effectful [`claim_due`] path instead DEAD-LETTERS such a
+/// row, so it surfaces as terminal `dead` and stops re-appearing). NOTE: once a second `ActionKind`
+/// exists, a genuinely-corrupt row would still list as `Notification` here — acceptable since the
+/// schema-version guard rules out a legitimate future kind reaching an older binary.
 fn hydrate_entry(r: &rusqlite::Row) -> rusqlite::Result<OutboxEntry> {
     let kind_wire: String = r.get(2)?;
     let status_wire: String = r.get(4)?;
@@ -379,10 +421,18 @@ mod tests {
         mark_retry(&db, future, 1, 10_000, "later", 100).expect("reschedule future");
         let done = enqueue_notif(&db, "p1", "done", 100);
         mark_done(&db, done, 100).expect("done");
+        // A terminal `dead` row (due now) must also be excluded — the claim predicate is
+        // `status = 'pending'`, so a dead-lettered row is never re-claimed.
+        let dead = enqueue_notif(&db, "p1", "dead", 100);
+        mark_dead(&db, dead, 5, "final boom", 100).expect("dead");
 
         let claimed = claim_due(&db, 5_000).expect("claim");
         let ids: Vec<i64> = claimed.iter().map(|x| x.id).collect();
-        assert_eq!(ids, vec![a, b], "only due pending rows, oldest id first");
+        assert_eq!(
+            ids,
+            vec![a, b],
+            "only due pending rows, oldest id first (done/dead excluded)"
+        );
         assert!(claimed.iter().all(|x| x.attempt_count == 0));
 
         // Advancing now past the future row's schedule makes it claimable too.
@@ -516,30 +566,90 @@ mod tests {
         );
     }
 
-    // claim_due SKIPS a corrupt-kind row (AB#1066): a tampered/forward-incompatible `kind` must not
-    // crash the worker or blank the batch — it is skipped, while a good row alongside still claims.
+    // claim_due QUARANTINES (dead-letters) a corrupt-kind row (AB#1066): a tampered `kind` the
+    // worker can't route must not crash the batch NOR linger `pending` forever — it is flipped to
+    // terminal `dead` (panel-visible, no longer re-selected), while a good row alongside still
+    // claims. A second claim returns only the good row (the dead row is excluded), proving the
+    // corrupt row stops re-appearing.
     #[test]
-    fn claim_due_skips_corrupt_kind_row() {
+    fn claim_due_dead_letters_corrupt_kind_row() {
         let db = Database::open_in_memory().expect("open db");
         let good = enqueue_notif(&db, "p1", "good", 100);
-        db.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO action_outbox \
-                 (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, \
-                  created_at, updated_at) \
-                 VALUES ('p1', 'gitlab-bot', 's', '{}', 'pending', 0, 100, 100, 100)",
-                [],
-            )
-        })
-        .expect("insert corrupt-kind row");
+        let corrupt = db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO action_outbox \
+                     (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, \
+                      created_at, updated_at) \
+                     VALUES ('p1', 'gitlab-bot', 's', '{}', 'pending', 0, 100, 100, 100)",
+                    [],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .expect("insert corrupt-kind row");
 
         let claimed = claim_due(&db, 500).expect("claim does not crash");
         let ids: Vec<i64> = claimed.iter().map(|x| x.id).collect();
         assert_eq!(
             ids,
             vec![good],
-            "corrupt-kind row skipped, good row claimed"
+            "corrupt-kind row excluded, good row claimed"
         );
+
+        // The corrupt row was dead-lettered (terminal), carrying the parse error, and is not
+        // re-claimed on the next cycle.
+        let entry = get_entry(&db, corrupt).expect("get").expect("exists");
+        assert_eq!(
+            entry.status,
+            ActionStatus::Dead,
+            "corrupt-kind row dead-lettered"
+        );
+        assert!(
+            entry.last_error.is_some(),
+            "carries the unrecognized-kind error"
+        );
+        assert!(
+            claim_due(&db, 500)
+                .expect("re-claim")
+                .iter()
+                .all(|x| x.id != corrupt),
+            "dead-lettered corrupt row is not re-claimed"
+        );
+    }
+
+    // `last_error` is clamped on write (AB#1066, security review): a short message is stored
+    // verbatim; an over-budget one is truncated on a char boundary with an ellipsis, so a giant /
+    // crafted error can't bloat the panel-visible column. Multi-byte input must not split a char.
+    #[test]
+    fn last_error_is_clamped_on_write() {
+        let db = Database::open_in_memory().expect("open db");
+        let id = enqueue_notif(&db, "p1", "a", 100);
+
+        let short = "boom";
+        mark_dead(&db, id, 1, short, 100).expect("dead short");
+        assert_eq!(
+            get_entry(&db, id)
+                .expect("get")
+                .expect("exists")
+                .last_error
+                .as_deref(),
+            Some(short),
+            "short error stored verbatim"
+        );
+
+        // A multi-byte string longer than the cap truncates on a char boundary (never panics).
+        let huge = "字".repeat(MAX_LAST_ERROR_LEN); // 3 bytes each → well over the byte budget
+        mark_retry(&db, id, 2, 200, &huge, 100).expect("retry huge");
+        let stored = get_entry(&db, id)
+            .expect("get")
+            .expect("exists")
+            .last_error
+            .expect("has error");
+        assert!(
+            stored.len() <= MAX_LAST_ERROR_LEN + 4,
+            "clamped to the byte budget (+ellipsis)"
+        );
+        assert!(stored.ends_with('…'), "truncation marker appended");
     }
 
     // Retention cap prunes oldest TERMINAL rows but NEVER a pending one (AB#1066): a pending row is
