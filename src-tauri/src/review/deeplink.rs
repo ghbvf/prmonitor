@@ -242,18 +242,16 @@ async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
         }
     };
 
-    notify_completion(&app, pr_number, &outcome).await;
+    notify_completion(&app, pr_number, &outcome);
     focus_main_window(&app);
 }
 
-/// Send the fire-and-forget completion notification. `wire_status` (not the `Done`/`Failed`
-/// collapse) distinguishes completed vs interrupted vs failed; the body carries the pr-review
-/// comment URL (the actionable artifact) when one was resolved.
-async fn notify_completion<R: Runtime>(
-    app: &AppHandle<R>,
-    pr_number: u64,
-    outcome: &CompletionOutcome,
-) {
+/// Build the normalized completion [`Notification`] for a finished review (AB#1066). PURE (no
+/// `AppHandle` / no IO), so the `wire_status` → (title, body) mapping is unit-tested directly (F6).
+/// `wire_status` (not the `Done`/`Failed` collapse) distinguishes completed vs interrupted vs failed;
+/// the body carries the pr-review comment URL (the actionable artifact) when one was resolved, else a
+/// fixed no-link fallback. `project_id` is empty — a deeplink isn't project-scoped.
+fn build_completion_notification(pr_number: u64, outcome: &CompletionOutcome) -> Notification {
     // Whitelist the known terminal statuses; never reflect codex's raw `wire_status` (it comes from
     // the codex subprocess) into the notification title. An unexpected value gets a fixed label +
     // a diagnostic log rather than surfacing arbitrary content.
@@ -274,22 +272,36 @@ async fn notify_completion<R: Runtime>(
         Some(url) => RedactedNotificationBody::action_url(url),
         None => RedactedNotificationBody::fixed(no_link_body),
     };
-    let note = Notification::new(
+    Notification::new(
         NotificationLevel::Info,
         format!("PR #{pr_number} review {status_label}"),
         outcome.comment_url.clone().unwrap_or_default(),
         body,
         String::new(),
-    );
+    )
+}
 
-    if let Err(e) = notify::deliver(app, NotificationKind::Desktop, &note).await {
-        eprintln!("deeplink 通知发送失败: {e}");
+/// ENQUEUE the completion notification into the durable action outbox (AB#1066) instead of
+/// delivering it inline: the worker performs the desktop notification, so a pending notification
+/// survives an app restart and a failed delivery retries to a dead-letter. Enqueues through the
+/// composition-root-injected `notify_outbox` sink — `review` never names the `outbox` slice (F1);
+/// the sink (in `lib.rs`) serializes the `Notification` + enqueues it. Synchronous — enqueue is a
+/// durable write + a worker wake, no await.
+fn notify_completion<R: Runtime>(app: &AppHandle<R>, pr_number: u64, outcome: &CompletionOutcome) {
+    let note = build_completion_notification(pr_number, outcome);
+    if let Err(e) = app.state::<AppState>().notify_outbox.enqueue(note) {
+        eprintln!("deeplink 通知入队失败: {}", e.message);
     }
 }
 
 /// Surface a deeplink FAILURE to the user (codex F3). A deeplink is fire-and-forget with no return
-/// channel, so a clicked link that can't run would otherwise be silent (only stderr). Best-effort,
-/// like [`notify_completion`].
+/// channel, so a clicked link that can't run would otherwise be silent (only stderr).
+///
+/// Delivers INLINE via `notify::deliver` (NOT through the outbox, unlike `notify_completion` which
+/// enqueues for durable + retried delivery). This is deliberate: a failure notice is transient
+/// immediate feedback on a bad click BEFORE any session exists — there is nothing durable to resume,
+/// and a retried "link invalid" toast minutes later would be noise. If the inline delivery fails it
+/// is logged, not retried.
 ///
 /// `body` is a [`RedactedNotificationBody`], so callers cannot pass an arbitrary
 /// `AppError::message` directly. Project-resolution errors embed the external `reference`
@@ -348,6 +360,49 @@ mod tests {
     fn kind_defaults_to_review_when_absent() {
         let p = parse("prmonitor://review?pr=7&repo=octo/app").expect("ok");
         assert_eq!(p.kind, "review");
+    }
+
+    fn outcome(wire_status: &str, comment_url: Option<&str>) -> CompletionOutcome {
+        CompletionOutcome {
+            status: crate::review::session::SessionStatus::Done,
+            wire_status: wire_status.to_string(),
+            comment_url: comment_url.map(str::to_string),
+        }
+    }
+
+    // F6 (AB#1066): the outbox producer's payload mapping is characterization-tested. A `completed`
+    // outcome WITH a comment URL → title「完成」+ body/url = the comment URL (the actionable
+    // artifact); the project_id stays empty (a deeplink isn't project-scoped).
+    #[test]
+    fn build_completion_notification_completed_with_url() {
+        let note =
+            build_completion_notification(7, &outcome("completed", Some("https://x/pr/7#c")));
+        assert_eq!(note.title, "PR #7 review 完成");
+        assert_eq!(note.url, "https://x/pr/7#c");
+        assert_eq!(note.body.as_str(), "https://x/pr/7#c");
+        assert_eq!(note.project_id, "");
+    }
+
+    // F6: interrupted / failed map to their labels with the fixed no-link body when no URL resolved;
+    // an unknown wire_status falls back to「结束」(never echoes the raw codex status into the title).
+    #[test]
+    fn build_completion_notification_status_label_and_no_link_body() {
+        let interrupted = build_completion_notification(7, &outcome("interrupted", None));
+        assert_eq!(interrupted.title, "PR #7 review 已中断");
+        assert_eq!(interrupted.url, "");
+        assert_eq!(
+            interrupted.body.as_str(),
+            "本次 review 已中断（无评论链接）"
+        );
+
+        let failed = build_completion_notification(7, &outcome("failed", None));
+        assert_eq!(failed.title, "PR #7 review 失败");
+
+        let unknown = build_completion_notification(7, &outcome("weird-codex-status", None));
+        assert_eq!(
+            unknown.title, "PR #7 review 结束",
+            "unknown status uses a fixed label"
+        );
     }
 
     #[test]

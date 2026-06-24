@@ -5,7 +5,7 @@
 
 use serde::Serialize;
 
-use crate::model::{InboxEntry, TrackedPrView};
+use crate::model::{InboxEntry, OutboxEntry, TrackedPrView};
 
 /// Tauri event name carrying a [`PrEvent`] (scheduled/manual PR-list refresh).
 pub const PRS_UPDATED_EVENT: &str = "prs:updated";
@@ -18,6 +18,11 @@ pub const REVIEW_EVENT: &str = "review:event";
 /// re-processed (a webhook delivery persisted / replayed). Mirrored by
 /// `INBOX_UPDATED_EVENT` in `src/inbox/api.ts`.
 pub const INBOX_UPDATED_EVENT: &str = "inbox:updated";
+
+/// Tauri event name carrying an [`OutboxEvent`] (AB#1066): one outbox row was enqueued or
+/// transitioned (executed / retried / dead-lettered). Mirrored by `OUTBOX_UPDATED_EVENT` in
+/// `src/outbox/api.ts`.
+pub const OUTBOX_UPDATED_EVENT: &str = "outbox:updated";
 
 /// Payload emitted on [`PRS_UPDATED_EVENT`] each poll cycle (scheduled or manual).
 ///
@@ -61,6 +66,26 @@ pub enum InboxEvent {
     Updated {
         project_id: String,
         entry: InboxEntry,
+    },
+}
+
+/// Payload emitted on [`OUTBOX_UPDATED_EVENT`] (AB#1066) when an outbox row is enqueued or
+/// transitions (executed → `done`, retried, or dead-lettered → `dead`). The frontend's
+/// action-outbox panel upserts the carried [`OutboxEntry`] into the list it keys by `project_id`
+/// (the routing key, mirroring [`InboxEvent`] / [`PrEvent`]).
+///
+/// Like the unions above, the container `rename_all` camelCases the *variant* name into the
+/// `kind` tag and each struct variant carries its own `rename_all`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum OutboxEvent {
+    /// An outbox row was enqueued or transitioned. `entry` is the full current row (so the
+    /// frontend can upsert it without a follow-up `outbox_list`); `project_id` is the routing
+    /// key the panel scopes the upsert to.
+    #[serde(rename_all = "camelCase")]
+    Updated {
+        project_id: String,
+        entry: OutboxEntry,
     },
 }
 
@@ -145,7 +170,8 @@ pub enum ReviewEvent {
 mod tests {
     use super::*;
     use crate::model::{
-        Event, EventType, InboxStatus, PrPresence, PullRequestView, SourceKind, TrackedPrView,
+        ActionKind, ActionStatus, Event, EventType, InboxStatus, OutboxEntry, PrPresence,
+        PullRequestView, SourceKind, TrackedPrView,
     };
 
     fn sample_view() -> TrackedPrView {
@@ -264,6 +290,53 @@ mod tests {
         assert_eq!(entry["status"], "received");
         assert!(entry["event"].is_object());
         assert!(entry["event"].get("dedupeKey").is_some());
+    }
+
+    #[test]
+    fn outbox_updated_event_name_is_pinned() {
+        // Mirrored by `OUTBOX_UPDATED_EVENT` in `src/outbox/api.ts`; a drift breaks the frontend's
+        // `listen` registration for the action-outbox panel.
+        assert_eq!(OUTBOX_UPDATED_EVENT, "outbox:updated");
+    }
+
+    // Serde wire-shape lock for the AB#1066 `OutboxEvent` discriminated union (Medium carrier per
+    // ai-robust.md): the `kind` tag is camelCase, `projectId` is the camelCase routing key, and the
+    // NESTED `entry` carries the full `OutboxEntry` wire shape (a drift in `OutboxEntry` surfaces
+    // here too). The downstream `src/types.ts` `OutboxEvent` union must be synced in lockstep (the
+    // open end of this funnel; future Hard path = codegen from `events.rs`).
+    #[test]
+    fn outbox_updated_wire_shape_is_camel_case() {
+        let event = OutboxEvent::Updated {
+            project_id: "p1".to_string(),
+            entry: OutboxEntry {
+                id: 7,
+                project_id: "p1".to_string(),
+                kind: ActionKind::Notification,
+                summary: "PR #7 review 完成".to_string(),
+                status: ActionStatus::Pending,
+                attempt_count: 0,
+                next_attempt_at: 1_700_000_000,
+                last_error: None,
+                created_at: 1_700_000_000,
+                updated_at: 1_700_000_000,
+            },
+        };
+
+        let v = serde_json::to_value(&event).expect("OutboxEvent serializes");
+
+        assert_eq!(v["kind"], "updated");
+        assert!(v.get("projectId").is_some());
+        assert!(v.get("project_id").is_none());
+
+        // The nested `entry` carries the `OutboxEntry` wire shape: camelCase keys + pinned strings.
+        let entry = &v["entry"];
+        assert!(entry.get("id").is_some());
+        assert!(entry.get("attemptCount").is_some());
+        assert!(entry.get("attempt_count").is_none());
+        assert!(entry.get("nextAttemptAt").is_some());
+        assert_eq!(entry["kind"], "notification");
+        assert_eq!(entry["status"], "pending");
+        assert_eq!(entry["lastError"], serde_json::Value::Null);
     }
 
     #[test]

@@ -444,6 +444,89 @@ pub enum NotificationKind {
     // future AB#1070: Email, Feishu, Telegram, WeChatWork
 }
 
+/// The kind of side effect a persisted outbox row executes (AB#1066, epic AB#1078).
+///
+/// **Hard carrier** (sealed enum): the outbox's executor router branches on an exhaustive
+/// `match ActionKind { ... }` (installed by the composition root in `lib.rs`, the only place that
+/// names `review::notify`), so adding a variant without an arm is a compile error — the missing
+/// action cannot be expressed. The store's `status`-style wire mapping
+/// ([`crate::outbox::store::kind_as_wire`]) is likewise exhaustive. Today ONE variant
+/// (`Notification`), already load-bearing at the review-completion enqueue site.
+///
+/// AB#1069/1070 design reservation: future kinds slot in as `Email`, `ImNotify`,
+/// `WebhookForward`, `Review`, … each forcing a new executor arm. Wire string pinned camelCase;
+/// the serde golden locks it (Medium carrier).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ActionKind {
+    #[default]
+    Notification,
+    // future AB#1069/1070: Email, ImNotify, WebhookForward, Review, WorkItemComment
+}
+
+/// The lifecycle state of one persisted outbox action (AB#1066, epic AB#1078): surfaced to the
+/// frontend's action-outbox panel and the worker's terminal state.
+///
+/// **Hard carrier** (sealed enum): the outbox store branches on an exhaustive
+/// `match ActionStatus { ... }` ([`crate::outbox::store::status_as_wire`]), so adding a variant
+/// without an arm is a compile error — the missing case cannot be expressed.
+///
+/// Three states (no transient `Processing`): a queued action is [`Pending`](Self::Pending)
+/// (`Default` — every action starts here) until the worker executes it; on success it is
+/// [`Done`](Self::Done); a failure that exhausts the retry budget is [`Dead`](Self::Dead) — the
+/// terminal dead-letter. A transient failure stays `Pending` (the row's `attempt_count` /
+/// `last_error` carry the detail and `next_attempt_at` reschedules it), so a crash mid-execute
+/// re-runs the action next boot (at-least-once). Wire strings are pinned camelCase
+/// (`"pending" | "done" | "dead"`) — the frontend's `OUTBOX_STATUSES` (`src/types.ts`) mirrors
+/// them; the serde golden below is the **Medium** carrier locking them against a `rename_all` /
+/// variant drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ActionStatus {
+    /// Queued (or awaiting a retry); the worker will execute it when `next_attempt_at` is due.
+    #[default]
+    Pending,
+    /// Executed successfully — terminal.
+    Done,
+    /// The retry budget was exhausted — terminal dead-letter (`last_error` carries the reason).
+    Dead,
+}
+
+/// One persisted outbox action row (AB#1066, epic AB#1078): the side effect's kind + lifecycle,
+/// surfaced to the frontend's action-outbox panel. The raw `payload` is NOT carried here (it is
+/// backend-internal — a `Notification` JSON today); the panel fetches it on demand via
+/// `outbox_get_raw`, mirroring the inbox's `inbox_get_raw`.
+///
+/// `Serialize` only (like [`InboxEntry`]): a front/back contract mirrored in `src/types.ts`
+/// (`OutboxEntry`) — a field change must be synced there in lockstep (the open end of this funnel;
+/// future Hard path = codegen `types.ts` from `model.rs` + `git diff --exit-code`). The store
+/// hydrates it from columns, so no `Deserialize`. The serde golden below
+/// (`outbox_entry_wire_shape_is_camel_case`) is the **Medium** carrier locking the camelCase shape.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutboxEntry {
+    /// The outbox row id (the `action_outbox` table PRIMARY KEY) — the get-raw / retry key.
+    pub id: i64,
+    /// Routing key (#35): which project this action belongs to.
+    pub project_id: String,
+    /// The side effect's kind.
+    pub kind: ActionKind,
+    /// A short human-readable label the panel renders without deserializing the payload.
+    pub summary: String,
+    /// The action's lifecycle state.
+    pub status: ActionStatus,
+    /// How many execution attempts have run (0 until the worker first tries it).
+    pub attempt_count: u32,
+    /// When the action is next eligible to run (epoch seconds); a retry pushes it forward.
+    pub next_attempt_at: u64,
+    /// The most recent failure message, or `None` (→ JSON `null`) if it has never failed.
+    pub last_error: Option<String>,
+    /// When the action was enqueued (epoch seconds).
+    pub created_at: u64,
+    /// When the row last transitioned (epoch seconds).
+    pub updated_at: u64,
+}
+
 /// Serde wire-shape locks for `model.rs`'s cross-slice types.
 ///
 /// The **Medium carrier** for these serde shapes per
@@ -948,5 +1031,99 @@ mod tests {
             serde_json::to_value(NotificationKind::default()).expect("NotificationKind serializes"),
             "desktop"
         );
+    }
+
+    // Cross-agent wire contract lock for the AB#1066 outbox status / kind (Medium carrier per
+    // ai-robust.md): the frontend's `OUTBOX_STATUSES` / `ACTION_KINDS` (`src/types.ts`) mirror
+    // these exact camelCase strings. A variant rename or a `rename_all` change surfaces here (the
+    // exhaustive `match` in `outbox::store::status_as_wire` / `kind_as_wire` is the Hard carrier).
+    // Defaults: `Pending` (the state every action starts in) / `Notification` (the only kind).
+    #[test]
+    fn outbox_status_and_kind_serialize_to_pinned_wire_strings() {
+        assert_eq!(
+            serde_json::to_value(ActionStatus::Pending).expect("ActionStatus serializes"),
+            "pending"
+        );
+        assert_eq!(
+            serde_json::to_value(ActionStatus::Done).expect("ActionStatus serializes"),
+            "done"
+        );
+        assert_eq!(
+            serde_json::to_value(ActionStatus::Dead).expect("ActionStatus serializes"),
+            "dead"
+        );
+        assert_eq!(
+            serde_json::to_value(ActionStatus::default()).expect("ActionStatus serializes"),
+            "pending"
+        );
+        assert_eq!(
+            serde_json::to_value(ActionKind::Notification).expect("ActionKind serializes"),
+            "notification"
+        );
+        assert_eq!(
+            serde_json::to_value(ActionKind::default()).expect("ActionKind serializes"),
+            "notification"
+        );
+    }
+
+    // Front/back contract lock for the AB#1066 `OutboxEntry` row (Medium carrier per ai-robust.md):
+    // mirrored in `src/types.ts` (`OutboxEntry`); a field change must be synced there in lockstep
+    // (the open end of the funnel — future Hard path = codegen from `model.rs` + `git diff
+    // --exit-code`). Locks camelCase keys present + snake_case absent, the nested `kind` / `status`
+    // wire strings, and that an absent `lastError` serializes as JSON null (not omitted) so the TS
+    // mirror's `lastError: string | null` stays closed. The raw payload is intentionally NOT a
+    // field (fetched via `outbox_get_raw`), mirroring the inbox's raw-payload split.
+    #[test]
+    fn outbox_entry_wire_shape_is_camel_case() {
+        let entry = OutboxEntry {
+            id: 7,
+            project_id: "p1".to_string(),
+            kind: ActionKind::Notification,
+            summary: "PR #7 review 完成".to_string(),
+            status: ActionStatus::Pending,
+            attempt_count: 2,
+            next_attempt_at: 1_700_000_060,
+            last_error: Some("notify failed".to_string()),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_030,
+        };
+
+        let v = serde_json::to_value(&entry).expect("OutboxEntry serializes");
+
+        // camelCase keys present.
+        assert!(v.get("id").is_some());
+        assert!(v.get("projectId").is_some());
+        assert!(v.get("kind").is_some());
+        assert!(v.get("summary").is_some());
+        assert!(v.get("status").is_some());
+        assert!(v.get("attemptCount").is_some());
+        assert!(v.get("nextAttemptAt").is_some());
+        assert!(v.get("lastError").is_some());
+        assert!(v.get("createdAt").is_some());
+        assert!(v.get("updatedAt").is_some());
+
+        // snake_case forms absent — a rename of a multi-word field surfaces here.
+        assert!(v.get("project_id").is_none());
+        assert!(v.get("attempt_count").is_none());
+        assert!(v.get("next_attempt_at").is_none());
+        assert!(v.get("last_error").is_none());
+        assert!(v.get("created_at").is_none());
+        assert!(v.get("updated_at").is_none());
+
+        // The nested enums serialize to their pinned wire strings.
+        assert_eq!(v["kind"], "notification");
+        assert_eq!(v["status"], "pending");
+
+        // A never-failed action's `lastError` is JSON null (not omitted), keeping the TS mirror's
+        // `lastError: string | null` a closed contract.
+        let fresh = OutboxEntry {
+            attempt_count: 0,
+            last_error: None,
+            status: ActionStatus::Done,
+            ..entry
+        };
+        let fv = serde_json::to_value(&fresh).expect("OutboxEntry serializes");
+        assert_eq!(fv["status"], "done");
+        assert_eq!(fv["lastError"], serde_json::Value::Null);
     }
 }

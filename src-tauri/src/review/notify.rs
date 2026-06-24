@@ -17,11 +17,52 @@
 //!   `NotificationKind` / `NotificationLevel` wire shapes are locked by serde golden tests in
 //!   `model.rs`; this slice consumes them but never redefines them.
 
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_notification::NotificationExt;
 
 use crate::error::{AppError, AppResult};
 use crate::model::{Notification, NotificationKind};
+
+/// The durable-enqueue sink the composition root injects (AB#1066). Given a normalized
+/// [`Notification`], it persists it into the action outbox for reliable (retried, restart-resumed)
+/// delivery. OPAQUE on purpose: the `review` slice holds only this `dyn Fn` (the closure, installed
+/// in `lib.rs`, is the sole place that names `crate::outbox`), so the review slice never references a
+/// sibling slice — the producer mirror of how the inbox holds OPAQUE re-feed closures. The closure
+/// captures its own `AppHandle`, so the signature stays `Fn(Notification) -> AppResult<()>`.
+pub type NotificationSink = Arc<dyn Fn(Notification) -> AppResult<()> + Send + Sync>;
+
+/// Holds the composition-root-injected [`NotificationSink`] (AB#1066). A `tauri::State` field on
+/// [`crate::state::AppState`] (which stays `Default`), `&self` + interior mutability — mirroring the
+/// inbox's `InboxManager`. The review slice enqueues durable notifications through [`enqueue`] without
+/// ever naming `crate::outbox`.
+#[derive(Default)]
+pub struct NotificationOutbox {
+    sink: StdMutex<Option<NotificationSink>>,
+}
+
+impl NotificationOutbox {
+    /// Install the durable-enqueue sink (composition root, before any deeplink fires). Replaces any
+    /// prior sink (last writer wins), mirroring `InboxManager::set_hooks`.
+    pub fn set_sink(&self, sink: NotificationSink) {
+        *self.sink.lock().unwrap() = Some(sink);
+    }
+
+    /// Enqueue a notification for durable delivery via the injected sink. Clones the `Arc` out of the
+    /// lock before calling so the lock isn't held across the enqueue. Fails closed if the root hasn't
+    /// installed the sink yet (never in practice — a notification before `setup` completes).
+    pub fn enqueue(&self, note: Notification) -> AppResult<()> {
+        let sink = self.sink.lock().unwrap().clone();
+        match sink {
+            Some(sink) => sink(note),
+            None => Err(AppError::new(
+                "通知出口未初始化（notify sink 未安装）".to_string(),
+            )),
+        }
+    }
+}
 
 /// A channel that delivers a normalized [`Notification`]. Best-effort: a channel failure is
 /// an `Err` the caller logs (notifications are fire-and-forget today), never a panic.

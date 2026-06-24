@@ -34,4 +34,14 @@ pub struct AppState {
     /// `inbox_replay` command re-uses (installed once by the composition root in `setup()`,
     /// like the webhook ingestor/refresher). Methods take `&self`.
     pub inbox: crate::inbox::manager::InboxManager,
+    /// The action outbox (AB#1066): the durable side-effect queue + its background worker. Holds
+    /// the composition-root-injected executor closure, the worker's wake/stop signals, and the
+    /// spawned task handle. Started once in `lib.rs` `setup()`; killed on app shutdown. Methods
+    /// take `&self`.
+    pub outbox: crate::outbox::manager::OutboxManager,
+    /// The review slice's durable-notification producer seam (AB#1066): holds the composition-root-
+    /// injected sink that enqueues a `model::Notification` into the action outbox. Lets `review`
+    /// produce durable notifications WITHOUT naming the `outbox` slice (the sink closure, installed in
+    /// `lib.rs`, is the only place that bridges review→outbox). Methods take `&self`.
+    pub notify_outbox: crate::review::notify::NotificationOutbox,
 }
