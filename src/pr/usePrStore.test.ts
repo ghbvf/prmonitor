@@ -143,6 +143,7 @@ beforeEach(() => {
     webhookPublicUrl: "",
     localApiPort: 8788,
     localApiToken: "",
+    outbox: { notificationTtlSecs: 7200 },
     listeners: [],
     tunnels: [],
   });
@@ -288,6 +289,7 @@ describe("usePrStore toggle()", () => {
       webhookPublicUrl: "",
       localApiPort: 8788,
       localApiToken: "",
+      outbox: { notificationTtlSecs: 7200 },
       listeners: [],
       tunnels: [],
     });

@@ -9,6 +9,7 @@
 import { onMounted, reactive, ref, watch } from "vue";
 import { useConfigStore } from "./useConfigStore";
 import type { AppConfig } from "./types";
+import { DEFAULT_OUTBOX_CONFIG } from "./defaults";
 import { GLOBAL_GROUPS, type FieldDef, type GlobalFieldKey } from "./fields";
 import ConfigField from "./ConfigField.vue";
 import ProjectsManager from "./ProjectsManager.vue";
@@ -50,6 +51,9 @@ const draft = reactive<AppConfig>({
   webhookPublicUrl: "",
   localApiPort: 8788,
   localApiToken: "",
+  // No settings-panel control yet (AB#1182): the draft carries the loaded value through a save
+  // round-trip (hydrate overwrites it) so saving settings never wipes a configured TTL.
+  outbox: { ...DEFAULT_OUTBOX_CONFIG },
   listeners: [],
   tunnels: [],
 });
@@ -68,6 +72,10 @@ function hydrate(cfg: AppConfig) {
   draft.webhookPublicUrl = cfg.webhookPublicUrl;
   draft.localApiPort = cfg.localApiPort;
   draft.localApiToken = cfg.localApiToken;
+  // Preserve the loaded outbox policy verbatim (AB#1182): no UI edits it, but `save()` persists the
+  // whole draft, so a missed copy here would silently reset the TTL on every settings save. Fall
+  // back to the default if an older cached config lacks the field.
+  draft.outbox = { ...(cfg.outbox ?? DEFAULT_OUTBOX_CONFIG) };
   // Deep-copy the remote-access resources (AB#1064) so card edits never mutate the store's
   // config object before a save — same reason as the projects deep-copy above. A listener's
   // allowedOrigins is a string[], so clone it too (mirrors the authors clone).

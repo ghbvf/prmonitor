@@ -33,14 +33,46 @@ const BACKOFF_BASE_SECS: u64 = 30;
 /// rather than growing the delay unboundedly toward the dead-letter.
 const BACKOFF_CAP_SECS: u64 = 3600;
 
+/// Backoff jitter as a fraction of the base delay (AB#1182): the retry fires within ±25% of the
+/// exponential base. Decorrelates rows that fail in the SAME epoch (thundering-herd avoidance) so a
+/// burst of failures doesn't re-fire in lockstep — the risk rises as more `ActionKind`s (AB#1069/
+/// 1070) share the worker. river-style jittered backoff (river's `DefaultClientRetryPolicy` jitters
+/// each retry by `retrySeconds * (rand*0.2 - 0.1)`, ±10%); we widen it to ±25% per the issue and
+/// derive it deterministically from the row id instead of an RNG. ref: river retry_policy.go
+const JITTER_DEN: u64 = 4; // 1/4 = 25%
+
+/// A cheap, allocation-free 64-bit mix (splitmix64) (AB#1182): maps ONE already-mixed `seed` to a
+/// well-distributed hash WITHOUT an RNG dependency, so the jitter is DETERMINISTIC (reproducible in
+/// tests) yet decorrelated across rows. Distinct seeds map to distinct, uniformly-spread outputs.
+/// The caller ([`next_backoff`]) folds the row id and attempt into the single `seed` it passes here.
+fn splitmix64(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 /// Exponential backoff for the `attempt`-th failure (1-based) (AB#1066): `BASE * 2^(attempt-1)`,
-/// capped at [`BACKOFF_CAP_SECS`]. `attempt` 1 → 30s, 2 → 60s, 3 → 120s, … Saturating + a bounded
-/// shift so a large `attempt` can't overflow (it just pins at the cap).
-fn next_backoff(attempt: u32) -> u64 {
+/// capped at [`BACKOFF_CAP_SECS`], then jittered ±25% (AB#1182). `attempt` 1 ≈ 30s, 2 ≈ 60s, … each
+/// within [0.75·base, 1.25·base]. Saturating + a bounded shift so a large `attempt` can't overflow
+/// (it just pins at the cap). `seed` (the row id) keys the jitter so simultaneous failures spread
+/// out instead of retrying in lockstep; the same `(attempt, seed)` is reproducible. The result is
+/// clamped to ≥ 1 so the schedule always advances (a 0 delay would re-claim the row immediately).
+fn next_backoff(attempt: u32, seed: u64) -> u64 {
     // Shifts ≥ 63 would overflow u64; clamp the exponent — the result pins at the cap anyway.
     let exp = attempt.saturating_sub(1).min(63);
-    let delay = BACKOFF_BASE_SECS.saturating_mul(1u64 << exp);
-    delay.min(BACKOFF_CAP_SECS)
+    let base = BACKOFF_BASE_SECS
+        .saturating_mul(1u64 << exp)
+        .min(BACKOFF_CAP_SECS);
+    // ±(base/JITTER_DEN) deterministic jitter keyed by (seed, attempt). `span == 0` (base < 4)
+    // can't happen with BASE=30, but guard it so a future small base degrades to no-jitter.
+    let span = base / JITTER_DEN;
+    if span == 0 {
+        return base.max(1);
+    }
+    let h = splitmix64(seed ^ ((attempt as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+    let offset = (h % (2 * span + 1)) as i64 - span as i64; // uniform in [-span, +span]
+    (base as i64 + offset).max(1) as u64
 }
 
 /// What the worker does with a row after an execution attempt (AB#1066). The pure decision, so the
@@ -56,10 +88,11 @@ enum Outcome {
 }
 
 /// Decide a row's fate after an attempt (AB#1066): `Ok` → [`Outcome::Done`]; an error with attempts
-/// left → [`Outcome::Retry`] at `now + next_backoff(new_attempt_count)`; an error at the
+/// left → [`Outcome::Retry`] at `now + next_backoff(new_attempt_count, seed)`; an error at the
 /// [`MAX_ATTEMPTS`] budget → [`Outcome::Dead`]. `new_attempt_count` is the count INCLUDING the
-/// attempt that just ran (so `MAX_ATTEMPTS` total attempts dead-letter).
-fn decide_outcome(new_attempt_count: u32, now: u64, is_err: bool) -> Outcome {
+/// attempt that just ran (so `MAX_ATTEMPTS` total attempts dead-letter). `seed` (the row id, AB#1182)
+/// keys the backoff jitter so rows that fail together don't retry in lockstep.
+fn decide_outcome(new_attempt_count: u32, now: u64, is_err: bool, seed: u64) -> Outcome {
     if !is_err {
         return Outcome::Done;
     }
@@ -67,9 +100,40 @@ fn decide_outcome(new_attempt_count: u32, now: u64, is_err: bool) -> Outcome {
         Outcome::Dead
     } else {
         Outcome::Retry {
-            next_attempt_at: now.saturating_add(next_backoff(new_attempt_count)),
+            next_attempt_at: now.saturating_add(next_backoff(new_attempt_count, seed)),
         }
     }
+}
+
+/// Per-kind staleness TTL in seconds (AB#1182), or `None` when the kind never expires. `0` (the
+/// config disable sentinel) maps to `None` so a misconfigured `0` can't expire every queued action
+/// instantly.
+///
+/// **Hard carrier:** the exhaustive `match ActionKind` (NO `_` wildcard arm) makes adding a kind
+/// without deciding its TTL a COMPILE error — the per-kind policy can't silently default. Mirrors
+/// `store::kind_as_wire`'s sealed-enum match. A `notification` carries the configured TTL (default
+/// 2h) because a stale one fired late is a GHOST UI event. The work-triggering `review`/`check`
+/// (AB#1069) do NOT expire: a row queued before a restart is still valid work the "restart-resume"
+/// drain SHOULD fire, not a ghost to suppress; `stopReview` is idempotent (a no-op success when no
+/// session is live), so it doesn't expire either. A future time-sensitive non-idempotent kind would
+/// add its own TTL arm here.
+fn ttl_secs(kind: ActionKind, notification_ttl_secs: u64) -> Option<u64> {
+    match kind {
+        ActionKind::Notification => (notification_ttl_secs > 0).then_some(notification_ttl_secs),
+        ActionKind::Review | ActionKind::Check | ActionKind::StopReview => None,
+    }
+}
+
+/// Whether a claimed row is STALE (AB#1182): its `created_at` is older than its kind's TTL as of
+/// `now`. A kind with no TTL ([`ttl_secs`] `None`) never expires. Pure, so the sweep decision is
+/// unit-tested without a DB or AppHandle (the [`run_due_once`] glue only dead-letters + emits).
+///
+/// Degenerate `created_at = 0` (the `store::now_epoch()` pre-epoch-clock fallback) is treated as
+/// stale once the TTL has elapsed since the Unix epoch — effectively immediate on any real clock.
+/// Acceptable: a 0 timestamp is already the documented degenerate, and dead-lettering such a row is
+/// safer than firing a notification with an unknowable age.
+fn is_expired(kind: ActionKind, created_at: u64, now: u64, notification_ttl_secs: u64) -> bool {
+    ttl_secs(kind, notification_ttl_secs).is_some_and(|ttl| created_at.saturating_add(ttl) <= now)
 }
 
 /// Enqueue a produced side effect (AB#1066) — the public producer API. Persists a `pending` row
@@ -111,7 +175,9 @@ fn record_action_result(
         .err()
         .map(|e| e.message.clone())
         .unwrap_or_default();
-    let outcome = decide_outcome(new_attempt_count, now, result.is_err());
+    // The row `id` seeds the backoff jitter (AB#1182): rows that fail in the same cycle get
+    // distinct retry delays, so they don't re-fire in lockstep (thundering-herd avoidance).
+    let outcome = decide_outcome(new_attempt_count, now, result.is_err(), id as u64);
     match &outcome {
         Outcome::Done => store::mark_done(db, id, new_attempt_count, now)?,
         Outcome::Retry { next_attempt_at } => {
@@ -122,44 +188,159 @@ fn record_action_result(
     Ok(outcome)
 }
 
+/// Fold a worker cycle's per-row failures of ONE operation into the single representative
+/// cycle-error to emit (AB#1182 review F1/F2), or `None` when none failed (→ no emit). A single
+/// failure surfaces the error verbatim; many collapse to "{n} {noun}（首条）：{first}" so the panel
+/// sees the SCALE plus one sample, NOT one IPC event per row. Pure (no IO / AppHandle) so the "emit
+/// once, not once-per-row" dedup is unit-tested directly; [`run_due_once`] only emits the result.
+fn cycle_error_summary(failures: u32, first: Option<String>, noun: &str) -> Option<String> {
+    let first = first?;
+    Some(if failures > 1 {
+        format!("{failures} {noun}（首条）：{first}")
+    } else {
+        first
+    })
+}
+
 /// Run ONE worker cycle (AB#1066): claim the due `pending` rows and, for each, execute the injected
 /// closure and record the outcome (done / reschedule / dead-letter) via [`record_action_result`],
 /// re-emitting `outbox:updated`. Also emits for any rows `claim_due` dead-lettered as corrupt-kind
 /// (so an open panel sees that transition). Best-effort throughout — a claim or record error is
 /// logged, not propagated (the next tick retries). Concrete [`tauri::AppHandle`] (the executor's
 /// signature is concrete, like the inbox's injected hooks).
-pub async fn run_due_once(app: &tauri::AppHandle, db: &Database, executor: &ActionExecutor) {
-    let (due, quarantined) = match store::claim_due(db, store::now_epoch()) {
+///
+/// **Staleness sweep (AB#1182):** a claimed row whose `created_at` is older than its kind's
+/// [`ttl_secs`] is DEAD-LETTERED instead of executed, so a restart (whose first tick drains the
+/// persisted backlog at once) doesn't fire hours-old notifications as ghosts. `notification_ttl_secs`
+/// is the live config value the [`super::manager`] reads each cycle (so a config edit takes effect
+/// without a restart).
+///
+/// **Cycle-error observability (AB#1182):** a `claim_due` / record / announce-read failure now ALSO
+/// emits an [`crate::events::OutboxEvent::Error`] (alongside the `eprintln!`) so a persistent worker
+/// failure surfaces in the panel rather than only on the desktop app's invisible stderr. The looped
+/// `record`-write and `announce`-read failures are AGGREGATED (review F1/F2): each operation emits at
+/// most ONE representative cycle-error per tick via [`cycle_error_summary`], never one per row.
+pub async fn run_due_once(
+    app: &tauri::AppHandle,
+    db: &Database,
+    executor: &ActionExecutor,
+    notification_ttl_secs: u64,
+) {
+    // One epoch for the whole cycle's claim + staleness check (a row is "due" and "stale" against
+    // the same `now`); the per-action record re-reads `now` after the (awaited) executor call.
+    let now0 = store::now_epoch();
+    let (due, quarantined) = match store::claim_due(db, now0) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("outbox: claim_due 失败：{}", e.message);
+            announce_cycle_error(app, "claim", &e.message);
             return;
         }
     };
-    // Announce the corrupt-kind rows claim_due just dead-lettered (their `dead` transition).
+    // Aggregate per-row failures so a batch that fails EVERY write/read emits ONE cycle-error per
+    // OPERATION after the loop, not one IPC event per row (AB#1182 review F1/F2: a locked WAL could
+    // otherwise emit up to CLAIM_LIMIT events in a single tick — for the record-WRITE path AND the
+    // announce READ-back path, both of which run inside this per-row loop). `first_*` is the
+    // representative sample; the count conveys the scale. The single-command announce path
+    // ([`announce_updated`]) keeps emitting immediately — only the looped worker path aggregates.
+    let mut record_failures = 0u32;
+    let mut first_record_error: Option<String> = None;
+    let mut announce_failures = 0u32;
+    let mut first_announce_error: Option<String> = None;
+
+    // Announce the corrupt-kind rows claim_due just dead-lettered (their `dead` transition),
+    // aggregating any read-back failure with the rest of this cycle's.
     for id in quarantined {
-        announce_updated(app, db, id);
+        if let Err(m) = try_announce_updated(app, db, id) {
+            announce_failures += 1;
+            first_announce_error.get_or_insert(m);
+        }
     }
     for action in due {
         let id = action.id;
         let prev_attempt_count = action.attempt_count;
+
+        // Staleness sweep (AB#1182): dead-letter a too-old row INSTEAD of executing it. `kind`
+        // (Copy) and `created_at` are read before `action` moves into the executor below.
+        if is_expired(action.kind, action.created_at, now0, notification_ttl_secs) {
+            // A static, user-readable reason (AB#1182 review F3): no raw epochs — the panel already
+            // renders this row's `created` / `updated` timestamps next to the error.
+            let reason =
+                "通知过期未投递：超过保留时限 / notification expired before delivery (stale beyond TTL)";
+            if let Err(e) = store::mark_dead(db, id, prev_attempt_count, reason, now0) {
+                eprintln!("outbox: 死信过期行失败（id={id}）：{}", e.message);
+                record_failures += 1;
+                first_record_error.get_or_insert(e.message);
+            }
+            if let Err(m) = try_announce_updated(app, db, id) {
+                announce_failures += 1;
+                first_announce_error.get_or_insert(m);
+            }
+            continue;
+        }
 
         // The executor RESULT is authoritative: Ok → done, Err → retry/dead (no false `done`).
         let result = executor(app.clone(), action).await;
         let now = store::now_epoch();
         if let Err(e) = record_action_result(db, id, prev_attempt_count, now, &result) {
             eprintln!("outbox: 记录动作终态失败（id={id}）：{}", e.message);
+            record_failures += 1;
+            first_record_error.get_or_insert(e.message);
         }
-        announce_updated(app, db, id);
+        if let Err(m) = try_announce_updated(app, db, id) {
+            announce_failures += 1;
+            first_announce_error.get_or_insert(m);
+        }
     }
+    // One cycle-error PER OPERATION for the whole batch's failures (AB#1182 review F1/F2): dedup so
+    // a persistently failing DB write/read surfaces once per tick per operation, not once per row.
+    if let Some(summary) = cycle_error_summary(record_failures, first_record_error, "行写入失败")
+    {
+        announce_cycle_error(app, "record", &summary);
+    }
+    if let Some(summary) =
+        cycle_error_summary(announce_failures, first_announce_error, "行更新发送失败")
+    {
+        announce_cycle_error(app, "announce", &summary);
+    }
+}
+
+/// Emit a worker-CYCLE-level failure to the panel (AB#1182) — a failure NOT tied to one row
+/// (`claim_due` spans the whole queue; a record/emit read failed). Runs ALONGSIDE the `eprintln!`
+/// (the log keeps the dev-console trail; the emit is the only way a desktop user sees it, since the
+/// app's stderr is invisible). `operation` names the failing site (`"claim"` / `"record"` /
+/// `"announce"`) so the panel banner is actionable. Best-effort: a failed emit is dropped (there is
+/// nowhere left to route it). Carries NO `project_id` — a cycle failure isn't project-scoped.
+pub(crate) fn announce_cycle_error<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    operation: &str,
+    message: &str,
+) {
+    let _ = app.emit(
+        OUTBOX_UPDATED_EVENT,
+        &OutboxEvent::Error {
+            operation: operation.to_string(),
+            // Clamp the panel-visible text to the SAME budget as a row's `last_error` (AB#1182
+            // review F2): a raw DB error could otherwise carry an unbounded / path-bearing string
+            // straight to the panel — parity with the per-row `clamp_error` defense.
+            message: store::clamp_error(message),
+        },
+    );
 }
 
 /// Look up row `id` and emit `outbox:updated` for it (best-effort). Always re-reads so the emit
 /// carries the CURRENT persisted state (post-transition), and routes on the entry's OWN
 /// `project_id` (no external threading — unlike the inbox, `OutboxEntry` carries `projectId` at the
-/// top level). A gone row (e.g. pruned) is silently skipped; a store ERROR is logged (not swallowed)
-/// so a persistent read failure stays diagnosable.
-pub(crate) fn announce_updated<R: Runtime>(app: &tauri::AppHandle<R>, db: &Database, id: i64) {
+/// top level). A gone row (e.g. pruned) is `Ok(())` (nothing to emit). A store READ error is LOGGED
+/// (not swallowed) and RETURNED as `Err(message)` — the CALLER decides how to surface it: the worker
+/// cycle ([`run_due_once`]) AGGREGATES per-tick read failures into ONE representative cycle-error
+/// (AB#1182 review F2 — a persistently failing read in the per-row loop must not emit one IPC event
+/// per row, up to CLAIM_LIMIT), while the single-command path ([`announce_updated`]) emits at once.
+fn try_announce_updated<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    db: &Database,
+    id: i64,
+) -> Result<(), String> {
     match store::get_entry(db, id) {
         Ok(Some(entry)) => {
             let _ = app.emit(
@@ -169,12 +350,26 @@ pub(crate) fn announce_updated<R: Runtime>(app: &tauri::AppHandle<R>, db: &Datab
                     entry,
                 },
             );
+            Ok(())
         }
-        Ok(None) => {} // row gone (e.g. pruned) — nothing to emit.
-        Err(e) => eprintln!(
-            "outbox: 读取条目以发送 outbox:updated 失败（id={id}）：{}",
-            e.message
-        ),
+        Ok(None) => Ok(()), // row gone (e.g. pruned) — nothing to emit.
+        Err(e) => {
+            eprintln!(
+                "outbox: 读取条目以发送 outbox:updated 失败（id={id}）：{}",
+                e.message
+            );
+            Err(e.message)
+        }
+    }
+}
+
+/// Single-command `outbox:updated` announce ([`enqueue`] + the `outbox_retry` command): re-read +
+/// emit, and on a read failure surface it IMMEDIATELY as a cycle-error. One call site per command =
+/// no storm, so immediacy is correct here; the worker cycle instead uses [`try_announce_updated`]
+/// directly to AGGREGATE per-tick read failures into one representative event (AB#1182 review F2).
+pub(crate) fn announce_updated<R: Runtime>(app: &tauri::AppHandle<R>, db: &Database, id: i64) {
+    if let Err(message) = try_announce_updated(app, db, id) {
+        announce_cycle_error(app, "announce", &message);
     }
 }
 
@@ -183,53 +378,199 @@ mod tests {
     use super::*;
     use crate::error::AppError;
 
-    // Exponential backoff is monotonic non-decreasing and capped (AB#1066).
+    // Backoff is the exponential base ±25% jitter (AB#1066 + AB#1182): every result lands within the
+    // jitter band of `BASE*2^(attempt-1)` (capped), is DETERMINISTIC per (attempt, seed), and
+    // DECORRELATES across seeds — the machine-checked sub-properties that make the jitter a Medium
+    // carrier (the emergent thundering-herd avoidance is the documented rationale, not lockable).
     #[test]
-    fn next_backoff_grows_then_caps() {
-        // `attempt` is documented 1-based; `0` is never passed in practice (the caller uses
-        // `attempt_count + 1`, min 1), but pin that `0` and `1` coincide so a future 0-based refactor
-        // can't silently change the first-retry delay.
-        assert_eq!(next_backoff(0), 30);
-        assert_eq!(next_backoff(1), 30);
-        assert_eq!(next_backoff(2), 60);
-        assert_eq!(next_backoff(3), 120);
-        assert_eq!(next_backoff(4), 240);
-        // Large attempt pins at the cap and never overflows (the bounded shift guard).
-        assert_eq!(next_backoff(100), BACKOFF_CAP_SECS);
-        let mut prev = 0;
-        for n in 1..=20 {
-            let d = next_backoff(n);
-            assert!(d >= prev, "non-decreasing");
-            assert!(d <= BACKOFF_CAP_SECS, "capped");
-            prev = d;
+    fn next_backoff_is_jittered_within_band_and_deterministic() {
+        // The un-jittered exponential base the jitter is applied around (mirrors `next_backoff`).
+        fn base_of(attempt: u32) -> u64 {
+            let exp = attempt.saturating_sub(1).min(63);
+            BACKOFF_BASE_SECS
+                .saturating_mul(1u64 << exp)
+                .min(BACKOFF_CAP_SECS)
         }
+
+        // `attempt` 0 and 1 share the base (the 1-based convention) — pinned so a 0-based refactor
+        // can't silently shift the first-retry band.
+        assert_eq!(base_of(0), base_of(1));
+
+        // Bounds: every result is within [base - base/4, base + base/4] and ≥ 1 (the schedule must
+        // always advance — a 0 delay would re-claim the row immediately). Jitter MAY exceed the
+        // exponential cap by up to 25% (the cap bounds growth; jitter adds spread on top).
+        for attempt in 0u32..=20 {
+            let base = base_of(attempt);
+            let span = base / JITTER_DEN;
+            for seed in 0u64..64 {
+                let d = next_backoff(attempt, seed);
+                assert!(d >= 1, "delay always advances the schedule");
+                assert!(
+                    d >= base.saturating_sub(span) && d <= base + span,
+                    "attempt={attempt} seed={seed}: {d} outside [{}, {}]",
+                    base.saturating_sub(span),
+                    base + span
+                );
+            }
+        }
+
+        // Deterministic: same (attempt, seed) → same delay (reproducible, RNG-free).
+        assert_eq!(next_backoff(3, 42), next_backoff(3, 42));
+
+        // Decorrelated: across many seeds at a fixed attempt the jitter spreads to >1 distinct delay
+        // (a deterministic-but-constant backoff would collapse to one value — the herd this guards).
+        let spread: std::collections::HashSet<u64> =
+            (0u64..50).map(|seed| next_backoff(3, seed)).collect();
+        assert!(spread.len() > 1, "jitter decorrelates rows by seed");
+
+        // The jitter band INTENTIONALLY exceeds the exponential cap (review F8): at a large attempt
+        // the base pins at BACKOFF_CAP_SECS, but +25% jitter can push the actual delay above it —
+        // the cap bounds exponential GROWTH, not the jitter spread on top. Pin a concrete example so
+        // that documented behavior is machine-checked, not just prose.
+        assert_eq!(
+            base_of(100),
+            BACKOFF_CAP_SECS,
+            "large attempt pins the base at the cap"
+        );
+        let max_at_cap = (0u64..256)
+            .map(|seed| next_backoff(100, seed))
+            .max()
+            .expect("non-empty");
+        assert!(
+            max_at_cap > BACKOFF_CAP_SECS,
+            "jitter can exceed the cap ({max_at_cap} > {BACKOFF_CAP_SECS})"
+        );
+    }
+
+    // Per-kind staleness TTL (AB#1182): `ttl_secs` resolves the configured window via the exhaustive
+    // `match ActionKind` (Hard carrier); `0` disables it; `is_expired` is the pure sweep predicate
+    // `run_due_once` applies — true at/after `created_at + ttl`, false strictly before.
+    #[test]
+    fn ttl_expires_notification_after_window_and_zero_disables() {
+        const TTL: u64 = 7200; // 2h
+        let kind = ActionKind::Notification;
+
+        assert_eq!(ttl_secs(kind, TTL), Some(TTL));
+        assert_eq!(ttl_secs(kind, 0), None, "0 disables the TTL");
+
+        let created = 1_000u64;
+        assert!(
+            !is_expired(kind, created, created, TTL),
+            "fresh row not expired"
+        );
+        assert!(
+            !is_expired(kind, created, created + TTL - 1, TTL),
+            "1s before the window closes"
+        );
+        assert!(
+            is_expired(kind, created, created + TTL, TTL),
+            "expired exactly at the TTL boundary"
+        );
+        assert!(
+            is_expired(kind, created, created + TTL + 100, TTL),
+            "expired past the window"
+        );
+        assert!(
+            !is_expired(kind, created, created + 10_000_000, 0),
+            "ttl=0 never expires (disabled)"
+        );
+    }
+
+    // End-to-end staleness sweep over the REAL store (AB#1182), WITHOUT an AppHandle: a row enqueued
+    // long before `now` is claimed, judged stale by `is_expired`, and dead-lettered — the exact
+    // claim → is_expired → mark_dead sequence `run_due_once`'s sweep runs (minus the emit). Proves a
+    // restart that drains an old backlog terminalizes ghosts instead of firing them, and they never
+    // re-claim.
+    #[test]
+    fn stale_pending_row_is_swept_to_dead() {
+        const TTL: u64 = 7200;
+        let db = Database::open_in_memory().expect("open db");
+        // Enqueued at epoch 0; "now" is well past the TTL (a restart draining a stale backlog).
+        let id =
+            store::enqueue(&db, "p1", ActionKind::Notification, "stale", "{}", 0).expect("enqueue");
+        let now = TTL + 1;
+
+        let (due, _q) = store::claim_due(&db, now).expect("claim");
+        let action = due.into_iter().find(|a| a.id == id).expect("claimed");
+        assert!(
+            is_expired(action.kind, action.created_at, now, TTL),
+            "an old pending row is stale"
+        );
+        store::mark_dead(&db, id, action.attempt_count, "expired", now).expect("dead");
+
+        let entry = store::get_entry(&db, id).expect("get").expect("exists");
+        assert_eq!(
+            entry.status,
+            crate::model::ActionStatus::Dead,
+            "swept to dead, not executed"
+        );
+        // A swept row is terminal → never re-claimed (no ghost fire on a later tick).
+        let (again, _q) = store::claim_due(&db, now + 1_000_000).expect("claim again");
+        assert!(again.iter().all(|a| a.id != id), "dead row not re-claimed");
+    }
+
+    // Per-cycle error folding (AB#1182 review F1/F2): N per-row failures of one operation collapse
+    // to ONE representative cycle-error, NOT one IPC event per row — the storm `run_due_once`
+    // aggregates away for BOTH the record-write and announce-read loop paths. This locks the
+    // emission COUNT at the decision seam (the worker loop's only cycle-error emit sites pass their
+    // aggregated counters through here): none → no emit, one → verbatim, many → scale + first sample.
+    #[test]
+    fn cycle_error_summary_folds_many_failures_into_one() {
+        // Nothing failed → nothing to emit (no spurious cycle-error on a clean tick).
+        assert_eq!(cycle_error_summary(0, None, "行写入失败"), None);
+
+        // A single failure surfaces verbatim (no count prefix) — the common 1-row case.
+        assert_eq!(
+            cycle_error_summary(1, Some("boom".to_string()), "行写入失败"),
+            Some("boom".to_string())
+        );
+
+        // Many failures collapse to ONE summary carrying the scale + first sample, not one event per
+        // row (the up-to-CLAIM_LIMIT storm this dedup prevents). Reused for the announce path too.
+        assert_eq!(
+            cycle_error_summary(7, Some("locked".to_string()), "行更新发送失败"),
+            Some("7 行更新发送失败（首条）：locked".to_string())
+        );
     }
 
     // The retry/dead-letter decision table (AB#1066): success → Done regardless of count; an error
     // under the budget → Retry at now+backoff; an error AT the budget → Dead.
     #[test]
     fn decide_outcome_done_retry_dead() {
-        // Success is Done no matter the attempt count.
-        assert_eq!(decide_outcome(1, 1_000, false), Outcome::Done);
-        assert_eq!(decide_outcome(MAX_ATTEMPTS, 1_000, false), Outcome::Done);
+        // A fixed seed so the jittered retry schedule is reproducible in the assertion (both sides
+        // pass the SAME seed). The success/dead paths ignore the seed.
+        const SEED: u64 = 7;
 
-        // Error with attempts left → Retry at now + backoff(new_attempt_count).
+        // Success is Done no matter the attempt count.
+        assert_eq!(decide_outcome(1, 1_000, false, SEED), Outcome::Done);
         assert_eq!(
-            decide_outcome(1, 1_000, true),
+            decide_outcome(MAX_ATTEMPTS, 1_000, false, SEED),
+            Outcome::Done
+        );
+
+        // Error with attempts left → Retry at now + the SAME jittered backoff (same seed).
+        assert_eq!(
+            decide_outcome(1, 1_000, true, SEED),
             Outcome::Retry {
-                next_attempt_at: 1_000 + next_backoff(1)
+                next_attempt_at: 1_000 + next_backoff(1, SEED)
             }
         );
         assert_eq!(
-            decide_outcome(MAX_ATTEMPTS - 1, 1_000, true),
+            decide_outcome(MAX_ATTEMPTS - 1, 1_000, true, SEED),
             Outcome::Retry {
-                next_attempt_at: 1_000 + next_backoff(MAX_ATTEMPTS - 1)
+                next_attempt_at: 1_000 + next_backoff(MAX_ATTEMPTS - 1, SEED)
             }
         );
 
         // Error at the budget → Dead (no further reschedule).
-        assert_eq!(decide_outcome(MAX_ATTEMPTS, 1_000, true), Outcome::Dead);
-        assert_eq!(decide_outcome(MAX_ATTEMPTS + 1, 1_000, true), Outcome::Dead);
+        assert_eq!(
+            decide_outcome(MAX_ATTEMPTS, 1_000, true, SEED),
+            Outcome::Dead
+        );
+        assert_eq!(
+            decide_outcome(MAX_ATTEMPTS + 1, 1_000, true, SEED),
+            Outcome::Dead
+        );
     }
 
     // End-to-end retry → dead-letter walk over the REAL store (AB#1066 acceptance), driven through

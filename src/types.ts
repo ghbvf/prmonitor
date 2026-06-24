@@ -394,11 +394,13 @@ export interface OutboxEntry {
 
 // Mirrors the `outbox:updated` Tauri event payload (AB#1066) — the downstream end of the
 // event-name funnel for the outbox push stream (the upstream `OUTBOX_UPDATED_EVENT` name lives
-// in `outbox/api.ts`). A single-arm tagged union (discriminant `kind`) mirroring `InboxEvent` /
-// `PrEvent`, so it can widen later without churning the call sites. `projectId` (#35) routes
-// each upsert to its monitored project.
-export type OutboxEvent = {
-  kind: "updated";
-  projectId: string;
-  entry: OutboxEntry;
-};
+// in `outbox/api.ts`). A discriminated union (discriminant `kind`) mirroring `InboxEvent` /
+// `PrEvent`. The `updated` arm carries one row's upsert (`projectId` (#35) routes it to its
+// monitored project); the `error` arm (AB#1182) is a worker-CYCLE-level failure NOT tied to a row
+// or project (so it has NO `projectId` — the panel shows it as a global banner). `operation` names
+// the failing site (`claim`/`record`/`announce`). Keep this 2-arm shape in lockstep with the Rust
+// `events.rs::OutboxEvent` (the open end of the funnel); `useOutboxStore.subscribe`'s `assertNever`
+// switch is the Medium exhaustiveness carrier.
+export type OutboxEvent =
+  | { kind: "updated"; projectId: string; entry: OutboxEntry }
+  | { kind: "error"; operation: string; message: string };

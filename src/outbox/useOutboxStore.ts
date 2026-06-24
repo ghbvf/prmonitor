@@ -4,6 +4,7 @@
 // the listener apply results. Mirrors the option-store pattern set by useInboxStore.
 import { defineStore } from "pinia";
 import { outboxGetRaw, outboxList, outboxRetry, onOutboxUpdated } from "./api";
+import { assertNever } from "../types";
 import type { OutboxEntry } from "../types";
 
 interface OutboxState {
@@ -12,6 +13,11 @@ interface OutboxState {
   entries: OutboxEntry[];
   loading: boolean;
   error: string | null;
+  // A worker-CYCLE-level failure pushed via the `error` event (AB#1182) — claim/record/emit
+  // failures the desktop app's invisible stderr would otherwise swallow. Kept SEPARATE from the
+  // command-path `error` banner (refresh/retry own that one) so the two can't clobber each other;
+  // null = none. Surfaced as a distinct, dismissible global banner (not project-scoped).
+  cycleError: string | null;
   // Optional project-scope filter passed to `outbox_list`; null = every project.
   projectId: string | null;
   // Raw payloads fetched lazily by the "查看原始" disclosure, cached once per entry id.
@@ -39,6 +45,7 @@ export const useOutboxStore = defineStore("outbox", {
     entries: [],
     loading: false,
     error: null,
+    cycleError: null,
     projectId: null,
     rawCache: {},
     rawLoading: {},
@@ -52,14 +59,26 @@ export const useOutboxStore = defineStore("outbox", {
     // Returns the `Promise<UnlistenFn>` so the component can await it for cleanup.
     subscribe() {
       return onOutboxUpdated((e) => {
-        if (e.kind !== "updated") return;
-        // Honor the active project filter: a scoped view ignores other projects' pushes.
-        // NOTE: OutboxEntry carries projectId at the TOP level (unlike InboxEntry, whose
-        // projectId is nested under `.event.projectId`).
-        if (this.projectId !== null && e.entry.projectId !== this.projectId) {
-          return;
+        switch (e.kind) {
+          case "updated":
+            // Honor the active project filter: a scoped view ignores other projects' pushes.
+            // NOTE: OutboxEntry carries projectId at the TOP level (unlike InboxEntry, whose
+            // projectId is nested under `.event.projectId`).
+            if (this.projectId !== null && e.entry.projectId !== this.projectId) {
+              return;
+            }
+            this.upsert(e.entry);
+            return;
+          case "error":
+            // A worker-cycle failure (AB#1182): NOT tied to a row/project, so it bypasses the
+            // project filter and surfaces on the dedicated global `cycleError` banner.
+            this.cycleError = `${e.operation}: ${e.message}`;
+            return;
+          default:
+            // Exhaustiveness carrier (Medium): a new OutboxEvent arm without a case here is a
+            // COMPILE error, so a backend variant can't silently drop on the floor.
+            return assertNever(e);
         }
-        this.upsert(e.entry);
       });
     },
     // Replace-or-prepend an entry by id, then re-sort newest-first. Extracted so the

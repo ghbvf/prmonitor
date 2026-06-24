@@ -100,6 +100,20 @@ describe("useOutboxStore subscribe()", () => {
 
     expect(store.entries.map((e) => e.id)).toEqual([1]);
   });
+
+  it("routes an `error` event to the cycleError banner, not entries (AB#1182)", () => {
+    const store = useOutboxStore();
+    // A project filter must NOT gate a cycle error — it's global, not row-scoped.
+    store.projectId = "p1";
+    store.subscribe();
+
+    outboxCb?.({ kind: "error", operation: "claim", message: "database is locked" });
+
+    expect(store.cycleError).toBe("claim: database is locked");
+    // The row list and the command-path banner are untouched (separate channels).
+    expect(store.entries).toEqual([]);
+    expect(store.error).toBeNull();
+  });
 });
 
 describe("useOutboxStore fetchRaw()", () => {

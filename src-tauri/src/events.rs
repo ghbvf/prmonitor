@@ -87,6 +87,16 @@ pub enum OutboxEvent {
         project_id: String,
         entry: OutboxEntry,
     },
+    /// A worker-CYCLE-level failure NOT tied to one row (AB#1182): a `claim_due` query failed, a
+    /// terminal-state write failed, or the `outbox:updated` re-read failed — the `eprintln!`-only
+    /// paths that were invisible on the desktop app's stderr. Carries NO `project_id` (a cycle
+    /// failure spans the whole queue — `claim_due` is not project-scoped, and the read-failure site
+    /// may have no row left to attribute), so the panel surfaces it as a GLOBAL banner rather than a
+    /// per-row upsert. `operation` names the failing site (`"claim"` / `"record"` / `"announce"`)
+    /// so the banner is actionable. Its own `#[serde(rename_all)]` so `operation`/`message`
+    /// serialize camelCase (the container tag rename maps only the variant name to `"error"`).
+    #[serde(rename_all = "camelCase")]
+    Error { operation: String, message: String },
 }
 
 /// A single streamed unit of a review session, forwarded to the frontend.
@@ -337,6 +347,29 @@ mod tests {
         assert_eq!(entry["kind"], "notification");
         assert_eq!(entry["status"], "pending");
         assert_eq!(entry["lastError"], serde_json::Value::Null);
+    }
+
+    // Serde wire-shape lock for the AB#1182 `OutboxEvent::Error` variant (Medium carrier): the
+    // `kind` tag is camelCase `"error"`, `operation`/`message` are present, and the variant carries
+    // NO project routing key (a cycle-level failure isn't project-scoped). The downstream
+    // `src/types.ts` `OutboxEvent` union must mirror this 2-arm shape in lockstep (the open end of
+    // the funnel; future Hard path = codegen from `events.rs`).
+    #[test]
+    fn outbox_error_wire_shape_is_camel_case_and_project_less() {
+        let event = OutboxEvent::Error {
+            operation: "claim".to_string(),
+            message: "database is locked".to_string(),
+        };
+
+        let v = serde_json::to_value(&event).expect("OutboxEvent serializes");
+
+        assert_eq!(v["kind"], "error");
+        assert!(v.get("operation").is_some());
+        assert!(v.get("message").is_some());
+        // Project-less (a cycle failure spans the queue): a regression that added a routing key
+        // surfaces here, and the TS mirror must stay project-less in lockstep.
+        assert!(v.get("projectId").is_none());
+        assert!(v.get("project_id").is_none());
     }
 
     #[test]

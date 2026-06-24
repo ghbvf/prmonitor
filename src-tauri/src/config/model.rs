@@ -130,6 +130,39 @@ impl Default for Project {
     }
 }
 
+/// Default staleness TTL for a `notification` action (seconds) = 2h (AB#1182). A persisted
+/// `pending` notification older than this (by `created_at`) is dead-lettered instead of fired, so a
+/// restart that drains hours-old rows doesn't surface ghost "review 完成" notifications. Single-
+/// sourced here so [`OutboxConfig::default`] and the worker's load-failure fallback (which reads
+/// `AppConfig::default().outbox`) agree on one value.
+pub const DEFAULT_NOTIFICATION_TTL_SECS: u64 = 2 * 60 * 60;
+
+/// Outbox worker policy (AB#1182): the per-kind staleness TTLs for the durable action queue.
+/// GLOBAL (one policy serves every project) on purpose — staleness is an infrastructure concern,
+/// not project domain, and the worker's `claim_due` drains every project's `pending` rows in one
+/// batch (a per-project TTL would also have no project to resolve for the project-less deeplink
+/// notifications). `#[serde(default)]` keeps it forward-compatible: a config persisted before this
+/// struct existed (or a partial `{"outbox":{}}`) fills absent fields from [`Default`] rather than
+/// failing to load.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OutboxConfig {
+    /// Staleness TTL for a `notification` action (seconds). A `pending` notification whose
+    /// `created_at` is older than this is dead-lettered instead of executed. `0` DISABLES the TTL
+    /// (the action never expires) — a safe sentinel so a misconfigured `0` can't expire every
+    /// queued action instantly. The per-kind resolver in `outbox::service` (`ttl_secs`, an
+    /// exhaustive `match ActionKind`) is the Hard carrier forcing a new kind to declare its own TTL.
+    pub notification_ttl_secs: u64,
+}
+
+impl Default for OutboxConfig {
+    fn default() -> Self {
+        Self {
+            notification_ttl_secs: DEFAULT_NOTIFICATION_TTL_SECS,
+        }
+    }
+}
+
 /// Persisted application configuration (#35: multi-project). Holds the list of
 /// monitored [`Project`]s plus the GLOBAL webhook/shell settings (one webhook
 /// receiver serves every project).
@@ -178,6 +211,9 @@ pub struct AppConfig {
     /// 重启。loopback-only 仍是触发端点（本机任意进程 + DNS rebinding 可达），故非空时按
     /// `LOCAL_API_TOKEN_MIN_LEN` 强制最小长度（与 `webhook_secret` 同理由）。
     pub local_api_token: String,
+    /// Outbox worker policy (AB#1182): per-kind staleness TTLs for the durable action queue. Global
+    /// (one policy serves every project). Forward-compat via the nested `#[serde(default)]`.
+    pub outbox: OutboxConfig,
     /// Declarative Remote Access listeners (AB#1064). Config-only this round; no runtime consumer yet.
     pub listeners: Vec<Listener>,
     /// Declarative Remote Access tunnels (AB#1064). `mode` reuses WebhookTunnelMode.
@@ -199,6 +235,7 @@ impl Default for AppConfig {
             // AB#1043: 8788 = webhook 默认 8787 + 1，避免两端口同默认时冲突。
             local_api_port: 8788,
             local_api_token: String::new(),
+            outbox: OutboxConfig::default(),
             listeners: Vec::new(),
             tunnels: Vec::new(),
         }
@@ -817,6 +854,7 @@ mod tests {
             webhook_public_url: String::new(),
             local_api_port: 8788,
             local_api_token: "local-api-token-0123456789".to_string(),
+            outbox: OutboxConfig::default(),
             listeners: Vec::new(),
             tunnels: Vec::new(),
         };
@@ -826,6 +864,15 @@ mod tests {
         // Multi-project keys present (camelCase).
         assert!(v.get("projects").is_some());
         assert!(v.get("activeProjectId").is_some());
+        // AB#1182: the nested outbox policy serializes camelCase (a drift in the nested struct's
+        // wire shape surfaces here too — the TS `AppConfig.outbox` mirror must stay in lockstep).
+        assert!(v.get("outbox").is_some());
+        assert!(v["outbox"].get("notificationTtlSecs").is_some());
+        assert!(v["outbox"].get("notification_ttl_secs").is_none());
+        assert_eq!(
+            v["outbox"]["notificationTtlSecs"],
+            DEFAULT_NOTIFICATION_TTL_SECS
+        );
         // Global webhook keys stay at the top level.
         assert!(v.get("webhookEnabled").is_some());
         assert!(v.get("webhookPort").is_some());
@@ -859,6 +906,35 @@ mod tests {
         assert!(v.get("repo").is_none());
         assert!(v.get("repoRoot").is_none());
         assert!(v.get("autoReview").is_none());
+    }
+
+    // AB#1182 forward-compat lock: a config persisted BEFORE the `outbox` field existed (key
+    // absent), and a PARTIAL `{"outbox":{}}` (key present, inner field absent), both deserialize
+    // by filling the missing pieces from `Default` rather than failing — the `#[serde(default)]`
+    // on both `AppConfig` and `OutboxConfig`. A regression that dropped either default would make
+    // old stored configs un-loadable, so lock it.
+    #[test]
+    fn outbox_config_deserializes_forward_compatibly() {
+        // Older config: no `outbox` key at all → the whole struct defaults.
+        let without: AppConfig =
+            serde_json::from_str(r#"{"activeProjectId":"default"}"#).expect("missing outbox loads");
+        assert_eq!(
+            without.outbox.notification_ttl_secs,
+            DEFAULT_NOTIFICATION_TTL_SECS
+        );
+
+        // Partial: `outbox` present but its field absent → the field defaults.
+        let partial: AppConfig =
+            serde_json::from_str(r#"{"outbox":{}}"#).expect("partial outbox loads");
+        assert_eq!(
+            partial.outbox.notification_ttl_secs,
+            DEFAULT_NOTIFICATION_TTL_SECS
+        );
+
+        // An explicit value round-trips (and `0` — the disable sentinel — is preserved verbatim).
+        let explicit: AppConfig = serde_json::from_str(r#"{"outbox":{"notificationTtlSecs":0}}"#)
+            .expect("explicit loads");
+        assert_eq!(explicit.outbox.notification_ttl_secs, 0);
     }
 
     #[test]

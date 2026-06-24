@@ -130,9 +130,20 @@ export interface AppConfig {
   // (fail-closed 401). Mirror the Rust `AppConfig.localApiPort`/`localApiToken` wire fields.
   localApiPort: number;
   localApiToken: string;
+  // Outbox worker policy (AB#1182): per-kind staleness TTLs for the durable action queue. Global
+  // (one policy serves every project). Mirrors the Rust `AppConfig.outbox` wire field; the nested
+  // struct is `#[serde(default)]` so an older persisted config without it loads with defaults.
+  outbox: OutboxConfig;
   // Remote-access resources (AB#1064): declarative lists of listeners (bind endpoints)
   // and tunnels (public publishers) edited by the Remote Access settings page. Mirror
   // the Rust `AppConfig.listeners`/`tunnels` wire fields (golden-locked on the Rust side).
   listeners: Listener[];
   tunnels: Tunnel[];
+}
+
+// Mirrors `src-tauri/src/config/model.rs`'s `OutboxConfig` (serde camelCase; locked by the
+// `app_config_wire_shape_is_camel_case` golden). `notificationTtlSecs` is the staleness window for
+// a `notification` action in SECONDS (default 7200 = 2h); `0` DISABLES the TTL (never expires).
+export interface OutboxConfig {
+  notificationTtlSecs: number;
 }

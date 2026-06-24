@@ -17,6 +17,7 @@ use tauri::Manager;
 use tokio::sync::Notify;
 use tokio::time::{interval, MissedTickBehavior};
 
+use crate::config::service as config_service;
 use crate::db::Database;
 use crate::outbox::{service, ActionExecutor};
 
@@ -96,10 +97,27 @@ async fn worker_loop(
             _ = stop.notified() => return,
         }
         let db = app.state::<Database>();
+        // Resolve the staleness TTL from LIVE config each cycle (AB#1182), through the config
+        // slice's PUBLIC `load` seam (the same entry `pr::scheduler` uses for its poll interval),
+        // so a config edit applies without a restart. A config-read failure degrades to the default
+        // TTL rather than skipping the cycle — but is LOGGED (review F4), so a persistent read
+        // failure doesn't silently pin the default forever. The fallback default also comes through
+        // the config PUBLIC service seam (`default_outbox_config`, AB#1182 F1) — the outbox slice
+        // never reaches into `config::model` for the constant.
+        let notification_ttl_secs = match config_service::load(&app) {
+            Ok(cfg) => cfg.outbox.notification_ttl_secs,
+            Err(e) => {
+                eprintln!(
+                    "outbox: 读取配置失败，使用默认 staleness TTL：{}",
+                    e.message
+                );
+                config_service::default_outbox_config().notification_ttl_secs
+            }
+        };
         // Run the cycle to completion, but let a stop signal cut it short (unified cancellation,
         // mirroring `pr::scheduler::run_loop`).
         tokio::select! {
-            _ = service::run_due_once(&app, db.inner(), &executor) => {}
+            _ = service::run_due_once(&app, db.inner(), &executor, notification_ttl_secs) => {}
             _ = stop.notified() => return,
         }
     }

@@ -70,4 +70,8 @@ pub struct OutboxAction {
     pub payload: String,
     /// Attempts that have already run for this row (0 on the first claim).
     pub attempt_count: u32,
+    /// When the action was enqueued (epoch seconds) (AB#1182). The worker compares this against
+    /// the kind's staleness TTL to dead-letter a row that has sat `pending` too long (e.g. a
+    /// notification persisted before a restart) instead of firing it as a ghost.
+    pub created_at: u64,
 }

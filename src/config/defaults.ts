@@ -5,12 +5,20 @@
 // config/model.rs) so an added/onboarded project is immediately valid except for
 // the user-supplied repo/repoRoot.
 import type { SourceKind } from "../types";
-import type { Project } from "./types";
+import type { OutboxConfig, Project } from "./types";
 
 // The fixed id the wizard gives the first project; mirrors the backend migration's
 // fixed id for symmetry. ProjectsManager mints a fresh uuid per added project, so
 // only the onboarding seed uses this.
 export const DEFAULT_PROJECT_ID = "default";
+
+// Global outbox worker policy default (AB#1182): mirrors the backend `OutboxConfig::default`
+// (`DEFAULT_NOTIFICATION_TTL_SECS` = 7200 = 2h). There's no settings-panel control for it yet, so
+// the SettingsView draft just carries the loaded value through a save round-trip and a fresh
+// onboarding config seeds this. Single-sourced here so the two AppConfig literals can't drift.
+export const DEFAULT_OUTBOX_CONFIG: OutboxConfig = {
+  notificationTtlSecs: 2 * 60 * 60,
+};
 
 // Per-project field defaults sans identity (`id`/`name`): callers supply those.
 // ProjectsManager spreads this with `{ id: crypto.randomUUID(), name: "新项目" }`;

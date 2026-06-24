@@ -4,7 +4,7 @@
 // Bitbucket-required auto-corrections. Pure (mutates a plain Project) → no Pinia/mocks.
 import { describe, expect, it } from "vitest";
 import type { Project } from "./types";
-import { applySourceKindDefaults } from "./defaults";
+import { DEFAULT_OUTBOX_CONFIG, applySourceKindDefaults } from "./defaults";
 
 // A github-shaped project carrying the github-friendly defaults (labelSource "native",
 // updateMode "webhook-only") the backend rejects for a Bitbucket source.
@@ -91,5 +91,16 @@ describe("applySourceKindDefaults (717 F9)", () => {
     expect(p.azureProject).toBe("gocell");
     expect(p.labelSource).toBe("native");
     expect(p.updateMode).toBe("webhook-only");
+  });
+});
+
+// AB#1182 (review F1/F7): the frontend default TTL must mirror the backend
+// `DEFAULT_NOTIFICATION_TTL_SECS` (= 7200 = 2h). The Rust golden pins the backend value; this pins
+// the TS literal so a one-sided drift (e.g. only the backend default is changed) fails in CI rather
+// than silently writing a stale default through onboarding / a settings save (lifts the cross-source
+// mirror from Soft toward Medium on the TS side).
+describe("DEFAULT_OUTBOX_CONFIG (AB#1182)", () => {
+  it("mirrors the backend default notification TTL (2h)", () => {
+    expect(DEFAULT_OUTBOX_CONFIG.notificationTtlSecs).toBe(7200);
   });
 });

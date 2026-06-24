@@ -102,6 +102,21 @@ onUnmounted(() => unlisten?.());
       </button>
     </header>
 
+    <!-- Worker-CYCLE error banner (AB#1182): a claim/record/emit failure pushed via the `error`
+         event. Kept SEPARATE from the command-path banner below so a background worker failure and
+         a refresh/retry failure don't clobber each other. Global (not project-scoped). -->
+    <p v-if="store.cycleError" class="error banner cycle">
+      <span>后台投递异常 / worker error：{{ store.cycleError }}</span>
+      <button
+        type="button"
+        class="dismiss"
+        aria-label="关闭 / dismiss"
+        @click="store.cycleError = null"
+      >
+        ✕
+      </button>
+    </p>
+
     <p v-if="store.error" class="error banner">
       <span>{{ store.error }}</span>
       <button

@@ -59,7 +59,8 @@ function validProject(): Project {
 
 // The global (non-per-project) AppConfig keys. Only the webhook/shell fields are
 // driven by GLOBAL_GROUPS; `projects`/`activeProjectId` are structural and managed
-// by the project list/selector UI, not a field group.
+// by the project list/selector UI, and `outbox` (AB#1182) is a nested policy object
+// with no settings-panel control yet — none of these is a field group.
 const GLOBAL_FORM_KEYS: (keyof AppConfig)[] = [
   "webhookEnabled",
   "webhookPort",

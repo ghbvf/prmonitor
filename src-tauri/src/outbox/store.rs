@@ -41,8 +41,9 @@ const MAX_LAST_ERROR_LEN: usize = 512;
 
 /// Truncate a `last_error` to [`MAX_LAST_ERROR_LEN`] on a char boundary (never mid-UTF-8), appending
 /// an ellipsis marker when cut. Applied at every `last_error` write so no path can persist an
-/// unbounded message.
-fn clamp_error(error: &str) -> String {
+/// unbounded message. `pub(crate)` so the service layer can apply the SAME bound to the
+/// panel-visible cycle-error message (AB#1182), not just persisted row errors.
+pub(crate) fn clamp_error(error: &str) -> String {
     if error.len() <= MAX_LAST_ERROR_LEN {
         return error.to_string();
     }
@@ -165,14 +166,23 @@ pub fn enqueue(
 /// `outbox:updated` for the quarantined ids too, so an open panel sees the `dead` transition (the
 /// store has no `AppHandle` to emit itself — all persisted transitions surface through the service).
 pub fn claim_due(db: &Database, now: u64) -> AppResult<(Vec<OutboxAction>, Vec<i64>)> {
-    let rows: Vec<(i64, String, String, String, i64)> = db.with_conn(|conn| {
+    // The 6th column `created_at` (AB#1182) lets the caller dead-letter a row that has sat
+    // `pending` past its kind's staleness TTL instead of executing a stale action.
+    let rows: Vec<(i64, String, String, String, i64, i64)> = db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, kind, payload, attempt_count FROM action_outbox \
+            "SELECT id, project_id, kind, payload, attempt_count, created_at FROM action_outbox \
              WHERE status = 'pending' AND next_attempt_at <= ?1 ORDER BY id LIMIT ?2",
         )?;
         let rows = stmt
             .query_map(rusqlite::params![now as i64, CLAIM_LIMIT], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(rows)
@@ -187,7 +197,7 @@ pub fn claim_due(db: &Database, now: u64) -> AppResult<(Vec<OutboxAction>, Vec<i
 
     let mut actions = Vec::with_capacity(rows.len());
     let mut quarantined = Vec::new();
-    for (id, project_id, kind, payload, attempt_count) in rows {
+    for (id, project_id, kind, payload, attempt_count, created_at) in rows {
         let attempt_count = attempt_count.max(0) as u32;
         match kind_from_wire(&kind) {
             Ok(kind) => actions.push(OutboxAction {
@@ -196,6 +206,7 @@ pub fn claim_due(db: &Database, now: u64) -> AppResult<(Vec<OutboxAction>, Vec<i
                 kind,
                 payload,
                 attempt_count,
+                created_at: created_at.max(0) as u64,
             }),
             Err(e) => {
                 // Quarantine: dead-letter the corrupt row so it terminalizes (panel-visible) instead
@@ -304,6 +315,12 @@ pub enum RetryReset {
 /// manual retry gets the full attempt allowance again. `last_error` is KEPT (the user still sees why
 /// it last failed until the next attempt clears it on success).
 ///
+/// **Resets `created_at = now` too (AB#1182).** A manual retry is an explicit "re-send it now", so it
+/// gets a FRESH staleness window — otherwise a row dead-lettered BY the staleness sweep (its
+/// `created_at` already past the TTL) would be re-claimed and immediately re-expired, a futile
+/// retry → re-dead loop. Resetting `created_at` makes the re-queued action fresh, consistent with
+/// the fresh retry budget.
+///
 /// **Guards to `status = 'dead'` (backend invariant, not UI-only).** Only a dead-lettered action may
 /// be manually retried — re-queuing a `done` row would re-run an already-succeeded side effect, and a
 /// `pending` row is already queued. The UI only renders the retry button on `dead` rows, but this SQL
@@ -313,7 +330,7 @@ pub fn reset_for_retry(db: &Database, id: i64, now: u64) -> AppResult<RetryReset
     db.with_conn(|conn| {
         let updated = conn.execute(
             "UPDATE action_outbox SET status = ?2, attempt_count = 0, next_attempt_at = ?3, \
-             updated_at = ?3 WHERE id = ?1 AND status = ?4",
+             created_at = ?3, updated_at = ?3 WHERE id = ?1 AND status = ?4",
             rusqlite::params![
                 id,
                 status_as_wire(ActionStatus::Pending),
@@ -491,6 +508,12 @@ mod tests {
             "only due pending rows, oldest id first (done/dead excluded)"
         );
         assert!(claimed.iter().all(|x| x.attempt_count == 0));
+        // AB#1182: the claimed action carries `created_at` (the enqueue epoch), so the worker can
+        // evaluate the staleness TTL. `a`/`b` were enqueued at 100 → that is their created_at.
+        assert!(
+            claimed.iter().all(|x| x.created_at == 100),
+            "created_at hydrated from the enqueue epoch"
+        );
         assert!(quarantined.is_empty(), "no corrupt rows here");
 
         // Advancing now past the future row's schedule makes it claimable too.
@@ -546,6 +569,10 @@ mod tests {
         assert_eq!(r.status, ActionStatus::Pending);
         assert_eq!(r.attempt_count, 0, "fresh retry budget");
         assert_eq!(r.next_attempt_at, 500);
+        // AB#1182: a manual retry resets `created_at` too (was 100 at enqueue) so the re-queued row
+        // gets a FRESH staleness window — a row dead-lettered by the TTL sweep won't instantly
+        // re-expire on retry.
+        assert_eq!(r.created_at, 500, "retry resets the staleness window");
         let (due, _q) = claim_due(&db, 500).expect("claim");
         assert!(due.iter().any(|x| x.id == id));
 

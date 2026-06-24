@@ -22,6 +22,17 @@ use crate::error::{AppError, AppResult};
 /// use `Project` through this same re-export.
 pub use super::model::Project;
 
+/// The DEFAULT outbox worker policy, exposed THROUGH the config public service surface (AB#1182
+/// F1) — the seam the `outbox` worker uses as its config-read-failure FALLBACK. The worker reads
+/// the LIVE policy via [`load`] each cycle; when THAT read fails it degrades to this default (and
+/// logs), so the outbox slice depends only on `config::service`, never reaching into
+/// `config::model` for the constant (the boundary the `slice_boundary_test` now machine-enforces
+/// to `config::service` only). Returns [`OutboxConfig::default`] — single-sourced with
+/// `DEFAULT_NOTIFICATION_TTL_SECS`, so a future outbox-policy field is picked up here for free.
+pub fn default_outbox_config() -> super::model::OutboxConfig {
+    super::model::OutboxConfig::default()
+}
+
 /// `id`/`name` assigned to the single project lifted out of a legacy flat config by
 /// [`migrate_value`] (#35). One source so the migration and its tests agree on the
 /// id the active-project pointer (`activeProjectId`) is also set to.

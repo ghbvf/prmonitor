@@ -10,7 +10,12 @@
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useConfigStore } from "./useConfigStore";
 import type { AppConfig, Project } from "./types";
-import { DEFAULT_PROJECT_ID, NEW_PROJECT_DEFAULTS, applySourceKindDefaults } from "./defaults";
+import {
+  DEFAULT_OUTBOX_CONFIG,
+  DEFAULT_PROJECT_ID,
+  NEW_PROJECT_DEFAULTS,
+  applySourceKindDefaults,
+} from "./defaults";
 import type { SourceKind } from "../types";
 import {
   STEPS,
@@ -165,6 +170,7 @@ function composeConfig(): AppConfig {
     webhookPublicUrl: "",
     localApiPort: 8788,
     localApiToken: "",
+    outbox: { ...DEFAULT_OUTBOX_CONFIG },
     // Remote-access resources (AB#1064) start empty — onboarding only seeds the first
     // project + webhook defaults; listeners/tunnels are added later in Settings.
     listeners: [],
