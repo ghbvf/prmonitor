@@ -32,11 +32,44 @@ const {
 const draft = ref("");
 const collapsed = ref(false);
 
+// The scrollable conversation viewport (middle zone). Auto-scroll follows new streamed
+// output, but ONLY while the user is already pinned to the bottom — if they scrolled up
+// to read history, streaming must not yank them back down.
+const streamScroll = ref<HTMLElement | null>(null);
+const stickToBottom = ref(true);
+// Sub-pixel rounding + the gap below the last item mean "at bottom" is rarely exactly 0;
+// treat anything within this margin of the bottom as still pinned.
+const STICK_THRESHOLD_PX = 24;
+
+function onStreamScroll() {
+  const el = streamScroll.value;
+  if (!el) return;
+  stickToBottom.value =
+    el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD_PX;
+}
+
+// Follow streamed deltas to the bottom when pinned. `deep` catches in-place text appends
+// onto existing item objects (not just pushes); `flush: "post"` runs after the DOM (and
+// thus scrollHeight) reflects the new content.
+watch(
+  items,
+  () => {
+    if (!stickToBottom.value) return;
+    const el = streamScroll.value;
+    if (el) el.scrollTop = el.scrollHeight;
+  },
+  { deep: true, flush: "post" },
+);
+
 // When a session becomes focused (freshly started or picked from the list), auto-expand
-// the composer so its chat isn't hidden behind a prior manual collapse. Only on the
-// null → non-null edge — a manual collapse during an active session is preserved.
+// the composer so its chat isn't hidden behind a prior manual collapse, and re-pin to the
+// bottom so the new session's stream follows. Only on the null → non-null edge — a manual
+// collapse during an active session is preserved.
 watch(activeThreadId, (id) => {
-  if (id != null) collapsed.value = false;
+  if (id != null) {
+    collapsed.value = false;
+    stickToBottom.value = true;
+  }
 });
 
 // The composer is usable only when a session is focused, no turn is running (the
@@ -131,21 +164,28 @@ function onStart() {
     <p v-if="listenerError" class="error">事件监听注册失败 / {{ listenerError }}</p>
     <p v-else-if="!listenerReady" class="muted">正在连接事件流… / connecting</p>
 
-    <p v-if="running && items.length === 0" class="muted">等待输出… / waiting</p>
+    <!-- Scrollable conversation: only the stream scrolls; the header/status above and
+         the composer below stay pinned to the panel edges (see .stream-scroll styles). -->
+    <div ref="streamScroll" class="stream-scroll" @scroll="onStreamScroll">
+      <p v-if="running && items.length === 0" class="muted">等待输出… / waiting</p>
 
-    <ReviewStream :items="items" />
+      <ReviewStream :items="items" />
+    </div>
 
-    <!-- Follow-up chat composer (#chat). Collapses to a thin header bar via the
-         toggle; frozen (disabled) while a turn is running or no session is focused. -->
+    <!-- Follow-up chat composer (#chat). Pinned to the panel bottom; collapses to a thin
+         header bar via the toggle; frozen (disabled) while a turn is running or no session
+         is focused. -->
     <div class="composer" :class="{ collapsed }">
       <div class="composer-head">
         <span class="composer-title">对话 / Chat</span>
         <button
           type="button"
           class="toggle"
+          :aria-label="collapsed ? '展开 / expand' : '缩小 / collapse'"
+          :title="collapsed ? '展开 / expand' : '缩小 / collapse'"
           @click="collapsed = !collapsed"
         >
-          {{ collapsed ? "展开 / expand" : "缩小 / collapse" }}
+          {{ collapsed ? "▲" : "▼" }}
         </button>
       </div>
 
@@ -183,6 +223,29 @@ function onStart() {
 </template>
 
 <style scoped>
+/* Three-zone panel: header/status pinned at the top, the conversation scrolls in the
+   middle, and the composer is pinned at the bottom. height:100% fills the SplitPane
+   bottom .pane's content box (the pane has a definite flex height + small vertical
+   padding), so the pane itself stops scrolling and .stream-scroll becomes the only
+   visible scrollbar. */
+.review-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.stream-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+/* Fixed top zone: never compress, so the controls/status stay legible when the pane is
+   dragged short — symmetric with .composer's flex-shrink:0 at the bottom. */
+.head,
+.status,
+.error {
+  flex-shrink: 0;
+}
 .head {
   display: flex;
   align-items: center;
@@ -221,6 +284,8 @@ function onStart() {
   margin-top: var(--space-4);
   border-top: 1px solid var(--color-border);
   padding-top: var(--space-3);
+  /* Never compress when the conversation grows — stays pinned at the panel bottom. */
+  flex-shrink: 0;
 }
 .composer-head {
   display: flex;
@@ -236,6 +301,8 @@ function onStart() {
   padding: var(--space-1) var(--space-3);
   font: inherit;
   font-size: var(--font-size-sm);
+  /* Stabilize the ▲/▼ glyph baseline/height across platform fonts (macOS vs Windows). */
+  line-height: 1;
   cursor: pointer;
 }
 .hint {
