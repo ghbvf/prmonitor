@@ -11,7 +11,7 @@ use crate::review::engines::claude::process::{claude_availability, ClaudeStatus,
 use crate::review::engines::claude::ClaudeEngine;
 use crate::review::engines::codex::{CodexEngine, CodexStatus};
 use crate::review::history_store::{self, HistoryItem};
-use crate::review::session::{CommentUrlContext, SessionInfo};
+use crate::review::session::{CommentUrlContext, SessionInfo, StopTarget};
 use crate::state::AppState;
 
 /// The codex binary name (PATH-resolved). Single source for every review command
@@ -99,45 +99,61 @@ pub fn stop_codex(state: tauri::State<'_, AppState>) -> AppResult<CodexStatus> {
     Ok(state.codex.stop())
 }
 
-/// The single source for engine selection on the MANUAL / explicit path (AB#1042): the
-/// shared dispatch body behind BOTH [`start_review`] (project resolved by id) and
-/// [`trigger_review`] (project resolved by id-or-repo `reference`). The AUTO-dispatch path
-/// has its own engine selection in `lib.rs::run_auto_dispatch` (intentionally separate — it
-/// monomorphizes `dispatch::auto_dispatch` per concrete engine and applies the codex
-/// stop-flag gate that doesn't exist on the manual path). Both are INDEPENDENTLY exhaustive
-/// `match project.engine_kind` over the sealed [`EngineKind`] (model.rs) — that exhaustiveness
-/// is the **Hard** carrier: a new variant without an arm in EITHER match is a compile error,
-/// so neither path can silently miss a new engine. Don't add a THIRD manual-path `match`:
-/// this one folds in the dedup + outcome mapping, so every explicit entry routes through it.
+/// Whether a review start is an EXPLICIT user action or an AUTOMATIC one (AB#1069). The distinction
+/// is the codex stop-flag contract (PR #47 F1): an explicit trigger (UI button / CLI / deeplink)
+/// `resume()`s a user-stopped codex; an automatic trigger (the outbox action executor, driven by the
+/// rule engine) must NOT revive it — it respects the user's `stop_codex` exactly like
+/// `lib.rs::run_auto_dispatch`. Claude has no resident server / stop flag, so this only gates codex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartTrigger {
+    /// Manual UI/CLI/deeplink start — overrides a prior `stop_codex` (resumes codex).
+    Explicit,
+    /// Outbox / rule-engine start — respects `stop_codex` (never resumes). [`start_for_outbox`]
+    /// short-circuits an already-stopped codex, so an `Auto` start here is reached only when live.
+    Auto,
+}
+
+/// The single source for engine selection on the START path (AB#1042/AB#1069): the shared
+/// engine-selection-and-start body behind [`dispatch_engine`] (manual UI/CLI start, `Explicit`) AND
+/// the outbox action executor's [`start_for_outbox`] (`Auto`). Builds the concrete engine for
+/// `project.engine_kind` and starts the review, returning the RAW [`StartReviewOutcome`] — each
+/// caller maps the outcome differently (a dedup is a benign error on the manual path, but a SUCCESS
+/// on the at-least-once outbox path — see [`ok_on_started_or_deduped`]). `trigger` decides the codex
+/// stop-flag handling: `Explicit` resumes a user-stopped codex; `Auto` does not (PR #47 F1).
 ///
-/// Folds the `outcome → Result` mapping in (both callers handle a [`StartReviewOutcome`]
-/// identically): `Started` → the session id; `Deduped` (the registry already has an
-/// in-flight review for this `(project_id, pr, kind)`) → a benign "already in flight" error
-/// — a re-start does NOT double-start; stop the running one first to re-review.
+/// The AUTO-POLL dispatch path has its OWN engine selection in `lib.rs::run_auto_dispatch`
+/// (monomorphizes `dispatch::auto_dispatch` per concrete engine), and the follow-up chat path its own
+/// in [`send_review_message`]. All are INDEPENDENTLY exhaustive `match …engine_kind` over the sealed
+/// [`EngineKind`] (model.rs) — that exhaustiveness is the **Hard** carrier: a new variant without an
+/// arm in ANY of them is a compile error. This is the only START-path `match EngineKind` (manual
+/// UI/CLI AND the outbox executor route through it) — don't add another start-path match.
 ///
-/// `kind` is pre-validated by the caller (both validate before resolving the project).
-async fn dispatch_engine<R: tauri::Runtime>(
+/// `kind` is pre-validated by the caller (`"review"` | `"check"`).
+async fn start_via_engine<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppState,
     project: &config_service::Project,
     pr_number: u64,
     kind: &str,
-) -> AppResult<SessionId> {
+    trigger: StartTrigger,
+) -> AppResult<StartReviewOutcome> {
     // Snapshot the comment-URL source context from the project NOW (AB#1042), so the terminal
     // `finalize_turn` resolves the pr-review comment URL against the project the review ran
     // against — never a config edited mid-review. Both engines carry this owned context into
     // their `Starting` session; built once here since the fields are identical for either.
     let url_ctx = comment_url_ctx_from(project);
-    let outcome = match project.engine_kind {
+    match project.engine_kind {
         EngineKind::Codex => {
             let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
-            // MANUAL / explicit force-start: an explicit trigger (UI button OR a CLI/deeplink
-            // entry, AB#1042) overrides a prior `stop_codex`. `resume()` clears the user-stop
-            // flag BEFORE `engine.start()` reaches the `connection()` funnel (which refuses
-            // when stopped). Auto-dispatch does NOT resume, so a stopped server is never
-            // auto-revived (PR #47 F1) — `trigger_review` IS explicit/manual, so it resumes
-            // like `start_review` (same convention for every explicit entry point).
-            state.codex.resume();
+            // Codex stop-flag contract (PR #47 F1): an EXPLICIT trigger (UI / CLI / deeplink)
+            // overrides a prior `stop_codex` — `resume()` clears the user-stop flag BEFORE
+            // `engine.start()` reaches the `connection()` funnel (which refuses when stopped). An
+            // AUTO trigger (outbox / rule-engine) does NOT resume: it respects the user's stop just
+            // like `run_auto_dispatch` (the caller `start_for_outbox` already short-circuits a
+            // stopped codex, so an `Auto` start reaches here only when codex is live).
+            if trigger == StartTrigger::Explicit {
+                state.codex.resume();
+            }
             let engine = CodexEngine {
                 app,
                 codex: &state.codex,
@@ -153,7 +169,7 @@ async fn dispatch_engine<R: tauri::Runtime>(
                 pr_number: 0,
                 session_info: None,
             };
-            engine.start(pr_number, kind).await?
+            engine.start(pr_number, kind).await
         }
         EngineKind::Claude => {
             let engine = ClaudeEngine {
@@ -170,14 +186,88 @@ async fn dispatch_engine<R: tauri::Runtime>(
                 pr_number: 0,
                 session_info: None,
             };
-            engine.start(pr_number, kind).await?
+            engine.start(pr_number, kind).await
         }
-    };
-    match outcome {
+    }
+}
+
+/// The MANUAL / explicit start path (AB#1042): the shared dispatch body behind BOTH
+/// [`start_review`] (project resolved by id) and [`trigger_review`] (project resolved by id-or-repo
+/// `reference`). Thin mapper over [`start_via_engine`]: `Started` → the session id; `Deduped` (the
+/// registry already has an in-flight review for this `(project_id, pr, kind)`) → a benign "already in
+/// flight" error — a re-start does NOT double-start; stop the running one first to re-review. This
+/// `Deduped → Err` is correct for a USER action (a re-click deserves the message); the outbox path
+/// maps the same `Deduped` to `Ok` instead (see [`ok_on_started_or_deduped`]).
+///
+/// `kind` is pre-validated by the caller (both validate before resolving the project).
+async fn dispatch_engine<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    project: &config_service::Project,
+    pr_number: u64,
+    kind: &str,
+) -> AppResult<SessionId> {
+    match start_via_engine(app, state, project, pr_number, kind, StartTrigger::Explicit).await? {
         StartReviewOutcome::Started(session_id) => Ok(session_id),
         StartReviewOutcome::Deduped => Err(AppError::new(format!(
             "PR {pr_number} 的 {kind} review 已在进行中"
         ))),
+    }
+}
+
+/// The outbox action executor's entry into the review funnel (AB#1069): the same funnel
+/// [`start_review`] goes through (`validate_kind` + `validate_pr_number` → `project_validated` →
+/// [`start_via_engine`]), so a replayed `review`/`check` action CANNOT bypass any guard. Folds the
+/// outcome mapping in ([`ok_on_started_or_deduped`]) so it returns a plain `AppResult<()>` the worker
+/// consumes directly: `Ok` → the row is `done`, `Err` → retry / dead-letter.
+///
+/// **AUTO trigger (PR #47 F1)**: an outbox review is produced by the automatic rule engine, not a
+/// user click — so it runs via [`StartTrigger::Auto`] (NO `resume()`), respecting a user's
+/// `stop_codex` exactly like `run_auto_dispatch`. If the user stopped codex, `engine.start`'s
+/// `connection()` funnel refuses with an `Err` (it does NOT revive) — which propagates as a RETRYABLE
+/// failure: the row stays `pending` and re-runs on a later sweep (so it executes once codex resumes),
+/// or dead-letters at the attempt cap if codex stays stopped. We do NOT short-circuit a stopped codex
+/// to `Ok` (AB#1069 F2): the outbox `Ok = done` contract means `done` must imply the review actually
+/// ran — marking a non-executed (user-stopped) action `done` is a lie. (A nicer non-dead-lettering
+/// "blocked-until-resume" outbox state is tracked as a follow-up; this honest retry is the minimal fix.)
+///
+/// `kind` is `"review"` | `"check"` (the executor derives it from the sealed
+/// [`crate::model::ActionKind`] variant); it is re-validated here for fail-closed symmetry with
+/// [`stop_for_outbox`] (a future maintainer who reads `kind` from the payload can't silently bypass
+/// it). `pr_number` comes from the persisted/replayed payload, so it too is re-validated. `pub(crate)`
+/// so the composition root (`lib.rs`, outside the `review` module) can call it — it names only
+/// `config`/`state`/review-internal types, never `crate::outbox`, so the slice boundary holds.
+pub(crate) async fn start_for_outbox<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    project_id: &str,
+    pr_number: u64,
+    kind: &str,
+) -> AppResult<()> {
+    // Fail-closed on a replayed payload (parity with `start_review` / `stop_for_outbox`): a bogus
+    // `kind` or a `pr = 0` would otherwise reach the engine and start a bogus review.
+    validate_kind(kind)?;
+    validate_pr_number(pr_number)?;
+    let project = config_service::project_validated(app, project_id)?;
+    // Auto trigger: no `resume()` (respects `stop_codex`). A stopped codex makes `engine.start`
+    // return a retryable `Err` (connection refused) — NOT a false `Ok`/`done` (F2). See the doc above.
+    let outcome =
+        start_via_engine(app, state, &project, pr_number, kind, StartTrigger::Auto).await?;
+    ok_on_started_or_deduped(outcome)
+}
+
+/// Map a [`StartReviewOutcome`] to the OUTBOX action result (AB#1069): BOTH `Started` AND `Deduped`
+/// are `Ok(())`. This is the load-bearing semantics of the action executor — the OPPOSITE of the
+/// manual path's [`dispatch_engine`] (`Deduped → Err`). A `Deduped` means the registry already has an
+/// in-flight review for this `(project, pr, kind)`, so the action's intent ("this PR is being
+/// reviewed") already holds — it is NOT a failure. Mapping it to `Err` would make the outbox worker
+/// retry with backoff and, across enough crash-replays, DEAD-LETTER a review that started
+/// successfully (the worker's terminal decision is `Ok → done` / `Err → retry/dead`). This mirrors
+/// `dispatch::auto_dispatch`, where a `Deduped` candidate is a silent skip, never an error banner.
+/// Pure (no `AppHandle`) so the contract is unit-tested without a Tauri runtime — see the test below.
+pub(crate) fn ok_on_started_or_deduped(outcome: StartReviewOutcome) -> AppResult<()> {
+    match outcome {
+        StartReviewOutcome::Started(_) | StartReviewOutcome::Deduped => Ok(()),
     }
 }
 
@@ -375,22 +465,20 @@ pub async fn trigger_review<R: tauri::Runtime>(
     dispatch_engine(&app, &state, &project, pr_number, &kind).await
 }
 
-/// Interrupt a running review session (by its `threadId`). The terminal
-/// `turnCompleted` (status `interrupted`) follows on the `review:event` stream.
-#[tauri::command]
-pub async fn stop_review<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    state: tauri::State<'_, AppState>,
-    session_id: String,
+/// Interrupt a running review session by its `threadId` (#718): the shared stop body behind the
+/// manual [`stop_review`] command AND the AB#1069 outbox `stop-review` action ([`stop_for_outbox`]).
+/// Stop-engine resolution WITHOUT an engine field on the persisted `SessionInfo`: a session id is
+/// globally unique, so whichever manager holds its kill handle definitively OWNS the session. Try
+/// claude first — `stop` returns true iff the ClaudeManager owned this session (and just aborted its
+/// pump → killed `claude -p`). Deterministic, not a guess; if false, the session is codex's (or
+/// already gone) → fall through to the codex interrupt path. `pub(crate)` so the composition root
+/// (`lib.rs`) reuses it for the outbox action — names only review-internal / config types.
+pub(crate) async fn stop_session_by_id<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    session_id: &str,
 ) -> AppResult<()> {
-    // Stop-engine resolution WITHOUT an engine field on the persisted `SessionInfo`
-    // (#718): a session id is globally unique, so whichever manager holds its kill handle
-    // definitively OWNS the session. Try claude first — `stop` returns true iff the
-    // ClaudeManager owned this session (and just aborted its pump → killed `claude -p`).
-    // This is deterministic, not a guess, and avoids changing `SessionInfo`'s
-    // persisted/mirrored wire shape and all its constructors. If false, the session is
-    // codex's (or already gone) → fall through to the unchanged codex interrupt path.
-    if state.claude.stop(&session_id) {
+    if state.claude.stop(session_id) {
         return Ok(());
     }
     // `stop` interrupts an already-live turn purely by its session id (codex
@@ -399,7 +487,7 @@ pub async fn stop_review<R: tauri::Runtime>(
     // build the engine with empty context fields and skip the config read entirely —
     // a missing / invalid config must not block stopping a running review.
     let engine = CodexEngine {
-        app: &app,
+        app,
         codex: &state.codex,
         registry: &state.sessions,
         codex_bin: CODEX_BIN,
@@ -421,7 +509,83 @@ pub async fn stop_review<R: tauri::Runtime>(
         pr_number: 0,
         session_info: None,
     };
-    engine.stop(&session_id).await
+    // The trait's `stop` takes `&SessionId` (== `&String`); `claude.stop` above took `&str`. Own the
+    // id once for the codex arm (a stop is rare, so the single allocation is irrelevant).
+    engine.stop(&session_id.to_string()).await
+}
+
+/// Interrupt a running review session (by its `threadId`). The terminal `turnCompleted` (status
+/// `interrupted`) follows on the `review:event` stream. Thin wrapper over [`stop_session_by_id`].
+#[tauri::command]
+pub async fn stop_review<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> AppResult<()> {
+    stop_session_by_id(&app, &state, &session_id).await
+}
+
+/// Absorb a stop-review TOCTOU race (AB#1069): given the `stop_session_by_id` result and whether the
+/// session is STILL active immediately after, decide the outbox action result. A stop that FAILED on
+/// a session that has since vanished is the benign race (the session ended between our lookup and the
+/// interrupt) — the stop's intent ("no running turn") already holds, so → `Ok(())` (idempotent, no
+/// dead-letter). A stop that failed while the session is STILL active is a genuine interrupt failure →
+/// propagate for retry. Pure (no `AppHandle`) so the contract is unit-tested without a Tauri runtime.
+fn absorb_stop_toctou(result: AppResult<()>, still_active: bool) -> AppResult<()> {
+    match result {
+        Ok(()) => Ok(()),
+        // The session vanished mid-stop → the race resolved in our favor; the intent holds.
+        Err(_) if !still_active => Ok(()),
+        // Still active but the interrupt errored → a real failure, retry it.
+        Err(e) => Err(e),
+    }
+}
+
+/// The outbox action executor's stop-review entry (AB#1069): interrupt the in-flight session for
+/// `(project_id, pr_number, kind)`. Resolves the triple to a [`StopTarget`] (AB#1069 F4) and acts on
+/// each of the three states:
+/// - [`Absent`](StopTarget::Absent) → `Ok(())`. IDEMPOTENT for at-least-once execution — a crash-replay
+///   or a stop fired after the review already self-completed finds nothing to stop, and that intent
+///   ("no running turn") already holds; an `Err` here would dead-letter a no-op.
+/// - [`Reserved`](StopTarget::Reserved) → a RETRYABLE `Err`. A start is mid-flight (reserved, not yet
+///   promoted to a `thread_id`): returning `Ok` would DROP the stop and let the start promote to
+///   `Running` unimpeded (the F4 bug). Retrying re-resolves on a later sweep — by then the start has
+///   promoted to `Live` (interrupt it) or failed (→ `Absent` → `Ok`). The reservation→promotion window
+///   is the `thread/start` latency, so this resolves within a sweep or two.
+/// - [`Live`](StopTarget::Live) → interrupt by `thread_id`. If the stop FAILS, re-resolve: a session
+///   that vanished mid-stop (no longer `Live`) is the benign TOCTOU race → absorb to `Ok`; a still-`Live`
+///   session means a genuine interrupt failure → propagate for retry (see [`absorb_stop_toctou`]).
+///
+/// `pub(crate)` for the composition root; re-validates the replayed payload fail-closed (`kind` here is
+/// a persisted string, so unlike the start path it IS validated).
+pub(crate) async fn stop_for_outbox<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    project_id: &str,
+    pr_number: u64,
+    kind: &str,
+) -> AppResult<()> {
+    validate_kind(kind)?;
+    validate_pr_number(pr_number)?;
+    let thread_id = match state.sessions.stop_target(project_id, pr_number, kind) {
+        StopTarget::Absent => return Ok(()), // nothing in flight → intent holds (idempotent)
+        // A start is mid-flight (reserved, no thread_id yet): a RETRYABLE error so the stop is not
+        // dropped — the next sweep finds it promoted (Live) or failed (Absent).
+        StopTarget::Reserved => {
+            return Err(AppError::new(format!(
+            "stop-review：PR {pr_number} 的 {kind} 评审正在启动（reserved，未 promote），稍后重试"
+        )))
+        }
+        StopTarget::Live(thread_id) => thread_id,
+    };
+    let result = stop_session_by_id(app, state, &thread_id).await;
+    // Re-resolve (typed, not string-matched): if the session is no longer Live, a stop error was the
+    // benign TOCTOU race; only a still-Live session's error is a real failure worth retrying.
+    let still_live = matches!(
+        state.sessions.stop_target(project_id, pr_number, kind),
+        StopTarget::Live(_)
+    );
+    absorb_stop_toctou(result, still_live)
 }
 
 /// Snapshot of all review sessions (running + finished) for the UI — the IN-MEMORY
@@ -503,5 +667,44 @@ mod tests {
         for ok in [1, 7, 160, u64::MAX] {
             assert!(validate_pr_number(ok).is_ok(), "pr={ok} must be accepted");
         }
+    }
+
+    // AB#1069 acceptance lock: the outbox executor maps BOTH `Started` AND `Deduped` to `Ok(())` —
+    // the OPPOSITE of the manual path (`dispatch_engine`, `Deduped → Err`). A `Deduped` means the
+    // review is already in flight, so the action's intent holds; mapping it to `Err` would make the
+    // worker retry and eventually DEAD-LETTER a review that started successfully. Mirrors
+    // `dispatch::auto_dispatch`'s "a dedup is not a failure" arm.
+    #[test]
+    fn ok_on_started_or_deduped_treats_both_as_success() {
+        assert!(
+            ok_on_started_or_deduped(StartReviewOutcome::Started("t1".to_string())).is_ok(),
+            "Started → Ok"
+        );
+        assert!(
+            ok_on_started_or_deduped(StartReviewOutcome::Deduped).is_ok(),
+            "Deduped → Ok (NOT a failure → no retry/dead-letter)"
+        );
+    }
+
+    // AB#1069 idempotent stop: `stop_for_outbox` re-checks the registry after a failed stop. A stop
+    // error whose session has since vanished is the benign TOCTOU race → Ok (no dead-letter); a stop
+    // error on a still-active session is a real failure → propagate. (The "no live session at all"
+    // path is covered by `session::active_session_for` returning None → early Ok, tested in
+    // `session.rs`.)
+    #[test]
+    fn absorb_stop_toctou_only_propagates_real_failures() {
+        // Success stays success regardless of liveness.
+        assert!(absorb_stop_toctou(Ok(()), true).is_ok());
+        assert!(absorb_stop_toctou(Ok(()), false).is_ok());
+        // Stop error + session gone → benign race, absorbed to Ok (idempotent).
+        assert!(
+            absorb_stop_toctou(Err(AppError::new("未找到 review 会话")), false).is_ok(),
+            "session vanished mid-stop → Ok (no dead-letter)"
+        );
+        // Stop error + session still active → a genuine interrupt failure, propagated for retry.
+        assert!(
+            absorb_stop_toctou(Err(AppError::new("interrupt failed")), true).is_err(),
+            "still-active session's stop error must propagate"
+        );
     }
 }

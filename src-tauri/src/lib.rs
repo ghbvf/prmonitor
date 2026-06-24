@@ -226,13 +226,16 @@ fn build_app() {
                     })
                 }
             }));
-            // Install the ACTION OUTBOX executor (AB#1066) — the ONLY place that names
-            // `review::notify`. The outbox slice holds this only as the OPAQUE `ActionExecutor`; the
-            // exhaustive `match ActionKind` HERE is the Hard carrier routing each kind to its
-            // provider (today the desktop notifier). A new `ActionKind` without an arm is a compile
-            // error — the missing channel cannot be expressed. The closure deserializes the stored
-            // payload (a `model::Notification` JSON) and delivers it; a deser/deliver Err propagates
-            // so the worker retries / dead-letters rather than marking the row falsely `done`.
+            // Install the ACTION OUTBOX executor (AB#1066/AB#1069) — the ONLY place that names
+            // `review::notify` / `review::commands`. The outbox slice holds this only as the OPAQUE
+            // `ActionExecutor`; the exhaustive `match ActionKind` HERE is the Hard carrier routing
+            // each kind to its provider — `Notification` → the desktop notifier; `Review`/`Check` →
+            // the review funnel (`run_review_action`); `StopReview` → the idempotent stop
+            // (`run_stop_action`). A new `ActionKind` without an arm is a compile error — the missing
+            // action cannot be expressed. Each arm deserializes the stored payload; a deser/execute
+            // Err propagates so the worker retries / dead-letters rather than marking the row falsely
+            // `done`. The review arms map `Deduped → Ok` (a review already in flight is success, not a
+            // retry — `ok_on_started_or_deduped`), the OPPOSITE of the manual command path.
             let outbox_executor: outbox::ActionExecutor =
                 Arc::new(|app: tauri::AppHandle, action: outbox::OutboxAction| {
                     Box::pin(async move {
@@ -251,6 +254,13 @@ fn build_app() {
                                 )
                                 .await
                             }
+                            model::ActionKind::Review => {
+                                run_review_action(&app, &action, "review").await
+                            }
+                            model::ActionKind::Check => {
+                                run_review_action(&app, &action, "check").await
+                            }
+                            model::ActionKind::StopReview => run_stop_action(&app, &action).await,
                         }
                     })
                 });
@@ -493,6 +503,64 @@ fn make_dispatcher<R: tauri::Runtime>(
         let app = app.clone();
         Box::pin(run_auto_dispatch(app, project_id, cands))
     })
+}
+
+/// Execute an AB#1069 `review` / `check` outbox action (the composition root's executor arm body):
+/// deserialize the routing payload and run it through the review funnel
+/// ([`review::commands::start_for_outbox`], which folds in the `Started`/`Deduped` → `Ok` mapping and
+/// the PR #47 F1 `stop_codex` skip). `kind` is the funnel string the executor derived from the sealed
+/// [`model::ActionKind`] variant (`Review` → `"review"`, `Check` → `"check"`), so it is valid by
+/// construction. A deser `Err` propagates so the worker retries / dead-letters rather than marking the
+/// row falsely `done`.
+///
+/// Routing key is `action.project_id` — the outbox ROW's single-source key (AB#1069 F3), NOT a
+/// payload copy: the payload carries only `pr_number`, so a row shown under project A can't start
+/// project B's review. Retry semantics (at-least-once): a `Deduped` (review already in flight)
+/// resolves `Ok` so a crash-replay never dead-letters a running review. A prior attempt that FAILED
+/// mid-start leaves a `Failed` session, which does NOT block a re-dispatch (`try_reserve_pair`
+/// excludes `Failed`), so a retry genuinely re-runs the start — the intended at-least-once behavior.
+async fn run_review_action(
+    app: &tauri::AppHandle,
+    action: &outbox::OutboxAction,
+    kind: &str,
+) -> error::AppResult<()> {
+    let payload: model::ReviewActionPayload = serde_json::from_str(&action.payload)
+        .map_err(|e| error::AppError::new(format!("outbox review action 反序列化失败：{e}")))?;
+    let state = app.state::<AppState>();
+    review::commands::start_for_outbox(
+        app,
+        state.inner(),
+        &action.project_id,
+        payload.pr_number,
+        kind,
+    )
+    .await
+}
+
+/// Execute an AB#1069 `stop-review` outbox action (the composition root's executor arm body):
+/// deserialize the `(pr, kind)` payload and interrupt the matching in-flight session
+/// ([`review::commands::stop_for_outbox`], keyed by the ROW's `project_id` + payload `(pr, kind)`).
+/// IDEMPOTENT — no live session is a benign `Ok(())`, so an at-least-once replay (or a stop fired
+/// after the review already self-completed) never dead-letters; a bare reservation retries (F4).
+/// Routing key is `action.project_id` (the row's single source, AB#1069 F3), not a payload copy.
+/// A deser `Err` propagates (retry / dead-letter).
+async fn run_stop_action(
+    app: &tauri::AppHandle,
+    action: &outbox::OutboxAction,
+) -> error::AppResult<()> {
+    let payload: model::StopReviewActionPayload =
+        serde_json::from_str(&action.payload).map_err(|e| {
+            error::AppError::new(format!("outbox stop-review action 反序列化失败：{e}"))
+        })?;
+    let state = app.state::<AppState>();
+    review::commands::stop_for_outbox(
+        app,
+        state.inner(),
+        &action.project_id,
+        payload.pr_number,
+        &payload.kind,
+    )
+    .await
 }
 
 /// Composition-root assembly for one auto-trigger cycle: this is the ONE place that

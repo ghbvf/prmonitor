@@ -406,12 +406,14 @@ pub fn get_raw(db: &Database, id: i64) -> AppResult<Option<String>> {
 
 /// Map one queried row to an [`OutboxEntry`]. The `kind` / `status` columns degrade leniently so a
 /// tampered row still LISTS rather than failing the whole page: `status_from_wire` defaults a
-/// corrupt value to `Dead`, and `kind` falls back to `ActionKind::default()` (currently
-/// `Notification`) — a diagnostic lie for an unrecognized kind, but acceptable for a read-only list
-/// (the strict `kind_from_wire` on the side-effectful [`claim_due`] path instead DEAD-LETTERS such a
-/// row, so it surfaces as terminal `dead` and stops re-appearing). NOTE: once a second `ActionKind`
-/// exists, a genuinely-corrupt row would still list as `Notification` here — acceptable since the
-/// schema-version guard rules out a legitimate future kind reaching an older binary.
+/// corrupt value to `Dead`, and `kind` falls back to `ActionKind::default()` (`Notification`) — a
+/// diagnostic lie for an UNRECOGNIZED kind, but acceptable for a read-only list (the strict
+/// `kind_from_wire` on the side-effectful [`claim_due`] path instead DEAD-LETTERS such a row, so it
+/// surfaces as terminal `dead` and stops re-appearing). Every KNOWN kind
+/// (`notification`/`review`/`check`/`stopReview`, AB#1069) hydrates correctly — only a genuinely
+/// unrecognized string falls back to `Notification`, and the schema-version guard rules out a
+/// legitimate future kind reaching an older binary. (`hydrate_entry_round_trips_all_known_kinds`
+/// locks this so a new kind can't silently list as `Notification`.)
 fn hydrate_entry(r: &rusqlite::Row) -> rusqlite::Result<OutboxEntry> {
     let kind_wire: String = r.get(2)?;
     let status_wire: String = r.get(4)?;
@@ -631,20 +633,55 @@ mod tests {
         assert_eq!(status_from_wire("???"), ActionStatus::Dead);
     }
 
-    // `ActionKind` wire is strict on the side-effectful path (AB#1066): known kinds round-trip;
-    // an unknown value is an explicit error (claim_due SKIPS such a row rather than mis-routing).
+    // `ActionKind` wire is strict on the side-effectful path (AB#1066/AB#1069): every known kind
+    // round-trips (a `"review"` row is parsed + executed, NOT quarantined); an unknown value is an
+    // explicit error (claim_due DEAD-LETTERS such a row rather than mis-routing). `"email"` stays
+    // unknown by design — email/IM are NotificationKind channels, not ActionKinds (AB#1069).
     #[test]
     fn kind_wire_round_trips_known_and_errors_on_unknown() {
-        let wire = kind_as_wire(ActionKind::Notification);
-        assert_eq!(wire, "notification");
-        assert_eq!(
-            kind_from_wire(&wire).expect("known"),
-            ActionKind::Notification
-        );
+        for (kind, wire) in [
+            (ActionKind::Notification, "notification"),
+            (ActionKind::Review, "review"),
+            (ActionKind::Check, "check"),
+            (ActionKind::StopReview, "stopReview"),
+        ] {
+            assert_eq!(kind_as_wire(kind), wire, "{kind:?} → {wire}");
+            assert_eq!(
+                kind_from_wire(wire).expect("known kind parses (not quarantined)"),
+                kind,
+                "{wire} → {kind:?}"
+            );
+        }
         assert!(
             kind_from_wire("email").is_err(),
-            "unknown kind is an explicit error"
+            "email is a NotificationKind channel, not an ActionKind — stays an explicit error"
         );
+    }
+
+    // The read-only LIST path (`hydrate_entry`) must surface every KNOWN kind correctly — the lenient
+    // `kind_from_wire(...).unwrap_or_default()` fallback (→ Notification) is ONLY for an unrecognized
+    // string, never for a legitimate AB#1069 kind. This locks that a `review`/`check`/`stopReview` row
+    // does NOT silently list as `Notification` in the panel (the "diagnostic lie" must not bite a
+    // real kind).
+    #[test]
+    fn hydrate_entry_round_trips_all_known_kinds() {
+        let db = Database::open_in_memory().expect("open db");
+        for (i, kind) in [
+            ActionKind::Notification,
+            ActionKind::Review,
+            ActionKind::Check,
+            ActionKind::StopReview,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = enqueue(&db, "p1", kind, "s", "{}", 100 + i as u64).expect("enqueue");
+            let entry = get_entry(&db, id).expect("get").expect("exists");
+            assert_eq!(
+                entry.kind, kind,
+                "row {id} hydrates to {kind:?}, not a fallback"
+            );
+        }
     }
 
     // claim_due QUARANTINES (dead-letters) a corrupt-kind row (AB#1066): a tampered `kind` the

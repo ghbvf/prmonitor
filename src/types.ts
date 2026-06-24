@@ -349,9 +349,10 @@ export function outboxStatusLabel(s: OutboxStatus): string {
 
 // The kind of action an outbox entry performs — mirrors the Rust `ActionKind` enum's camelCase
 // serde form (locked by the model.rs golden test). Single-sourced as an `as const` array
-// (mirrors OUTBOX_STATUSES): the type is DERIVED from the array. Currently only "notification"
-// (the sole action the rule engine enqueues).
-export const ACTION_KINDS = ["notification"] as const;
+// (mirrors OUTBOX_STATUSES): the type is DERIVED from the array. `notification` (AB#1066) +
+// `review`/`check`/`stopReview` (AB#1069 action executor — reuse the review funnel). email/IM are
+// NOT kinds here: they are notification channels under `notification` (see Rust `NotificationKind`).
+export const ACTION_KINDS = ["notification", "review", "check", "stopReview"] as const;
 export type ActionKind = (typeof ACTION_KINDS)[number];
 
 // A human-readable label for an ActionKind, rendered as the outbox row's kind tag.
@@ -361,6 +362,12 @@ export function outboxKindLabel(k: ActionKind): string {
   switch (k) {
     case "notification":
       return "通知 / Notification";
+    case "review":
+      return "评审 / Review";
+    case "check":
+      return "复查 / Check";
+    case "stopReview":
+      return "停止评审 / Stop Review";
     default:
       return assertNever(k);
   }

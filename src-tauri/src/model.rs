@@ -444,24 +444,79 @@ pub enum NotificationKind {
     // future AB#1070: Email, Feishu, Telegram, WeChatWork
 }
 
-/// The kind of side effect a persisted outbox row executes (AB#1066, epic AB#1078).
+/// The kind of side effect a persisted outbox row executes (AB#1066/AB#1069, epic AB#1078).
 ///
 /// **Hard carrier** (sealed enum): the outbox's executor router branches on an exhaustive
 /// `match ActionKind { ... }` (installed by the composition root in `lib.rs`, the only place that
-/// names `review::notify`), so adding a variant without an arm is a compile error — the missing
-/// action cannot be expressed. The store's `status`-style wire mapping
-/// ([`crate::outbox::store::kind_as_wire`]) is likewise exhaustive. Today ONE variant
-/// (`Notification`), already load-bearing at the review-completion enqueue site.
+/// names `review::notify` / `review::commands`), so adding a variant without an arm is a compile
+/// error — the missing action cannot be expressed. The store's wire mapping
+/// ([`crate::outbox::store::kind_as_wire`] / `kind_from_wire`) round-trips through serde, so a new
+/// variant is carried automatically (no exhaustive store edit). Variants: `Notification` (the
+/// review-completion desktop notification, AB#1066) + `Review` / `Check` / `StopReview` (the
+/// AB#1069 action executor, each reusing the existing review funnel).
 ///
-/// AB#1069/1070 design reservation: future kinds slot in as `Email`, `ImNotify`,
-/// `WebhookForward`, `Review`, … each forcing a new executor arm. Wire string pinned camelCase;
-/// the serde golden locks it (Medium carrier).
+/// **Email / IM are NOT ActionKinds — they are [`NotificationKind`] channels** under the single
+/// `Notification` action: "send via email/Feishu/…" is one notification delivered over a different
+/// channel, sharing the unified status/retry/dead-letter lifecycle, not a distinct action class.
+/// AB#1069/1070 design reservation for genuinely-distinct future kinds: `WebhookForward`,
+/// `WorkItemComment` — each forcing a new executor arm. Wire string pinned camelCase; the serde
+/// golden locks it (Medium carrier).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum ActionKind {
+    /// The review-completion desktop notification (AB#1066) → `"notification"`.
     #[default]
     Notification,
-    // future AB#1069/1070: Email, ImNotify, WebhookForward, Review, WorkItemComment
+    /// Start a full review for a PR via the review funnel (AB#1069) → `"review"`.
+    Review,
+    /// Start a lightweight check for a PR via the review funnel (AB#1069) → `"check"`.
+    Check,
+    /// Interrupt an in-flight review/check session for a `(project, pr, kind)` (AB#1069) →
+    /// `"stopReview"`. Idempotent: no live session is a benign no-op success, not a failure.
+    StopReview,
+    // future genuinely-distinct kinds (AB#1069/1070): WebhookForward, WorkItemComment.
+    // Email/IM are NotificationKind channels, NOT kinds here — see the doc comment.
+}
+
+/// The outbox payload for a [`ActionKind::Review`] / [`ActionKind::Check`] action (AB#1069): the PR
+/// the executor reviews via the review funnel (`review::commands::start_for_outbox`).
+///
+/// **Routing key is NOT here (AB#1069 F3).** The owning project is the OUTBOX ROW's single-source
+/// routing key ([`crate::outbox::OutboxAction::project_id`] / [`OutboxEntry::project_id`] — what the
+/// panel + `outbox:updated` events route by); the executor reads `action.project_id`, never a payload
+/// copy. Carrying `project_id` here too would be a dual source of truth: a drifted/forged payload
+/// could route a row shown under project A to project B's review. The action MODE (review vs check) is
+/// likewise the sealed [`ActionKind`] variant, not a field — so neither the project nor the kind can be
+/// forged in the persisted payload.
+///
+/// Backend-internal (read only by the `lib.rs` executor; a future Rule Engine, AB#1068, produces it),
+/// so NOT mirrored in `src/types.ts`, like [`Notification`] / [`Candidate`]. It IS persisted in the
+/// outbox `payload` column and replayed, so its camelCase shape must stay stable. serde camelCase;
+/// the golden locks it (Medium carrier).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewActionPayload {
+    /// The PR / MR number to review (re-validated `> 0` at the executor boundary).
+    pub pr_number: u64,
+}
+
+/// The outbox payload for a [`ActionKind::StopReview`] action (AB#1069): which in-flight session to
+/// interrupt, keyed (together with the row's `project_id`) by `(project, pr, kind)` — the review
+/// funnel's native session key, not an engine-assigned thread id, so it is restart-stable and
+/// producible by a future Rule Engine (AB#1068). The executor resolves it to a live `thread_id` via
+/// `SessionRegistry::stop_target`; no live session is a benign no-op (idempotent).
+///
+/// **Routing key is NOT here (AB#1069 F3):** the owning project is the OUTBOX ROW's single-source
+/// `project_id` (the executor reads `action.project_id`), never a payload copy — same anti-dual-source
+/// rationale as [`ReviewActionPayload`]. Same backend-internal, persisted-and-replayed status (not
+/// mirrored in `src/types.ts`). serde camelCase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopReviewActionPayload {
+    /// The PR / MR number whose session to stop (re-validated `> 0` at the executor boundary).
+    pub pr_number: u64,
+    /// Which session mode to stop: `"review"` | `"check"` (re-validated at the executor boundary).
+    pub kind: String,
 }
 
 /// The lifecycle state of one persisted outbox action (AB#1066, epic AB#1078): surfaced to the
@@ -1061,6 +1116,18 @@ mod tests {
             "notification"
         );
         assert_eq!(
+            serde_json::to_value(ActionKind::Review).expect("ActionKind serializes"),
+            "review"
+        );
+        assert_eq!(
+            serde_json::to_value(ActionKind::Check).expect("ActionKind serializes"),
+            "check"
+        );
+        assert_eq!(
+            serde_json::to_value(ActionKind::StopReview).expect("ActionKind serializes"),
+            "stopReview"
+        );
+        assert_eq!(
             serde_json::to_value(ActionKind::default()).expect("ActionKind serializes"),
             "notification"
         );
@@ -1125,5 +1192,47 @@ mod tests {
         let fv = serde_json::to_value(&fresh).expect("OutboxEntry serializes");
         assert_eq!(fv["status"], "done");
         assert_eq!(fv["lastError"], serde_json::Value::Null);
+    }
+
+    // Wire lock for the AB#1069 review/check action payload (Medium carrier per ai-robust.md):
+    // backend-internal (read by the lib.rs executor, produced by a future Rule Engine), so NOT
+    // mirrored in `src/types.ts` — but persisted in the outbox `payload` column and replayed, so its
+    // camelCase shape must stay stable. Round-trips (the executor deserializes it).
+    #[test]
+    fn review_action_payload_wire_shape_is_camel_case() {
+        let payload = ReviewActionPayload { pr_number: 7 };
+        let v = serde_json::to_value(&payload).expect("ReviewActionPayload serializes");
+        // camelCase present, snake_case absent.
+        assert!(v.get("prNumber").is_some());
+        assert!(v.get("pr_number").is_none());
+        // F3: the routing key is the outbox ROW's project_id, NOT a payload field — assert it is
+        // absent so a producer can't reintroduce a dual project source.
+        assert!(v.get("projectId").is_none());
+        assert!(v.get("project_id").is_none());
+        // Round-trips — the executor reads it back from the stored payload.
+        let back: ReviewActionPayload =
+            serde_json::from_value(v).expect("ReviewActionPayload round-trips");
+        assert_eq!(back, payload);
+    }
+
+    // Wire lock for the AB#1069 stop-review action payload (Medium carrier): same backend-internal,
+    // persisted-and-replayed status as the review payload; carries the `(pr, kind)` session key (the
+    // project is the outbox row's, AB#1069 F3). Round-trips.
+    #[test]
+    fn stop_review_action_payload_wire_shape_is_camel_case() {
+        let payload = StopReviewActionPayload {
+            pr_number: 7,
+            kind: "review".to_string(),
+        };
+        let v = serde_json::to_value(&payload).expect("StopReviewActionPayload serializes");
+        assert!(v.get("prNumber").is_some());
+        assert!(v.get("kind").is_some());
+        assert!(v.get("pr_number").is_none());
+        // F3: routing key is the row's project_id, not a payload field.
+        assert!(v.get("projectId").is_none());
+        assert!(v.get("project_id").is_none());
+        let back: StopReviewActionPayload =
+            serde_json::from_value(v).expect("StopReviewActionPayload round-trips");
+        assert_eq!(back, payload);
     }
 }

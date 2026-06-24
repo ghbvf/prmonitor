@@ -32,6 +32,24 @@ use crate::review::engine::StartReviewOutcome;
 /// A review session is identified by its codex `threadId`.
 pub type ThreadId = String;
 
+/// The result of resolving a `(project, pr, kind)` for a stop-review action (AB#1069 F4): the
+/// three states an interrupt must tell apart, so a stop is never silently dropped.
+///
+/// - [`Live`](Self::Live): a promoted in-flight session — interrupt it by `thread_id`.
+/// - [`Reserved`](Self::Reserved): a start is mid-flight ([`SessionRegistry::try_reserve_pair`] taken
+///   but [`promote_reservation`](SessionRegistry::promote_reservation) not yet run), so there is no
+///   `thread_id` to interrupt YET. The stop intent must NOT be dropped (it would let the start promote
+///   to `Running` unimpeded) — the caller retries until it promotes to `Live` (then interrupt) or the
+///   start fails (then [`Absent`](Self::Absent)).
+/// - [`Absent`](Self::Absent): nothing in flight — the stop's intent ("no running turn") already
+///   holds, so it is a benign idempotent success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopTarget {
+    Live(ThreadId),
+    Reserved,
+    Absent,
+}
+
 /// The skill `name` attached to every review turn (matches the local project
 /// skill under `<repo_root>/<skillRelPath>`).
 const PR_REVIEW_SKILL: &str = "pr-review";
@@ -457,6 +475,40 @@ impl SessionRegistry {
                 .map(|(_, pr, kind)| (*pr, kind.clone())),
         );
         pairs
+    }
+
+    /// Resolve `(project_id, pr_number, kind)` to a [`StopTarget`] for the outbox stop-review action
+    /// (AB#1069 F4): a [`Live`](StopTarget::Live) in-flight session (interrupt by `thread_id`), a bare
+    /// [`Reserved`](StopTarget::Reserved) start mid-flight (no `thread_id` yet — the caller must retry
+    /// so the stop is not dropped), or [`Absent`](StopTarget::Absent) (nothing to stop — idempotent).
+    ///
+    /// The inverse of [`Self::active_pairs`] (which drops the thread id and lumps reservations in with
+    /// sessions). A `Live` session takes priority over a reservation for the same triple — the
+    /// promote-into-session swap is atomic under this same lock, so the two never both register, but
+    /// checking sessions first is the correct precedence. Project-scoped (#35). Synchronous (no
+    /// `.await` under the lock).
+    pub fn stop_target(&self, project_id: &str, pr_number: u64, kind: &str) -> StopTarget {
+        let st = self.inner.lock().unwrap();
+        if let Some(s) = st.sessions.values().find(|s| {
+            s.project_id == project_id
+                && s.pr_number == pr_number
+                && s.kind == kind
+                && matches!(
+                    s.status,
+                    SessionStatus::Starting | SessionStatus::Running | SessionStatus::Interrupting
+                )
+        }) {
+            return StopTarget::Live(s.thread_id.clone());
+        }
+        // A reserved-but-not-yet-promoted triple: a start is mid-flight with no `thread_id` to
+        // interrupt yet. NOT `Absent` — dropping the stop here would let the start promote unimpeded.
+        if st
+            .reserved
+            .contains(&(project_id.to_string(), pr_number, kind.to_string()))
+        {
+            return StopTarget::Reserved;
+        }
+        StopTarget::Absent
     }
 
     /// Subscribe to this `thread_id`'s terminal completion (AB#1042). Returns a
@@ -1557,6 +1609,78 @@ mod tests {
                 (2, "check".to_string()),
                 (3, "review".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn stop_target_resolves_live_terminal_and_absent() {
+        // AB#1069 F4: the stop-review executor's reverse lookup. A live in-flight session → Live(id);
+        // terminal / absent / wrong-project → Absent (the idempotency hinge — Absent → the executor
+        // no-ops the stop instead of erroring).
+        let reg = SessionRegistry::default();
+        let info = |thread: &str, project: &str, pr: u64, kind: &str, status| {
+            reg.insert(SessionInfo {
+                project_id: project.to_string(),
+                thread_id: thread.to_string(),
+                turn_id: String::new(),
+                pr_number: pr,
+                kind: kind.to_string(),
+                engine_kind: EngineKind::Codex,
+                status,
+                created_at_epoch: 0,
+                comment_url: None,
+            });
+        };
+        info("a", "p1", 1, "review", SessionStatus::Running);
+        info("b", "p1", 1, "check", SessionStatus::Starting); // same PR, different kind
+        info("c", "p1", 2, "review", SessionStatus::Done); // terminal → not stoppable
+
+        // In-flight pair → Live(thread_id).
+        assert_eq!(
+            reg.stop_target("p1", 1, "review"),
+            StopTarget::Live("a".to_string())
+        );
+        // Kind is part of the key — review and check for the same PR are independent sessions.
+        assert_eq!(
+            reg.stop_target("p1", 1, "check"),
+            StopTarget::Live("b".to_string())
+        );
+        // Terminal session → Absent (finished, nothing to stop).
+        assert_eq!(reg.stop_target("p1", 2, "review"), StopTarget::Absent);
+        // Absent pair → Absent.
+        assert_eq!(reg.stop_target("p1", 99, "review"), StopTarget::Absent);
+        // Project-scoped (#35): another project's id never matches.
+        assert_eq!(reg.stop_target("p2", 1, "review"), StopTarget::Absent);
+    }
+
+    #[test]
+    fn stop_target_reports_reserved_for_bare_reservation() {
+        // AB#1069 F4: a reserved-but-not-yet-promoted pair has no thread_id to interrupt YET, but the
+        // stop must NOT be dropped (that would let the start promote to Running unimpeded) — it is
+        // `Reserved`, distinct from `Absent`, so the executor retries until promotion / start failure.
+        // (`active_pairs` lumps reservations in as "taken"; `stop_target` keeps the distinction.)
+        let reg = SessionRegistry::default();
+        assert!(reg.try_reserve_pair("p1", 7, "review"));
+        assert!(reg.active_pairs("p1").contains(&(7, "review".to_string())));
+        assert_eq!(reg.stop_target("p1", 7, "review"), StopTarget::Reserved);
+        // A different pair is still Absent.
+        assert_eq!(reg.stop_target("p1", 7, "check"), StopTarget::Absent);
+    }
+
+    // Characterization (AB#1069, Medium carrier): try_reserve_pair consults ONLY in-memory state,
+    // NOT the durable `review_session` table. So after a restart (the registry is empty and any
+    // orphaned durable row was flipped to `failed`), a `(project, pr, kind)` whose review already
+    // ran is reservable again — i.e. an at-least-once outbox Review action replayed across a restart
+    // CAN start a duplicate review (the known one-per-crash-window limitation, mirroring the
+    // `auto_dispatch` ledger). This pins that limitation; the durable-reservation follow-up
+    // (backlog) will flip this assertion when the cross-restart guard lands.
+    #[test]
+    fn try_reserve_pair_is_in_memory_only_documents_restart_duplicate_window() {
+        let reg = SessionRegistry::default(); // a fresh post-restart registry
+        assert!(
+            reg.try_reserve_pair("p1", 7, "review"),
+            "a fresh (empty) registry reserves freely — no durable guard is consulted, so a \
+             replayed Review action can re-start a review that already ran before a restart"
         );
     }
 
