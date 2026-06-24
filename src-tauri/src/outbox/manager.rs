@@ -19,7 +19,7 @@ use tokio::time::{interval, MissedTickBehavior};
 
 use crate::config::service as config_service;
 use crate::db::Database;
-use crate::outbox::{service, ActionExecutor};
+use crate::outbox::{service, ActionExecutor, ClaimReleaser};
 
 /// How often the worker wakes to sweep for due retries even with no new enqueue (AB#1066). Enqueue
 /// also `wake()`s the loop, so this interval only bounds RETRY latency, not first-run latency.
@@ -44,14 +44,54 @@ impl OutboxManager {
     /// task is live is a no-op. `executor` is the injected side-effect router (the only place naming
     /// `review::notify`, in `lib.rs`); the spawned task owns it, so the manager itself names no
     /// foreign type.
-    pub fn start(&self, app: tauri::AppHandle, executor: ActionExecutor) {
+    ///
+    /// **AB#1204 ordering guard (F3, Medium runtime guard).** `before_worker` is an OPAQUE
+    /// composition-root closure (same review-blind injection shape as [`ActionExecutor`] /
+    /// [`ClaimReleaser`] — the manager sees only `FnOnce`, never a `review` type) that MUST run
+    /// before the worker can process ANY row. We invoke it SYNCHRONOUSLY here, BEFORE the worker task
+    /// is spawned — so it is impossible for the worker to claim/execute a row before it has run. In
+    /// `lib.rs` this closure is the startup `fail_orphaned_sessions` reconcile: a crash-replayed
+    /// outbox review re-enters `start_for_outbox` and reads its claim's `review_session` row, which
+    /// MUST already be reconciled to a stable terminal status (a mid-flight session flipped to
+    /// `failed`, not left `running`) for `replayed_review_should_suppress` to decide correctly.
+    /// Folding the order INTO `start` replaces the previous Soft "keep this call above `outbox.start`"
+    /// comment guard: reconcile-not-run-before-worker is now unrepresentable rather than convention.
+    pub fn start(
+        &self,
+        app: tauri::AppHandle,
+        executor: ActionExecutor,
+        release_terminal: ClaimReleaser,
+        before_worker: impl FnOnce() + Send + 'static,
+    ) {
+        // The real spawn step is deferred to `start_with_spawn` so the order-sensitive control flow
+        // (idempotency gate → `before_worker` → spawn) is unit-testable with a FAKE spawn closure
+        // (no `AppHandle` / tokio runtime needed) — see the `before_worker_runs_before_spawn` test.
+        let wake = Arc::clone(&self.wake);
+        let stop = Arc::clone(&self.stop);
+        self.start_with_spawn(before_worker, move || {
+            spawn(worker_loop(app, executor, release_terminal, wake, stop))
+        });
+    }
+
+    /// The order-sensitive core of [`start`](Self::start), parameterized over the SPAWN step so the
+    /// AB#1204 F3 ordering invariant is unit-testable without an `AppHandle`. Idempotent: a second
+    /// call while a task is live is a no-op (and does NOT re-run `before_worker`). Otherwise it runs
+    /// `before_worker()` SYNCHRONOUSLY, THEN `spawn_worker()` to start the task — so the worker can
+    /// never process a row before the pre-worker reconcile has completed.
+    fn start_with_spawn(
+        &self,
+        before_worker: impl FnOnce(),
+        spawn_worker: impl FnOnce() -> JoinHandle<()>,
+    ) {
         let mut task = self.task.lock().unwrap();
         if task.is_some() {
             return;
         }
-        let wake = Arc::clone(&self.wake);
-        let stop = Arc::clone(&self.stop);
-        *task = Some(spawn(worker_loop(app, executor, wake, stop)));
+        // Run the injected pre-worker step (AB#1204: orphan-session reconcile) SYNCHRONOUSLY before
+        // the worker exists. The worker task is spawned only AFTER this returns, so no row can be
+        // processed ahead of it — the load-bearing ORDERING is enforced by control flow, not a note.
+        before_worker();
+        *task = Some(spawn_worker());
     }
 
     /// Wake the worker to sweep now (called by `service::enqueue` and `outbox_retry`). A no-op if
@@ -85,6 +125,7 @@ impl OutboxManager {
 async fn worker_loop(
     app: tauri::AppHandle,
     executor: ActionExecutor,
+    release_terminal: ClaimReleaser,
     wake: Arc<Notify>,
     stop: Arc<Notify>,
 ) {
@@ -117,7 +158,7 @@ async fn worker_loop(
         // Run the cycle to completion, but let a stop signal cut it short (unified cancellation,
         // mirroring `pr::scheduler::run_loop`).
         tokio::select! {
-            _ = service::run_due_once(&app, db.inner(), &executor, notification_ttl_secs) => {}
+            _ = service::run_due_once(&app, db.inner(), &executor, &release_terminal, notification_ttl_secs) => {}
             _ = stop.notified() => return,
         }
     }
@@ -134,5 +175,52 @@ mod tests {
         let m = OutboxManager::default();
         m.wake();
         m.shutdown(); // takes a `None` task handle — no panic
+    }
+
+    // AB#1204 F3 ordering guard (Medium runtime guard): `start` runs `before_worker` BEFORE spawning
+    // the worker — so the orphan-session reconcile cannot be raced by row processing. Driven through
+    // `start_with_spawn` with a FAKE spawn closure (no AppHandle): a shared order log records that
+    // "reconcile" (the `before_worker` body) is pushed BEFORE "spawn-worker" (the spawn step).
+    #[tokio::test]
+    async fn before_worker_runs_before_spawn() {
+        use std::sync::Mutex as StdMutex;
+
+        let order: Arc<StdMutex<Vec<&'static str>>> = Arc::new(StdMutex::new(Vec::new()));
+        let m = OutboxManager::default();
+
+        let before = {
+            let order = Arc::clone(&order);
+            move || order.lock().unwrap().push("reconcile")
+        };
+        let spawn_worker = {
+            let order = Arc::clone(&order);
+            move || -> JoinHandle<()> {
+                order.lock().unwrap().push("spawn-worker");
+                // A real (trivial) worker handle so `task` is `Some` afterwards (idempotency).
+                spawn(async {})
+            }
+        };
+
+        m.start_with_spawn(before, spawn_worker);
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["reconcile", "spawn-worker"],
+            "before_worker (reconcile) must run BEFORE the worker is spawned"
+        );
+
+        // Idempotent second start: a live task short-circuits, so `before_worker` does NOT re-run
+        // (a re-run would re-reconcile pointlessly and, worse, imply the worker could restart).
+        let reran = Arc::new(StdMutex::new(false));
+        let before2 = {
+            let reran = Arc::clone(&reran);
+            move || *reran.lock().unwrap() = true
+        };
+        m.start_with_spawn(before2, || -> JoinHandle<()> {
+            panic!("a second start while a task is live must NOT spawn again")
+        });
+        assert!(
+            !*reran.lock().unwrap(),
+            "an idempotent second start must not re-run before_worker"
+        );
     }
 }

@@ -6,6 +6,10 @@
 //! session state machine and the notification → [`crate::events::ReviewEvent`]
 //! mapping (the pump task).
 
+/// Outbox review-execution claim (AB#1204): a write-ahead, `outbox_id`-keyed durable claim that
+/// lets the at-least-once outbox executor suppress a duplicate review after a crash-restart,
+/// without over-blocking a new-commit re-review. Consulted by [`commands::start_for_outbox`].
+pub mod claim_store;
 pub mod commands;
 /// Read-only pr-review comment URL resolver (AB#1042). Slice-internal (not `pub`): only
 /// the funnel in [`session`] calls it, so it is reachable as `super::comment_url` from

@@ -607,6 +607,10 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
     // project at start. Handed to the `Starting` session in `promote_reservation` so the
     // terminal `finalize_turn` resolves the URL against the project the review ran against.
     url_ctx: CommentUrlContext,
+    // AB#1204 outbox claim id: `Some(outbox_id)` ONLY on the outbox executor's start path, `None`
+    // otherwise. When `Some`, the claim's `thread_id` breadcrumb is written right after
+    // `thread/start` (below) — before `start_turn` runs the turn / posts a `pm:` comment.
+    outbox_claim_id: Option<i64>,
 ) -> AppResult<StartReviewOutcome> {
     // Atomic test-and-set BEFORE any `.await`: if this `(project_id, pr, kind)` is
     // already reserved or covered by an in-flight session, do NOT start a second review.
@@ -664,6 +668,22 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
     // PR's session list survives a restart and its history can be reopened. Best-effort.
     persist_session(app, &starting);
     reservation.disarm();
+
+    // F1 (AB#1204): write the outbox claim's thread_id breadcrumb HERE — right after thread/start
+    // yields a stable thread_id and the Starting session is persisted, but BEFORE `start_turn`
+    // lets the turn run / post a `pm:` comment. This closes the window where a crash between the
+    // turn starting and the (former) post-return attach left the claim NULL → replay duplicated.
+    // Best-effort: a failure only narrows back toward the pre-AB#1204 window (no regression) and
+    // must NOT fail the started review.
+    if let Some(outbox_id) = outbox_claim_id {
+        let db = app.state::<crate::db::Database>();
+        if let Err(e) = super::claim_store::attach_thread(db.inner(), outbox_id, &thread_id) {
+            eprintln!(
+                "outbox review claim：记录 thread_id 失败（outbox_id={outbox_id}）：{}",
+                e.message
+            );
+        }
+    }
 
     let prompt = review_prompt(repo, &skill_command(pr_number, kind));
     let turn_id = match process::start_turn(
@@ -1667,20 +1687,25 @@ mod tests {
         assert_eq!(reg.stop_target("p1", 7, "check"), StopTarget::Absent);
     }
 
-    // Characterization (AB#1069, Medium carrier): try_reserve_pair consults ONLY in-memory state,
-    // NOT the durable `review_session` table. So after a restart (the registry is empty and any
-    // orphaned durable row was flipped to `failed`), a `(project, pr, kind)` whose review already
-    // ran is reservable again — i.e. an at-least-once outbox Review action replayed across a restart
-    // CAN start a duplicate review (the known one-per-crash-window limitation, mirroring the
-    // `auto_dispatch` ledger). This pins that limitation; the durable-reservation follow-up
-    // (backlog) will flip this assertion when the cross-restart guard lands.
+    // Characterization (AB#1069 → AB#1204): try_reserve_pair consults ONLY in-memory state and
+    // STAYS that way BY DESIGN — it is the atomic within-process test-and-set whose "terminal
+    // sessions don't block" semantics are what let a NEW commit re-review (a prior `Done` must NOT
+    // block). Making it consult a durable `(project, pr, kind)` check would over-block exactly that
+    // legitimate re-review (the `review_session` table has no head_sha to tell commits apart).
+    //
+    // So the cross-restart duplicate window AB#1204 closes is NOT closed here — this assertion stays
+    // true. It is closed one layer up, at the outbox executor entry, by a write-ahead claim keyed by
+    // the OUTBOX ROW id (`review::claim_store` + `commands::start_for_outbox`): a crash-replay of the
+    // same outbox row resolves its prior review's outcome instead of reserving freely. The carriers
+    // for the closed window live there (`claim_store` round-trip + the `replayed_review_should_*`
+    // suppression tests in `commands.rs`); this test pins that try_reserve_pair itself is unchanged.
     #[test]
     fn try_reserve_pair_is_in_memory_only_documents_restart_duplicate_window() {
         let reg = SessionRegistry::default(); // a fresh post-restart registry
         assert!(
             reg.try_reserve_pair("p1", 7, "review"),
-            "a fresh (empty) registry reserves freely — no durable guard is consulted, so a \
-             replayed Review action can re-start a review that already ran before a restart"
+            "a fresh (empty) registry reserves freely — try_reserve_pair stays in-memory by design; \
+             the cross-restart guard (AB#1204) lives at the outbox executor, keyed by outbox_id"
         );
     }
 

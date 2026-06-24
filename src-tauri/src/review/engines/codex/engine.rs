@@ -48,6 +48,14 @@ pub struct CodexEngine<'a, R: tauri::Runtime> {
     /// Full persisted session identity for the FOLLOW-UP path. It pins the creating engine,
     /// original kind, timestamp, and URL metadata across app restarts/config edits.
     pub session_info: Option<SessionInfo>,
+    /// The owning outbox row id for the AB#1204 cross-restart dedup claim — `Some(outbox_id)` ONLY
+    /// on the OUTBOX executor's start path ([`crate::review::commands::start_for_outbox`]), `None`
+    /// on the manual / follow-up / auto-dispatch paths. When `Some`, `start` writes the claim's
+    /// `thread_id` breadcrumb INSIDE `session::start_review` — right after `thread/start` yields a
+    /// stable `thread_id` and the `Starting` session is persisted, but BEFORE `start_turn` runs the
+    /// turn (so the breadcrumb lands before any `pm:` comment could be posted; see F1 in
+    /// `start_for_outbox`). `None` skips the write entirely (no outbox row to claim).
+    pub outbox_claim_id: Option<i64>,
 }
 
 impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
@@ -66,6 +74,9 @@ impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
             kind,
             // `&self` start can't move the field; clone the owned context for this turn.
             self.url_ctx.clone(),
+            // AB#1204: outbox path passes `Some(outbox_id)` so the claim breadcrumb is written
+            // right after `thread/start` (before the turn runs); manual/auto paths pass `None`.
+            self.outbox_claim_id,
         )
         .await
     }

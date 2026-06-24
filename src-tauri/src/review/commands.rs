@@ -6,12 +6,13 @@ use crate::config::service as config_service;
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::model::EngineKind;
+use crate::review::claim_store;
 use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
 use crate::review::engines::claude::process::{claude_availability, ClaudeStatus, CLAUDE_BIN};
 use crate::review::engines::claude::ClaudeEngine;
 use crate::review::engines::codex::{CodexEngine, CodexStatus};
 use crate::review::history_store::{self, HistoryItem};
-use crate::review::session::{CommentUrlContext, SessionInfo, StopTarget};
+use crate::review::session::{CommentUrlContext, SessionInfo, SessionStatus, StopTarget};
 use crate::state::AppState;
 
 /// The codex binary name (PATH-resolved). Single source for every review command
@@ -136,6 +137,10 @@ async fn start_via_engine<R: tauri::Runtime>(
     pr_number: u64,
     kind: &str,
     trigger: StartTrigger,
+    // AB#1204: the owning outbox row id on the OUTBOX path (`Some`), `None` on the manual path. It
+    // threads to the engine's `outbox_claim_id` field so the engine writes the claim's `thread_id`
+    // breadcrumb at `thread/start` (F1), before the turn runs — closing the cross-restart dup window.
+    outbox_claim_id: Option<i64>,
 ) -> AppResult<StartReviewOutcome> {
     // Snapshot the comment-URL source context from the project NOW (AB#1042), so the terminal
     // `finalize_turn` resolves the pr-review comment URL against the project the review ran
@@ -168,6 +173,8 @@ async fn start_via_engine<R: tauri::Runtime>(
                 // `start` takes `pr_number` as a method arg; the field is the follow-up path's.
                 pr_number: 0,
                 session_info: None,
+                // AB#1204: `Some(outbox_id)` on the outbox path → claim breadcrumb at thread/start.
+                outbox_claim_id,
             };
             engine.start(pr_number, kind).await
         }
@@ -185,6 +192,8 @@ async fn start_via_engine<R: tauri::Runtime>(
                 // `start` takes `pr_number` as a method arg; the field is the follow-up path's.
                 pr_number: 0,
                 session_info: None,
+                // AB#1204: `Some(outbox_id)` on the outbox path → claim breadcrumb at thread/start.
+                outbox_claim_id,
             };
             engine.start(pr_number, kind).await
         }
@@ -207,7 +216,18 @@ async fn dispatch_engine<R: tauri::Runtime>(
     pr_number: u64,
     kind: &str,
 ) -> AppResult<SessionId> {
-    match start_via_engine(app, state, project, pr_number, kind, StartTrigger::Explicit).await? {
+    // Manual path: no outbox row, so `None` — the engine writes no AB#1204 claim breadcrumb.
+    match start_via_engine(
+        app,
+        state,
+        project,
+        pr_number,
+        kind,
+        StartTrigger::Explicit,
+        None,
+    )
+    .await?
+    {
         StartReviewOutcome::Started(session_id) => Ok(session_id),
         StartReviewOutcome::Deduped => Err(AppError::new(format!(
             "PR {pr_number} 的 {kind} review 已在进行中"
@@ -237,23 +257,108 @@ async fn dispatch_engine<R: tauri::Runtime>(
 /// it). `pr_number` comes from the persisted/replayed payload, so it too is re-validated. `pub(crate)`
 /// so the composition root (`lib.rs`, outside the `review` module) can call it — it names only
 /// `config`/`state`/review-internal types, never `crate::outbox`, so the slice boundary holds.
+///
+/// **Cross-restart dedup (AB#1204)**: `try_reserve_pair` is in-memory only, so after a restart a
+/// replayed action whose review already ran would reserve freely → a DUPLICATE review. A write-ahead
+/// [`claim_store`] claim keyed by `outbox_id` (the row IS the unit of at-least-once replay) closes
+/// that window: on a replay whose claim already carries a `thread_id`, the prior review's durable
+/// outcome is resolved and the duplicate suppressed (returns `Ok` → row `done`). `outbox_id` is the
+/// row's id (`OutboxAction::id`), passed by the composition root.
+///
+/// **F1 (AB#1204) — breadcrumb written at thread/start, not after this returns**: the claim's
+/// `thread_id` breadcrumb is recorded INSIDE the engine's `start` (via the `outbox_claim_id` we pass
+/// to [`start_via_engine`]) — right after `thread/start` yields a stable thread id and the `Starting`
+/// session is persisted, but BEFORE the turn runs / posts a `pm:` comment. This forward placement
+/// closes the window the previous post-return attach left open: a crash between the turn starting and
+/// the late attach used to leave the claim NULL, so a replay treated it as "never started" and
+/// duplicated. The breadcrumb write stays best-effort (F8): a failure only narrows back toward the
+/// pre-AB#1204 window (no regression), never failing the started review. The `Deduped` outcome (F5)
+/// deliberately writes NO breadcrumb — its claim row keeps a NULL `thread_id`, which is EXPECTED: an
+/// existing in-flight registry session for this `(project, pr, kind)` needs no new thread, and the
+/// action's intent ("this PR is being reviewed") already holds. The next replay re-takes the same
+/// `Deduped → Ok` path; once the row terminalizes the composition root's `release_claim` drops the
+/// NULL-thread claim normally (idempotent) — see `release_claim_cleans_up_null_thread_claim` in
+/// `claim_store.rs`. The chain is idempotent.
 pub(crate) async fn start_for_outbox<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppState,
     project_id: &str,
     pr_number: u64,
     kind: &str,
+    outbox_id: i64,
 ) -> AppResult<()> {
     // Fail-closed on a replayed payload (parity with `start_review` / `stop_for_outbox`): a bogus
     // `kind` or a `pr = 0` would otherwise reach the engine and start a bogus review.
     validate_kind(kind)?;
     validate_pr_number(pr_number)?;
     let project = config_service::project_validated(app, project_id)?;
+
+    // AB#1204 cross-restart dedup. Write-ahead a claim keyed by the OUTBOX ROW id BEFORE starting
+    // (propagating error: a write failure retries the row, nothing started yet). `begin_claim`
+    // returns `Some(thread_id)` ONLY when THIS row already reached `thread/start` in a prior run (a
+    // crash-replay) — resolve that review's durable outcome and SUPPRESS the duplicate if it ran far
+    // enough to have posted its `pm:` comment. A fresh claim, or a claim with no thread (crashed
+    // before `thread/start`, so no comment), falls through to a genuine start (at-least-once).
+    let db = app.state::<Database>();
+    if let Some(prior_thread_id) =
+        claim_store::begin_claim(db.inner(), outbox_id, project_id, pr_number, kind)?
+    {
+        if replayed_review_should_suppress(db.inner(), &prior_thread_id)? {
+            return Ok(());
+        }
+    }
+
     // Auto trigger: no `resume()` (respects `stop_codex`). A stopped codex makes `engine.start`
     // return a retryable `Err` (connection refused) — NOT a false `Ok`/`done` (F2). See the doc above.
-    let outcome =
-        start_via_engine(app, state, &project, pr_number, kind, StartTrigger::Auto).await?;
+    //
+    // F1 (AB#1204): pass `Some(outbox_id)` so the engine writes the claim's `thread_id` breadcrumb
+    // at `thread/start` — INSIDE `start`, after the `Starting` session is persisted but BEFORE the
+    // turn runs / posts a `pm:` comment. This is the FORWARD placement that closes the dup window;
+    // the previous post-return attach (deleted) left the claim NULL across a turn-start crash. The
+    // breadcrumb write is best-effort there (F8); the `Deduped` path writes none (F5). See doc above.
+    let outcome = start_via_engine(
+        app,
+        state,
+        &project,
+        pr_number,
+        kind,
+        StartTrigger::Auto,
+        Some(outbox_id),
+    )
+    .await?;
     ok_on_started_or_deduped(outcome)
+}
+
+/// Decide whether a crash-replayed outbox review (whose claim already carries a `thread_id`) should
+/// be SUPPRESSED rather than re-run (AB#1204). Resolves the prior review's durable `review_session`
+/// row and biases toward suppress — re-run ONLY when we can PROVE no `pm:` comment was posted: the
+/// session `Failed` with an EMPTY `turn_id` (the turn never started; `turn_id` is set at
+/// `set_running`, strictly before the codex skill posts). A `Done`, a `Failed`-with-a-turn, an
+/// unexpected still-live status, or a pruned/missing row all suppress — a duplicate `pm:` comment is
+/// the worse failure than an occasional missed retry (mirrors the outbox `Deduped → Ok` philosophy).
+///
+/// Why the still-live statuses (`Starting`/`Running`/`Interrupting`) ALSO suppress: on the normal
+/// path `lib.rs`'s startup `fail_orphaned_sessions` runs BEFORE the outbox worker, so any session
+/// left non-terminal by a dead process is already reconciled to `Failed` before this is reached
+/// (see the ORDERING note in `lib.rs`). A still-live status arriving here is therefore unexpected —
+/// and `Failed`-with-empty-turn is the ONLY proof-of-no-comment case, so every non-matching status
+/// (including these) takes the conservative suppress branch. The tests below pin that.
+///
+/// **Known residual window (best-effort turn_id persist):** `turn_id` lands in the durable row via
+/// `session.rs::persist_session`, which is BEST-EFFORT (it logs + swallows a DB error; see its
+/// doc-comment). So a turn can actually start — and the codex skill can post its `pm:` comment —
+/// while the `persist_session` that would record its `turn_id` FAILS, leaving the DB row at
+/// `Failed` (after the orphan flip) with an EMPTY `turn_id`. This function then reads `Failed +
+/// empty turn` and rules the replay safe to re-run ⇒ a DUPLICATE `pm:` comment. This is an
+/// inherited residual of the pre-existing best-effort persist, not a new regression — the claim
+/// still closes the FAR larger window (a fully-recorded prior review). Closing this last sliver
+/// needs the funnel's downstream Hard-ened (e.g. a non-swallowing turn_id write-ahead, or keying
+/// the proof on the comment-URL rather than turn_id presence); tracked as a follow-up issue.
+fn replayed_review_should_suppress(db: &Database, thread_id: &str) -> AppResult<bool> {
+    Ok(match history_store::get_session(db, thread_id)? {
+        Some(s) => !(s.status == SessionStatus::Failed && s.turn_id.is_empty()),
+        None => true,
+    })
 }
 
 /// Map a [`StartReviewOutcome`] to the OUTBOX action result (AB#1069): BOTH `Started` AND `Deduped`
@@ -389,6 +494,8 @@ pub async fn send_review_message<R: tauri::Runtime>(
                 url_ctx,
                 pr_number,
                 session_info: Some(session_info.clone()),
+                // Follow-up path: no outbox row → no AB#1204 claim breadcrumb.
+                outbox_claim_id: None,
             };
             engine
                 .send_message(&thread_id, &message, &user_item_id)
@@ -407,6 +514,8 @@ pub async fn send_review_message<R: tauri::Runtime>(
                 url_ctx,
                 pr_number,
                 session_info: Some(session_info.clone()),
+                // Follow-up path: no outbox row → no AB#1204 claim breadcrumb.
+                outbox_claim_id: None,
             };
             engine
                 .send_message(&thread_id, &message, &user_item_id)
@@ -508,6 +617,8 @@ pub(crate) async fn stop_session_by_id<R: tauri::Runtime>(
         // `stop` resolves purely by session id; pr_number is the follow-up path's field only.
         pr_number: 0,
         session_info: None,
+        // `stop` never starts a review → no AB#1204 claim breadcrumb.
+        outbox_claim_id: None,
     };
     // The trait's `stop` takes `&SessionId` (== `&String`); `claude.stop` above took `&str`. Own the
     // id once for the codex arm (a stop is rare, so the single allocation is irrelevant).
@@ -705,6 +816,103 @@ mod tests {
         assert!(
             absorb_stop_toctou(Err(AppError::new("interrupt failed")), true).is_err(),
             "still-active session's stop error must propagate"
+        );
+    }
+
+    // ── AB#1204 cross-restart dedup: the replay-suppression decision ────────────────────────────
+    //
+    // The closure proof (Medium runtime-guard carrier). `start_for_outbox` consults a write-ahead
+    // `outbox_id` claim; on a crash-replay whose claim already carries a `thread_id`, this decision
+    // resolves the prior review's durable `review_session` row to suppress-vs-rerun. Seeding a row +
+    // asserting the decision is the unit-testable core of the window closure (the full async start is
+    // exercised by the outbox service tests + the claim_store round-trip). Bias: suppress unless we
+    // can PROVE no `pm:` comment was posted.
+    fn seed_session(db: &Database, thread_id: &str, status: SessionStatus, turn_id: &str) {
+        history_store::upsert_session(
+            db,
+            &SessionInfo {
+                project_id: "p1".to_string(),
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                pr_number: 7,
+                kind: "review".to_string(),
+                engine_kind: EngineKind::Codex,
+                status,
+                created_at_epoch: 0,
+                comment_url: None,
+            },
+        )
+        .expect("seed review_session");
+    }
+
+    #[test]
+    fn replayed_review_suppressed_when_prior_session_done() {
+        let db = Database::open_in_memory().expect("open");
+        seed_session(&db, "t-done", SessionStatus::Done, "turn-1");
+        assert!(
+            replayed_review_should_suppress(&db, "t-done").expect("resolve"),
+            "a Done prior review completed (its pm: comment posted) → suppress the replay"
+        );
+    }
+
+    #[test]
+    fn replayed_review_suppressed_when_failed_with_a_turn() {
+        let db = Database::open_in_memory().expect("open");
+        seed_session(&db, "t-fail-turn", SessionStatus::Failed, "turn-1");
+        assert!(
+            replayed_review_should_suppress(&db, "t-fail-turn").expect("resolve"),
+            "a Failed session whose turn ran MAY have posted → suppress (no duplicate comment)"
+        );
+    }
+
+    #[test]
+    fn replayed_review_reruns_when_failed_before_any_turn() {
+        let db = Database::open_in_memory().expect("open");
+        // Empty turn_id ⇒ the turn never started (turn_id is set at set_running, before the codex
+        // skill posts), so no comment could exist → safe at-least-once rerun.
+        seed_session(&db, "t-fail-noturn", SessionStatus::Failed, "");
+        assert!(
+            !replayed_review_should_suppress(&db, "t-fail-noturn").expect("resolve"),
+            "a Failed session that never ran a turn never posted → rerun (preserve at-least-once)"
+        );
+    }
+
+    #[test]
+    fn replayed_review_suppressed_when_session_missing() {
+        let db = Database::open_in_memory().expect("open");
+        // No row (pruned / never persisted): a claim carrying a thread_id means a start happened, so
+        // bias to suppress rather than risk a duplicate comment.
+        assert!(
+            replayed_review_should_suppress(&db, "t-absent").expect("resolve"),
+            "a missing session row conservatively suppresses"
+        );
+    }
+
+    // F4 (AB#1204): a still-live status (`Starting` / `Interrupting`) found HERE is unexpected on
+    // the normal path — `lib.rs`'s startup `fail_orphaned_sessions` reconciles every non-terminal
+    // session to `Failed` BEFORE the outbox worker re-enters `start_for_outbox` (the load-bearing
+    // ORDERING in `lib.rs`). Since `Failed`-with-empty-turn is the ONLY proof-of-no-comment case,
+    // these statuses fall through to the conservative SUPPRESS branch (a possible already-posted
+    // comment outweighs a missed retry). These pin that the non-`Failed` arms suppress.
+    #[test]
+    fn replayed_review_suppressed_when_session_starting() {
+        let db = Database::open_in_memory().expect("open");
+        // Defensive: even if the orphan flip did not (somehow) reconcile this, a `Starting` row is
+        // not proof of "no comment" → suppress.
+        seed_session(&db, "t-starting", SessionStatus::Starting, "");
+        assert!(
+            replayed_review_should_suppress(&db, "t-starting").expect("resolve"),
+            "a Starting session (normally orphan-reconciled before this) conservatively suppresses"
+        );
+    }
+
+    #[test]
+    fn replayed_review_suppressed_when_session_interrupting() {
+        let db = Database::open_in_memory().expect("open");
+        seed_session(&db, "t-interrupting", SessionStatus::Interrupting, "turn-1");
+        assert!(
+            replayed_review_should_suppress(&db, "t-interrupting").expect("resolve"),
+            "an Interrupting session (normally orphan-reconciled before this) conservatively suppresses"
         );
     }
 }

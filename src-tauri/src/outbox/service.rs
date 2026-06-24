@@ -19,7 +19,7 @@ use crate::db::Database;
 use crate::error::AppResult;
 use crate::events::{OutboxEvent, OUTBOX_UPDATED_EVENT};
 use crate::model::ActionKind;
-use crate::outbox::{store, ActionExecutor};
+use crate::outbox::{store, ActionExecutor, ClaimReleaser};
 use crate::state::AppState;
 
 /// Max execution attempts before an action dead-letters (AB#1066). After this many failed attempts
@@ -224,6 +224,7 @@ pub async fn run_due_once(
     app: &tauri::AppHandle,
     db: &Database,
     executor: &ActionExecutor,
+    release_terminal: &ClaimReleaser,
     notification_ttl_secs: u64,
 ) {
     // One epoch for the whole cycle's claim + staleness check (a row is "due" and "stale" against
@@ -249,7 +250,8 @@ pub async fn run_due_once(
     let mut first_announce_error: Option<String> = None;
 
     // Announce the corrupt-kind rows claim_due just dead-lettered (their `dead` transition),
-    // aggregating any read-back failure with the rest of this cycle's.
+    // aggregating any read-back failure with the rest of this cycle's. (A corrupt-kind row never
+    // reached `start_for_outbox`, so it has no AB#1204 claim to release.)
     for id in quarantined {
         if let Err(m) = try_announce_updated(app, db, id) {
             announce_failures += 1;
@@ -282,10 +284,30 @@ pub async fn run_due_once(
         // The executor RESULT is authoritative: Ok → done, Err → retry/dead (no false `done`).
         let result = executor(app.clone(), action).await;
         let now = store::now_epoch();
-        if let Err(e) = record_action_result(db, id, prev_attempt_count, now, &result) {
-            eprintln!("outbox: 记录动作终态失败（id={id}）：{}", e.message);
-            record_failures += 1;
-            first_record_error.get_or_insert(e.message);
+        match record_action_result(db, id, prev_attempt_count, now, &result) {
+            // Only `Done` explicitly releases its AB#1204 review claim — a `Done` row is never
+            // re-claimed by the worker NOR re-queued, so the claim has no further reader and is
+            // dropped to bound `outbox_review_claim` (a no-op for non-review rows). `Dead` does NOT
+            // release: `store::reset_for_retry` lets a user manually re-queue a `dead` row back to
+            // `pending` → it re-enters `start_for_outbox`, where the RETAINED claim is the breadcrumb
+            // that SUPPRESSES a duplicate review (if the dead row's review already started/posted).
+            // Releasing on `Dead` would drop that breadcrumb and re-open the dup window on manual
+            // retry. The dead/leaked claim is instead cleaned up by the F4 FK `ON DELETE CASCADE`
+            // when the owning `action_outbox` row is retention-pruned (so the table stays bounded
+            // without the outbox slice ever needing to know about the claim — review-blind). A
+            // still-`pending` Retry ALSO keeps the claim (a later sweep re-resolves it).
+            Ok(outcome) => {
+                if matches!(outcome, Outcome::Done) {
+                    release_terminal(db, id);
+                }
+            }
+            // AB#1182 cycle-error aggregation: a record-write failure is counted (one representative
+            // cycle-error emitted after the loop), not one IPC event per row.
+            Err(e) => {
+                eprintln!("outbox: 记录动作终态失败（id={id}）：{}", e.message);
+                record_failures += 1;
+                first_record_error.get_or_insert(e.message);
+            }
         }
         if let Err(m) = try_announce_updated(app, db, id) {
             announce_failures += 1;

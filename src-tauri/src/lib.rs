@@ -87,14 +87,11 @@ fn build_app() {
             // config / tracked PRs / ledger carry over before the first read.
             app.manage(db::Database::open(app.handle())?);
             import_legacy_stores(app.handle())?;
-            // Reconcile sessions left non-terminal by a dead previous process (pr-review F1):
-            // a persisted starting/running/interrupting status has no live pump, so mark it
-            // failed rather than letting the UI restore it as still running.
-            let stale =
-                review::history_store::fail_orphaned_sessions(app.state::<db::Database>().inner())?;
-            if stale > 0 {
-                eprintln!("启动：{stale} 个遗留未完成 review 会话已标记 failed");
-            }
+            // The orphan-session reconcile (mark sessions left non-terminal by a dead previous
+            // process as `failed`) now runs INSIDE `state.outbox.start(...)` via the `before_worker`
+            // closure below (AB#1204 F3) — so its load-bearing ORDERING (reconcile BEFORE the outbox
+            // worker can process any row) is enforced by control flow, not a comment. See the closure
+            // passed to `outbox.start` and `OutboxManager::start`'s doc.
 
             let state = app.state::<AppState>();
             // Install the auto-trigger dispatcher BEFORE starting the loop, so the
@@ -264,10 +261,55 @@ fn build_app() {
                         }
                     })
                 });
+            // AB#1204 claim releaser — the ONLY place naming `review::claim_store`, injected like the
+            // executor so the outbox slice stays review-blind. The worker calls it when a row goes
+            // terminal (`done`/`dead`) to drop that row's review-execution claim; a no-op for rows
+            // that never had one. Table hygiene only — correctness never depends on it.
+            let claim_releaser: outbox::ClaimReleaser =
+                Arc::new(|db: &db::Database, outbox_id: i64| {
+                    if let Err(e) = review::claim_store::release_claim(db, outbox_id) {
+                        eprintln!(
+                            "outbox review claim：释放失败（outbox_id={outbox_id}）：{}",
+                            e.message
+                        );
+                    }
+                });
+            // The AB#1204 F3 pre-worker reconcile closure: mark sessions left non-terminal by a dead
+            // previous process (pr-review F1) as `failed` BEFORE the outbox worker can process any
+            // row. `OutboxManager::start` invokes this synchronously before spawning the worker, so
+            // the load-bearing ORDERING (a crash-replayed outbox review re-entering `start_for_outbox`
+            // must read an ALREADY-reconciled `review_session` row, not a stale `running`) is enforced
+            // by control flow rather than a "keep this above start" comment. Best-effort: a reconcile
+            // failure at startup is logged (not fatal) — it only degrades a replay's suppress decision,
+            // and the worker's first sweep is anyway gated behind this returning. The closure is the
+            // ONLY place naming `review::history_store` here; the outbox slice sees only `FnOnce`
+            // (review-blind, same injection shape as the executor / claim releaser).
+            let reconcile_before_worker = {
+                let app = app.handle().clone();
+                move || {
+                    let db = app.state::<db::Database>();
+                    match review::history_store::fail_orphaned_sessions(db.inner()) {
+                        Ok(stale) if stale > 0 => {
+                            eprintln!("启动：{stale} 个遗留未完成 review 会话已标记 failed");
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!(
+                            "启动：遗留 review 会话 reconcile 失败（继续启动）：{}",
+                            e.message
+                        ),
+                    }
+                }
+            };
             // Start the outbox worker (AB#1066): drains the durable queue, retries failures with
             // backoff, dead-letters at the attempt cap. Its first sweep is immediate, so any rows
             // persisted before a previous exit resume now (restart-resume). Killed on app shutdown.
-            state.outbox.start(app.handle().clone(), outbox_executor);
+            // The reconcile closure runs first (AB#1204 F3 ordering guard).
+            state.outbox.start(
+                app.handle().clone(),
+                outbox_executor,
+                claim_releaser,
+                reconcile_before_worker,
+            );
 
             // Install the review→outbox notification sink (AB#1066) — the ONLY bridge from the review
             // slice's notification producer to the outbox slice. `review::deeplink` builds a
@@ -533,6 +575,9 @@ async fn run_review_action(
         &action.project_id,
         payload.pr_number,
         kind,
+        // AB#1204: the outbox ROW id is the dedup key — a crash-replay of this row resolves its
+        // prior review's claim instead of starting a duplicate.
+        action.id,
     )
     .await
 }
@@ -642,6 +687,8 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
                 // the field is the follow-up (`send_message`) path's.
                 pr_number: 0,
                 session_info: None,
+                // Auto-poll dispatch is NOT the outbox path → no AB#1204 claim breadcrumb.
+                outbox_claim_id: None,
             };
             dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
         }
@@ -660,6 +707,8 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
                 // the follow-up (`send_message`) path's.
                 pr_number: 0,
                 session_info: None,
+                // Auto-poll dispatch is NOT the outbox path → no AB#1204 claim breadcrumb.
+                outbox_claim_id: None,
             };
             dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
         }

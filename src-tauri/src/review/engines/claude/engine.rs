@@ -55,6 +55,13 @@ pub struct ClaudeEngine<'a, R: tauri::Runtime> {
     /// Full persisted session identity for the FOLLOW-UP path. It pins the creating engine,
     /// original kind, timestamp, and URL metadata across app restarts/config edits.
     pub session_info: Option<SessionInfo>,
+    /// The owning outbox row id for the AB#1204 cross-restart dedup claim — `Some(outbox_id)` ONLY
+    /// on the OUTBOX executor's start path ([`crate::review::commands::start_for_outbox`]), `None`
+    /// on the manual / follow-up / auto-dispatch paths. When `Some`, `start` writes the claim's
+    /// `thread_id` (== claude `session_id`) breadcrumb INSIDE `start_review` — right after the
+    /// `system/init` line yields a stable `session_id` and the `Starting` session is persisted, but
+    /// BEFORE the turn streams / posts a `pm:` comment (mirrors the codex path's F1 placement).
+    pub outbox_claim_id: Option<i64>,
 }
 
 impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
@@ -71,6 +78,9 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
             kind,
             // `&self` start can't move the field; clone the owned context for this turn.
             self.url_ctx.clone(),
+            // AB#1204: outbox path passes `Some(outbox_id)` so the claim breadcrumb is written
+            // right after the session id is known (before the turn runs); other paths pass `None`.
+            self.outbox_claim_id,
         )
         .await
     }
@@ -139,6 +149,10 @@ async fn start_review<R: tauri::Runtime>(
     // `promote_reservation` so the terminal `finalize_turn` resolves the URL against the
     // project this review ran against (mirrors the codex path).
     url_ctx: CommentUrlContext,
+    // AB#1204 outbox claim id: `Some(outbox_id)` ONLY on the outbox executor's start path, `None`
+    // otherwise. When `Some`, the claim's `thread_id` (== `session_id`) breadcrumb is written right
+    // after the `system/init` line yields the session id (below) — before the turn posts a comment.
+    outbox_claim_id: Option<i64>,
 ) -> AppResult<StartReviewOutcome> {
     // Atomic test-and-set BEFORE spawning: if this `(project_id, pr, kind)` is already
     // reserved or covered by an in-flight session, do NOT start a second review (the
@@ -205,6 +219,24 @@ async fn start_review<R: tauri::Runtime>(
     registry.promote_reservation(starting.clone(), url_ctx);
     persist_session(app, &starting);
     reservation.disarm();
+
+    // F1 (AB#1204): write the outbox claim's thread_id (== claude `session_id`) breadcrumb HERE —
+    // right after the `system/init` line yields a stable session id and the Starting session is
+    // persisted, but BEFORE `set_running` / the pump lets the turn stream / post a `pm:` comment.
+    // This closes the window where a crash between the turn starting and the (former) post-return
+    // attach left the claim NULL → replay duplicated. Best-effort: a failure only narrows back
+    // toward the pre-AB#1204 window (no regression) and must NOT fail the started review.
+    if let Some(outbox_id) = outbox_claim_id {
+        let db = app.state::<crate::db::Database>();
+        if let Err(e) =
+            crate::review::claim_store::attach_thread(db.inner(), outbox_id, &session_id)
+        {
+            eprintln!(
+                "outbox review claim：记录 thread_id 失败（outbox_id={outbox_id}）：{}",
+                e.message
+            );
+        }
+    }
 
     // Flip to Running (the child is live and streaming). turn_id stays the session id.
     registry.set_running(&session_id, session_id.clone());

@@ -27,6 +27,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::db::Database;
 use crate::error::AppResult;
 use crate::model::ActionKind;
 
@@ -51,6 +52,14 @@ pub type ActionExecutor = Arc<
         + Send
         + Sync,
 >;
+
+/// Composition-root-injected hook to release a row's AB#1204 review-execution claim once the row
+/// TERMINALIZES (`done`/`dead`) — the same injection shape as [`ActionExecutor`] keeps this slice
+/// blind to `review` (the closure, in `lib.rs`, is the only place naming `review::claim_store`). The
+/// worker calls it after a terminal transition; it is a no-op for non-review rows (no claim exists)
+/// and idempotent. Table hygiene only — correctness does NOT depend on it (a terminal row is never
+/// re-claimed), so this never affects the dedup decision, only bounds `outbox_review_claim`.
+pub type ClaimReleaser = Arc<dyn Fn(&Database, i64) + Send + Sync>;
 
 /// One claimed outbox row, handed to the [`ActionExecutor`] (AB#1066). Carries the neutral
 /// [`ActionKind`] + the opaque `payload` (a `model::Notification` JSON today; the executor

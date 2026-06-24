@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 7;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -185,6 +185,12 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 5 {
         apply_v5(conn)?;
     }
+    if version < 6 {
+        apply_v6(conn)?;
+    }
+    if version < 7 {
+        apply_v7(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -234,6 +240,36 @@ fn apply_v4(conn: &Connection) -> AppResult<()> {
 /// under replay).
 fn apply_v5(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(SCHEMA_V5).map_err(map_err)?;
+    Ok(())
+}
+
+/// v6 (AB#1204): the outbox review-execution claim. Closes the cross-restart duplicate-review
+/// window: the AB#1069 outbox executor is at-least-once, so a crash AFTER an outbox `review`/`check`
+/// action started a review but BEFORE the row was marked `done` re-runs that action next boot —
+/// and the purely-in-memory [`crate::review::session::SessionRegistry::try_reserve_pair`] reserves
+/// freely after a restart, so the replay launches a DUPLICATE review (a second `pm:` comment). This
+/// table is a write-ahead claim keyed by the OUTBOX ROW id (the unit of at-least-once replay), so
+/// the replay can tell "this action already started a review (resolve its outcome, don't duplicate)"
+/// from "a new review need" — keying on `(project,pr,kind)` instead would wrongly suppress a
+/// legitimate re-review of a NEW commit. A FRESH `CREATE TABLE` batch (like [`SCHEMA_V4`] /
+/// [`SCHEMA_V5`]), NOT an `ALTER` — a fresh DB runs v1..v6 and an existing v5 install runs ONLY this
+/// step (the `CREATE TABLE IF NOT EXISTS` is also idempotent under replay).
+fn apply_v6(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(SCHEMA_V6).map_err(map_err)?;
+    Ok(())
+}
+
+/// v7 (AB#1204): add a `FOREIGN KEY(outbox_id) REFERENCES action_outbox(id) ON DELETE CASCADE` to
+/// `outbox_review_claim` so a claim is AUTOMATICALLY removed when its owning `action_outbox` row is
+/// deleted (retention prune in `outbox::store`, `DELETE FROM action_outbox`). SQLite cannot
+/// `ALTER TABLE … ADD CONSTRAINT`, so the only way to add an FK to an existing table is the
+/// documented 12-step table-rebuild: create a `_new` table WITH the FK, copy the rows, drop the old
+/// table, rename `_new` into place (see [`SCHEMA_V7`]). A fresh DB (version 0) runs v1..v6 (creating
+/// the FK-less claim) then this v7 step rebuilds it WITH the FK — the end state is identical to an
+/// existing-v6 install upgrading. The rebuild touches `outbox_review_claim` (the CHILD/referencing
+/// side); nothing references IT, so the DROP/RENAME is safe even under `foreign_keys=ON`.
+fn apply_v7(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(SCHEMA_V7).map_err(map_err)?;
     Ok(())
 }
 
@@ -382,6 +418,62 @@ CREATE INDEX IF NOT EXISTS idx_action_outbox_due ON action_outbox(status, next_a
 CREATE INDEX IF NOT EXISTS idx_action_outbox_project ON action_outbox(project_id, id DESC);
 "#;
 
+/// v6 schema (AB#1204): the outbox review-execution claim — see [`apply_v6`].
+///
+/// **Hard carrier (`outbox_id PRIMARY KEY`):** the claim is 1:1 with its `action_outbox` row, so a
+/// second `INSERT` for the same row is unexpressible — `review::claim_store::begin_claim` relies on
+/// `INSERT … ON CONFLICT(outbox_id) DO NOTHING`, the same idempotency-by-key shape `inbox_event`'s
+/// `UNIQUE(dedupe_key)` uses. `thread_id` is NULL between the write-ahead claim and the
+/// `thread/start` that fills it; on a replay an existing claim's `thread_id` resolves the prior
+/// review's `review_session` outcome to decide suppress-vs-rerun. NO `head_sha` / `(project,pr,kind)`
+/// key on purpose: keying on the outbox row id is what avoids over-blocking a new-commit re-review.
+const SCHEMA_V6: &str = r#"
+CREATE TABLE IF NOT EXISTS outbox_review_claim (
+    outbox_id   INTEGER PRIMARY KEY,
+    project_id  TEXT    NOT NULL,
+    pr_number   INTEGER NOT NULL,
+    kind        TEXT    NOT NULL,
+    thread_id   TEXT,
+    created_at  INTEGER NOT NULL
+);
+"#;
+
+/// v7 schema (AB#1204): rebuild `outbox_review_claim` WITH a child FK to `action_outbox` — see
+/// [`apply_v7`]. Same columns / types / order / constraints as [`SCHEMA_V6`] (the `INSERT … SELECT *`
+/// copy is positional, so the column layout MUST stay byte-identical) PLUS the trailing FK.
+///
+/// **Hard carrier (`FOREIGN KEY(outbox_id) REFERENCES action_outbox(id) ON DELETE CASCADE`):** the
+/// claim is a CHILD of its `action_outbox` row, so "the owning outbox row is deleted (retention
+/// prune in `outbox::store`) but the claim survives as an orphan" is now UNEXPRESSIBLE at the DB
+/// layer — SQLite cascades the delete automatically (`foreign_keys=ON`, set in `from_conn`). This
+/// is what bounds `outbox_review_claim` WITHOUT the outbox slice ever naming the claim table: it
+/// pairs with F2 (a `Dead` row RETAINS its claim as a manual-retry suppress breadcrumb), so a
+/// dead/leaked claim is not eagerly released but is instead reaped when its owning row is finally
+/// pruned — review-blind cleanup driven purely by the FK. The PK shape (`outbox_id PRIMARY KEY`)
+/// and all other columns are unchanged from v6; only the FK is added.
+///
+/// `foreign_keys` is toggled OFF for the rebuild (SQLite's documented 12-step procedure): the
+/// positional `INSERT … SELECT *` must not be FK-checked row-by-row mid-rebuild, and `DROP TABLE`
+/// on the old table must not trip a (transient) reference check. `run_migrations` runs OUTSIDE a
+/// transaction, so this `PRAGMA` takes effect (a no-op inside a tx); `from_conn` restores
+/// `foreign_keys=ON` is unnecessary because we re-enable it here at the end of the batch.
+const SCHEMA_V7: &str = r#"
+PRAGMA foreign_keys=OFF;
+CREATE TABLE outbox_review_claim_new (
+    outbox_id   INTEGER PRIMARY KEY,
+    project_id  TEXT    NOT NULL,
+    pr_number   INTEGER NOT NULL,
+    kind        TEXT    NOT NULL,
+    thread_id   TEXT,
+    created_at  INTEGER NOT NULL,
+    FOREIGN KEY(outbox_id) REFERENCES action_outbox(id) ON DELETE CASCADE
+);
+INSERT INTO outbox_review_claim_new SELECT * FROM outbox_review_claim;
+DROP TABLE outbox_review_claim;
+ALTER TABLE outbox_review_claim_new RENAME TO outbox_review_claim;
+PRAGMA foreign_keys=ON;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +500,7 @@ mod tests {
                 "dispatch_key",
                 "inbox_event",
                 "meta",
+                "outbox_review_claim",
                 "review_history_item",
                 "review_session",
                 "tracked_pr",
@@ -477,7 +570,7 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 5, "current schema is v5");
+            assert_eq!(SCHEMA_VERSION, 7, "current schema is v7");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"
@@ -493,6 +586,14 @@ mod tests {
             assert!(
                 table_exists(conn, "action_outbox"),
                 "fresh v0 → v5 has the action_outbox table"
+            );
+            assert!(
+                table_exists(conn, "outbox_review_claim"),
+                "fresh v0 → v6 has the outbox_review_claim table"
+            );
+            assert!(
+                table_has_fk(conn, "outbox_review_claim"),
+                "fresh v0 → v7 rebuilt outbox_review_claim WITH the action_outbox FK cascade"
             );
             Ok(())
         })
@@ -588,12 +689,15 @@ mod tests {
             "v4 must not already have action_outbox"
         );
 
-        run_migrations(&conn).expect("v4 -> v5 migrates");
+        // `run_migrations` replays ALL pending steps, so a v4 DB lands on the CURRENT schema
+        // (v5's action_outbox AND every later step); this test's job is to lock that the v5 step
+        // runs on the existing-install path.
+        run_migrations(&conn).expect("v4 -> current migrates");
 
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("read version");
-        assert_eq!(version, 5, "stamped to v5");
+        assert_eq!(version, SCHEMA_VERSION, "stamped to the current schema");
         assert!(
             table_exists(&conn, "action_outbox"),
             "v5 added the action_outbox table"
@@ -609,6 +713,157 @@ mod tests {
         for idx in ["idx_action_outbox_due", "idx_action_outbox_project"] {
             assert!(index_exists(&conn, idx), "v5 created the {idx} index");
         }
+    }
+
+    /// v5 → v6 migration lock (AB#1204): a DB stamped at v5 (no `outbox_review_claim` table) must
+    /// gain the claim table at v6. Mirrors `migrate_v4_to_v5_…`: a missing table here means
+    /// `review::claim_store`'s first query fails at runtime, not compile time, so pin the table's
+    /// arrival on the existing-install upgrade path (fresh-open is covered by
+    /// `migrations_create_all_tables_and_stamp_version`). Also pins the `thread_id` column the
+    /// replay-resolution reads by name, and the **Hard** `outbox_id PRIMARY KEY` idempotency carrier.
+    ///
+    /// Runs the v6 step IN ISOLATION (`apply_v6`, not the full `run_migrations`): v6 is the FK-LESS
+    /// claim table, and v7 (`migrate_v6_to_v7_adds_fk_cascade`) is what adds the FK. Keeping this
+    /// step-scoped pins v6's exact shape independently of later rebuilds (the full-replay end state
+    /// is covered by the fresh-open + v6→v7 tests).
+    #[test]
+    fn migrate_v5_to_v6_adds_outbox_review_claim_table() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        apply_v1(&conn).expect("seed v1");
+        apply_v2(&conn).expect("seed v2");
+        apply_v3(&conn).expect("seed v3");
+        apply_v4(&conn).expect("seed v4");
+        apply_v5(&conn).expect("seed v5");
+        conn.pragma_update(None, "user_version", 5)
+            .expect("stamp v5");
+        assert!(
+            !table_exists(&conn, "outbox_review_claim"),
+            "v5 must not already have outbox_review_claim"
+        );
+
+        // Just the v6 delta — v6's claim table is FK-LESS (v7 adds the FK).
+        apply_v6(&conn).expect("v5 -> v6 adds the claim table");
+
+        assert!(
+            table_exists(&conn, "outbox_review_claim"),
+            "v6 added the outbox_review_claim table"
+        );
+        assert!(
+            table_has_column(&conn, "outbox_review_claim", "thread_id"),
+            "v6 outbox_review_claim has the thread_id (replay-resolution) column"
+        );
+        // v6 has NO FK yet (it is added by v7).
+        assert!(
+            !table_has_fk(&conn, "outbox_review_claim"),
+            "v6 outbox_review_claim is FK-less (the FK arrives in v7)"
+        );
+
+        // Pin the **Hard** idempotency carrier (`outbox_id PRIMARY KEY`): INSERTing the SAME
+        // `outbox_id` twice with `ON CONFLICT(outbox_id) DO NOTHING` (the exact shape
+        // `review::claim_store::begin_claim` relies on) must not error and must not add a second row.
+        // A schema drift that dropped the PK (or keyed on something else) would let the second INSERT
+        // create a duplicate claim — re-opening the cross-restart duplicate-review window AB#1204 closes.
+        let insert_claim = |conn: &Connection| {
+            conn.execute(
+                "INSERT INTO outbox_review_claim \
+                 (outbox_id, project_id, pr_number, kind, created_at) \
+                 VALUES (1, 'p1', 7, 'review', 0) \
+                 ON CONFLICT(outbox_id) DO NOTHING",
+                [],
+            )
+        };
+        insert_claim(&conn).expect("first claim insert");
+        insert_claim(&conn).expect("second claim insert (PK conflict → DO NOTHING, no error)");
+        let claim_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox_review_claim WHERE outbox_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count claims");
+        assert_eq!(
+            claim_rows, 1,
+            "outbox_id PRIMARY KEY makes a duplicate claim unexpressible (still one row)"
+        );
+    }
+
+    /// v6 → v7 migration lock (AB#1204): a DB stamped at v6 (FK-LESS `outbox_review_claim`) must gain
+    /// the child FK `outbox_id → action_outbox(id) ON DELETE CASCADE` and stamp to v7. This is the
+    /// **Hard** carrier proof: deleting an `action_outbox` row CASCADE-removes its claim, so an
+    /// orphaned claim outliving its owning outbox row is unexpressible at the DB layer (the bound that
+    /// pairs with F2's "Dead retains the claim"). Existing claim rows survive the table rebuild
+    /// (`INSERT … SELECT *` copies them). Needs `foreign_keys=ON` for the cascade to fire at delete
+    /// time — `open_in_memory` sets it, but this test opens a RAW connection, so it sets it explicitly.
+    #[test]
+    fn migrate_v6_to_v7_adds_fk_cascade() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .expect("enable fk");
+        apply_v1(&conn).expect("seed v1");
+        apply_v2(&conn).expect("seed v2");
+        apply_v3(&conn).expect("seed v3");
+        apply_v4(&conn).expect("seed v4");
+        apply_v5(&conn).expect("seed v5");
+        apply_v6(&conn).expect("seed v6");
+        conn.pragma_update(None, "user_version", 6)
+            .expect("stamp v6");
+        // Precondition: the v6 claim table has NO FK.
+        assert!(
+            !table_has_fk(&conn, "outbox_review_claim"),
+            "v6 must not already have the FK"
+        );
+
+        // Seed an `action_outbox` row + its claim BEFORE the migration, so the rebuild's
+        // `INSERT … SELECT *` is exercised on real data (existing claims must survive).
+        conn.execute(
+            "INSERT INTO action_outbox \
+             (id, project_id, kind, summary, payload, status, next_attempt_at, created_at, updated_at) \
+             VALUES (100, 'p1', 'review', 's', '{}', 'pending', 0, 0, 0)",
+            [],
+        )
+        .expect("seed action_outbox row");
+        conn.execute(
+            "INSERT INTO outbox_review_claim \
+             (outbox_id, project_id, pr_number, kind, thread_id, created_at) \
+             VALUES (100, 'p1', 7, 'review', 't-100', 0)",
+            [],
+        )
+        .expect("seed claim");
+
+        run_migrations(&conn).expect("v6 -> current migrates");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read version");
+        assert_eq!(version, SCHEMA_VERSION, "stamped to the current schema");
+        assert!(
+            table_has_fk(&conn, "outbox_review_claim"),
+            "v7 added the outbox_id → action_outbox FK"
+        );
+        // The pre-existing claim survived the table rebuild (INSERT … SELECT * copied it).
+        let survived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox_review_claim WHERE outbox_id = 100",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count");
+        assert_eq!(survived, 1, "existing claim survives the rebuild");
+
+        // The Hard proof: deleting the owning action_outbox row CASCADE-deletes its claim.
+        conn.execute("DELETE FROM action_outbox WHERE id = 100", [])
+            .expect("delete owning row");
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM outbox_review_claim WHERE outbox_id = 100",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count after delete");
+        assert_eq!(
+            after, 0,
+            "ON DELETE CASCADE reaps the claim when its owning outbox row is pruned"
+        );
     }
 
     /// Whether an index of the given name exists (via `sqlite_master`).
@@ -647,6 +902,20 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .expect("collect");
         names.iter().any(|n| n == column)
+    }
+
+    /// Whether `table` has at least one FOREIGN KEY (via `PRAGMA foreign_key_list`). Used to pin the
+    /// AB#1204 v7 FK arrival on `outbox_review_claim` (a missing FK = the cascade never fires, so an
+    /// orphaned claim could outlive its outbox row — the exact regression v7 prevents).
+    fn table_has_fk(conn: &Connection, table: &str) -> bool {
+        let count: i64 = conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM pragma_foreign_key_list('{table}')"),
+                [],
+                |r| r.get(0),
+            )
+            .expect("foreign_key_list");
+        count > 0
     }
 
     /// Whether `review_session` has a `comment_url` column (via `PRAGMA table_info`).
