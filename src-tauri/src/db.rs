@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -182,6 +182,9 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 4 {
         apply_v4(conn)?;
     }
+    if version < 5 {
+        apply_v5(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -220,6 +223,17 @@ fn apply_v3(conn: &Connection) -> AppResult<()> {
 /// step (the `CREATE TABLE IF NOT EXISTS` is also idempotent under replay).
 fn apply_v4(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(SCHEMA_V4).map_err(map_err)?;
+    Ok(())
+}
+
+/// v5 (AB#1066): the action outbox. Persists every queued side effect (today the
+/// review-completion desktop notification) so a pending action survives an app restart and a
+/// failed one retries to a terminal dead-letter. A FRESH `CREATE TABLE` batch (like
+/// [`SCHEMA_V1`] / [`SCHEMA_V4`]), NOT an `ALTER` — a fresh DB (version 0) runs v1..v5 and an
+/// existing v4 install runs ONLY this step (the `CREATE TABLE IF NOT EXISTS` is also idempotent
+/// under replay).
+fn apply_v5(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(SCHEMA_V5).map_err(map_err)?;
     Ok(())
 }
 
@@ -337,6 +351,37 @@ CREATE TABLE IF NOT EXISTS inbox_event (
 CREATE INDEX IF NOT EXISTS idx_inbox_event_project ON inbox_event(project_id, id DESC);
 "#;
 
+/// v5 schema — the action outbox (AB#1066). One row per queued side effect.
+///
+/// `kind` is the pinned [`crate::model::ActionKind`] wire string (the executor router branches
+/// on it). `payload` is the serialized action body (today a `model::Notification` JSON; the
+/// `outbox_get_raw` audit source). `summary` is a short human label the panel renders without
+/// deserializing the payload. `status` is the pinned [`crate::model::ActionStatus`] wire string
+/// — the worker selects `pending` rows whose `next_attempt_at <= now`, executes them, and on
+/// failure either bumps `attempt_count` + reschedules `next_attempt_at` (still `pending`) or, at
+/// the attempt cap, flips to the terminal `dead` (the dead-letter) with `last_error`. No
+/// `UNIQUE`/dedupe constraint (unlike `inbox_event`): the outbox is a producer queue, at-least-
+/// once by design — a crash mid-execute leaves the row `pending` to re-run next boot.
+const SCHEMA_V5: &str = r#"
+CREATE TABLE IF NOT EXISTS action_outbox (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id      TEXT    NOT NULL,
+    kind            TEXT    NOT NULL,
+    summary         TEXT    NOT NULL,
+    payload         TEXT    NOT NULL,
+    status          TEXT    NOT NULL,
+    attempt_count   INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL,
+    last_error      TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL
+);
+-- The worker's claim query: pending rows whose next_attempt_at is due, oldest first.
+CREATE INDEX IF NOT EXISTS idx_action_outbox_due ON action_outbox(status, next_attempt_at);
+-- The panel's per-project listing, newest first.
+CREATE INDEX IF NOT EXISTS idx_action_outbox_project ON action_outbox(project_id, id DESC);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +402,7 @@ mod tests {
                 .query_map([], |r| r.get::<_, String>(0))?
                 .collect::<rusqlite::Result<_>>()?;
             for expected in [
+                "action_outbox",
                 "config_blob",
                 "dispatch_event",
                 "dispatch_key",
@@ -431,7 +477,7 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 4, "current schema is v4");
+            assert_eq!(SCHEMA_VERSION, 5, "current schema is v5");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"
@@ -443,6 +489,10 @@ mod tests {
             assert!(
                 table_exists(conn, "inbox_event"),
                 "fresh v0 → v4 has the inbox_event table"
+            );
+            assert!(
+                table_exists(conn, "action_outbox"),
+                "fresh v0 → v5 has the action_outbox table"
             );
             Ok(())
         })
@@ -496,12 +546,15 @@ mod tests {
             "v3 must not already have inbox_event"
         );
 
-        run_migrations(&conn).expect("v3 -> v4 migrates");
+        // `run_migrations` replays ALL pending steps, so a v3 DB lands on the CURRENT schema
+        // (v4's inbox_event AND every later step); this test's job is to lock that the v4 step
+        // (inbox_event) runs on that existing-install path.
+        run_migrations(&conn).expect("v3 -> current migrates");
 
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .expect("read version");
-        assert_eq!(version, 4, "stamped to v4");
+        assert_eq!(version, SCHEMA_VERSION, "stamped to the current schema");
         assert!(
             table_exists(&conn, "inbox_event"),
             "v4 added the inbox_event table"
@@ -513,6 +566,44 @@ mod tests {
             table_has_column(&conn, "inbox_event", "webhook_event_json"),
             "v4 inbox_event has the webhook_event_json (replay) column"
         );
+    }
+
+    /// v4 → v5 migration lock (AB#1066): a DB stamped at v4 (no `action_outbox` table) must gain
+    /// the outbox table and stamp to v5. Mirrors `migrate_v3_to_v4_…`: a missing table here means
+    /// the outbox store's first query fails at runtime, not compile time, so pin the table's
+    /// arrival on the existing-install upgrade path (the fresh-open path is covered by
+    /// `migrations_create_all_tables_and_stamp_version`). Also pins the retry-bookkeeping columns
+    /// (`attempt_count` / `next_attempt_at` / `last_error`) the worker binds by name.
+    #[test]
+    fn migrate_v4_to_v5_adds_action_outbox_table() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        apply_v1(&conn).expect("seed v1");
+        apply_v2(&conn).expect("seed v2");
+        apply_v3(&conn).expect("seed v3");
+        apply_v4(&conn).expect("seed v4");
+        conn.pragma_update(None, "user_version", 4)
+            .expect("stamp v4");
+        assert!(
+            !table_exists(&conn, "action_outbox"),
+            "v4 must not already have action_outbox"
+        );
+
+        run_migrations(&conn).expect("v4 -> v5 migrates");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read version");
+        assert_eq!(version, 5, "stamped to v5");
+        assert!(
+            table_exists(&conn, "action_outbox"),
+            "v5 added the action_outbox table"
+        );
+        for col in ["attempt_count", "next_attempt_at", "last_error"] {
+            assert!(
+                table_has_column(&conn, "action_outbox", col),
+                "v5 action_outbox has the {col} retry column"
+            );
+        }
     }
 
     /// Whether a table of the given name exists (via `sqlite_master`).

@@ -26,6 +26,7 @@ pub mod error;
 pub mod events;
 pub mod inbox;
 pub mod model;
+pub mod outbox;
 pub mod pr;
 pub mod review;
 pub mod state;
@@ -221,6 +222,39 @@ fn build_app() {
                     })
                 }
             }));
+            // Install the ACTION OUTBOX executor (AB#1066) — the ONLY place that names
+            // `review::notify`. The outbox slice holds this only as the OPAQUE `ActionExecutor`; the
+            // exhaustive `match ActionKind` HERE is the Hard carrier routing each kind to its
+            // provider (today the desktop notifier). A new `ActionKind` without an arm is a compile
+            // error — the missing channel cannot be expressed. The closure deserializes the stored
+            // payload (a `model::Notification` JSON) and delivers it; a deser/deliver Err propagates
+            // so the worker retries / dead-letters rather than marking the row falsely `done`.
+            let outbox_executor: outbox::ActionExecutor =
+                Arc::new(|app: tauri::AppHandle, action: outbox::OutboxAction| {
+                    Box::pin(async move {
+                        match action.kind {
+                            model::ActionKind::Notification => {
+                                let note: model::Notification =
+                                    serde_json::from_str(&action.payload).map_err(|e| {
+                                        error::AppError::new(format!(
+                                            "outbox 通知反序列化失败：{e}"
+                                        ))
+                                    })?;
+                                review::notify::deliver(
+                                    &app,
+                                    model::NotificationKind::Desktop,
+                                    &note,
+                                )
+                                .await
+                            }
+                        }
+                    })
+                });
+            // Start the outbox worker (AB#1066): drains the durable queue, retries failures with
+            // backoff, dead-letters at the attempt cap. Its first sweep is immediate, so any rows
+            // persisted before a previous exit resume now (restart-resume). Killed on app shutdown.
+            state.outbox.start(app.handle().clone(), outbox_executor);
+
             // Auto-start the poll loop only when the persisted config is valid, via the
             // shared start_if_config_valid gate — the SINGLE funnel point (PR #41 F1) the
             // public start_polling command also goes through. On first launch (empty
@@ -286,6 +320,9 @@ fn build_app() {
             inbox::commands::inbox_list,
             inbox::commands::inbox_get_raw,
             inbox::commands::inbox_replay,
+            outbox::commands::outbox_list,
+            outbox::commands::outbox_get_raw,
+            outbox::commands::outbox_retry,
             review::commands::get_codex_status,
             review::commands::get_claude_status,
             review::commands::start_codex,
@@ -317,6 +354,9 @@ fn build_app() {
                 state.webhook.shutdown();
                 // Stop the resident local REST API listener (AB#1043): same shutdown contract.
                 state.local_api.shutdown();
+                // Stop the action-outbox worker (AB#1066): signal + abort the task so it never
+                // outlives the app (same "软件关闭时一起关闭" contract).
+                state.outbox.shutdown();
             }
         });
 }

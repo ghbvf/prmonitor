@@ -28,7 +28,9 @@ use tauri::{AppHandle, Manager, Runtime};
 use url::Url;
 
 use crate::error::{AppError, AppResult};
-use crate::model::{Notification, NotificationKind, NotificationLevel, RedactedNotificationBody};
+use crate::model::{
+    ActionKind, Notification, NotificationKind, NotificationLevel, RedactedNotificationBody,
+};
 use crate::review::commands::{self, validate_kind, validate_pr_number};
 use crate::review::notify;
 use crate::review::session::CompletionOutcome;
@@ -242,18 +244,17 @@ async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
         }
     };
 
-    notify_completion(&app, pr_number, &outcome).await;
+    notify_completion(&app, pr_number, &outcome);
     focus_main_window(&app);
 }
 
-/// Send the fire-and-forget completion notification. `wire_status` (not the `Done`/`Failed`
-/// collapse) distinguishes completed vs interrupted vs failed; the body carries the pr-review
-/// comment URL (the actionable artifact) when one was resolved.
-async fn notify_completion<R: Runtime>(
-    app: &AppHandle<R>,
-    pr_number: u64,
-    outcome: &CompletionOutcome,
-) {
+/// ENQUEUE the completion notification into the durable action outbox (AB#1066) instead of
+/// delivering it inline: the worker performs the desktop notification, so a pending notification
+/// survives an app restart and a failed delivery retries to a dead-letter. `wire_status` (not the
+/// `Done`/`Failed` collapse) distinguishes completed vs interrupted vs failed; the body carries the
+/// pr-review comment URL (the actionable artifact) when one was resolved. Synchronous now — enqueue
+/// is a durable write + a worker wake, no await.
+fn notify_completion<R: Runtime>(app: &AppHandle<R>, pr_number: u64, outcome: &CompletionOutcome) {
     // Whitelist the known terminal statuses; never reflect codex's raw `wire_status` (it comes from
     // the codex subprocess) into the notification title. An unexpected value gets a fixed label +
     // a diagnostic log rather than surfacing arbitrary content.
@@ -274,16 +275,34 @@ async fn notify_completion<R: Runtime>(
         Some(url) => RedactedNotificationBody::action_url(url),
         None => RedactedNotificationBody::fixed(no_link_body),
     };
+    let summary = format!("PR #{pr_number} review {status_label}");
     let note = Notification::new(
         NotificationLevel::Info,
-        format!("PR #{pr_number} review {status_label}"),
+        summary.clone(),
         outcome.comment_url.clone().unwrap_or_default(),
         body,
         String::new(),
     );
 
-    if let Err(e) = notify::deliver(app, NotificationKind::Desktop, &note).await {
-        eprintln!("deeplink 通知发送失败: {e}");
+    // Enqueue rather than deliver: persist the action, let the outbox worker (which holds the
+    // `match ActionKind` executor → `notify::deliver`) perform + retry it. The payload is the
+    // serialized `Notification` the executor deserializes; `project_id` is empty (a deeplink isn't
+    // project-scoped), matching the `Notification`'s own empty routing key.
+    let payload = match serde_json::to_string(&note) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("deeplink 通知序列化失败: {e}");
+            return;
+        }
+    };
+    if let Err(e) = crate::outbox::service::enqueue(
+        app,
+        &note.project_id,
+        ActionKind::Notification,
+        &summary,
+        &payload,
+    ) {
+        eprintln!("deeplink 通知入队失败: {}", e.message);
     }
 }
 

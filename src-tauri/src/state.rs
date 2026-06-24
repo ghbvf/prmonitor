@@ -34,4 +34,9 @@ pub struct AppState {
     /// `inbox_replay` command re-uses (installed once by the composition root in `setup()`,
     /// like the webhook ingestor/refresher). Methods take `&self`.
     pub inbox: crate::inbox::manager::InboxManager,
+    /// The action outbox (AB#1066): the durable side-effect queue + its background worker. Holds
+    /// the composition-root-injected executor closure, the worker's wake/stop signals, and the
+    /// spawned task handle. Started once in `lib.rs` `setup()`; killed on app shutdown. Methods
+    /// take `&self`.
+    pub outbox: crate::outbox::manager::OutboxManager,
 }
