@@ -315,3 +315,83 @@ export type InboxEvent = {
   projectId: string;
   entry: InboxEntry;
 };
+
+// ── Action outbox contracts (AB#1066, epic AB#1078) ───────────────────────────────
+// The outbox is the symmetric counterpart to the inbox: it retains each outbound ACTION the
+// rule engine enqueued, with a retry lifecycle (attempt count / next-attempt time / last
+// error) and a dead-letter terminal. It mirrors the inbox's `as const` + `assertNever` carrier
+// shape so a new status/kind can't drift past the rendered labels.
+
+// The retry lifecycle status of an outbox entry — mirrors the Rust `ActionStatus` enum's
+// camelCase serde form (locked by the model.rs golden test). Single-sourced as an `as const`
+// array (mirrors INBOX_STATUSES / EVENT_TYPES): the type is DERIVED from the array, so the
+// literal set is Hard — a value outside `["pending","done","dead"]` is un-expressible. The
+// `outboxStatusLabel` switch below is the Medium `assertNever`穷尽 carrier on top of it.
+export const OUTBOX_STATUSES = ["pending", "done", "dead"] as const;
+export type OutboxStatus = (typeof OUTBOX_STATUSES)[number];
+
+// A human-readable label for an OutboxStatus, rendered as the outbox row's status badge.
+// `default: assertNever(s)` (Medium — `assertNever`穷尽, same carrier class as
+// `inboxStatusLabel`): adding an OutboxStatus without a label arm here is a COMPILE error, so
+// the status set and the rendered badges can't drift.
+export function outboxStatusLabel(s: OutboxStatus): string {
+  switch (s) {
+    case "pending":
+      return "待执行 / Pending";
+    case "done":
+      return "已完成 / Done";
+    case "dead":
+      return "最终失败 / Dead-letter";
+    default:
+      return assertNever(s);
+  }
+}
+
+// The kind of action an outbox entry performs — mirrors the Rust `ActionKind` enum's camelCase
+// serde form (locked by the model.rs golden test). Single-sourced as an `as const` array
+// (mirrors OUTBOX_STATUSES): the type is DERIVED from the array. Currently only "notification"
+// (the sole action the rule engine enqueues).
+export const ACTION_KINDS = ["notification"] as const;
+export type ActionKind = (typeof ACTION_KINDS)[number];
+
+// A human-readable label for an ActionKind, rendered as the outbox row's kind tag.
+// `default: assertNever(k)` (Medium — `assertNever`穷尽, same carrier class as
+// `outboxStatusLabel`): adding an ActionKind without a label arm here is a COMPILE error.
+export function outboxKindLabel(k: ActionKind): string {
+  switch (k) {
+    case "notification":
+      return "通知 / Notification";
+    default:
+      return assertNever(k);
+  }
+}
+
+// A retained outbox entry (AB#1066) — mirrors `model.rs::OutboxEntry` (Serialize-only, serde
+// camelCase; locked by the model.rs golden test). Unlike `InboxEntry`, the raw action payload
+// is NOT embedded: it's fetched on demand via `outboxGetRaw` (the "查看原始" disclosure). The
+// retry fields drive the row's "重试中 (N)" badge / next-attempt readout. `projectId` is at the
+// TOP level (unlike InboxEntry, whose projectId is nested under `.event.projectId`). `lastError`
+// is non-null only for an entry that has failed at least once.
+export interface OutboxEntry {
+  id: number;
+  projectId: string;
+  kind: ActionKind;
+  summary: string;
+  status: OutboxStatus;
+  attemptCount: number;
+  nextAttemptAt: number;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+// Mirrors the `outbox:updated` Tauri event payload (AB#1066) — the downstream end of the
+// event-name funnel for the outbox push stream (the upstream `OUTBOX_UPDATED_EVENT` name lives
+// in `outbox/api.ts`). A single-arm tagged union (discriminant `kind`) mirroring `InboxEvent` /
+// `PrEvent`, so it can widen later without churning the call sites. `projectId` (#35) routes
+// each upsert to its monitored project.
+export type OutboxEvent = {
+  kind: "updated";
+  projectId: string;
+  entry: OutboxEntry;
+};

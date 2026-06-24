@@ -5,7 +5,7 @@
 // actions; vue-router would add a dependency for three URL-less desktop views.
 import { ref } from "vue";
 
-export type AppView = "monitor" | "settings" | "onboarding" | "inbox";
+export type AppView = "monitor" | "settings" | "onboarding" | "inbox" | "outbox";
 
 const currentView = ref<AppView>("monitor");
 
@@ -16,5 +16,6 @@ export function useAppView() {
     goSettings: () => (currentView.value = "settings"),
     goOnboarding: () => (currentView.value = "onboarding"),
     goInbox: () => (currentView.value = "inbox"),
+    goOutbox: () => (currentView.value = "outbox"),
   };
 }
