@@ -28,6 +28,7 @@ pub mod inbox;
 pub mod model;
 pub mod outbox;
 pub mod pr;
+pub mod remote;
 pub mod review;
 pub mod state;
 
@@ -343,14 +344,31 @@ fn build_app() {
             // valid config lands, running the same gate. The dispatcher hook above stays
             // installed, so the first tick after a later start already dispatches.
             let _ = pr::commands::start_if_config_valid(app.handle(), state.inner());
-            // Start the RESIDENT local REST API (AB#1043): a 127.0.0.1-only axum listener that
-            // lets a third party (curl/CLI) trigger a review + poll for completion + comment URL.
-            // NEVER tunneled — this is the inbound trigger control plane, strictly separate from
-            // the public `webhook` receiver. The bound PORT is read once here (a change needs an
-            // app restart, like the webhook port); the TOKEN is read live per request, so
-            // setting/clearing it in Settings takes effect without a restart. A bind failure is
-            // logged + swallowed inside the spawned task (a port clash must not crash the app).
-            state.local_api.start(app.handle().clone());
+            // Start the Remote Access listener runtime (AB#1225): reconcile `config.listeners[]` →
+            // bound loopback listeners. local-api is the sole real binder this PR — it mounts the
+            // 127.0.0.1-only trigger control plane (`review::local_api::build_router`) on the port
+            // from its `listeners[]` entry (NEVER tunneled; the TOKEN is still read live per request,
+            // so setting/clearing it in Settings takes effect without a restart). Fail-closed: a
+            // non-loopback bindHost is refused (needs AB#1073); remote-web/terminal/event-ingress are
+            // reported `unsupported`. A per-listener bind failure is captured in status, never crashes
+            // the app. Reconciled again after each `set_config` save.
+            match config::service::load(app.handle()) {
+                Ok(cfg) => state.remote.reconcile(app.handle(), &cfg.listeners),
+                Err(e) => eprintln!("Remote 监听运行时：读取配置失败，跳过初次 reconcile：{e}"),
+            }
+            // Install the post-save reconcile hook (AB#1225 F4) — the ONLY place that bridges
+            // config→remote. `config::commands::set_config` fires `state.config_saved` after a save;
+            // THIS closure (capturing the concrete Wry `AppHandle` at install time, which sidesteps
+            // the generic-`R` problem `set_config` would otherwise hit) reconciles the listener
+            // runtime. The `config` slice never names `crate::remote` — the seam mirrors the
+            // review→outbox notification sink + the webhook ingestor. (The startup reconcile above is
+            // a direct call: lib.rs is the composition root, so naming remote here is by design.)
+            state.config_saved.set_hook(Arc::new({
+                let app = app.handle().clone();
+                move |listeners: Vec<config::model::Listener>| {
+                    app.state::<AppState>().remote.reconcile(&app, &listeners);
+                }
+            }));
 
             // Deeplink trigger (AB#1045): route opened `prmonitor://review?…` URLs into the
             // `trigger_review` funnel. `register_all` is DEBUG-ONLY — it runtime-registers the
@@ -414,6 +432,7 @@ fn build_app() {
             review::commands::get_session_history,
             review::commands::get_pr_sessions,
             config::commands::set_active_project,
+            remote::commands::get_listener_runtime_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -431,8 +450,9 @@ fn build_app() {
                 // Kill the cloudflared tunnel + abort the receiver so neither outlives
                 // the app (same "软件关闭时一起关闭" contract as codex).
                 state.webhook.shutdown();
-                // Stop the resident local REST API listener (AB#1043): same shutdown contract.
-                state.local_api.shutdown();
+                // Stop the Remote Access listener runtime (AB#1225): fire each listener's graceful
+                // shutdown + abort its serve task so none outlives the app (same contract).
+                state.remote.shutdown();
                 // Stop the action-outbox worker (AB#1066): signal + abort the task so it never
                 // outlives the app (same "软件关闭时一起关闭" contract).
                 state.outbox.shutdown();

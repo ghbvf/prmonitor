@@ -36,8 +36,7 @@
 //!  - `GET /reviews/{id}` → `200 {status, commentUrl?}` (the in-memory registry, falling
 //!    through to the durable by-id read for a finished / post-restart session).
 
-use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -46,9 +45,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
-use tauri::async_runtime::{spawn, JoinHandle};
 use tauri::Manager;
-use tokio::sync::oneshot;
 
 use super::session::{SessionInfo, SessionStatus};
 use crate::config::service as config_service;
@@ -56,10 +53,6 @@ use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 
-/// Bounded bind retry to ride out OS socket-release lag on a rapid restart (mirrors the
-/// webhook receiver's F3 handling). A final failure is logged + swallowed, never propagated.
-const BIND_RETRIES: u32 = 10;
-const BIND_RETRY_DELAY: Duration = Duration::from_millis(20);
 /// Trigger bodies are tiny (`{projectId, pr, kind}`). Cap what an unauthenticated POST can
 /// make us buffer before the auth check rejects it (the same body-cap defense the webhook
 /// receiver uses, with a smaller cap — a trigger body is far smaller than a webhook payload).
@@ -358,115 +351,29 @@ async fn handle_status<R: tauri::Runtime>(
 }
 
 // ===========================================================================================
-// Manager — resident listener lifecycle (mirrors `WebhookManager`'s `&self` + interior mut).
+// Router builder — the local-api router, mounted by the listener supervisor (AB#1225).
 // ===========================================================================================
 
 /// Shared handler state. Holds the app handle (to reach `trigger_review` / the registry / the
 /// live config) + the bound port (for `statusUrl`). It does NOT snapshot the token — that is
-/// read live per request.
-struct Ctx<R: tauri::Runtime> {
-    app: tauri::AppHandle<R>,
-    port: u16,
+/// read live per request. `pub(crate)` so [`crate::remote::supervisor`] constructs it when it
+/// binds the local-api port from a `config.listeners[]` entry.
+pub(crate) struct Ctx<R: tauri::Runtime> {
+    pub(crate) app: tauri::AppHandle<R>,
+    pub(crate) port: u16,
 }
 
-struct LocalApiRuntime {
-    server_task: JoinHandle<()>,
-    /// Graceful-shutdown signal; firing it lets `axum::serve` drop the listener before the
-    /// task ends (so a future re-bind on the same port is clean, as in the webhook receiver).
-    shutdown: oneshot::Sender<()>,
-}
-
-/// Resident local REST API listener handle, lives in [`crate::state::AppState`]. `Default`
-/// (no listener until [`start`](Self::start)); methods take `&self`.
-#[derive(Default)]
-pub struct LocalApiManager {
-    runtime: StdMutex<Option<LocalApiRuntime>>,
-}
-
-impl LocalApiManager {
-    /// Start the resident listener (called once from `lib.rs` `setup()`). Reads the bound port
-    /// once; `port == 0` means "off" (no bind). The bind + serve run in a spawned task whose
-    /// final bind failure is LOGGED + SWALLOWED — a port clash must never crash the desktop app
-    /// (setup does not await this), and the feature is opt-in via the curl client anyway.
-    pub fn start<R: tauri::Runtime>(&self, app: tauri::AppHandle<R>) {
-        // Idempotent: a second `start` (e.g. a future setup refactor) must NOT spawn a second
-        // listener and orphan the first's task — one resident listener for the app's life.
-        if self.runtime.lock().unwrap().is_some() {
-            return;
-        }
-        let port = match config_service::load(&app) {
-            Ok(cfg) => cfg.local_api_port,
-            Err(e) => {
-                eprintln!("本地 API：读取配置失败，跳过启动：{e}");
-                return;
-            }
-        };
-        if port == 0 {
-            return;
-        }
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-        let ctx = Arc::new(Ctx {
-            app: app.clone(),
-            port,
-        });
-        let server_task = spawn(async move {
-            let listener = {
-                let mut bound = None;
-                let mut last_err = None;
-                for attempt in 0..BIND_RETRIES {
-                    match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                        Ok(l) => {
-                            bound = Some(l);
-                            break;
-                        }
-                        Err(e) => {
-                            last_err = Some(e);
-                            if attempt + 1 < BIND_RETRIES {
-                                tokio::time::sleep(BIND_RETRY_DELAY).await;
-                            }
-                        }
-                    }
-                }
-                match bound {
-                    Some(l) => l,
-                    None => {
-                        // Defensive: `last_err` is `Some` whenever a bind was attempted and
-                        // failed (BIND_RETRIES > 0), but degrade gracefully rather than panic
-                        // in this detached task if that invariant ever changes.
-                        let reason = last_err
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "no bind attempt (BIND_RETRIES is 0)".to_string());
-                        eprintln!("本地 API：端口 {port} 监听失败，已跳过（{reason}）");
-                        return;
-                    }
-                }
-            };
-            let router = Router::new()
-                .route("/reviews", post(handle_create::<R>))
-                .route("/reviews/:id", get(handle_status::<R>))
-                .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-                .with_state(ctx);
-            let _ = axum::serve(listener, router.into_make_service())
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.await;
-                })
-                .await;
-        });
-        *self.runtime.lock().unwrap() = Some(LocalApiRuntime {
-            server_task,
-            shutdown: shutdown_tx,
-        });
-    }
-
-    /// App-shutdown cleanup (wired to `RunEvent::Exit` in `lib.rs`, like the other managers):
-    /// fire the graceful-shutdown signal + abort the task so the listener never outlives the app.
-    /// Sync best-effort (the exit handler can't await).
-    pub fn shutdown(&self) {
-        if let Some(rt) = self.runtime.lock().unwrap().take() {
-            let _ = rt.shutdown.send(());
-            rt.server_task.abort();
-        }
-    }
+/// Build the local-api router for an already-resolved [`Ctx`]. Extracted (AB#1225) from the
+/// former resident `LocalApiManager::start` so the listener supervisor (`crate::remote`) can
+/// mount this SAME router — handlers + the 3-layer security gate ([`check_request`]) + the live
+/// per-request token read are unchanged — on the port it binds. The local-api runtime is now
+/// driven by `config.listeners[]` (single source of truth), not a resident manager.
+pub(crate) fn build_router<R: tauri::Runtime>(ctx: Arc<Ctx<R>>) -> Router {
+    Router::new()
+        .route("/reviews", post(handle_create::<R>))
+        .route("/reviews/:id", get(handle_status::<R>))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(ctx)
 }
 
 #[cfg(test)]

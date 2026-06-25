@@ -104,4 +104,8 @@ alloc-no-stdlib = "=2.0.4"
 # `#[tokio::test]` lifecycle tests, which spawn `run_loop` and drive it through
 # wake/reconfigure/stop deterministically (no sleeps).
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util", "io-util"] }
+# `test` feature exposes `tauri::test::{mock_app, MockRuntime}` for the AB#1225 listener
+# supervisor reconcile integration test, which builds a mock app handle and drives a real
+# loopback bind→serve→teardown cycle (the unit tests cover the pure paths). CI-safe: 127.0.0.1 only.
+tauri = { version = "2", features = ["test"] }
 

@@ -168,12 +168,17 @@ function composeConfig(): AppConfig {
     webhookTunnelMode: "quick",
     webhookTunnelCommand: "",
     webhookPublicUrl: "",
-    localApiPort: 8788,
     localApiToken: "",
     outbox: { ...DEFAULT_OUTBOX_CONFIG },
-    // Remote-access resources (AB#1064) start empty — onboarding only seeds the first
-    // project + webhook defaults; listeners/tunnels are added later in Settings.
-    listeners: [],
+    // Remote-access resources (AB#1064 / F10): source listeners from the LOADED backend
+    // config so the backend `default_local_api_listener()` in config/model.rs is the single
+    // source of truth — no TS-side literal mirror. On first launch `AppConfig::default()`
+    // always seeds a local-api listener, so `store.config.listeners` is guaranteed non-empty
+    // when `finish()` runs (load() completes on mount before the user can reach the done step).
+    // Guard: if config is null (load failed) or listeners is empty (backend bug), spread an
+    // empty array — the backend will re-apply its own defaults on next read (F4 not regressed
+    // because a backend load-failure is already surfaced as store.error before finish() runs).
+    listeners: store.config?.listeners ? [...store.config.listeners] : [],
     tunnels: [],
   };
 }

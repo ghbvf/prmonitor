@@ -32,6 +32,42 @@ export const LISTENER_KINDS = [
 ] as const;
 export type ListenerKind = (typeof LISTENER_KINDS)[number];
 
+// Runtime listener state (AB#1225 PR1) — mirrors the Rust `ListenerState` enum's
+// kebab-case wire values emitted by the `get_listener_runtime_status` command.
+// bound = successfully bound; bound-no-auth = bound but `local_api_token` is empty
+// so requests 401 (bound ≠ usable; user must set a token); blocked-needs-1073 =
+// loopback-only gate prevents binding on a non-loopback host (AB#1073 will lift
+// this); unsupported = the kind can't bind yet (e.g. remote-web, event-ingress,
+// terminal — awaiting AB#1073 / tunnel); error = bind attempt failed (see
+// `message` for details).
+//
+// Single-sourced as an `as const` array (same #50 review G9 pattern): the type is
+// DERIVED from the array so the Medium `assertNever`穷尽 carrier in
+// RemoteAccessRuntimeStatus.vue (listenerStateLabel switch) covers every value here.
+// Adding a new state is a compile error in that switch unless a case is added.
+export const LISTENER_STATES = [
+  "bound",
+  "bound-no-auth",
+  "blocked-needs-1073",
+  "unsupported",
+  "error",
+] as const;
+export type ListenerState = (typeof LISTENER_STATES)[number];
+
+// Runtime status row for one listener (AB#1225 PR1) — mirrors the Rust
+// `ListenerRuntimeStatus` struct's camelCase wire shape emitted by
+// `get_listener_runtime_status`. `boundPort` is present only when `bound` is true.
+// Golden-locked on the Rust side (serde camelCase test); this interface is the
+// TS downstream end of that funnel.
+export interface ListenerRuntimeStatus {
+  id: string;
+  kind: ListenerKind;
+  bound: boolean;
+  boundPort?: number;
+  state: ListenerState;
+  message: string;
+}
+
 // Listener auth mode (AB#1064): none = no credential (loopback only); bearer = an
 // Authorization: Bearer <token> gate. Mirrors the Rust `ListenerAuthMode` wire values.
 // Default "none". Same single-sourced `as const`-array pattern as LISTENER_KINDS.
@@ -125,10 +161,10 @@ export interface AppConfig {
   webhookTunnelMode: WebhookTunnelMode;
   webhookTunnelCommand: string;
   webhookPublicUrl: string;
-  // Local REST API (AB#1043): a resident 127.0.0.1-only trigger endpoint for a third-party
-  // CLI/curl. Distinct from the webhook (never tunneled). `localApiToken` empty = disabled
-  // (fail-closed 401). Mirror the Rust `AppConfig.localApiPort`/`localApiToken` wire fields.
-  localApiPort: number;
+  // Local REST API token (AB#1043): Bearer credential for the 127.0.0.1 trigger endpoint.
+  // `localApiToken` empty = disabled (fail-closed 401). The port is now owned by the
+  // `listeners[]` entry of kind "local-api" (AB#1225 PR1) — `localApiPort` is gone from
+  // AppConfig. Mirror the Rust `AppConfig.localApiToken` wire field.
   localApiToken: string;
   // Outbox worker policy (AB#1182): per-kind staleness TTLs for the durable action queue. Global
   // (one policy serves every project). Mirrors the Rust `AppConfig.outbox` wire field; the nested

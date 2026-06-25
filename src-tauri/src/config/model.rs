@@ -202,10 +202,6 @@ pub struct AppConfig {
     /// 非空则作为 `WebhookStatus.public_url`，UI 据此拼出 GitHub Payload URL；为空则 `None`。
     /// `quick` 模式忽略本字段（URL 从 cloudflared 日志抓取）。
     pub webhook_public_url: String,
-    /// 本地 REST API（AB#1043）监听端口（仅绑 `127.0.0.1`；给本机第三方 CLI/curl 调用方触发
-    /// review 用）。与 `webhook_port` 的公网接收端**严格分离**——本地 API 永不走隧道。`0` =
-    /// 不绑定（彻底关闭逃生口）；改端口需重启 app（端口在启动时绑定一次，与 webhook 一致）。
-    pub local_api_port: u16,
     /// 本地 REST API 的 Bearer token（AB#1043）。**空 = fail-closed 禁用**：listener 仍绑定，但
     /// handler 每个请求实时读取本字段做常量时间比较，空 token 一律 401。设 / 清即时生效、无需
     /// 重启。loopback-only 仍是触发端点（本机任意进程 + DNS rebinding 可达），故非空时按
@@ -232,11 +228,12 @@ impl Default for AppConfig {
             webhook_tunnel_mode: WebhookTunnelMode::default(),
             webhook_tunnel_command: String::new(),
             webhook_public_url: String::new(),
-            // AB#1043: 8788 = webhook 默认 8787 + 1，避免两端口同默认时冲突。
-            local_api_port: 8788,
             local_api_token: String::new(),
             outbox: OutboxConfig::default(),
-            listeners: Vec::new(),
+            // AB#1225: 全新安装默认开启本地触发 API（端口 8788 = webhook 默认 8787 + 1，避免
+            // 两端口同默认时冲突），现以 `listeners[]` 的 local-api 条目表达——supervisor 绑定的
+            // 单一真值源（取代旧的 `local_api_port` 字段）。
+            listeners: vec![default_local_api_listener()],
             tunnels: Vec::new(),
         }
     }
@@ -276,6 +273,46 @@ pub struct Listener {
     pub auth: ListenerAuthMode,
     pub allowed_origins: Vec<String>,
     pub public_url: String,
+}
+
+/// Stable `id` of the seeded local-api listener (AB#1225). Single source for the literal so the
+/// model's [`default_local_api_listener`] and the service's `seed_local_api_listener` (detect-by-id
+/// / seeded `id`) and its seeded `kind` string agree. NOTE: this wire string equals
+/// [`ListenerKind::LocalApi`]'s serde value (`"local-api"`), golden-locked by
+/// `listener_kind_wire_values_are_kebab` — keep the two in sync if either changes.
+pub(crate) const LOCAL_API_LISTENER_ID: &str = "local-api";
+
+/// Loopback bindHost whitelist (AB#1225). Single source for both save-time validation here and
+/// the runtime supervisor's fail-closed gate. Whitelist, never blacklist.
+///
+/// Narrowed (F2) to ONLY the literal `127.0.0.1` the supervisor actually binds (`bind_std_with_retry`
+/// always binds `("127.0.0.1", port)` and the status text is fixed `127.0.0.1:{p}`): accepting
+/// `localhost` / `::1` / `[::1]` here would let a config value pass save-time validation while the
+/// runtime silently bound a DIFFERENT address than the one configured — a config/runtime mismatch.
+/// `localhost` / `::1` are simply NOT YET supported as a `bindHost` value (no compat shim — they were
+/// never wired to a distinct bind). NOTE: this is a SEPARATE concern from
+/// `review::local_api`'s `security::host_allowed`, which validates the incoming request `Host` HEADER
+/// (and correctly accepts `localhost` / `::1` for loopback clients) — do not conflate the two.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    host.trim() == "127.0.0.1"
+}
+
+/// The default local-api listener (AB#1225). Fresh installs get the local trigger API ON at
+/// 8788 (was the old `local_api_port` default), now expressed as a `listeners[]` entry — the
+/// single source of truth the supervisor binds. `auth: Bearer` is descriptive; the token is the
+/// global `local_api_token`, read live by the handler (a per-listener token is an AB#1073 follow-up).
+pub(crate) fn default_local_api_listener() -> Listener {
+    Listener {
+        id: LOCAL_API_LISTENER_ID.to_string(),
+        name: "Local API".to_string(),
+        kind: ListenerKind::LocalApi,
+        bind_host: "127.0.0.1".to_string(),
+        port: 8788,
+        enabled: true,
+        auth: ListenerAuthMode::Bearer,
+        allowed_origins: Vec::new(),
+        public_url: String::new(),
+    }
 }
 
 /// A declarative tunnel descriptor (AB#1064). Reuses WebhookTunnelMode (quick/command/listener).
@@ -706,13 +743,53 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
         }
     }
 
+    // 1b. Listener / tunnel `id` uniqueness (AB#1225 F3): every listener `id` and every tunnel `id`
+    //     must be non-empty and unique. These ids are HashMap-by-id lookup keys — the supervisor's
+    //     `desired_ports` / runtime map and `listener_enabled_by_id`, plus tunnel `target_listener_id`
+    //     resolution — so a duplicate id would silently fold two entries into one (last writer wins),
+    //     and an empty id can't be addressed by a tunnel target. Checked for EVERY listener/tunnel
+    //     (enabled or not): a disabled entry's id still occupies the id space the moment it is enabled,
+    //     and a tunnel may target a (currently) disabled listener by id. Messages keep the
+    //     `listenerId` / `tunnelId` field-token prefix (cross-end routing contract). The Hard path
+    //     (future) is a typed-id newtype whose constructor rejects empties at the type level.
+    let mut seen_listener_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for listener in &config.listeners {
+        let id = listener.id.trim();
+        if id.is_empty() {
+            return Err(AppError::new(format!(
+                "listenerId 不能为空（监听器「{}」需要一个唯一 id）",
+                listener.name
+            )));
+        }
+        if !seen_listener_ids.insert(id) {
+            return Err(AppError::new(format!(
+                "listenerId 重复: {id}（每个监听器的 id 必须唯一）"
+            )));
+        }
+    }
+    let mut seen_tunnel_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for tunnel in &config.tunnels {
+        let id = tunnel.id.trim();
+        if id.is_empty() {
+            return Err(AppError::new(format!(
+                "tunnelId 不能为空（隧道「{}」需要一个唯一 id）",
+                tunnel.name
+            )));
+        }
+        if !seen_tunnel_ids.insert(id) {
+            return Err(AppError::new(format!(
+                "tunnelId 重复: {id}（每个隧道的 id 必须唯一）"
+            )));
+        }
+    }
+
     // 2. Port conflict: every ENABLED listening port must be unique. Sources are the webhook
-    //    receiver (when enabled), the local REST API (when its port is non-zero — `0` = disabled
-    //    sentinel), and each enabled listener with a non-zero port. The label (port → human
-    //    name) makes the first collision's message name both occupants.
-    // Claim order is fixed (webhook → localApi → listeners in declared order), so the first
-    // collision — and thus the conflict error message — is deterministic despite HashMap being
-    // an unordered container (we only ever read `insert`'s returned prior value, never iterate).
+    //    receiver (when enabled) and each enabled listener with a non-zero port (the local REST
+    //    API is now one such listener — kind `local-api` — not a standalone field, AB#1225). The
+    //    label (port → human name) makes the first collision's message name both occupants.
+    // Claim order is fixed (webhook → listeners in declared order), so the first collision — and
+    // thus the conflict error message — is deterministic despite HashMap being an unordered
+    // container (we only ever read `insert`'s returned prior value, never iterate).
     let mut ports: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
     let mut claim = |port: u16, label: String| -> AppResult<()> {
         if let Some(existing) = ports.insert(port, label.clone()) {
@@ -725,9 +802,6 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
     if config.webhook_enabled {
         claim(config.webhook_port, "webhookPort".to_string())?;
     }
-    if config.local_api_port != 0 {
-        claim(config.local_api_port, "localApiPort".to_string())?;
-    }
     for listener in &config.listeners {
         if !listener.enabled {
             continue;
@@ -739,6 +813,22 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
             return Err(AppError::new(format!(
                 "port 必须大于 0（监听器「{}」已启用但端口为 0/未设置）",
                 listener.name
+            )));
+        }
+        // AB#1225 security gate: an ENABLED listener MUST bind a loopback host. Remote exposure
+        // (`0.0.0.0` / LAN IP / hostname) is deferred to AB#1073 (per-listener auth/origin), so a
+        // non-loopback enabled listener is rejected here — fail-closed, and via the SAME whitelist
+        // ([`is_loopback_host`]) the runtime supervisor enforces at bind time, so save-time and
+        // bind-time agree. Ordered AFTER the port-0 reject (a 0-port listener is unbindable
+        // regardless of host, so that diagnostic wins) and BEFORE the conflict claim (a
+        // remote-exposed listener never reaches port-arbitration). Disabled listeners are exempt
+        // (they never bind), mirroring the disabled port-0 / port-conflict exemptions. The message
+        // keeps the `bindHost` field-token prefix so SettingsView's `errorToStep` routes it to the
+        // listener's bindHost field.
+        if !is_loopback_host(&listener.bind_host) {
+            return Err(AppError::new(format!(
+                "bindHost 仅支持 127.0.0.1（监听器「{}」远程暴露需 AB#1073；localhost/::1 暂不支持）: {}",
+                listener.name, listener.bind_host
             )));
         }
         // Label the occupant by its user-facing name, falling back to a short id when the
@@ -852,7 +942,6 @@ mod tests {
             webhook_tunnel_mode: WebhookTunnelMode::default(),
             webhook_tunnel_command: String::new(),
             webhook_public_url: String::new(),
-            local_api_port: 8788,
             local_api_token: "local-api-token-0123456789".to_string(),
             outbox: OutboxConfig::default(),
             listeners: Vec::new(),
@@ -882,8 +971,8 @@ mod tests {
         assert_eq!(v["webhookTunnelMode"], "quick");
         assert!(v.get("webhookTunnelCommand").is_some());
         assert!(v.get("webhookPublicUrl").is_some());
-        // AB#1043: local REST API keys present (camelCase) at the top level.
-        assert!(v.get("localApiPort").is_some());
+        // AB#1043: local REST API token present (camelCase) at the top level. (The port is no
+        // longer a top-level field — AB#1225 moved it into a `listeners[]` local-api entry.)
         assert!(v.get("localApiToken").is_some());
         // AB#1064: Remote Access collections present at the top level.
         assert!(v.get("listeners").is_some());
@@ -898,7 +987,6 @@ mod tests {
         assert!(v.get("webhook_tunnel_mode").is_none());
         assert!(v.get("webhook_tunnel_command").is_none());
         assert!(v.get("webhook_public_url").is_none());
-        assert!(v.get("local_api_port").is_none());
         assert!(v.get("local_api_token").is_none());
 
         // The per-project fields must NOT have leaked back to the top level (they
@@ -1123,11 +1211,21 @@ mod tests {
         );
     }
 
-    /// First-launch marker lock (AB#1064, Medium): a fresh config has no Remote Access
-    /// listeners/tunnels, so nothing is exposed until the user adds one.
+    /// Default local-api listener lock (AB#1225, Medium): a fresh install ships exactly ONE
+    /// listener — the local trigger API, enabled at `127.0.0.1:8788` — which is the single source
+    /// of truth the supervisor binds (replacing the old `local_api_port` field). A silent change
+    /// to the seeded default (off / different port / wrong kind) would break "local API on by
+    /// default" for new installs, so it is machine-checked here. No tunnels are seeded — nothing
+    /// public is exposed until the user adds one.
     #[test]
-    fn default_has_no_listeners_or_tunnels() {
-        assert!(AppConfig::default().listeners.is_empty());
+    fn default_seeds_local_api_listener() {
+        let listeners = AppConfig::default().listeners;
+        assert_eq!(listeners.len(), 1);
+        let l = &listeners[0];
+        assert_eq!(l.kind, ListenerKind::LocalApi);
+        assert!(l.enabled);
+        assert_eq!(l.port, 8788);
+        assert_eq!(l.bind_host, "127.0.0.1");
         assert!(AppConfig::default().tunnels.is_empty());
     }
 
@@ -1151,9 +1249,8 @@ mod tests {
     #[test]
     fn validate_accepts_https_public_url() {
         let config = AppConfig {
-            // Isolate the HTTPS guard: localApiPort 0 = off so the port-conflict check can't
-            // mask/fire — only the HTTPS path is exercised here.
-            local_api_port: 0,
+            // Override `listeners` so only this one listener exists (no seeded default local-api
+            // listener) — only the HTTPS path is exercised here.
             listeners: vec![Listener {
                 port: 9100,
                 public_url: "https://example.com".to_string(),
@@ -1169,19 +1266,22 @@ mod tests {
     #[test]
     fn validate_rejects_port_conflict() {
         let config = AppConfig {
-            // No projects + no local API (port 0) so ONLY the listener port check can fire.
-            local_api_port: 0,
+            // Override `listeners` so ONLY these two compete (no seeded default local-api listener).
+            // Both bind loopback so the AB#1225 bindHost gate passes and the PORT conflict is what
+            // surfaces.
             listeners: vec![
                 Listener {
                     id: "a".to_string(),
                     port: 9000,
                     enabled: true,
+                    bind_host: "127.0.0.1".to_string(),
                     ..Listener::default()
                 },
                 Listener {
                     id: "b".to_string(),
                     port: 9000,
                     enabled: true,
+                    bind_host: "127.0.0.1".to_string(),
                     ..Listener::default()
                 },
             ],
@@ -1993,8 +2093,8 @@ mod tests {
     #[test]
     fn validate_rejects_tunnel_http_public_url() {
         let config = AppConfig {
-            // No conflicting listeners + local API off so ONLY the HTTPS path can fire.
-            local_api_port: 0,
+            // No listeners (drop the seeded default) so ONLY the tunnel HTTPS path can fire.
+            listeners: Vec::new(),
             tunnels: vec![Tunnel {
                 id: "t1".to_string(),
                 public_url: "http://example.com".to_string(),
@@ -2013,8 +2113,7 @@ mod tests {
     #[test]
     fn validate_rejects_userinfo_in_public_url() {
         let config = AppConfig {
-            // Distinct listener port + local API off so ONLY the HTTPS/userinfo path can fire.
-            local_api_port: 0,
+            // Override `listeners` so ONLY this one (with the userinfo URL) is checked.
             listeners: vec![Listener {
                 port: 9100,
                 public_url: "https://user:pass@example.com".to_string(),
@@ -2036,12 +2135,14 @@ mod tests {
             webhook_enabled: true,
             webhook_port: 9000,
             webhook_secret: "webhook-secret-0123456789".to_string(),
-            // local API off so the only collision is webhook ↔ listener.
-            local_api_port: 0,
+            // Override `listeners` so the only collision is webhook ↔ this listener (no seeded
+            // default). Loopback bind_host so the AB#1225 bindHost gate passes and the webhook↔
+            // listener PORT conflict is what surfaces.
             listeners: vec![Listener {
                 id: "l1".to_string(),
                 port: 9000,
                 enabled: true,
+                bind_host: "127.0.0.1".to_string(),
                 ..Listener::default()
             }],
             ..AppConfig::default()
@@ -2050,18 +2151,29 @@ mod tests {
         assert!(err.starts_with("port"), "{err}");
     }
 
-    /// AB#1073 port-conflict (Medium runtime guard): an enabled listener colliding with the
-    /// local REST API port is rejected; the message keeps the `port` prefix.
+    /// AB#1225 port-conflict (Medium runtime guard): the local REST API is now itself a
+    /// `kind = local-api` listener (not a standalone field), so an enabled local-api listener
+    /// colliding with another enabled listener on the same port is rejected through the SAME
+    /// enabled-listeners loop; the message keeps the `port` prefix.
     #[test]
     fn validate_rejects_local_api_listener_port_conflict() {
         let config = AppConfig {
-            local_api_port: 9000,
-            listeners: vec![Listener {
-                id: "l1".to_string(),
-                port: 9000,
-                enabled: true,
-                ..Listener::default()
-            }],
+            listeners: vec![
+                Listener {
+                    port: 9000,
+                    enabled: true,
+                    ..default_local_api_listener()
+                },
+                Listener {
+                    id: "other".to_string(),
+                    port: 9000,
+                    enabled: true,
+                    // Loopback bind_host so the AB#1225 bindHost gate passes and the PORT conflict
+                    // with the local-api listener is what surfaces.
+                    bind_host: "127.0.0.1".to_string(),
+                    ..Listener::default()
+                },
+            ],
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
@@ -2070,17 +2182,23 @@ mod tests {
 
     /// AB#1073 port-conflict (Medium runtime guard): a DISABLED listener is excluded from the
     /// port-conflict check — only enabled listeners claim a port, so a disabled one sharing the
-    /// local API port is fine.
+    /// enabled local-api listener's port is fine.
     #[test]
     fn validate_disabled_listener_excluded_from_port_conflict() {
         let config = AppConfig {
-            local_api_port: 9000,
-            listeners: vec![Listener {
-                id: "l1".to_string(),
-                port: 9000,
-                enabled: false,
-                ..Listener::default()
-            }],
+            listeners: vec![
+                Listener {
+                    port: 9000,
+                    enabled: true,
+                    ..default_local_api_listener()
+                },
+                Listener {
+                    id: "l1".to_string(),
+                    port: 9000,
+                    enabled: false,
+                    ..Listener::default()
+                },
+            ],
             ..AppConfig::default()
         };
         assert!(validate(&config).is_ok());
@@ -2088,12 +2206,11 @@ mod tests {
 
     /// AB#1064 port-0 reject (Medium runtime guard): an ENABLED listener with `port == 0`
     /// (the unset/won't-bind sentinel) is unbindable, so it is rejected; the message keeps the
-    /// `port` prefix. local_api_port: 0 isolates this from the local-API claim.
+    /// `port` prefix.
     #[test]
     fn validate_rejects_enabled_listener_zero_port() {
         let config = AppConfig {
-            // local API off so ONLY the listener port-0 check can fire.
-            local_api_port: 0,
+            // Override `listeners` (drop the seeded default) so ONLY the port-0 check can fire.
             listeners: vec![Listener {
                 id: "l1".to_string(),
                 port: 0,
@@ -2106,13 +2223,196 @@ mod tests {
         assert!(err.starts_with("port"), "{err}");
     }
 
+    /// `is_loopback_host` whitelist (AB#1225, narrowed F2). The save-time bindHost gate and the
+    /// runtime supervisor's fail-closed bind gate share THIS predicate, so its behavior is the
+    /// contract: accept ONLY the literal `127.0.0.1` the supervisor actually binds (incl. surrounding
+    /// whitespace, which is trimmed). `localhost` / `::1` / `[::1]` are REJECTED — the runtime always
+    /// binds `127.0.0.1`, so accepting them would let a config value pass while the runtime bound a
+    /// different address (config/runtime mismatch); they are not yet a supported bindHost value. Also
+    /// reject `0.0.0.0` / a LAN IP / a hostname / empty / a look-alike (`127.0.0.1.evil.com`).
+    #[test]
+    fn is_loopback_host_whitelists_only_loopback() {
+        for ok in ["127.0.0.1", "  127.0.0.1  ", "\t127.0.0.1\n"] {
+            assert!(is_loopback_host(ok), "expected {ok:?} to be loopback");
+        }
+        for bad in [
+            // F2: localhost / ::1 / [::1] are no longer accepted — the runtime binds 127.0.0.1 only.
+            "localhost",
+            "::1",
+            "[::1]",
+            "0.0.0.0",
+            "192.168.1.10",
+            "10.0.0.1",
+            "example.com",
+            "",
+            "   ",
+            "127.0.0.1.evil.com",
+            "::",
+        ] {
+            assert!(!is_loopback_host(bad), "expected {bad:?} to be rejected");
+        }
+    }
+
+    /// AB#1225 bindHost gate (Medium/P2 security): an ENABLED listener that binds a non-loopback
+    /// host is rejected at save time — remote exposure is deferred to AB#1073 — with the message
+    /// starting at the `bindHost` field token so SettingsView's `errorToStep` routes it. A DISABLED
+    /// non-loopback listener is exempt (it never binds), and an enabled loopback listener validates.
+    #[test]
+    fn validate_rejects_enabled_non_loopback_bind_host() {
+        // (a) Enabled listener bound to 0.0.0.0 → rejected, message starts with `bindHost`.
+        let config = AppConfig {
+            // Drop the seeded default local-api listener so ONLY this one is checked.
+            listeners: vec![Listener {
+                id: "l1".to_string(),
+                port: 9000,
+                enabled: true,
+                bind_host: "0.0.0.0".to_string(),
+                ..Listener::default()
+            }],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("bindHost"), "{err}");
+    }
+
+    /// AB#1225 bindHost gate — the accept case: an enabled listener bound to loopback validates.
+    #[test]
+    fn validate_accepts_enabled_loopback_bind_host() {
+        let config = AppConfig {
+            listeners: vec![Listener {
+                id: "l1".to_string(),
+                port: 9000,
+                enabled: true,
+                bind_host: "127.0.0.1".to_string(),
+                ..Listener::default()
+            }],
+            ..AppConfig::default()
+        };
+        assert!(validate(&config).is_ok());
+    }
+
+    /// AB#1225 bindHost gate — the exemption: a DISABLED listener with a non-loopback bind_host is
+    /// NOT rejected (it never binds), mirroring the disabled port-0 / port-conflict exemptions.
+    #[test]
+    fn validate_exempts_disabled_non_loopback_bind_host() {
+        let config = AppConfig {
+            listeners: vec![Listener {
+                id: "l1".to_string(),
+                port: 9000,
+                enabled: false,
+                bind_host: "0.0.0.0".to_string(),
+                ..Listener::default()
+            }],
+            ..AppConfig::default()
+        };
+        assert!(validate(&config).is_ok());
+    }
+
+    /// AB#1225 F3 — duplicate listener id is rejected (the id is a HashMap-by-id lookup key the
+    /// supervisor/tunnel resolution fold by, so a duplicate would silently collapse two entries).
+    /// Two distinct loopback ports so the PORT check passes and the id-uniqueness reject is what
+    /// surfaces; the message keeps the `listenerId` prefix.
+    #[test]
+    fn validate_rejects_duplicate_listener_id() {
+        let config = AppConfig {
+            listeners: vec![
+                Listener {
+                    id: "dup".to_string(),
+                    port: 9000,
+                    enabled: true,
+                    bind_host: "127.0.0.1".to_string(),
+                    ..Listener::default()
+                },
+                Listener {
+                    id: "dup".to_string(),
+                    port: 9001,
+                    enabled: true,
+                    bind_host: "127.0.0.1".to_string(),
+                    ..Listener::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("listenerId"), "{err}");
+    }
+
+    /// AB#1225 F3 — an empty listener id is rejected (it can't be addressed by a tunnel target, and
+    /// the seeded local-api id is non-empty). The message keeps the `listenerId` prefix.
+    #[test]
+    fn validate_rejects_empty_listener_id() {
+        let config = AppConfig {
+            listeners: vec![Listener {
+                id: String::new(),
+                port: 9000,
+                enabled: true,
+                bind_host: "127.0.0.1".to_string(),
+                ..Listener::default()
+            }],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("listenerId"), "{err}");
+    }
+
+    /// AB#1225 F3 — duplicate tunnel id is rejected (tunnel ids are also a lookup key space). One
+    /// enabled listener target so the tunnels are otherwise coherent and the id-uniqueness reject is
+    /// what surfaces; the message keeps the `tunnelId` prefix.
+    #[test]
+    fn validate_rejects_duplicate_tunnel_id() {
+        let config = AppConfig {
+            listeners: vec![Listener {
+                id: "l1".to_string(),
+                port: 9000,
+                enabled: true,
+                bind_host: "127.0.0.1".to_string(),
+                ..Listener::default()
+            }],
+            tunnels: vec![
+                Tunnel {
+                    id: "dup".to_string(),
+                    enabled: true,
+                    target_listener_id: "l1".to_string(),
+                    ..Tunnel::default()
+                },
+                Tunnel {
+                    id: "dup".to_string(),
+                    enabled: true,
+                    target_listener_id: "l1".to_string(),
+                    ..Tunnel::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("tunnelId"), "{err}");
+    }
+
+    /// AB#1225 F3 — an empty tunnel id is rejected. The message keeps the `tunnelId` prefix.
+    #[test]
+    fn validate_rejects_empty_tunnel_id() {
+        let config = AppConfig {
+            // No listeners (drop the seeded default) so the empty-tunnel-id check is what fires.
+            listeners: Vec::new(),
+            tunnels: vec![Tunnel {
+                id: String::new(),
+                enabled: false,
+                ..Tunnel::default()
+            }],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("tunnelId"), "{err}");
+    }
+
     /// AB#1064 reference integrity (Medium runtime guard): an ENABLED tunnel with an empty
     /// `target_listener_id` is rejected (an enabled tunnel must name its target); the message
     /// keeps the `targetListenerId` prefix.
     #[test]
     fn validate_rejects_enabled_tunnel_empty_target() {
         let config = AppConfig {
-            local_api_port: 0,
+            // No listeners (drop the seeded default) so ONLY the tunnel reference check fires.
+            listeners: Vec::new(),
             tunnels: vec![Tunnel {
                 id: "t1".to_string(),
                 enabled: true,
@@ -2131,7 +2431,8 @@ mod tests {
     #[test]
     fn validate_rejects_enabled_tunnel_dangling_target() {
         let config = AppConfig {
-            local_api_port: 0,
+            // No listeners (drop the seeded default) so the target "nope" matches nothing.
+            listeners: Vec::new(),
             tunnels: vec![Tunnel {
                 id: "t1".to_string(),
                 enabled: true,
@@ -2150,7 +2451,6 @@ mod tests {
     #[test]
     fn validate_rejects_enabled_tunnel_disabled_target() {
         let config = AppConfig {
-            local_api_port: 0,
             listeners: vec![Listener {
                 id: "l1".to_string(),
                 port: 9000,
@@ -2171,15 +2471,18 @@ mod tests {
 
     /// AB#1064 reference integrity (Medium runtime guard): an ENABLED tunnel pointing at an
     /// existing ENABLED listener validates. The listener gets a non-zero port (so the port-0
-    /// reject does not fire) distinct from any other claim, and local_api_port: 0 isolates it.
+    /// reject does not fire) distinct from any other claim; overriding `listeners` drops the
+    /// seeded default so this lone listener is the only claim.
     #[test]
     fn validate_accepts_enabled_tunnel_valid_target() {
         let config = AppConfig {
-            local_api_port: 0,
+            // Loopback bind_host so the AB#1225 bindHost gate passes (an enabled listener must bind
+            // loopback) and the whole config validates.
             listeners: vec![Listener {
                 id: "l1".to_string(),
                 port: 9000,
                 enabled: true,
+                bind_host: "127.0.0.1".to_string(),
                 ..Listener::default()
             }],
             tunnels: vec![Tunnel {

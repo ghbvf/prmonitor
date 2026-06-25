@@ -3,6 +3,48 @@
 //! Slices attach their long-lived handles here as they are implemented
 //! (e.g. the scheduler handle in PR4, the review session manager in PR6).
 
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+
+use crate::config::model::Listener;
+
+/// The composition-root-injected post-save reconcile closure (AB#1225 F4). Given the just-saved
+/// `listeners`, it drives the Remote Access listener-runtime reconcile. OPAQUE on purpose (an `Arc<dyn
+/// Fn>` mirroring `review::notify::NotificationSink`): the `config` slice holds only this type, never
+/// references `crate::remote`. Aliased so the field type stays simple (clippy `type_complexity`).
+pub type ConfigSavedSink = Arc<dyn Fn(Vec<Listener>) + Send + Sync>;
+
+/// The post-`set_config`-save hook seam (AB#1225 F4): a composition-root-injected closure the
+/// `config` slice fires AFTER a successful save, so config never names a sibling horizontal
+/// (`crate::remote`) to drive listener reconcile. Mirrors the established AppState-injected-closure
+/// seams (`review::notify::NotificationOutbox` sink, `pr::webhook::WebhookManager` ingestor): the
+/// closure — installed once in `lib.rs` `setup()` — is the SOLE place that bridges config→remote.
+/// OPAQUE on purpose: `config::commands` holds only this `dyn Fn`, never references `crate::remote`.
+#[derive(Default)]
+pub struct ConfigSavedHook {
+    hook: StdMutex<Option<ConfigSavedSink>>,
+}
+
+impl ConfigSavedHook {
+    /// Install the post-save hook (composition root, in `setup()`). Replaces any prior hook (last
+    /// writer wins), mirroring `NotificationOutbox::set_sink` / `WebhookManager::set_ingestor`.
+    pub fn set_hook(&self, hook: ConfigSavedSink) {
+        *self.hook.lock().unwrap_or_else(|p| p.into_inner()) = Some(hook);
+    }
+
+    /// Fire the installed hook with the just-saved listeners. Clones the `Arc` out of the lock
+    /// before calling so the lock isn't held across the (best-effort) reconcile. Poison-safe
+    /// (`into_inner`): a panicked prior holder must not panic-cascade every subsequent save. A
+    /// no-op if the root hasn't installed the hook yet (never in practice — a save before `setup`
+    /// completes), so a missing hook silently skips reconcile rather than failing the save.
+    pub fn fire(&self, listeners: Vec<Listener>) {
+        let hook = self.hook.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        if let Some(hook) = hook {
+            hook(listeners);
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct AppState {
     /// The per-project scheduled-pull loops (#35): a `project_id → Scheduler` set the
@@ -25,11 +67,12 @@ pub struct AppState {
     /// on demand via the `start_webhook`/`stop_webhook` commands; killed on app
     /// shutdown. Methods take `&self`.
     pub webhook: crate::pr::webhook::WebhookManager,
-    /// The resident local REST API listener (AB#1043): a `127.0.0.1`-only axum server that
-    /// lets a third party (curl/CLI) trigger a review + poll for completion. Started once in
-    /// `lib.rs` `setup()`; NEVER tunneled (distinct from `webhook`); killed on app shutdown.
-    /// Methods take `&self`.
-    pub local_api: crate::review::local_api::LocalApiManager,
+    /// The Remote Access listener binding supervisor (AB#1225): reconciles `config.listeners[]`
+    /// to bound loopback listeners. local-api is the sole real binder this PR — it mounts
+    /// `review::local_api::build_router` on the port from its `listeners[]` entry (the resident
+    /// `LocalApiManager` was removed; `listeners[]` is now the single source of truth). Reconciled
+    /// in `lib.rs` `setup()` + after each `set_config`; killed on app shutdown. Methods take `&self`.
+    pub remote: crate::remote::supervisor::ListenerSupervisor,
     /// The event inbox's replay-time hooks (AB#1065): the dispatcher + Azure refresh the
     /// `inbox_replay` command re-uses (installed once by the composition root in `setup()`,
     /// like the webhook ingestor/refresher). Methods take `&self`.
@@ -44,4 +87,9 @@ pub struct AppState {
     /// produce durable notifications WITHOUT naming the `outbox` slice (the sink closure, installed in
     /// `lib.rs`, is the only place that bridges review→outbox). Methods take `&self`.
     pub notify_outbox: crate::review::notify::NotificationOutbox,
+    /// The post-`set_config`-save hook (AB#1225 F4): holds the composition-root-injected closure
+    /// that reconciles the Remote Access listener runtime after a save. Lets the `config` slice's
+    /// `set_config` take effect on the listener runtime WITHOUT naming `crate::remote` (the closure,
+    /// installed in `lib.rs`, is the sole bridge config→remote). Methods take `&self`.
+    pub config_saved: ConfigSavedHook,
 }

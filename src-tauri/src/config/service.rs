@@ -87,7 +87,17 @@ const WEBHOOK_KEYS: &[&str] = &[
 /// `{ "projects": [], "activeProjectId": "" }` so onboarding triggers, rather than a
 /// migrated default project. (A `{}` has no flat keys to lift; materializing a
 /// gocell-default project would skip onboarding.)
+///
+/// Two passes: [`normalize_multiproject`] first (legacy-flat → multi-project shape), then
+/// [`seed_local_api_listener`] (AB#1225) so the local-api `listeners[]` seed applies to BOTH
+/// legacy-flat configs and already-new ones (the latter early-return out of the first pass).
 fn migrate_value(raw: Value) -> Value {
+    seed_local_api_listener(normalize_multiproject(raw))
+}
+
+/// First migration pass: normalize the raw persisted value to the #35 multi-project shape.
+/// (Unchanged from the historical `migrate_value` body — see the module doc above.)
+fn normalize_multiproject(raw: Value) -> Value {
     let Value::Object(old) = raw else {
         // Non-object (null / array / scalar): treat as first launch.
         return json!({ "projects": [], "activeProjectId": "" });
@@ -124,6 +134,107 @@ fn migrate_value(raw: Value) -> Value {
     }
 
     Value::Object(new)
+}
+
+/// Second migration pass (AB#1225): seed the local-api `listeners[]` entry from a legacy
+/// top-level `localApiPort` key, so existing users who had the local trigger API configured
+/// keep it after the field is removed from [`AppConfig`]. The port now lives SOLELY in a
+/// `kind = "local-api"` listener (the single source of truth the supervisor binds).
+///
+/// Runs on BOTH shapes (legacy-flat and already-new) since it is unconditional in
+/// [`migrate_value`] — `normalize_multiproject` early-returns an already-new config unchanged,
+/// which is exactly where a surviving top-level `localApiPort` needs seeding.
+///
+/// Detect-by-kind (idempotent): if `listeners` already has a `local-api` entry, this is a
+/// no-op — a second pass (or a `save`d config reloaded) sees the seeded entry and skips. The
+/// now-unknown `localApiPort` key is left in place (harmless: no `deny_unknown_fields`, and
+/// `from_value` drops it). `port == 0` (the old "disabled" sentinel) seeds a `disabled` entry.
+///
+/// Overflow guard (AB#1225 F6): `localApiPort` is read as a JSON number (u64). A value
+/// `> u16::MAX` would TRUNCATE to a bogus `u16` when the seeded entry's `"port"` later
+/// deserializes into [`crate::config::model::Listener::port`], silently binding the wrong port.
+/// Such an out-of-range value is therefore NOT seeded (the key is left in place, the config is
+/// returned unchanged); the user can re-set a valid port in Settings.
+///
+/// KNOWN EDGE (AB#1225 F9): a TRULY pre-#35 FLAT config (no `projects` key) has its top-level
+/// `localApiPort` DROPPED by [`normalize_multiproject`] (the key is in neither `PROJECT_KEYS` nor
+/// `WEBHOOK_KEYS`) BEFORE this seed pass runs, so such a user's custom port is lost and resets to
+/// the default-seeded 8788 listener on deserialize. This is acceptable because the pre-#35 flat
+/// shape predates AB#1043 — the round that introduced `localApiPort` — so no real pre-#35 config
+/// carries it. Seeding therefore only ever recovers an ALREADY-new config's surviving
+/// `localApiPort` (the realistic case). Locked by `migrate_pre35_flat_drops_legacy_local_api_port`.
+fn seed_local_api_listener(value: Value) -> Value {
+    use crate::config::model::LOCAL_API_LISTENER_ID;
+
+    let Value::Object(mut obj) = value else {
+        // Non-object (first-launch sentinel etc.): nothing to seed onto.
+        return value;
+    };
+
+    // Only seed from a numeric legacy `localApiPort`.
+    let Some(port) = obj.get("localApiPort").and_then(Value::as_u64) else {
+        return Value::Object(obj);
+    };
+
+    // Overflow guard (F6): a `localApiPort > u16::MAX` would truncate to a bogus `u16` on the
+    // seeded entry's later deserialize. Do NOT seed such a value — leave the config unchanged and
+    // warn; the user can re-set a valid port. (`port == 0` is fine: it seeds a DISABLED entry.)
+    if port > u16::MAX as u64 {
+        eprintln!(
+            "[config] 忽略越界的 legacy localApiPort={port}（> {}）：未播种 local-api 监听器，请在设置中重设端口",
+            u16::MAX
+        );
+        return Value::Object(obj);
+    }
+
+    // Idempotent: skip if a `local-api` listener already exists.
+    let already_seeded = obj
+        .get("listeners")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(|l| l.get("kind") == Some(&json!(LOCAL_API_LISTENER_ID)))
+        });
+    if already_seeded {
+        return Value::Object(obj);
+    }
+
+    let seeded = json!({
+        "id": LOCAL_API_LISTENER_ID,
+        "name": "Local API",
+        // `kind` wire string equals `ListenerKind::LocalApi`'s serde value, golden-locked by
+        // `listener_kind_wire_values_are_kebab`; reusing the id const keeps the two literals one source.
+        "kind": LOCAL_API_LISTENER_ID,
+        "bindHost": "127.0.0.1",
+        "port": port,
+        "enabled": port != 0,
+        "auth": "bearer",
+        "allowedOrigins": [],
+        "publicUrl": "",
+    });
+
+    // Append to `listeners`, creating the array if absent (or replacing a non-array value —
+    // a malformed `listeners` would be dropped by `from_value` anyway).
+    match obj.get_mut("listeners").and_then(Value::as_array_mut) {
+        Some(arr) => arr.push(seeded),
+        None => {
+            obj.insert("listeners".to_string(), json!([seeded]));
+        }
+    }
+
+    Value::Object(obj)
+}
+
+/// The port the local-api listener is bound on (AB#1225 single source of truth): the first
+/// ENABLED `kind = local-api` listener's port, else 0 (off). Consumed by the CLI client
+/// (`cli.rs`) which connects to `127.0.0.1:<port>`. (A non-loopback local-api is refused at
+/// runtime by the supervisor; this helper still returns its port — the CLI is loopback-only.)
+pub fn local_api_port(cfg: &AppConfig) -> u16 {
+    cfg.listeners
+        .iter()
+        .find(|l| l.kind == crate::config::model::ListenerKind::LocalApi && l.enabled)
+        .map(|l| l.port)
+        .unwrap_or(0)
 }
 
 /// Loads the persisted configuration, falling back to [`AppConfig::default`]
@@ -432,14 +543,44 @@ mod tests {
     }
 
     #[test]
-    fn migrate_new_shape_is_identity() {
-        // A value already carrying `projects` is the new shape → returned unchanged.
+    fn migrate_new_shape_without_legacy_port_is_identity() {
+        // A value already carrying `projects` AND no legacy `localApiPort` is the new shape →
+        // returned unchanged. (Identity is NOT a general invariant for the new shape anymore: a
+        // new-shape input carrying `localApiPort` gets a seeded local-api listener — see
+        // `migrate_new_shape_with_legacy_port_seeds_listener`.)
         let raw = json!({
             "projects": [{ "id": "p1", "repo": "owner/name" }],
             "activeProjectId": "p1",
             "webhookEnabled": false
         });
         assert_eq!(migrate_value(raw.clone()), raw);
+    }
+
+    /// F10: a NEW-shape input (`projects` present) that ALSO carries a legacy top-level
+    /// `localApiPort` is NOT identity — the second pass seeds a `local-api` listener from it. This
+    /// is the realistic migration path (an AB#1043 config saved before AB#1225 removed the field),
+    /// and the reason `migrate_new_shape_is_identity` was narrowed to the no-legacy-port case.
+    #[test]
+    fn migrate_new_shape_with_legacy_port_seeds_listener() {
+        let raw = json!({
+            "projects": [{ "id": "p1", "repo": "owner/name" }],
+            "activeProjectId": "p1",
+            "localApiPort": 8790
+        });
+        let migrated = migrate_value(raw.clone());
+        // Not identity: a listener was appended.
+        assert_ne!(migrated, raw);
+
+        let config: AppConfig =
+            serde_json::from_value(migrated).expect("migrated shape deserializes");
+        let local_api: Vec<_> = config
+            .listeners
+            .iter()
+            .filter(|l| l.kind == crate::config::model::ListenerKind::LocalApi)
+            .collect();
+        assert_eq!(local_api.len(), 1, "exactly one local-api listener seeded");
+        assert!(local_api[0].enabled);
+        assert_eq!(local_api[0].port, 8790);
     }
 
     #[test]
@@ -510,6 +651,194 @@ mod tests {
         let once = migrate_value(raw);
         let twice = migrate_value(once.clone());
         assert_eq!(once, twice);
+    }
+
+    /// AB#1225 local-api seed: an existing config carrying the legacy top-level `localApiPort`
+    /// (the field being removed) must migrate into a `kind = local-api` listener so the user
+    /// keeps their local trigger API. (An already-new config is the realistic case — its
+    /// `localApiPort` survives `normalize_multiproject`'s identity early-return and is then
+    /// seeded by the second pass.)
+    #[test]
+    fn migrate_seeds_local_api_listener_from_legacy_port() {
+        let raw = json!({
+            "projects": [],
+            "activeProjectId": "",
+            "localApiPort": 8788
+        });
+
+        let config: AppConfig =
+            serde_json::from_value(migrate_value(raw)).expect("migrated shape deserializes");
+
+        let local_api: Vec<_> = config
+            .listeners
+            .iter()
+            .filter(|l| l.kind == crate::config::model::ListenerKind::LocalApi)
+            .collect();
+        assert_eq!(local_api.len(), 1, "exactly one local-api listener seeded");
+        assert!(local_api[0].enabled);
+        assert_eq!(local_api[0].port, 8788);
+    }
+
+    /// AB#1225 local-api seed idempotence (detect-by-kind): migrating twice must not double-seed.
+    #[test]
+    fn migrate_local_api_seed_is_idempotent() {
+        let raw = json!({
+            "projects": [],
+            "activeProjectId": "",
+            "localApiPort": 8788
+        });
+        let once = migrate_value(raw);
+        let twice = migrate_value(once.clone());
+        assert_eq!(once, twice, "second pass is a no-op (already-seeded)");
+
+        let config: AppConfig = serde_json::from_value(twice).expect("migrated shape deserializes");
+        let count = config
+            .listeners
+            .iter()
+            .filter(|l| l.kind == crate::config::model::ListenerKind::LocalApi)
+            .count();
+        assert_eq!(count, 1, "not double-seeded");
+    }
+
+    /// AB#1225 local-api seed: `localApiPort: 0` (the old "disabled" sentinel) seeds a DISABLED
+    /// entry preserving the port, so a user who had the API off stays off after migration.
+    #[test]
+    fn migrate_zero_local_api_port_seeds_disabled() {
+        let raw = json!({
+            "projects": [],
+            "activeProjectId": "",
+            "localApiPort": 0
+        });
+
+        let config: AppConfig =
+            serde_json::from_value(migrate_value(raw)).expect("migrated shape deserializes");
+
+        let local_api: Vec<_> = config
+            .listeners
+            .iter()
+            .filter(|l| l.kind == crate::config::model::ListenerKind::LocalApi)
+            .collect();
+        assert_eq!(local_api.len(), 1);
+        assert!(!local_api[0].enabled, "port 0 → disabled");
+        assert_eq!(local_api[0].port, 0);
+    }
+
+    /// AB#1225 local-api seed: a config whose `listeners` ALREADY has a local-api entry is NOT
+    /// double-seeded even though a stray legacy `localApiPort` is also present (detect-by-kind).
+    #[test]
+    fn migrate_does_not_seed_when_local_api_listener_already_present() {
+        let raw = json!({
+            "projects": [],
+            "activeProjectId": "",
+            "localApiPort": 9999,
+            "listeners": [{
+                "id": "local-api",
+                "name": "Local API",
+                "kind": "local-api",
+                "bindHost": "127.0.0.1",
+                "port": 8788,
+                "enabled": true,
+                "auth": "bearer",
+                "allowedOrigins": [],
+                "publicUrl": ""
+            }]
+        });
+
+        let config: AppConfig =
+            serde_json::from_value(migrate_value(raw)).expect("migrated shape deserializes");
+
+        let local_api: Vec<_> = config
+            .listeners
+            .iter()
+            .filter(|l| l.kind == crate::config::model::ListenerKind::LocalApi)
+            .collect();
+        assert_eq!(local_api.len(), 1, "existing entry kept, not duplicated");
+        // The pre-existing entry (port 8788) wins — the stray `localApiPort: 9999` is ignored.
+        assert_eq!(local_api[0].port, 8788);
+    }
+
+    /// AB#1225 F6 (overflow guard): a legacy `localApiPort` ABOVE `u16::MAX` must NOT be seeded — a
+    /// truncating cast (e.g. `70000 as u16 == 4464`) would bind a bogus port. Asserted at the raw
+    /// MIGRATED-VALUE level (before `from_value`): the seed pass must NOT append a `listeners` entry.
+    /// (Asserting on the deserialized `AppConfig` would be MASKED by `#[serde(default)]` re-seeding
+    /// the default 8788 listener for the absent `listeners` field — the correct safe fallback, but
+    /// it does not prove the guard fired; the raw shape does.)
+    #[test]
+    fn migrate_out_of_range_legacy_port_is_not_seeded() {
+        let raw = json!({
+            "projects": [],
+            "activeProjectId": "",
+            "localApiPort": 70000  // > u16::MAX (65535)
+        });
+
+        let migrated = migrate_value(raw);
+        // No `listeners` array created at all (input had none, and the out-of-range port
+        // short-circuited the seed) — so certainly no truncated-port entry was appended.
+        assert!(
+            migrated.get("listeners").is_none(),
+            "out-of-range port must not seed a listener, got: {migrated}"
+        );
+    }
+
+    /// AB#1225 F9 (documented pre-#35 edge — regression lock): a TRULY pre-#35 FLAT config (no
+    /// `projects` key) carrying a top-level `localApiPort` has that key DROPPED by
+    /// `normalize_multiproject` (it is in neither `PROJECT_KEYS` nor `WEBHOOK_KEYS`) before the seed
+    /// pass runs, so the custom port is LOST and the config falls back to the default-seeded 8788
+    /// listener on deserialize. This is acceptable (the pre-#35 flat shape predates AB#1043, which
+    /// introduced `localApiPort`, so no real pre-#35 config carries it). Locking the documented
+    /// behavior makes any future change to it a CONSCIOUS decision rather than a silent regression.
+    #[test]
+    fn migrate_pre35_flat_drops_legacy_local_api_port() {
+        let raw = json!({
+            "repo": "o/r",
+            "localApiPort": 9999
+        });
+
+        let config: AppConfig =
+            serde_json::from_value(migrate_value(raw)).expect("migrated shape deserializes");
+
+        // Exactly one local-api listener, and it is the DEFAULT (8788) — NOT the dropped 9999.
+        let local_api: Vec<_> = config
+            .listeners
+            .iter()
+            .filter(|l| l.kind == crate::config::model::ListenerKind::LocalApi)
+            .collect();
+        assert_eq!(
+            local_api.len(),
+            1,
+            "default-seeded local-api listener present"
+        );
+        assert_eq!(
+            local_api[0].port, 8788,
+            "pre-#35 flat localApiPort is dropped → falls back to default 8788, not 9999"
+        );
+    }
+
+    /// AB#1225 CLI port helper: resolves the enabled local-api listener's port, and 0 when there
+    /// is none or it is disabled (the CLI treats 0 as "API disabled").
+    #[test]
+    fn local_api_port_helper_resolves_enabled_listener() {
+        // Default config seeds an enabled local-api listener on 8788.
+        assert_eq!(local_api_port(&AppConfig::default()), 8788);
+
+        // Disabled local-api listener → 0 (off).
+        let disabled = AppConfig {
+            listeners: vec![crate::config::model::Listener {
+                kind: crate::config::model::ListenerKind::LocalApi,
+                port: 8788,
+                enabled: false,
+                ..Default::default()
+            }],
+            ..AppConfig::default()
+        };
+        assert_eq!(local_api_port(&disabled), 0);
+
+        // No local-api listener at all → 0 (off).
+        let none = AppConfig {
+            listeners: Vec::new(),
+            ..AppConfig::default()
+        };
+        assert_eq!(local_api_port(&none), 0);
     }
 
     /// A bare project with the given `id` / `repo` for the `match_project_ref` cases

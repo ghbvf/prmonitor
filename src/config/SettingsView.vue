@@ -36,6 +36,11 @@ const PROJECTS_NAV_ID = "projects";
 // (RemoteAccessManager) instead of the scalar GLOBAL_GROUPS ConfigField path.
 const REMOTE_ACCESS_NAV_ID = "remoteAccess";
 
+// Bumped on each successful save so RemoteAccessRuntimeStatus re-fetches live state
+// (AB#1225 PR1). Forwarded through RemoteAccessManager → RemoteAccessRuntimeStatus via
+// the `refreshKey` prop chain.
+const remoteAccessRefreshKey = ref(0);
+
 // Editable draft (decoupled from the store). The full multi-project AppConfig:
 // `projects`/`activeProjectId` are edited by ProjectsManager; the webhook fields by
 // the GLOBAL_GROUPS form below.
@@ -49,7 +54,6 @@ const draft = reactive<AppConfig>({
   webhookTunnelMode: "quick",
   webhookTunnelCommand: "",
   webhookPublicUrl: "",
-  localApiPort: 8788,
   localApiToken: "",
   // No settings-panel control yet (AB#1182): the draft carries the loaded value through a save
   // round-trip (hydrate overwrites it) so saving settings never wipes a configured TTL.
@@ -70,7 +74,6 @@ function hydrate(cfg: AppConfig) {
   draft.webhookTunnelMode = cfg.webhookTunnelMode;
   draft.webhookTunnelCommand = cfg.webhookTunnelCommand;
   draft.webhookPublicUrl = cfg.webhookPublicUrl;
-  draft.localApiPort = cfg.localApiPort;
   draft.localApiToken = cfg.localApiToken;
   // Preserve the loaded outbox policy verbatim (AB#1182): no UI edits it, but `save()` persists the
   // whole draft, so a missed copy here would silently reset the TTL on every settings save. Fall
@@ -138,13 +141,22 @@ async function onSave() {
     })),
     tunnels: draft.tunnels.map((t) => ({ ...t })),
   });
-  if (store.savedOk) emit("saved");
+  if (store.savedOk) {
+    emit("saved");
+    remoteAccessRefreshKey.value += 1;
+  }
   // On a failed save, route to the page that owns the offending field. The Remote Access
-  // validations (AB#1073) emit messages prefixed `publicUrl` / `port`, so land the user on
-  // that page (mirrors the wizard's errorToStep field-token routing).
+  // validations emit messages prefixed `publicUrl` / `port` (AB#1073), `bindHost` (new
+  // this PR — bind-address gate), or `targetListenerId` (tunnel ref-integrity check), so
+  // land the user on the 远程访问 page (mirrors the wizard's errorToStep field-token routing).
   else if (
     store.error &&
-    (store.error.startsWith("publicUrl") || store.error.startsWith("port"))
+    (
+      store.error.startsWith("publicUrl") ||
+      store.error.startsWith("port") ||
+      store.error.startsWith("bindHost") ||
+      store.error.startsWith("targetListenerId")
+    )
   ) {
     activeGroupId.value = REMOTE_ACCESS_NAV_ID;
   }
@@ -199,7 +211,7 @@ async function onSave() {
           v-if="activeGroupId === REMOTE_ACCESS_NAV_ID"
           class="group projects-group"
         >
-          <RemoteAccessManager :draft="draft" @edit="onEdit" />
+          <RemoteAccessManager :draft="draft" :refresh-key="remoteAccessRefreshKey" @edit="onEdit" />
         </div>
 
         <template v-for="g in GLOBAL_GROUPS" :key="g.id">

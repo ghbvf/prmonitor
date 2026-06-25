@@ -54,8 +54,8 @@ export interface FieldDef<K extends FieldKey = FieldKey> {
   options?: readonly string[];
   optionLabels?: Record<string, string>;
   // Only meaningful for kind "number": the DOM `min` constraint. Defaults to 1 in the
-  // renderer (`def.min ?? 1`) so ports/intervals stay ≥ 1; `localApiPort` sets `min: 0` so
-  // its "0 = 关闭不监听" config semantic is actually enterable (AB#1043, codex F3).
+  // renderer (`def.min ?? 1`) so ports/intervals stay ≥ 1. (AB#1043 codex F3: the old
+  // localApiPort used min: 0 for "0 = 关闭不监听"; port is now in listeners[], gone here.)
   min?: number;
   // Reserved single-option enums (#11) are shown but not editable.
   readonly?: boolean;
@@ -348,19 +348,12 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
     ],
   },
   {
-    // AB#1043: 本地 REST API（给本机 CLI/curl 触发 review 用）。与 webhook 严格分离、永不走隧道。
+    // AB#1043 / AB#1225 PR1: 本地 REST API（给本机 CLI/curl 触发 review 用）。与 webhook 严格分离、
+    // 永不走隧道。端口现在由 listeners[] 中 kind="local-api" 的条目持有（AB#1225 PR1 迁移）；
+    // 此处只保留 token 字段供全局设置管理鉴权。
     id: "localApi",
     title: "本地 API (CLI)",
     fields: [
-      {
-        key: "localApiPort",
-        label: "本地 API 端口",
-        kind: "number",
-        // 0 = 关闭不监听 (see backend `local_api_port` semantics); allow it as the min so the
-        // number input doesn't mark the documented "off" value as invalid (codex F3).
-        min: 0,
-        hint: "仅绑 127.0.0.1 的触发端点（curl/CLI 用）；改端口需重启 App。0=关闭不监听",
-      },
       {
         key: "localApiToken",
         label: "本地 API Token",

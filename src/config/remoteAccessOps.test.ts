@@ -29,7 +29,6 @@ function draft(): AppConfig {
     webhookTunnelMode: "quick",
     webhookTunnelCommand: "",
     webhookPublicUrl: "",
-    localApiPort: 8788,
     localApiToken: "",
     outbox: { notificationTtlSecs: 7200 },
     listeners: [],

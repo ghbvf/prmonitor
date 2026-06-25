@@ -201,7 +201,7 @@ async fn run_client(args: &ReviewArgs) -> i32 {
     if endpoint.port == 0 {
         // Single non-zero error code for every failure (gh: non-zero = failed); a CI `&&` chain
         // only cares that it is not 0.
-        eprintln!("本地 API 已禁用（端口为 0）；在设置中设置 localApiPort 后重试");
+        eprintln!("本地 API 已禁用（端口为 0）；请在「设置 → 远程访问」中为 local-api 监听器设置端口并启用后重试");
         return 1;
     }
     // `redirect(none)`: the local API only ever returns 2xx/4xx/5xx, never a redirect. Refusing to
@@ -402,10 +402,14 @@ struct Endpoint {
 /// Resolve (port, token): flag > env > saved config (or its defaults). Never hard-fails — a
 /// missing/unreadable config falls back to `AppConfig::default()` (port 8788, empty token), and
 /// the POST result disambiguates: connection-refused ⇒ app not running (cold start); 401 ⇒ token
-/// unset/wrong. (`port == 0` is handled by the caller as "API disabled".)
+/// unset/wrong. (`port == 0` is handled by the caller as "API disabled".) The port now comes from
+/// the local-api `listeners[]` entry via `config::service::local_api_port` (AB#1225 single source).
 fn resolve_endpoint(args: &ReviewArgs) -> Endpoint {
     let cfg = load_saved_config().unwrap_or_default();
-    let port = args.port.or_else(env_port).unwrap_or(cfg.local_api_port);
+    let port = args
+        .port
+        .or_else(env_port)
+        .unwrap_or(crate::config::service::local_api_port(&cfg));
     let token = args
         .token
         .clone()

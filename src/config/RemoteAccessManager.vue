@@ -24,15 +24,19 @@ import {
 } from "./remoteAccessOps";
 import ListenerCard from "./ListenerCard.vue";
 import TunnelCard from "./TunnelCard.vue";
+import RemoteAccessRuntimeStatus from "./RemoteAccessRuntimeStatus.vue";
 
 // The live AppConfig draft (reactive, owned by SettingsView). We mutate `listeners` and
 // `tunnels` in place; SettingsView persists the whole draft on save.
-const props = defineProps<{ draft: AppConfig }>();
+// `refreshKey` is forwarded to RemoteAccessRuntimeStatus so the parent (SettingsView) can
+// bump it after a config save to re-fetch live binding state.
+const props = defineProps<{ draft: AppConfig; refreshKey?: number }>();
 const emit = defineEmits<{ edit: [] }>();
 
 // Which cards are expanded. The two lists share one Set but keys are prefixed
-// ("listener:"/"tunnel:") so a listener and a tunnel that happen to share an id never
-// collide. Vue tracks Set .add/.delete/.has reactively inside a ref.
+// ("listener--"/"tunnel--") so a listener and a tunnel that happen to share an id never
+// collide. Vue tracks Set .add/.delete/.has reactively inside a ref. Double-dash avoids
+// a colon in the key, keeping any derived DOM ids valid for querySelector (F20).
 const expanded = ref(new Set<string>());
 function isExpanded(key: string): boolean {
   return expanded.value.has(key);
@@ -66,12 +70,12 @@ watch([() => props.draft.listeners, () => props.draft.tunnels], () => {
 // ----- Listeners -----
 function addListener() {
   const l = addListenerToDraft(props.draft);
-  expanded.value.add(`listener:${l.id}`);
+  expanded.value.add(`listener--${l.id}`);
   emit("edit");
 }
 function confirmDeleteListener(id: string) {
   if (deleteListenerFromDraft(props.draft, id)) {
-    expanded.value.delete(`listener:${id}`);
+    expanded.value.delete(`listener--${id}`);
     emit("edit");
   }
   pendingDeleteKey.value = null;
@@ -93,12 +97,12 @@ function onListenerName(id: string, e: Event) {
 // ----- Tunnels -----
 function addTunnel() {
   const t = addTunnelToDraft(props.draft);
-  expanded.value.add(`tunnel:${t.id}`);
+  expanded.value.add(`tunnel--${t.id}`);
   emit("edit");
 }
 function confirmDeleteTunnel(id: string) {
   if (deleteTunnelFromDraft(props.draft, id)) {
-    expanded.value.delete(`tunnel:${id}`);
+    expanded.value.delete(`tunnel--${id}`);
     emit("edit");
   }
   pendingDeleteKey.value = null;
@@ -117,13 +121,12 @@ function onTunnelName(id: string, e: Event) {
 
 <template>
   <div class="remote-access">
-    <!-- Archive-only notice (AB#1064 / AB#1073): the runtime is deferred this round, so the
-         config only persists — nothing binds/enforces yet. Shown once above both sections so
-         the user isn't misled into thinking an enabled listener actually listens. Styled like
-         ProjectCard.vue's `risk-banner` for visual consistency. -->
-    <p class="notice-banner" role="alert">
-      ⚠️ 远程访问仍在开发中：当前配置仅保存存档、尚未生效——启用的监听器不会绑定端口，鉴权也不会执行。（AB#1064 / AB#1073）
-    </p>
+    <!-- Runtime binding status (AB#1225 PR1): live per-listener state from the backend
+         supervisor. Shown above both sections so the user can see what's actually bound
+         before editing. `refreshKey` is forwarded from the parent so a save re-fetches.
+         `listeners` is forwarded so the status panel can display names and distinguish
+         empty-state cases (F14, F13). -->
+    <RemoteAccessRuntimeStatus :refresh-key="props.refreshKey" :listeners="draft.listeners" />
 
     <!-- Listeners -->
     <section class="resource">
@@ -143,13 +146,13 @@ function onTunnelName(id: string, e: Event) {
             <button
               type="button"
               class="chevron"
-              :aria-expanded="isExpanded(`listener:${l.id}`)"
+              :aria-expanded="isExpanded(`listener--${l.id}`)"
               :aria-controls="`listener-card-${l.id}`"
-              :aria-label="(isExpanded(`listener:${l.id}`) ? '收起' : '展开') + '监听器 ' + (l.name || '新监听器')"
-              :title="isExpanded(`listener:${l.id}`) ? '收起' : '展开'"
-              @click="toggleExpand(`listener:${l.id}`)"
+              :aria-label="(isExpanded(`listener--${l.id}`) ? '收起' : '展开') + '监听器 ' + (l.name || '新监听器')"
+              :title="isExpanded(`listener--${l.id}`) ? '收起' : '展开'"
+              @click="toggleExpand(`listener--${l.id}`)"
             >
-              {{ isExpanded(`listener:${l.id}`) ? "▾" : "▸" }}
+              {{ isExpanded(`listener--${l.id}`) ? "▾" : "▸" }}
             </button>
             <input
               class="name-input"
@@ -159,10 +162,10 @@ function onTunnelName(id: string, e: Event) {
               :aria-label="`监听器 ${l.name || '新监听器'} 的名称`"
               @input="onListenerName(l.id, $event)"
             />
-            <template v-if="pendingDeleteKey === `listener:${l.id}`">
+            <template v-if="pendingDeleteKey === `listener--${l.id}`">
               <span class="confirm-text">确认删除？</span>
               <button
-                :id="`confirm-yes-listener:${l.id}`"
+                :id="`confirm-yes-listener--${l.id}`"
                 type="button"
                 class="confirm-yes"
                 :aria-label="`确认删除监听器 ${l.name || '新监听器'}`"
@@ -186,13 +189,13 @@ function onTunnelName(id: string, e: Event) {
               type="button"
               class="delete"
               :aria-label="`删除监听器 ${l.name || '新监听器'}`"
-              @click="requestDelete(`listener:${l.id}`)"
+              @click="requestDelete(`listener--${l.id}`)"
             >
               删除
             </button>
           </header>
           <ListenerCard
-            v-show="isExpanded(`listener:${l.id}`)"
+            v-show="isExpanded(`listener--${l.id}`)"
             :id="`listener-card-${l.id}`"
             :listener="l"
             @update="(key, value) => onUpdateListener(l.id, key, value)"
@@ -226,13 +229,13 @@ function onTunnelName(id: string, e: Event) {
             <button
               type="button"
               class="chevron"
-              :aria-expanded="isExpanded(`tunnel:${t.id}`)"
+              :aria-expanded="isExpanded(`tunnel--${t.id}`)"
               :aria-controls="`tunnel-card-${t.id}`"
-              :aria-label="(isExpanded(`tunnel:${t.id}`) ? '收起' : '展开') + '隧道 ' + (t.name || '新隧道')"
-              :title="isExpanded(`tunnel:${t.id}`) ? '收起' : '展开'"
-              @click="toggleExpand(`tunnel:${t.id}`)"
+              :aria-label="(isExpanded(`tunnel--${t.id}`) ? '收起' : '展开') + '隧道 ' + (t.name || '新隧道')"
+              :title="isExpanded(`tunnel--${t.id}`) ? '收起' : '展开'"
+              @click="toggleExpand(`tunnel--${t.id}`)"
             >
-              {{ isExpanded(`tunnel:${t.id}`) ? "▾" : "▸" }}
+              {{ isExpanded(`tunnel--${t.id}`) ? "▾" : "▸" }}
             </button>
             <input
               class="name-input"
@@ -242,10 +245,10 @@ function onTunnelName(id: string, e: Event) {
               :aria-label="`隧道 ${t.name || '新隧道'} 的名称`"
               @input="onTunnelName(t.id, $event)"
             />
-            <template v-if="pendingDeleteKey === `tunnel:${t.id}`">
+            <template v-if="pendingDeleteKey === `tunnel--${t.id}`">
               <span class="confirm-text">确认删除？</span>
               <button
-                :id="`confirm-yes-tunnel:${t.id}`"
+                :id="`confirm-yes-tunnel--${t.id}`"
                 type="button"
                 class="confirm-yes"
                 :aria-label="`确认删除隧道 ${t.name || '新隧道'}`"
@@ -269,13 +272,13 @@ function onTunnelName(id: string, e: Event) {
               type="button"
               class="delete"
               :aria-label="`删除隧道 ${t.name || '新隧道'}`"
-              @click="requestDelete(`tunnel:${t.id}`)"
+              @click="requestDelete(`tunnel--${t.id}`)"
             >
               删除
             </button>
           </header>
           <TunnelCard
-            v-show="isExpanded(`tunnel:${t.id}`)"
+            v-show="isExpanded(`tunnel--${t.id}`)"
             :id="`tunnel-card-${t.id}`"
             :tunnel="t"
             :listeners="draft.listeners"
@@ -300,17 +303,6 @@ function onTunnelName(id: string, e: Event) {
   flex-direction: column;
   gap: var(--space-6);
   width: 100%;
-}
-/* Archive-only notice (AB#1064): copied from ProjectCard.vue's `.risk-banner` so the
-   "config-only, not yet live" warning reads consistently with the CLI-polling warning. */
-.notice-banner {
-  margin: 0;
-  padding: var(--space-3) var(--space-4);
-  font-size: var(--font-size-sm);
-  color: var(--color-warn);
-  background: var(--color-warn-bg);
-  border: 1px solid var(--color-warn-border);
-  border-radius: var(--radius-sm);
 }
 .resource {
   display: flex;

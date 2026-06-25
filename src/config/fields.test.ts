@@ -59,8 +59,10 @@ function validProject(): Project {
 
 // The global (non-per-project) AppConfig keys. Only the webhook/shell fields are
 // driven by GLOBAL_GROUPS; `projects`/`activeProjectId` are structural and managed
-// by the project list/selector UI, and `outbox` (AB#1182) is a nested policy object
-// with no settings-panel control yet — none of these is a field group.
+// by the project list/selector UI, not a field group. AB#1225 PR1: `localApiPort` has been
+// removed from AppConfig (port is now owned by the listeners[] entry of kind "local-api");
+// only `localApiToken` remains in the global form. AB#1182: `outbox` is a nested policy
+// object with no settings-panel control yet — none of these is a field group.
 const GLOBAL_FORM_KEYS: (keyof AppConfig)[] = [
   "webhookEnabled",
   "webhookPort",
@@ -69,7 +71,6 @@ const GLOBAL_FORM_KEYS: (keyof AppConfig)[] = [
   "webhookTunnelMode",
   "webhookTunnelCommand",
   "webhookPublicUrl",
-  "localApiPort",
   "localApiToken",
 ];
 
@@ -305,12 +306,18 @@ describe("GLOBAL_GROUPS", () => {
     expect(f?.secret).toBe(true);
   });
 
-  // AB#1043 codex F3: localApiPort documents "0 = 关闭" so it must carry a field-level min of 0
-  // (the renderer reads `def.min ?? 1`); webhookPort keeps the default (min undefined → ≥1).
-  it("lets localApiPort accept 0 via min, while webhookPort keeps the default min", () => {
+  // AB#1225 PR1: localApiPort is gone from the global form (port now lives in listeners[]);
+  // webhookPort keeps the default min (undefined → renderer uses 1).
+  it("webhookPort keeps the default min (undefined)", () => {
     const all = GLOBAL_GROUPS.flatMap((g) => g.fields);
-    expect(all.find((f) => f.key === "localApiPort")?.min).toBe(0);
     expect(all.find((f) => f.key === "webhookPort")?.min).toBeUndefined();
+  });
+
+  // localApiPort must no longer appear in any GLOBAL_GROUPS field (AB#1225 PR1 removal).
+  // Cast to `string` to compare against the removed key without a TS2367 error.
+  it("localApiPort is absent from GLOBAL_GROUPS (port moved to listeners[])", () => {
+    const all = GLOBAL_GROUPS.flatMap((g) => g.fields);
+    expect(all.find((f) => (f.key as string) === "localApiPort")).toBeUndefined();
   });
 });
 
