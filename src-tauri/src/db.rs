@@ -1045,20 +1045,6 @@ mod tests {
         outbox_write: Vec<Duration>,
     }
 
-    impl SpikeRunReport {
-        fn combined_read_latencies(&self) -> Vec<Duration> {
-            let mut out = Vec::with_capacity(
-                self.outbox_due_read.len()
-                    + self.pr_poll_read.len()
-                    + self.review_status_read.len(),
-            );
-            out.extend(self.outbox_due_read.iter().copied());
-            out.extend(self.pr_poll_read.iter().copied());
-            out.extend(self.review_status_read.iter().copied());
-            out
-        }
-    }
-
     struct SpikeThreadStats {
         outbox_due_read: Vec<Duration>,
         pr_poll_read: Vec<Duration>,
@@ -1361,29 +1347,27 @@ mod tests {
     }
 
     fn print_spike_decision(single: &SpikeRunReport, readonly_pool: &SpikeRunReport) {
-        let single_reads = single.combined_read_latencies();
-        let pool_reads = readonly_pool.combined_read_latencies();
-        let single_summary = LatencySummary::from(&single_reads);
-        let pool_summary = LatencySummary::from(&pool_reads);
-        let p95_improvement = improvement(single_summary.p95_ms, pool_summary.p95_ms);
-        let p99_improvement = improvement(single_summary.p99_ms, pool_summary.p99_ms);
+        let single_tail = worst_read_tail(single);
+        let pool_tail = worst_read_tail(readonly_pool);
+        let p95_improvement = improvement(single_tail.p95_ms, pool_tail.p95_ms);
+        let p99_improvement = improvement(single_tail.p99_ms, pool_tail.p99_ms);
         println!();
         println!(
             "decision_input: single_read_p95_ms={:.3} single_read_p99_ms={:.3} \
              readonly_pool_read_p95_ms={:.3} readonly_pool_read_p99_ms={:.3} \
              p95_improvement={:.1}% p99_improvement={:.1}%",
-            single_summary.p95_ms,
-            single_summary.p99_ms,
-            pool_summary.p95_ms,
-            pool_summary.p99_ms,
+            single_tail.p95_ms,
+            single_tail.p99_ms,
+            pool_tail.p95_ms,
+            pool_tail.p99_ms,
             p95_improvement * 100.0,
             p99_improvement * 100.0,
         );
-        if single_summary.p95_ms <= 25.0 && p95_improvement < 0.30 {
+        if single_tail.p95_ms <= 25.0 && p95_improvement < 0.30 {
             println!(
                 "decision: no immediate read pool; keep the single writer Database and defer production changes"
             );
-        } else if (single_summary.p95_ms > 50.0 || single_summary.p99_ms > 200.0)
+        } else if (single_tail.p95_ms > 50.0 || single_tail.p99_ms > 200.0)
             && (p95_improvement >= 0.40 || p99_improvement >= 0.40)
         {
             println!(
@@ -1394,6 +1378,27 @@ mod tests {
                 "decision: inconclusive; rerun with a longer duration and larger seed before changing production"
             );
         }
+    }
+
+    fn worst_read_tail(report: &SpikeRunReport) -> ReadTailSummary {
+        [
+            LatencySummary::from(&report.outbox_due_read),
+            LatencySummary::from(&report.pr_poll_read),
+            LatencySummary::from(&report.review_status_read),
+        ]
+        .into_iter()
+        .fold(ReadTailSummary::default(), |worst, summary| {
+            ReadTailSummary {
+                p95_ms: worst.p95_ms.max(summary.p95_ms),
+                p99_ms: worst.p99_ms.max(summary.p99_ms),
+            }
+        })
+    }
+
+    #[derive(Default)]
+    struct ReadTailSummary {
+        p95_ms: f64,
+        p99_ms: f64,
     }
 
     fn improvement(before: f64, after: f64) -> f64 {
@@ -1434,6 +1439,34 @@ mod tests {
 
     fn percentile_index(len: usize, percentile: usize) -> usize {
         ((len - 1) * percentile) / 100
+    }
+
+    #[test]
+    fn spike_decision_uses_worst_read_path_not_merged_read_samples() {
+        let report = SpikeRunReport {
+            mode: "single_mutex",
+            elapsed: Duration::from_secs(1),
+            outbox_due_read: vec![Duration::from_millis(75); 5],
+            pr_poll_read: vec![Duration::from_millis(1); 500],
+            review_status_read: vec![Duration::from_millis(1); 500],
+            inbox_write: Vec::new(),
+            outbox_write: Vec::new(),
+        };
+
+        let mut merged = Vec::new();
+        merged.extend(report.outbox_due_read.iter().copied());
+        merged.extend(report.pr_poll_read.iter().copied());
+        merged.extend(report.review_status_read.iter().copied());
+
+        let merged_summary = LatencySummary::from(&merged);
+        let worst_tail = worst_read_tail(&report);
+
+        assert_eq!(
+            merged_summary.p99_ms, 1.0,
+            "merged samples hide a small hot read path behind many fast reads"
+        );
+        assert_eq!(worst_tail.p95_ms, 75.0);
+        assert_eq!(worst_tail.p99_ms, 75.0);
     }
 
     /// AB#1044: a missing file is an error (the app has never written config), so the CLI caller
