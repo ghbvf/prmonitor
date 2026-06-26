@@ -477,6 +477,12 @@ PRAGMA foreign_keys=ON;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::thread;
+    use std::time::Instant;
 
     /// v1 migration lock (Medium per ai-robust.md): a missing/renamed table here means
     /// a slice store's first query fails at runtime, not at compile time — so pin the
@@ -964,6 +970,503 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    /// AB#1082 / issue #1376 spike: measure whether the single process-wide
+    /// `Mutex<Connection>` becomes a meaningful bottleneck once outbox polling, inbox writes, PR
+    /// list reads, and local-API status reads run concurrently. Ignored by default because it is a
+    /// timing benchmark, not a deterministic regression assertion.
+    ///
+    /// Tuning knobs:
+    /// - `PRMONITOR_DB_SPIKE_DURATION_MS` (default: 1500)
+    /// - `PRMONITOR_DB_SPIKE_READERS` (default: 8)
+    /// - `PRMONITOR_DB_SPIKE_SEED_ROWS` (default: 1000)
+    #[test]
+    #[ignore = "spike benchmark; run with --ignored --nocapture"]
+    fn sqlite_read_pool_spike_under_outbox_poll_inbox_and_status_reads() {
+        let cfg = SpikeConfig::from_env();
+        println!(
+            "sqlite contention spike: duration_ms={} readers={} seed_rows={}",
+            cfg.duration.as_millis(),
+            cfg.readers,
+            cfg.seed_rows
+        );
+
+        let single = run_spike_mode("single_mutex", ReadRouting::SingleMutex, &cfg);
+        let readonly_pool = run_spike_mode("readonly_pool", ReadRouting::ReadonlyPool, &cfg);
+        print_spike_report(&single);
+        print_spike_report(&readonly_pool);
+        print_spike_decision(&single, &readonly_pool);
+    }
+
+    #[derive(Clone, Copy)]
+    enum ReadRouting {
+        SingleMutex,
+        ReadonlyPool,
+    }
+
+    struct SpikeConfig {
+        duration: Duration,
+        readers: usize,
+        seed_rows: usize,
+    }
+
+    impl SpikeConfig {
+        fn from_env() -> Self {
+            Self {
+                duration: Duration::from_millis(env_u64("PRMONITOR_DB_SPIKE_DURATION_MS", 1500)),
+                readers: env_usize("PRMONITOR_DB_SPIKE_READERS", 8).max(1),
+                seed_rows: env_usize("PRMONITOR_DB_SPIKE_SEED_ROWS", 1000).max(10),
+            }
+        }
+    }
+
+    fn env_u64(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default)
+    }
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(default)
+    }
+
+    struct SpikeRunReport {
+        mode: &'static str,
+        elapsed: Duration,
+        outbox_due_read: Vec<Duration>,
+        pr_poll_read: Vec<Duration>,
+        review_status_read: Vec<Duration>,
+        inbox_write: Vec<Duration>,
+        outbox_write: Vec<Duration>,
+    }
+
+    struct SpikeThreadStats {
+        outbox_due_read: Vec<Duration>,
+        pr_poll_read: Vec<Duration>,
+        review_status_read: Vec<Duration>,
+        inbox_write: Vec<Duration>,
+        outbox_write: Vec<Duration>,
+    }
+
+    impl SpikeThreadStats {
+        fn new() -> Self {
+            Self {
+                outbox_due_read: Vec::new(),
+                pr_poll_read: Vec::new(),
+                review_status_read: Vec::new(),
+                inbox_write: Vec::new(),
+                outbox_write: Vec::new(),
+            }
+        }
+
+        fn merge_into(self, report: &mut SpikeRunReport) {
+            report.outbox_due_read.extend(self.outbox_due_read);
+            report.pr_poll_read.extend(self.pr_poll_read);
+            report.review_status_read.extend(self.review_status_read);
+            report.inbox_write.extend(self.inbox_write);
+            report.outbox_write.extend(self.outbox_write);
+        }
+    }
+
+    fn run_spike_mode(
+        mode: &'static str,
+        routing: ReadRouting,
+        cfg: &SpikeConfig,
+    ) -> SpikeRunReport {
+        let path = temp_db_path(mode);
+        cleanup(&path);
+
+        let writer_conn = Connection::open(&path).expect("open writer db");
+        let writer = Arc::new(Database::from_conn(writer_conn).expect("migrate writer db"));
+        seed_spike_db(writer.as_ref(), cfg.seed_rows);
+
+        let read_handles: Vec<Arc<Database>> = match routing {
+            ReadRouting::SingleMutex => vec![Arc::clone(&writer); cfg.readers],
+            ReadRouting::ReadonlyPool => (0..cfg.readers)
+                .map(|_| Arc::new(Database::open_readonly_at(&path).expect("open readonly db")))
+                .collect(),
+        };
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::new();
+        for (worker_id, db) in read_handles.iter().enumerate() {
+            let db = Arc::clone(db);
+            let stop = Arc::clone(&stop);
+            let seed_rows = cfg.seed_rows;
+            workers.push(thread::spawn(move || {
+                let mut stats = SpikeThreadStats::new();
+                let mut n = worker_id as i64;
+                while !stop.load(Ordering::Relaxed) {
+                    record_latency(&mut stats.outbox_due_read, || {
+                        read_due_outbox(db.as_ref(), n)
+                    });
+                    record_latency(&mut stats.pr_poll_read, || read_tracked_prs(db.as_ref()));
+                    record_latency(&mut stats.review_status_read, || {
+                        read_review_status(db.as_ref(), n, seed_rows)
+                    });
+                    n += 1;
+                }
+                stats
+            }));
+        }
+
+        for writer_id in 0..2 {
+            let db = Arc::clone(&writer);
+            let stop = Arc::clone(&stop);
+            let seed_rows = cfg.seed_rows;
+            workers.push(thread::spawn(move || {
+                let mut stats = SpikeThreadStats::new();
+                let mut n = writer_id as i64;
+                while !stop.load(Ordering::Relaxed) {
+                    if writer_id == 0 {
+                        record_latency(&mut stats.inbox_write, || {
+                            write_inbox_event(db.as_ref(), n)
+                        });
+                    } else {
+                        record_latency(&mut stats.outbox_write, || {
+                            write_outbox_retry(db.as_ref(), n, seed_rows)
+                        });
+                    }
+                    n += 1;
+                }
+                stats
+            }));
+        }
+
+        let started = Instant::now();
+        thread::sleep(cfg.duration);
+        stop.store(true, Ordering::Relaxed);
+        let elapsed = started.elapsed();
+
+        let mut report = SpikeRunReport {
+            mode,
+            elapsed,
+            outbox_due_read: Vec::new(),
+            pr_poll_read: Vec::new(),
+            review_status_read: Vec::new(),
+            inbox_write: Vec::new(),
+            outbox_write: Vec::new(),
+        };
+        for worker in workers {
+            worker.join().expect("worker joins").merge_into(&mut report);
+        }
+        cleanup(&path);
+        report
+    }
+
+    fn record_latency(samples: &mut Vec<Duration>, f: impl FnOnce() -> AppResult<()>) {
+        let started = Instant::now();
+        f().expect("spike operation succeeds");
+        samples.push(started.elapsed());
+    }
+
+    fn seed_spike_db(db: &Database, rows: usize) {
+        db.with_tx(|tx| {
+            let mut outbox = tx
+                .prepare(
+                    "INSERT INTO action_outbox \
+                     (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, \
+                      last_error, created_at, updated_at) \
+                     VALUES ('project-a', 'notification', ?1, '{}', 'pending', 0, ?2, NULL, ?2, ?2)",
+                )
+                .map_err(map_err)?;
+            let mut tracked = tx
+                .prepare(
+                    "INSERT INTO tracked_pr \
+                     (project_id, number, title, labels_json, url, kind, skip_reason, \
+                      first_seen_epoch, last_seen_epoch, archived) \
+                     VALUES ('project-a', ?1, ?2, '[\"review\"]', ?3, 'review', NULL, ?4, ?4, 0)",
+                )
+                .map_err(map_err)?;
+            let mut session = tx
+                .prepare(
+                    "INSERT INTO review_session \
+                     (thread_id, project_id, pr_number, turn_id, kind, status, created_at, \
+                      updated_at, comment_url, engine_kind) \
+                     VALUES (?1, 'project-a', ?2, 'turn', 'review', 'running', ?3, ?3, NULL, 'codex')",
+                )
+                .map_err(map_err)?;
+            for i in 0..rows {
+                let n = i as i64;
+                outbox
+                    .execute(rusqlite::params![
+                        format!("seed action {i}"),
+                        (n % 60) - 30,
+                    ])
+                    .map_err(map_err)?;
+                tracked
+                    .execute(rusqlite::params![
+                        n + 1,
+                        format!("PR {i}"),
+                        format!("https://example.invalid/pr/{i}"),
+                        n,
+                    ])
+                    .map_err(map_err)?;
+                session
+                    .execute(rusqlite::params![
+                        format!("thread-{i}"),
+                        n + 1,
+                        n,
+                    ])
+                    .map_err(map_err)?;
+            }
+            Ok(())
+        })
+        .expect("seed spike rows");
+    }
+
+    fn read_due_outbox(db: &Database, n: i64) -> AppResult<()> {
+        db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM action_outbox \
+                 WHERE status = 'pending' AND next_attempt_at <= ?1 ORDER BY id LIMIT 25",
+            )?;
+            let ids: Vec<i64> = stmt
+                .query_map([n % 60], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            std::hint::black_box(ids);
+            Ok(())
+        })
+    }
+
+    fn read_tracked_prs(db: &Database) -> AppResult<()> {
+        db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT number, title, labels_json FROM tracked_pr \
+                 WHERE project_id = 'project-a' ORDER BY number DESC LIMIT 100",
+            )?;
+            let rows: Vec<(i64, String, String)> = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            std::hint::black_box(rows);
+            Ok(())
+        })
+    }
+
+    fn read_review_status(db: &Database, n: i64, seed_rows: usize) -> AppResult<()> {
+        let idx = n.rem_euclid(seed_rows as i64);
+        db.with_conn(|conn| {
+            let row: Option<(String, Option<String>)> = conn
+                .query_row(
+                    "SELECT status, comment_url FROM review_session WHERE thread_id = ?1",
+                    [format!("thread-{idx}")],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?;
+            std::hint::black_box(row);
+            Ok(())
+        })
+    }
+
+    fn write_inbox_event(db: &Database, n: i64) -> AppResult<()> {
+        db.with_tx(|tx| {
+            tx.execute(
+                "INSERT INTO inbox_event \
+                 (dedupe_key, source, event_type, project_id, repo, number, event_json, \
+                  raw_payload, webhook_event_json, status, received_at_epoch) \
+                 VALUES (?1, 'github', 'pr', 'project-a', 'owner/repo', ?2, '{}', '{}', NULL, \
+                         'received', ?2) \
+                 ON CONFLICT(dedupe_key) DO NOTHING",
+                rusqlite::params![format!("spike:{n}"), n],
+            )
+            .map_err(map_err)?;
+            Ok(())
+        })
+    }
+
+    fn write_outbox_retry(db: &Database, n: i64, seed_rows: usize) -> AppResult<()> {
+        let id = n.rem_euclid(seed_rows as i64) + 1;
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE action_outbox \
+                 SET attempt_count = attempt_count + 1, next_attempt_at = ?2, updated_at = ?2 \
+                 WHERE id = ?1",
+                rusqlite::params![id, n],
+            )
+            .map(|_| ())
+        })
+    }
+
+    fn print_spike_report(report: &SpikeRunReport) {
+        println!();
+        println!("mode={}", report.mode);
+        print_metric(
+            report.mode,
+            "outbox_due_read",
+            &report.outbox_due_read,
+            report.elapsed,
+        );
+        print_metric(
+            report.mode,
+            "pr_poll_read",
+            &report.pr_poll_read,
+            report.elapsed,
+        );
+        print_metric(
+            report.mode,
+            "review_status_read",
+            &report.review_status_read,
+            report.elapsed,
+        );
+        print_metric(
+            report.mode,
+            "inbox_write",
+            &report.inbox_write,
+            report.elapsed,
+        );
+        print_metric(
+            report.mode,
+            "outbox_write",
+            &report.outbox_write,
+            report.elapsed,
+        );
+    }
+
+    fn print_metric(mode: &str, op: &str, samples: &[Duration], elapsed: Duration) {
+        let summary = LatencySummary::from(samples);
+        println!(
+            "{mode}.{op}: count={} ops_per_sec={:.1} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} max_ms={:.3}",
+            samples.len(),
+            samples.len() as f64 / elapsed.as_secs_f64(),
+            summary.p50_ms,
+            summary.p95_ms,
+            summary.p99_ms,
+            summary.max_ms,
+        );
+    }
+
+    fn print_spike_decision(single: &SpikeRunReport, readonly_pool: &SpikeRunReport) {
+        let single_tail = worst_read_tail(single);
+        let pool_tail = worst_read_tail(readonly_pool);
+        let p95_improvement = improvement(single_tail.p95_ms, pool_tail.p95_ms);
+        let p99_improvement = improvement(single_tail.p99_ms, pool_tail.p99_ms);
+        println!();
+        println!(
+            "decision_input: single_read_p95_ms={:.3} single_read_p99_ms={:.3} \
+             readonly_pool_read_p95_ms={:.3} readonly_pool_read_p99_ms={:.3} \
+             p95_improvement={:.1}% p99_improvement={:.1}%",
+            single_tail.p95_ms,
+            single_tail.p99_ms,
+            pool_tail.p95_ms,
+            pool_tail.p99_ms,
+            p95_improvement * 100.0,
+            p99_improvement * 100.0,
+        );
+        if single_tail.p95_ms <= 25.0 && p95_improvement < 0.30 {
+            println!(
+                "decision: no immediate read pool; keep the single writer Database and defer production changes"
+            );
+        } else if (single_tail.p95_ms > 50.0 || single_tail.p99_ms > 200.0)
+            && (p95_improvement >= 0.40 || p99_improvement >= 0.40)
+        {
+            println!(
+                "decision: create follow-up for a read-only pool; keep exactly one writer connection"
+            );
+        } else {
+            println!(
+                "decision: inconclusive; rerun with a longer duration and larger seed before changing production"
+            );
+        }
+    }
+
+    fn worst_read_tail(report: &SpikeRunReport) -> ReadTailSummary {
+        [
+            LatencySummary::from(&report.outbox_due_read),
+            LatencySummary::from(&report.pr_poll_read),
+            LatencySummary::from(&report.review_status_read),
+        ]
+        .into_iter()
+        .fold(ReadTailSummary::default(), |worst, summary| {
+            ReadTailSummary {
+                p95_ms: worst.p95_ms.max(summary.p95_ms),
+                p99_ms: worst.p99_ms.max(summary.p99_ms),
+            }
+        })
+    }
+
+    #[derive(Default)]
+    struct ReadTailSummary {
+        p95_ms: f64,
+        p99_ms: f64,
+    }
+
+    fn improvement(before: f64, after: f64) -> f64 {
+        if before <= f64::EPSILON {
+            0.0
+        } else {
+            ((before - after) / before).max(0.0)
+        }
+    }
+
+    struct LatencySummary {
+        p50_ms: f64,
+        p95_ms: f64,
+        p99_ms: f64,
+        max_ms: f64,
+    }
+
+    impl LatencySummary {
+        fn from(samples: &[Duration]) -> Self {
+            if samples.is_empty() {
+                return Self {
+                    p50_ms: 0.0,
+                    p95_ms: 0.0,
+                    p99_ms: 0.0,
+                    max_ms: 0.0,
+                };
+            }
+            let mut nanos: Vec<u128> = samples.iter().map(Duration::as_nanos).collect();
+            nanos.sort_unstable();
+            Self {
+                p50_ms: nanos[percentile_index(nanos.len(), 50)] as f64 / 1_000_000.0,
+                p95_ms: nanos[percentile_index(nanos.len(), 95)] as f64 / 1_000_000.0,
+                p99_ms: nanos[percentile_index(nanos.len(), 99)] as f64 / 1_000_000.0,
+                max_ms: *nanos.last().expect("non-empty") as f64 / 1_000_000.0,
+            }
+        }
+    }
+
+    fn percentile_index(len: usize, percentile: usize) -> usize {
+        ((len - 1) * percentile) / 100
+    }
+
+    #[test]
+    fn spike_decision_uses_worst_read_path_not_merged_read_samples() {
+        let report = SpikeRunReport {
+            mode: "single_mutex",
+            elapsed: Duration::from_secs(1),
+            outbox_due_read: vec![Duration::from_millis(75); 5],
+            pr_poll_read: vec![Duration::from_millis(1); 500],
+            review_status_read: vec![Duration::from_millis(1); 500],
+            inbox_write: Vec::new(),
+            outbox_write: Vec::new(),
+        };
+
+        let mut merged = Vec::new();
+        merged.extend(report.outbox_due_read.iter().copied());
+        merged.extend(report.pr_poll_read.iter().copied());
+        merged.extend(report.review_status_read.iter().copied());
+
+        let merged_summary = LatencySummary::from(&merged);
+        let worst_tail = worst_read_tail(&report);
+
+        assert_eq!(
+            merged_summary.p99_ms, 1.0,
+            "merged samples hide a small hot read path behind many fast reads"
+        );
+        assert_eq!(worst_tail.p95_ms, 75.0);
+        assert_eq!(worst_tail.p99_ms, 75.0);
     }
 
     /// AB#1044: a missing file is an error (the app has never written config), so the CLI caller
