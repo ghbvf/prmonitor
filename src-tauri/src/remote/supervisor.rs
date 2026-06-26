@@ -20,14 +20,18 @@
 //! per-listener bind failure is captured in status, NEVER propagated (a bad listener must not
 //! crash the app or fail a config save).
 //!
-//! **Future seam (AB#1225 / AB#1073):** this is deliberately a SINGLE binder — only `local-api`
-//! binds; every other kind is `Unsupported`. We do NOT introduce a `ListenerBinder` trait seam
-//! for PR1: with exactly one real binder, the seam would be speculative abstraction (the
-//! ai-robust charter's trait-seam rule wants "new implementation, not changed callsite" — there
-//! is no second implementation yet). When AB#1073 lands the second real binder (`remote-web` /
-//! `terminal`), evaluate introducing the `ListenerBinder` seam here plus a composition-root
-//! post-save hook injection (so `reconcile` dispatches per-kind without growing a `match` arm
-//! per binder). Tracked as a backlog issue, not in this PR.
+//! **Per-kind binder seam (F26 / #1382):** the per-kind runtime is a [`ListenerBinder`] — each kind
+//! that has a real runtime implements it, and `reconcile` dispatches via the exhaustive
+//! [`bind_for_kind`] `match` (mirrors the `ReviewEngine` seam in `review/engine.rs`: a new kind is a
+//! new impl + one dispatch arm, NOT a change to the reconcile/diff/status core). `local-api` is the
+//! SOLE real binder this PR; `remote-web` / `terminal` (AB#1073) and `event-ingress` (tunnel runtime)
+//! have no binder yet and are reported `Unsupported`. The seam is introduced ahead of AB#1073's second
+//! binder by deliberate decision (#1382) — a single-impl seam is acknowledged speculative, so it is
+//! gated on preserving the prior compile-time guarantee: [`bind_for_kind`]'s `match` is exhaustive with
+//! NO wildcard, so a new `ListenerKind` without an arm is a COMPILE ERROR (**Hard** carrier, unchanged
+//! from the pre-seam single `match`). `classify` stays the R-free bindability+reason source; the two
+//! agree on the bindable set, pinned by `binder_registry_consistent_with_classify` (**Medium** carrier).
+//! See `.claude/rules/prmonitor/ai-robust.md` §审查要求 for the rating obligation.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -130,9 +134,25 @@ fn status_of(
     }
 }
 
+/// One bindable listener's reconcile-relevant fields, kept TOGETHER so the bind step reads a single
+/// listener's `(port, kind)` as one unit.
+///
+/// F1 fix (#1382 review): the bind step previously derived `kind` from a SEPARATE `id -> kind` map
+/// built over ALL listeners, decoupled from the `(id -> port)` the desired set selected. Under a
+/// DUPLICATE listener id — reachable because the STARTUP reconcile loads config via the LENIENT
+/// `config::service::load` (no `validate`, which would reject duplicate ids) — the two `id`-keyed
+/// `HashMap` collapses can resolve to DIFFERENT listeners (last-writer-wins), letting a later
+/// non-runtime duplicate's kind suppress a bindable `local-api`'s bind. Carrying `kind` IN the
+/// desired entry (built from the SAME bindable-filtered pass) makes that divergence unrepresentable.
+#[derive(Clone, Copy)]
+struct DesiredListener {
+    port: u16,
+    kind: ListenerKind,
+}
+
 /// The desired set of bindable listeners: enabled + loopback + a kind the supervisor binds
-/// (`local-api` this PR) + a NON-ZERO port. Pure (id → port), so the reconcile diff is testable
-/// without an app.
+/// (`local-api` this PR) + a NON-ZERO port. Pure (id → `DesiredListener`), so the reconcile diff is
+/// testable without an app.
 ///
 /// The `l.port != 0` filter (F1) is a runtime backstop, not a duplicate of save-time validation:
 /// `config::model::validate` rejects an enabled `port == 0` listener, but the STARTUP reconcile in
@@ -141,29 +161,41 @@ fn status_of(
 /// without this filter `bind_std_with_retry(0)` would bind a RANDOM OS-assigned ephemeral port —
 /// silently exposing the trigger API on an unpredictable port instead of failing closed. Excluding
 /// it from `desired` means it is never bound → `status_of` reports it `Error` (should-bind-but-isn't),
-/// the fail-closed outcome the user can see and correct.
-fn desired_ports(listeners: &[Listener]) -> HashMap<String, u16> {
+/// the fail-closed outcome the user can see and correct. The `kind` travels WITH the port (vs a second
+/// `id`-keyed lookup) so the SAME lenient-load duplicate-id path can't decouple them (see
+/// [`DesiredListener`]).
+fn desired_listeners(listeners: &[Listener]) -> HashMap<String, DesiredListener> {
     listeners
         .iter()
         .filter(|l| l.enabled && l.port != 0 && matches!(classify(l), Disposition::Bind))
-        .map(|l| (l.id.clone(), l.port))
+        .map(|l| {
+            (
+                l.id.clone(),
+                DesiredListener {
+                    port: l.port,
+                    kind: l.kind,
+                },
+            )
+        })
         .collect()
 }
 
 /// Pure reconcile diff: ids to tear down (absent from desired, or port changed) and ids to bind
-/// (absent from current, or port changed). Unit-tested directly.
+/// (absent from current, or port changed). Compares the live `id -> port` snapshot against the
+/// desired entries' ports (a kind change on an existing id flips its desired membership, so port is
+/// the only rebind trigger). Unit-tested directly.
 fn diff(
     current: &HashMap<String, u16>,
-    desired: &HashMap<String, u16>,
+    desired: &HashMap<String, DesiredListener>,
 ) -> (Vec<String>, Vec<String>) {
     let remove = current
         .iter()
-        .filter(|(id, port)| desired.get(*id) != Some(*port))
+        .filter(|(id, port)| desired.get(*id).map(|d| d.port) != Some(**port))
         .map(|(id, _)| id.clone())
         .collect();
     let add = desired
         .iter()
-        .filter(|(id, port)| current.get(*id) != Some(*port))
+        .filter(|(id, d)| current.get(*id) != Some(&d.port))
         .map(|(id, _)| id.clone())
         .collect();
     (remove, add)
@@ -204,7 +236,7 @@ impl ListenerSupervisor {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
 
-        let desired = desired_ports(listeners);
+        let desired = desired_listeners(listeners);
 
         // 1) Briefly lock `runtimes`: snapshot current (id→port), compute the diff, and DRAIN the
         //    removed entries out so we can tear them down with NO lock held. The lock is released
@@ -239,13 +271,16 @@ impl ListenerSupervisor {
             b.server_task.abort();
         }
 
-        // 3) Bind each new listener with NO `runtimes` lock held — `bind_one` does the blocking
-        //    std bind + bounded retry sleep here, so a slow port-release can't stall other callers
-        //    (and the retry absorbs the step-2 abort's socket-release lag described above).
+        // 3) Bind each new listener with NO `runtimes` lock held — `bind_for_kind` routes the kind to
+        //    its `ListenerBinder`, which does the blocking std bind + bounded retry sleep here, so a
+        //    slow port-release can't stall other callers (and the retry absorbs the step-2 abort's
+        //    socket-release lag described above). The kind drives WHICH binder (F26 / #1382); it is read
+        //    from the SAME `desired` entry the port came from (`DesiredListener`) — never a second
+        //    `id`-keyed map over all listeners, which a duplicate id could decouple (F1 fix, #1382).
         let mut bound: Vec<(String, BoundListener)> = Vec::with_capacity(add.len());
         for id in add {
-            let port = desired[&id];
-            if let Some(b) = bind_one(app, port) {
+            let DesiredListener { port, kind } = desired[&id];
+            if let Some(b) = bind_for_kind(kind, app, port) {
                 bound.push((id, b));
             }
             // A bind failure inserts no entry → status_snapshot reports it as `Error`.
@@ -305,16 +340,79 @@ impl ListenerSupervisor {
     }
 }
 
-/// Synchronously bind `127.0.0.1:port` (std, works outside a runtime so `reconcile` knows success
-/// immediately) with bounded retry, convert to a tokio listener SYNCHRONOUSLY (so success is
-/// confirmed before any `BoundListener` exists — no phantom `Bound` status, F2), then hand the
-/// socket to a spawned serve task that mounts the local-api router. Returns `None` (→ status
-/// `Error`) if the bind or the `from_std` conversion ultimately fails.
+/// The per-kind listener runtime binder seam (F26 / #1382). Each [`ListenerKind`] that has a real
+/// runtime implements this; the reconcile / diff / status core never names a concrete binder. A new
+/// kind plugs in by implementing the trait + flipping one arm of [`bind_for_kind`] — the callsite
+/// (`reconcile`) does not change. Mirrors the `ReviewEngine` seam (`review/engine.rs`): monomorphic
+/// (no `dyn`), selected by an exhaustive `match` that names the concrete binder type.
+trait ListenerBinder {
+    /// Bind this kind's runtime on loopback `port`, returning a control handle, or `None` on failure
+    /// (→ status `Error`, fail-closed). Method-generic over the Tauri runtime so the trait needs no
+    /// object-safety and dispatch stays static.
+    fn bind<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        port: u16,
+    ) -> Option<BoundListener>;
+}
+
+/// The sole real binder this PR: mounts the local-api router (`review::local_api::build_router`) on the
+/// bound loopback socket. Other kinds have no binder yet (`remote-web` / `terminal` need AB#1073,
+/// `event-ingress` needs the tunnel runtime) — see [`bind_for_kind`].
+struct LocalApiBinder;
+
+impl ListenerBinder for LocalApiBinder {
+    fn bind<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        port: u16,
+    ) -> Option<BoundListener> {
+        bind_loopback(app, port, |app, port| {
+            build_router(Arc::new(Ctx { app, port }))
+        })
+    }
+}
+
+/// Dispatch a listener kind to its [`ListenerBinder`]. **Hard carrier:** the `match` over the sealed
+/// [`ListenerKind`] is exhaustive with NO wildcard — a new kind without an arm is a COMPILE ERROR, never
+/// a silent no-bind (this preserves the exact compile-time guarantee the pre-seam single `match` had;
+/// the seam must not regress it). Kinds with no runtime yet return `None`; in practice they never reach
+/// here (`desired_listeners` excludes them via `classify`), so the `None` is fail-closed defence-in-depth.
 ///
-/// Called from `reconcile`, which runs on a sync command/setup thread (NOT inside the async
-/// runtime), so `block_on` here is safe — it enters the runtime context just long enough for the
-/// reactor to register the socket; the conversion itself is instant.
-fn bind_one<R: tauri::Runtime>(app: &tauri::AppHandle<R>, port: u16) -> Option<BoundListener> {
+/// `classify` (R-free) is the source for bindability + the `Unsupported` reason; this (R-specific) is
+/// the source for WHICH binder. The two agree on the bindable set — pinned by
+/// `binder_registry_consistent_with_classify` (**Medium** carrier) per `.claude/rules/prmonitor/ai-robust.md`.
+fn bind_for_kind<R: tauri::Runtime>(
+    kind: ListenerKind,
+    app: &tauri::AppHandle<R>,
+    port: u16,
+) -> Option<BoundListener> {
+    match kind {
+        ListenerKind::LocalApi => LocalApiBinder.bind(app, port),
+        ListenerKind::EventIngress | ListenerKind::RemoteWeb | ListenerKind::Terminal => None,
+    }
+}
+
+/// Generic loopback bind + axum serve scaffolding shared by every axum-based [`ListenerBinder`]:
+/// synchronously bind `127.0.0.1:port` (std, works outside a runtime so the caller knows success
+/// immediately) with bounded retry, convert to a tokio listener SYNCHRONOUSLY (so success is confirmed
+/// before any `BoundListener` exists — no phantom `Bound` status, F2), then hand the socket to a spawned
+/// serve task. The binder supplies the router via `make_router(app, port)`; the per-kind mount is the
+/// ONLY thing that varies. Returns `None` (→ status `Error`) if the bind or the `from_std` conversion
+/// ultimately fails.
+///
+/// Called (via [`bind_for_kind`]) from `reconcile`, which runs on a sync command/setup thread (NOT
+/// inside the async runtime), so `block_on` here is safe — it enters the runtime context just long
+/// enough for the reactor to register the socket; the conversion itself is instant.
+fn bind_loopback<R, F>(
+    app: &tauri::AppHandle<R>,
+    port: u16,
+    make_router: F,
+) -> Option<BoundListener>
+where
+    R: tauri::Runtime,
+    F: FnOnce(tauri::AppHandle<R>, u16) -> axum::Router + Send + 'static,
+{
     let std_listener = bind_std_with_retry(port)?;
     if let Err(e) = std_listener.set_nonblocking(true) {
         eprintln!("Remote 监听运行时：端口 {port} set_nonblocking 失败，已跳过：{e}");
@@ -336,8 +434,7 @@ fn bind_one<R: tauri::Runtime>(app: &tauri::AppHandle<R>, port: u16) -> Option<B
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let app = app.clone();
     let server_task = spawn(async move {
-        let ctx = Arc::new(Ctx { app, port });
-        let router = build_router(ctx);
+        let router = make_router(app, port);
         if let Err(e) = axum::serve(listener, router.into_make_service())
             .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
@@ -506,23 +603,44 @@ mod tests {
         assert_eq!(s.state, ListenerState::Unsupported);
     }
 
-    // --- desired_ports + diff (the reconcile core) ------------------------------------------
+    // --- desired_listeners + diff (the reconcile core) --------------------------------------
 
     #[test]
-    fn desired_ports_only_includes_enabled_bindable_loopback() {
+    fn desired_listeners_only_includes_enabled_bindable_loopback() {
         let listeners = vec![
             listener("ok", ListenerKind::LocalApi, "127.0.0.1", 8788, true),
             listener("disabled", ListenerKind::LocalApi, "127.0.0.1", 8789, false),
             listener("remote", ListenerKind::LocalApi, "0.0.0.0", 8790, true),
             listener("web", ListenerKind::RemoteWeb, "127.0.0.1", 8791, true),
         ];
-        let d = desired_ports(&listeners);
+        let d = desired_listeners(&listeners);
         assert_eq!(d.len(), 1);
-        assert_eq!(d.get("ok"), Some(&8788));
+        assert_eq!(
+            d.get("ok").map(|x| (x.port, x.kind)),
+            Some((8788, ListenerKind::LocalApi))
+        );
     }
 
     #[test]
-    fn desired_ports_excludes_enabled_local_api_with_port_zero() {
+    fn desired_listeners_carries_bindable_kind_under_duplicate_id() {
+        // F1 fix (#1382 review): under a duplicate listener id (reachable via the lenient startup load,
+        // no `validate`), the desired entry must carry the BINDABLE listener's kind — a later
+        // non-runtime duplicate (filtered out of `desired`) must NOT decouple kind from port. Pins the
+        // funnel closed at the pure level (the reconcile-level proof is
+        // `reconcile_binds_local_api_despite_duplicate_id_nonruntime_kind`).
+        let listeners = vec![
+            listener("dup", ListenerKind::LocalApi, "127.0.0.1", 8788, true),
+            listener("dup", ListenerKind::RemoteWeb, "127.0.0.1", 9000, true),
+        ];
+        let d = desired_listeners(&listeners);
+        assert_eq!(d.len(), 1);
+        let entry = d.get("dup").expect("bindable local-api stays desired");
+        assert_eq!(entry.kind, ListenerKind::LocalApi);
+        assert_eq!(entry.port, 8788);
+    }
+
+    #[test]
+    fn desired_listeners_excludes_enabled_local_api_with_port_zero() {
         // F1 runtime backstop: an enabled loopback local-api with port 0 reaches reconcile via the
         // lenient startup `config::service::load` (no `validate`). It must NOT be desired — otherwise
         // `bind_std_with_retry(0)` would bind a RANDOM OS port. Excluded → never bound.
@@ -534,7 +652,7 @@ mod tests {
             true,
         )];
         assert!(
-            desired_ports(&listeners).is_empty(),
+            desired_listeners(&listeners).is_empty(),
             "an enabled local-api with port 0 must be excluded from desired (no random-port bind)"
         );
     }
@@ -562,10 +680,14 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let desired: HashMap<String, u16> = [
-            ("keep".to_string(), 1u16),
-            ("new".to_string(), 4),
-            ("move".to_string(), 5),
+        let dl = |port: u16| DesiredListener {
+            port,
+            kind: ListenerKind::LocalApi,
+        };
+        let desired: HashMap<String, DesiredListener> = [
+            ("keep".to_string(), dl(1)),
+            ("new".to_string(), dl(4)),
+            ("move".to_string(), dl(5)),
         ]
         .into_iter()
         .collect();
@@ -672,6 +794,98 @@ mod tests {
         assert_eq!(snap[0].state, ListenerState::Unsupported);
     }
 
+    // --- ListenerBinder seam (F26 / #1382): dispatch + binder + registry↔classify consistency ---
+
+    #[test]
+    fn bind_for_kind_non_runtime_kinds_return_none() {
+        // The three kinds without a runtime binder return `None` from the dispatch WITHOUT binding any
+        // socket (the `None` arm short-circuits before any bind). Pins that the seam never silently
+        // binds a non-runtime kind — the Hard exhaustive `match` routes them to `None`, fail-closed.
+        let app = tauri::test::mock_app();
+        for kind in [
+            ListenerKind::RemoteWeb,
+            ListenerKind::EventIngress,
+            ListenerKind::Terminal,
+        ] {
+            assert!(
+                bind_for_kind(kind, app.handle(), 0).is_none(),
+                "non-runtime kind {kind:?} must not bind"
+            );
+        }
+    }
+
+    #[test]
+    fn local_api_binder_binds_loopback() {
+        // The sole real binder this PR: `LocalApiBinder` mounts + binds the local-api router on a
+        // loopback port. Reserve a free ephemeral port, release it, bind through the binder directly,
+        // assert a live serve task, then clean up (mirrors the reconcile-integration CI-safe pattern;
+        // no HTTP request, so the router's managed state / DB is never touched).
+        let app = tauri::test::mock_app();
+        let port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral bind");
+            l.local_addr().expect("local_addr").port()
+        };
+        let bound = LocalApiBinder
+            .bind(app.handle(), port)
+            .expect("local-api binder binds a free loopback port");
+        assert_eq!(bound.port, port);
+        assert!(
+            !bound.server_task.inner().is_finished(),
+            "serve task should be live right after a successful bind"
+        );
+        // Clean up the spawned serve task (graceful signal + abort).
+        let _ = bound.shutdown.send(());
+        bound.server_task.abort();
+    }
+
+    #[test]
+    fn binder_registry_consistent_with_classify() {
+        // Medium carrier (per `.claude/rules/prmonitor/ai-robust.md` §审查要求): the bindable SET must
+        // agree between `classify` (R-free — bindability + Unsupported reason) and `bind_for_kind`
+        // (R-specific — WHICH binder). The three non-runtime kinds are BOTH `Unsupported` (classify)
+        // AND `None` (bind_for_kind); `local-api` is `Bind` (classify) AND `Some` (bind_for_kind). Both
+        // matches are exhaustive (Hard), so a NEW kind forces an arm in each; this test pins that an
+        // EXISTING kind can't be marked bindable in one and not the other — in BOTH directions, so a
+        // regression that drops `bind_for_kind`'s `LocalApi` arm to `None` fails HERE (not only in the
+        // reconcile integration test).
+        let app = tauri::test::mock_app();
+        for kind in [
+            ListenerKind::RemoteWeb,
+            ListenerKind::EventIngress,
+            ListenerKind::Terminal,
+        ] {
+            let l = listener("x", kind, "127.0.0.1", 9000, true);
+            assert!(
+                matches!(classify(&l), Disposition::Unsupported(_)),
+                "{kind:?} must classify Unsupported"
+            );
+            assert!(
+                bind_for_kind(kind, app.handle(), 9000).is_none(),
+                "{kind:?} must have no binder"
+            );
+        }
+        // local-api: bindable in BOTH the R-free source (classify) AND the R-specific source
+        // (bind_for_kind). Bind on port 0 (OS-assigned free port — CI-safe, no TOCTOU), assert a real
+        // binder, then tear the spawned serve task down.
+        assert!(
+            matches!(
+                classify(&listener(
+                    "local-api",
+                    ListenerKind::LocalApi,
+                    "127.0.0.1",
+                    8788,
+                    true
+                )),
+                Disposition::Bind
+            ),
+            "local-api must classify Bind"
+        );
+        let bound = bind_for_kind(ListenerKind::LocalApi, app.handle(), 0)
+            .expect("local-api must have a binder in bind_for_kind, not just Bind in classify");
+        let _ = bound.shutdown.send(());
+        bound.server_task.abort();
+    }
+
     // --- reconcile integration (CI-safe: loopback only; user-approved, F24) ------------------
     // Drives a real bind→serve→teardown cycle through a tauri mock app: the only test that
     // exercises the `Bound` status path end-to-end (a real `BoundListener` with a live serve
@@ -712,6 +926,39 @@ mod tests {
         );
 
         // App-shutdown cleanup is idempotent after teardown.
+        sup.shutdown();
+    }
+
+    #[test]
+    fn reconcile_binds_local_api_despite_duplicate_id_nonruntime_kind() {
+        // F1 regression (#1382 review): the startup reconcile loads config via the LENIENT
+        // `config::service::load` (no `validate`), so a hand-edited / forward-compat config with a
+        // DUPLICATE listener id reaches reconcile. A bindable local-api followed by a non-runtime kind
+        // sharing its id must STILL bind: the binder kind must come from the SAME bindable listener the
+        // desired set selected, never a second `id -> kind` map over ALL listeners (where the later
+        // non-runtime duplicate wins and silently suppresses the local-api bind). Pre-fix this bound
+        // nothing (local-api status → Error); post-fix the local-api binds.
+        let app = tauri::test::mock_app();
+        let port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral bind");
+            l.local_addr().expect("local_addr").port()
+        };
+        let sup = ListenerSupervisor::default();
+        let listeners = vec![
+            listener("dup", ListenerKind::LocalApi, "127.0.0.1", port, true),
+            listener("dup", ListenerKind::RemoteWeb, "127.0.0.1", 9000, true),
+        ];
+        sup.reconcile(app.handle(), &listeners);
+        let snap = sup.status_snapshot(&listeners, true);
+        let local_api_bound = snap.iter().any(|s| {
+            s.kind == ListenerKind::LocalApi
+                && s.state == ListenerState::Bound
+                && s.bound_port == Some(port)
+        });
+        assert!(
+            local_api_bound,
+            "a duplicate non-runtime kind must not suppress the bindable local-api bind"
+        );
         sup.shutdown();
     }
 
