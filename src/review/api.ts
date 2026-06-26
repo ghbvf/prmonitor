@@ -1,6 +1,6 @@
 // Review slice → backend adapter. Wraps the codex availability + review session
 // commands, and the streamed `review:event` Tauri event.
-import { invoke, listen } from "../api";
+import { getTransport } from "../transport";
 import type { ReviewEvent } from "../types";
 import type { ClaudeStatus, CodexStatus, ReviewSession, StreamItem } from "./types";
 
@@ -8,23 +8,23 @@ import type { ClaudeStatus, CodexStatus, ReviewSession, StreamItem } from "./typ
 const REVIEW_EVENT = "review:event" as const;
 
 export function getCodexStatus(): Promise<CodexStatus> {
-  return invoke<CodexStatus>("get_codex_status");
+  return getTransport().request<CodexStatus>("get_codex_status");
 }
 
 // claude availability (one-shot `claude --version`); no start/stop — claude has no
 // resident server (unlike codex).
 export function getClaudeStatus(): Promise<ClaudeStatus> {
-  return invoke<ClaudeStatus>("get_claude_status");
+  return getTransport().request<ClaudeStatus>("get_claude_status");
 }
 
 // Explicitly start the resident codex app-server (clears the user-stop flag).
 export function startCodex(): Promise<CodexStatus> {
-  return invoke<CodexStatus>("start_codex");
+  return getTransport().request<CodexStatus>("start_codex");
 }
 
 // Explicitly stop the resident codex app-server (passive probes won't revive it).
 export function stopCodex(): Promise<CodexStatus> {
-  return invoke<CodexStatus>("stop_codex");
+  return getTransport().request<CodexStatus>("stop_codex");
 }
 
 // Starts a review for a PR in the given project (#35); resolves with the session
@@ -35,11 +35,11 @@ export function startReview(
   prNumber: number,
   kind: string,
 ): Promise<string> {
-  return invoke<string>("start_review", { projectId, prNumber, kind });
+  return getTransport().request<string>("start_review", { projectId, prNumber, kind });
 }
 
 export function stopReview(sessionId: string): Promise<void> {
-  return invoke<void>("stop_review", { sessionId });
+  return getTransport().request<void>("stop_review", { sessionId });
 }
 
 // Send a follow-up chat message into an existing review thread (#chat). The AI
@@ -53,7 +53,7 @@ export function sendReviewMessage(
   message: string,
   userItemId: string,
 ): Promise<void> {
-  return invoke<void>("send_review_message", {
+  return getTransport().request<void>("send_review_message", {
     projectId,
     threadId,
     message,
@@ -62,7 +62,7 @@ export function sendReviewMessage(
 }
 
 export function listReviewSessions(): Promise<ReviewSession[]> {
-  return invoke<ReviewSession[]>("list_review_sessions");
+  return getTransport().request<ReviewSession[]>("list_review_sessions");
 }
 
 // A PR's persisted sessions, newest first, from the DURABLE store (#70) — survives an
@@ -72,7 +72,7 @@ export function getPrSessions(
   projectId: string,
   prNumber: number,
 ): Promise<ReviewSession[]> {
-  return invoke<ReviewSession[]>("get_pr_sessions", { projectId, prNumber });
+  return getTransport().request<ReviewSession[]>("get_pr_sessions", { projectId, prNumber });
 }
 
 // A session's persisted history items in stream order (#70) — message/reasoning blocks
@@ -83,7 +83,7 @@ export function getSessionHistory(
   prNumber: number,
   threadId: string,
 ): Promise<StreamItem[]> {
-  return invoke<StreamItem[]>("get_session_history", {
+  return getTransport().request<StreamItem[]>("get_session_history", {
     projectId,
     prNumber,
     threadId,
@@ -92,5 +92,5 @@ export function getSessionHistory(
 
 // Subscribe to streamed review events. Returns a Promise<UnlistenFn> for cleanup.
 export function onReviewEvent(cb: (e: ReviewEvent) => void) {
-  return listen<ReviewEvent>(REVIEW_EVENT, (event) => cb(event.payload));
+  return getTransport().subscribe<ReviewEvent>(REVIEW_EVENT, cb);
 }

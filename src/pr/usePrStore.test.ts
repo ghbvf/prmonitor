@@ -58,11 +58,14 @@ vi.mock("./api", () => ({
   }),
 }));
 
-// `useProjects().setActive` persists via the root `../api` invoke — stub it so
-// `switchTo` does not hit the Tauri bridge.
-vi.mock("../api", () => ({
-  invoke: vi.fn(() => Promise.resolve()),
-  listen: vi.fn(() => Promise.resolve(() => {})),
+// `useProjects().setActive` persists via config/api → the Transport port (AB#1375);
+// stub the port so `switchTo` does not hit a real backend.
+vi.mock("../transport", () => ({
+  getTransport: () => ({
+    request: vi.fn(() => Promise.resolve()),
+    subscribe: vi.fn(() => Promise.resolve(() => {})),
+    openExternal: vi.fn(() => Promise.resolve()),
+  }),
 }));
 
 import * as api from "./api";

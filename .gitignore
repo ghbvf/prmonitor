@@ -11,6 +11,7 @@ node_modules
 .pnpm-store/
 dist
 dist-ssr
+dist-web
 *.local
 
 # Claude Code scratch (one-off scripts, transient artifacts)

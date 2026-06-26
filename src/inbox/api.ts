@@ -1,8 +1,8 @@
 // Inbox slice → backend adapter. Wraps the inbox commands and the `inbox:updated`
-// event subscription. Mirrors src/pr/api.ts: the ONLY `@tauri-apps/api` access goes
-// through the shared `../api` root, and the wire types come from the `../types` root —
-// the inbox slice never imports a sibling slice (slice-boundary.test.ts).
-import { invoke, listen } from "../api";
+// event subscription. Mirrors src/pr/api.ts: backend access goes through the shared
+// `../transport` port, and the wire types come from the `../types` root — the inbox
+// slice never imports a sibling slice (slice-boundary.test.ts).
+import { getTransport } from "../transport";
 import type { InboxEntry, InboxEvent } from "../types";
 
 // Mirrors the backend's `inbox:updated` Tauri event name (this TS side is the open
@@ -15,24 +15,24 @@ export const INBOX_UPDATED_EVENT = "inbox:updated" as const;
 // pr slice's pollNow/getPrs). `undefined` is dropped from the serialized args, so the
 // backend sees an absent argument and returns the unscoped list.
 export function inboxList(projectId?: string): Promise<InboxEntry[]> {
-  return invoke<InboxEntry[]>("inbox_list", { projectId });
+  return getTransport().request<InboxEntry[]>("inbox_list", { projectId });
 }
 
 // Fetch one entry's raw inbound payload (AB#1065) — the original webhook body the
 // normalized `Event` was derived from, for the "View raw" disclosure.
 export function inboxGetRaw(id: number): Promise<string> {
-  return invoke<string>("inbox_get_raw", { id });
+  return getTransport().request<string>("inbox_get_raw", { id });
 }
 
 // Re-run processing for one entry (AB#1065). The backend re-emits `inbox:updated` for
 // the entry after replay, so the store refreshes via the existing listener — no return
 // value to apply here.
 export function inboxReplay(id: number): Promise<void> {
-  return invoke<void>("inbox_replay", { id });
+  return getTransport().request<void>("inbox_replay", { id });
 }
 
 // Subscribe to backend-pushed inbox updates. Returns the `Promise<UnlistenFn>` so the
 // caller can await it for cleanup on unmount (mirrors onPrsUpdated).
 export function onInboxUpdated(cb: (e: InboxEvent) => void) {
-  return listen<InboxEvent>(INBOX_UPDATED_EVENT, (event) => cb(event.payload));
+  return getTransport().subscribe<InboxEvent>(INBOX_UPDATED_EVENT, cb);
 }

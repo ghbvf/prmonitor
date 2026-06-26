@@ -43,6 +43,26 @@ const sources = import.meta.glob("./{config,pr,review,inbox,outbox}/**/*.{ts,vue
   eager: true,
 }) as Record<string, string>;
 
+// The Transport port (AB#1375): `@tauri-apps/*` desktop APIs (invoke/listen/opener)
+// must be reachable from EXACTLY ONE module — the Tauri transport adapter. Every other
+// file talks to the backend through the runtime-selected `Transport`, so the browser
+// SPA build can swap in HttpTransport and never bundle (or crash on) a desktop-only API.
+// The single legal importer:
+const TAURI_TRANSPORT_MODULE = "./transport/tauri.ts";
+
+// Eager-load EVERY src file as raw text (not just slices) so the tauri-import funnel is
+// CLOSED on the upstream side — a stray `@tauri-apps/*` import (static OR dynamic, see
+// extractImports) ANYWHERE under src/ is caught, not only inside a slice. `*.test.ts`
+// files are exempt for two independent reasons: (1) a test's `vi.mock("@tauri-apps/...")`
+// is a call argument, not an import statement, so extractImports never matches it anyway;
+// (2) test files are never included in the production SPA bundle, so even a direct
+// `@tauri-apps` import in a test does not violate browser safety.
+const allSources = import.meta.glob("./**/*.{ts,vue}", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+}) as Record<string, string>;
+
 // Which slice owns a glob key like "./pr/WebhookPanel.vue".
 function ownerSlice(key: string): Slice {
   for (const s of SLICES) {
@@ -56,8 +76,10 @@ interface ImportRef {
   typeOnly: boolean; // `import type ...` / `export type ... from`
 }
 
-// Extract every static import/re-export specifier from a source file, flagging the
-// type-only ones.
+// Extract every import/re-export specifier from a source file — static AND dynamic —
+// flagging the type-only ones. Dynamic `import()` is covered so the tauri-import funnel
+// stays closed against `(await import("@tauri-apps/…"))` (the very form main.ts uses to
+// load the adapters); without it the upstream scan would have a dynamic-import blind spot.
 function extractImports(source: string): ImportRef[] {
   const refs: ImportRef[] = [];
   // `import ... from "x"` and `import type ... from "x"` (default/named/namespace).
@@ -66,6 +88,8 @@ function extractImports(source: string): ImportRef[] {
   const sideEffectRe = /\bimport\s+["']([^"']+)["']/g;
   // Re-export: `export ... from "x"` / `export type ... from "x"`.
   const reExportRe = /\bexport\s+(type\s+)?[^;'"]*?\bfrom\s*["']([^"']+)["']/g;
+  // Dynamic `import("x")` / `import( "x" )` — always a runtime (value) edge, never type-only.
+  const dynamicRe = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
 
   let m: RegExpExecArray | null;
   while ((m = importRe.exec(source)) !== null) {
@@ -76,6 +100,9 @@ function extractImports(source: string): ImportRef[] {
   }
   while ((m = reExportRe.exec(source)) !== null) {
     refs.push({ spec: m[2], typeOnly: Boolean(m[1]) });
+  }
+  while ((m = dynamicRe.exec(source)) !== null) {
+    refs.push({ spec: m[1], typeOnly: false });
   }
   return refs;
 }
@@ -150,5 +177,56 @@ describe("vertical slice boundary (config / pr / review / inbox / outbox)", () =
     // Root-module / same-slice specifiers resolve to no sibling slice.
     expect(crossSliceTarget("pr", "../types")).toBeNull();
     expect(crossSliceTarget("pr", "./api")).toBeNull();
+  });
+});
+
+// Tauri-import funnel (Medium, AB#1375). CLOSED funnel: upstream = every src file is
+// scanned (allSources), downstream = exactly one exempt module (the Tauri transport
+// adapter). A `@tauri-apps/*` import leaking into any other module would make the
+// browser SPA build bundle a desktop-only API — caught here in CI.
+//
+// Carrier rationale (why Medium, not Hard): the Hard form would be a separate browser
+// tsconfig/build graph that physically excludes `@tauri-apps/*` from the web target so
+// the import is un-resolvable. That is the future `build:web` hardening path; this
+// lexical scan is the low-cost Medium that catches the expressible violation now.
+describe("tauri-import funnel (only transport/tauri.ts may import @tauri-apps/*)", () => {
+  const isExempt = (key: string) =>
+    key === TAURI_TRANSPORT_MODULE || key.endsWith(".test.ts");
+
+  it("loaded the single legal tauri-import module", () => {
+    // Guard against the exemption pointing at a path the glob never produced (a rename
+    // would otherwise make the next assertion vacuously pass).
+    expect(Object.keys(allSources)).toContain(TAURI_TRANSPORT_MODULE);
+  });
+
+  it("no module outside transport/tauri.ts imports @tauri-apps/*", () => {
+    const violations: string[] = [];
+    for (const [key, source] of Object.entries(allSources)) {
+      if (isExempt(key)) continue;
+      for (const ref of extractImports(source)) {
+        if (ref.spec.startsWith("@tauri-apps/")) {
+          violations.push(`${key} imports desktop-only API: ${ref.spec}`);
+        }
+      }
+    }
+    expect(violations).toEqual([]);
+  });
+
+  // Sanity-check the detector: a synthetic `@tauri-apps/*` import MUST be extracted and
+  // flagged — for BOTH static and dynamic forms (the dynamic form is what main.ts uses to
+  // load adapters, so the funnel must see it). Guards against the scan silently passing
+  // because the regex stopped matching.
+  it("detector flags an @tauri-apps import — static and dynamic (any subpath)", () => {
+    const refs = extractImports(
+      `import { openUrl } from "@tauri-apps/plugin-opener";\n` +
+        `import { invoke } from "@tauri-apps/api/core";\n` +
+        `const e = await import("@tauri-apps/api/event");`,
+    );
+    const tauri = refs.filter((r) => r.spec.startsWith("@tauri-apps/"));
+    expect(tauri.map((r) => r.spec).sort()).toEqual([
+      "@tauri-apps/api/core",
+      "@tauri-apps/api/event",
+      "@tauri-apps/plugin-opener",
+    ]);
   });
 });

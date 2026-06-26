@@ -9,16 +9,20 @@ import { LISTENER_STATES } from "./types";
 import { listenerStateLabel } from "./listenerStateLabel";
 import type { ListenerRuntimeStatus } from "./types";
 
-// Mock the real Tauri boundary (`../api` re-exports `invoke` from `@tauri-apps/api/core`).
+// Mock the real backend boundary — the Transport port (`getTransport().request`, AB#1375).
 // We intentionally do NOT mock `./api` — we want the real `getListenerRuntimeStatus`
 // wrapper to be exercised so that a rename of the Tauri command string fails the test
-// (F7 fix: test must not mock the system-under-test).
-vi.mock("../api", () => ({
-  invoke: vi.fn(),
-  listen: vi.fn(),
+// (F7 fix: test must not mock the system-under-test). `requestMock` is hoisted so the
+// vi.mock factory (also hoisted) can close over the stable mock fn.
+const { requestMock } = vi.hoisted(() => ({ requestMock: vi.fn() }));
+vi.mock("../transport", () => ({
+  getTransport: () => ({
+    request: requestMock,
+    subscribe: vi.fn(),
+    openExternal: vi.fn(),
+  }),
 }));
 
-import * as tauriApi from "../api";
 import { getListenerRuntimeStatus } from "./api";
 
 // ── listenerStateLabel exhaustiveness ───────────────────────────────────────────
@@ -73,9 +77,9 @@ describe("listenerStateLabel", () => {
 // ── getListenerRuntimeStatus API wrapper ─────────────────────────────────────────
 //
 // These tests exercise the REAL `getListenerRuntimeStatus` from `./api` (not a mock
-// of it). Only `invoke` (the Tauri IPC boundary in `../api`) is mocked. This means:
+// of it). Only the Transport port boundary (`getTransport().request`) is mocked. This means:
 //  • A rename of the Tauri command string "get_listener_runtime_status" will fail here.
-//  • The wrapper's `invoke<ListenerRuntimeStatus[]>(...)` call shape is verified.
+//  • The wrapper's `request<ListenerRuntimeStatus[]>(...)` call shape is verified.
 // (F7 fix: mock the boundary, not the system-under-test.)
 
 describe("getListenerRuntimeStatus (api wrapper)", () => {
@@ -83,14 +87,14 @@ describe("getListenerRuntimeStatus (api wrapper)", () => {
     vi.resetAllMocks();
   });
 
-  it("calls invoke with the correct Tauri command name", async () => {
+  it("calls request with the correct Tauri command name", async () => {
     // Verify the wire contract: if the Rust command is renamed, this test fails.
-    vi.mocked(tauriApi.invoke).mockResolvedValue([]);
+    requestMock.mockResolvedValue([]);
     await getListenerRuntimeStatus();
-    expect(tauriApi.invoke).toHaveBeenCalledWith("get_listener_runtime_status");
+    expect(requestMock).toHaveBeenCalledWith("get_listener_runtime_status");
   });
 
-  it("resolves to the array returned by invoke", async () => {
+  it("resolves to the array returned by request", async () => {
     const rows: ListenerRuntimeStatus[] = [
       {
         id: "lis-local",
@@ -108,7 +112,7 @@ describe("getListenerRuntimeStatus (api wrapper)", () => {
         message: "non-loopback bind requires a loopback address",
       },
     ];
-    vi.mocked(tauriApi.invoke).mockResolvedValue(rows);
+    requestMock.mockResolvedValue(rows);
 
     const result = await getListenerRuntimeStatus();
     expect(result).toHaveLength(2);
@@ -125,8 +129,8 @@ describe("getListenerRuntimeStatus (api wrapper)", () => {
     expect(stateLabel.length).toBeGreaterThan(0);
   });
 
-  it("returns an empty array when invoke resolves to []", async () => {
-    vi.mocked(tauriApi.invoke).mockResolvedValue([]);
+  it("returns an empty array when request resolves to []", async () => {
+    requestMock.mockResolvedValue([]);
     const result = await getListenerRuntimeStatus();
     expect(result).toHaveLength(0);
   });
@@ -143,7 +147,7 @@ describe("getListenerRuntimeStatus (api wrapper)", () => {
 describe("RemoteAccessRuntimeStatus refreshKey watch pattern (F22)", () => {
   beforeEach(() => {
     vi.resetAllMocks();
-    vi.mocked(tauriApi.invoke).mockResolvedValue([]);
+    requestMock.mockResolvedValue([]);
   });
 
   it("watch with immediate:true fires on setup and on change", async () => {
@@ -164,14 +168,14 @@ describe("RemoteAccessRuntimeStatus refreshKey watch pattern (F22)", () => {
     // immediate fires synchronously — callLog already has the initial entry.
     expect(callLog).toHaveLength(1);
     expect(callLog[0]).toBe(0);
-    expect(tauriApi.invoke).toHaveBeenCalledTimes(1);
+    expect(requestMock).toHaveBeenCalledTimes(1);
 
     // Bump refreshKey — the watch should fire again.
     refreshKey.value = 1;
     await nextTick();
     expect(callLog).toHaveLength(2);
     expect(callLog[1]).toBe(1);
-    expect(tauriApi.invoke).toHaveBeenCalledTimes(2);
+    expect(requestMock).toHaveBeenCalledTimes(2);
 
     stop();
   });

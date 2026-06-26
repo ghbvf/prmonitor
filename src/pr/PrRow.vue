@@ -4,7 +4,7 @@
 // carrying `skipReason` when the PR would not dispatch. Clicking the row selects
 // the PR (for the Review panel); the title link opens the browser (`@click.stop`
 // so the two actions stay distinct).
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { getTransport } from "../transport";
 import type { TrackedPrView } from "../types";
 
 const props = defineProps<{ pr: TrackedPrView; selected: boolean }>();
@@ -18,7 +18,9 @@ function open() {
   // and surface a failure instead of dropping it silently.
   const url = props.pr.url;
   if (!/^https?:\/\//i.test(url)) return;
-  openUrl(url).catch((err) => console.error("打开链接失败", err));
+  getTransport()
+    .openExternal(url)
+    .catch((err) => console.error("打开链接失败", err));
 }
 </script>
 
