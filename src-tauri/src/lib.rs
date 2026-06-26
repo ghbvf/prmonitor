@@ -31,6 +31,7 @@ pub mod pr;
 pub mod remote;
 pub mod review;
 pub mod state;
+pub mod stream;
 
 /// Rust slice-boundary enforcement test (AB#1066 F1, Medium carrier) — test-only module.
 #[cfg(test)]
@@ -40,7 +41,7 @@ use std::sync::Arc;
 
 use model::{Candidate, EngineKind};
 use state::AppState;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -744,12 +745,12 @@ fn emit_dispatch_error<R: tauri::Runtime>(
     project_id: &str,
     message: String,
 ) {
-    let _ = app.emit(
-        events::REVIEW_EVENT,
-        &events::ReviewEvent::DispatchError {
+    stream::emit(
+        app,
+        events::StreamEvent::Review(events::ReviewEvent::DispatchError {
             project_id: project_id.to_string(),
             message,
-        },
+        }),
     );
 }
 

@@ -7,14 +7,14 @@
 //! rather than a resident RPC connection). The dedup registry, history persistence,
 //! and [`ReviewEvent`] wire contract are REUSED, not duplicated.
 
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tokio::io::{AsyncBufRead, BufReader};
 use tokio::process::Child;
 
 use super::manager::ClaudeManager;
 use super::process::{self, ParsedEvent, ParserState};
 use crate::error::{AppError, AppResult};
-use crate::events::{ReviewEvent, REVIEW_EVENT};
+use crate::events::{ReviewEvent, StreamEvent};
 use crate::model::EngineKind;
 use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
 use crate::review::history_store::{self, HistoryItemKind};
@@ -718,7 +718,7 @@ fn emit_and_persist<R: tauri::Runtime>(
             return;
         }
     };
-    let _ = app.emit(REVIEW_EVENT, &event);
+    crate::stream::emit(app, StreamEvent::Review(event));
     let db = app.state::<crate::db::Database>();
     if let Err(e) = history_store::append_item(db.inner(), session_id, item_id, kind, &text) {
         eprintln!(

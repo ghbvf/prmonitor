@@ -13,11 +13,11 @@
 //! unit-tested without a Tauri runtime, mirroring `inbox::service::record_terminal`); [`run_due_once`]
 //! only sequences the IO around it.
 
-use tauri::{Emitter, Manager, Runtime};
+use tauri::{Manager, Runtime};
 
 use crate::db::Database;
 use crate::error::AppResult;
-use crate::events::{OutboxEvent, OUTBOX_UPDATED_EVENT};
+use crate::events::{OutboxEvent, StreamEvent};
 use crate::model::ActionKind;
 use crate::outbox::{store, ActionExecutor, ClaimReleaser};
 use crate::state::AppState;
@@ -338,15 +338,15 @@ pub(crate) fn announce_cycle_error<R: Runtime>(
     operation: &str,
     message: &str,
 ) {
-    let _ = app.emit(
-        OUTBOX_UPDATED_EVENT,
-        &OutboxEvent::Error {
+    crate::stream::emit(
+        app,
+        StreamEvent::Action(OutboxEvent::Error {
             operation: operation.to_string(),
             // Clamp the panel-visible text to the SAME budget as a row's `last_error` (AB#1182
             // review F2): a raw DB error could otherwise carry an unbounded / path-bearing string
             // straight to the panel — parity with the per-row `clamp_error` defense.
             message: store::clamp_error(message),
-        },
+        }),
     );
 }
 
@@ -365,12 +365,12 @@ fn try_announce_updated<R: Runtime>(
 ) -> Result<(), String> {
     match store::get_entry(db, id) {
         Ok(Some(entry)) => {
-            let _ = app.emit(
-                OUTBOX_UPDATED_EVENT,
-                &OutboxEvent::Updated {
+            crate::stream::emit(
+                app,
+                StreamEvent::Action(OutboxEvent::Updated {
                     project_id: entry.project_id.clone(),
                     entry,
-                },
+                }),
             );
             Ok(())
         }

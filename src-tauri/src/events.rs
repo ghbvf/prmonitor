@@ -160,6 +160,35 @@ pub enum ReviewEvent {
     DispatchError { project_id: String, message: String },
 }
 
+/// The unified realtime-stream envelope (AB#1072 / #1373) — the single type the in-process
+/// [`crate::stream::StreamBus`] broadcasts. It wraps the existing per-domain event unions so a
+/// SECOND consumer (the local-api SSE endpoint) can subscribe to ONE typed stream, while the
+/// desktop frontend keeps receiving the inner [`ReviewEvent`] / [`OutboxEvent`] on their existing
+/// Tauri channels. The demux + dual emit live in [`crate::stream::emit`], whose exhaustive `match`
+/// over this sealed enum is the **Hard carrier**: a new domain without an arm is a compile error,
+/// forcing it to declare its desktop channel there.
+///
+/// `#[serde(tag = "domain")]` adds a `domain` discriminant ALONGSIDE each inner union's own
+/// internal `kind` tag (both inner enums serialize as a JSON object, so serde's internal tagging
+/// merges the `domain` key in): e.g. `{"domain":"review","kind":"messageDelta","projectId":…}`.
+/// Only domains with a LIVE producer are present (review + action); `terminal` / `workflow` are
+/// added when their producers land (#1372 etc.), never pre-declared empty (no speculative variant).
+///
+/// HTTP-only (SSE) wire type: like the `local_api` request/response structs it is NOT a Tauri
+/// command payload, so it intentionally has NO `src/types.ts` mirror — the same cross-Rust-slice-
+/// but-backend-internal status as `model::Candidate` / `model::Notification`. The camelCase +
+/// `domain` contract is locked by the goldens below (**Medium carrier**), not a hand-mirrored TS
+/// interface (Serialize-only, like the inner unions — the bus never deserializes events).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "domain", rename_all = "camelCase")]
+pub enum StreamEvent {
+    /// A review-session event (deltas / terminal / session error). Desktop channel: `review:event`.
+    Review(ReviewEvent),
+    /// An action-outbox event (row enqueued / transitioned / cycle error). Desktop channel:
+    /// `outbox:updated`.
+    Action(OutboxEvent),
+}
+
 /// Serde wire-shape lock for the `ReviewEvent` discriminated union.
 ///
 /// This is the **Medium carrier** for the `events.rs` ↔ `src/types.ts` serde
@@ -497,5 +526,48 @@ mod tests {
         })
         .expect("ReviewEvent serializes");
         assert!(no_url.get("commentUrl").is_none(), "None omits commentUrl");
+    }
+
+    // Serde wire-shape lock for the AB#1072 `StreamEvent` envelope (Medium carrier per
+    // ai-robust.md): the `domain` discriminant is present + camelCase, and the inner union's own
+    // `kind` tag + camelCase fields coexist in the SAME object (serde internal tagging merges the
+    // `domain` key into the inner map). This is the SSE wire contract — there is no `src/types.ts`
+    // mirror (HTTP-only, backend-internal), so this golden is the SOLE machine check on the shape.
+    #[test]
+    fn stream_event_review_wire_shape_has_domain_and_inner_kind() {
+        let event = StreamEvent::Review(ReviewEvent::MessageDelta {
+            project_id: "p1".to_string(),
+            thread_id: "t1".to_string(),
+            item_id: "i1".to_string(),
+            text: "hello".to_string(),
+        });
+
+        let v = serde_json::to_value(&event).expect("StreamEvent serializes");
+
+        // `domain` discriminant present + camelCase value.
+        assert_eq!(v["domain"], "review");
+        // The inner ReviewEvent is FLATTENED: its own `kind` tag + camelCase fields coexist.
+        assert_eq!(v["kind"], "messageDelta");
+        assert!(v.get("projectId").is_some());
+        assert!(v.get("threadId").is_some());
+        // snake_case must not leak through the envelope.
+        assert!(v.get("project_id").is_none());
+        assert!(v.get("thread_id").is_none());
+    }
+
+    #[test]
+    fn stream_event_action_wire_shape_has_domain_and_inner_kind() {
+        let event = StreamEvent::Action(OutboxEvent::Error {
+            operation: "claim".to_string(),
+            message: "database is locked".to_string(),
+        });
+
+        let v = serde_json::to_value(&event).expect("StreamEvent serializes");
+
+        assert_eq!(v["domain"], "action");
+        // The inner OutboxEvent's `kind` tag + fields coexist with `domain`.
+        assert_eq!(v["kind"], "error");
+        assert!(v.get("operation").is_some());
+        assert!(v.get("message").is_some());
     }
 }

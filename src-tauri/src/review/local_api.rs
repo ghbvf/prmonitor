@@ -41,16 +41,20 @@ use std::sync::Arc;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
+use tokio_stream::wrappers::BroadcastStream;
 
 use super::session::{SessionInfo, SessionStatus};
 use crate::config::service as config_service;
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
+use crate::events::{ReviewEvent, StreamEvent};
 use crate::state::AppState;
 
 /// Trigger bodies are tiny (`{projectId, pr, kind}`). Cap what an unauthenticated POST can
@@ -351,6 +355,180 @@ async fn handle_status<R: tauri::Runtime>(
 }
 
 // ===========================================================================================
+// SSE stream endpoint (AB#1072 / #1373): `GET /reviews/{id}/stream` — live review deltas +
+// terminal status for ONE review id, served from the realtime stream bus (`crate::stream`). The
+// live analogue of the `GET /reviews/{id}` poll; same fixed-order three-layer gate. The pure
+// helpers AND the `review_event_stream` builder below are unit-tested; only the thin
+// `handle_stream` gate/lookup wiring is exercised end-to-end manually (curl).
+// ===========================================================================================
+
+/// The owning `thread_id` of a session-scoped [`ReviewEvent`], or `None` for the session-less
+/// [`ReviewEvent::DispatchError`]. The exhaustive `match` keeps this honest if a variant is added.
+fn review_thread_id(event: &ReviewEvent) -> Option<&str> {
+    match event {
+        ReviewEvent::MessageDelta { thread_id, .. }
+        | ReviewEvent::ReasoningDelta { thread_id, .. }
+        | ReviewEvent::TurnCompleted { thread_id, .. }
+        | ReviewEvent::Error { thread_id, .. } => Some(thread_id),
+        ReviewEvent::DispatchError { .. } => None,
+    }
+}
+
+/// Whether `event` is THIS id's terminal `turnCompleted` — the cue to close the SSE stream after
+/// yielding it.
+fn is_terminal_review(event: &ReviewEvent, id: &str) -> bool {
+    matches!(event, ReviewEvent::TurnCompleted { thread_id, .. } if thread_id == id)
+}
+
+/// Build a synthetic terminal [`StreamEvent`] for a session that ALREADY finished before the
+/// client connected: the bus does not replay past events, so the handler emits this ONE event from
+/// the durable status and closes rather than hanging on keep-alive. `Done`→`"completed"`,
+/// `Failed`→`"failed"` — the durable [`SessionInfo::status`] does not retain the raw codex
+/// `interrupted` wire string (only the live `CompletionOutcome` does), so `Done` maps to
+/// `completed`; the precise wire status is a live-stream detail while the `commentUrl` is the
+/// payload that matters on reconnect.
+fn terminal_stream_event(info: &SessionInfo) -> StreamEvent {
+    let status = match info.status {
+        SessionStatus::Done => "completed",
+        SessionStatus::Failed => "failed",
+        // Non-terminal never reaches here (the caller gates on Done/Failed); map defensively.
+        SessionStatus::Starting | SessionStatus::Running | SessionStatus::Interrupting => "running",
+    };
+    StreamEvent::Review(ReviewEvent::TurnCompleted {
+        project_id: info.project_id.clone(),
+        thread_id: info.thread_id.clone(),
+        status: status.to_string(),
+        comment_url: info.comment_url.clone(),
+    })
+}
+
+/// Serialize one [`StreamEvent`] as an SSE `data:` frame. `Event::json_data` needs axum's `json`
+/// feature (off here — we run `default-features = false`), so serialize with `serde_json` (already
+/// a dep) and set the `data:` field directly: compact JSON is single-line, valid for an SSE frame.
+/// Serialization never fails for `StreamEvent`, but degrade to a tiny error frame rather than panic
+/// the stream task — the `Infallible` item error keeps the axum `Sse` response from short-circuiting.
+fn sse_data(event: &StreamEvent) -> Result<SseEvent, std::convert::Infallible> {
+    let payload = serde_json::to_string(event).unwrap_or_else(|_| {
+        r#"{"domain":"review","kind":"dispatchError","projectId":"","message":"stream serialize error"}"#
+            .to_string()
+    });
+    Ok(SseEvent::default().data(payload))
+}
+
+/// Build the live SSE event stream for one review `id` from a bus subscription: yields each of this
+/// id's review events (filtering out other ids / the action domain) and CLOSES right AFTER this
+/// id's terminal `turnCompleted` (`unfold` yields the terminal then ends on the next poll WITHOUT
+/// waiting for another upstream event — a `scan`/`take_while` could not close until the next
+/// matching event arrived). Runtime-free (no `tauri`) so it is `#[tokio::test]`-covered below.
+///
+/// `on_lag` is the fail-safe for a slow consumer (reviewer P2): if the broadcast ring overflows,
+/// the dropped batch MAY have contained this id's terminal `turnCompleted` — without recovery the
+/// stream would block forever (the bus `Sender` lives for the app's lifetime, so `rx.next()` never
+/// returns `None`) and the connection would hang under keep-alive. On a lag, `on_lag()` re-reads the
+/// durable status: a terminal session yields ONE synthetic terminal event and the stream closes; a
+/// still-running one returns `None` and streaming continues (best-effort — the next live terminal
+/// still closes it). The lag is also logged (parity with the session pump's lag breadcrumb).
+fn review_event_stream<F>(
+    rx: tokio::sync::broadcast::Receiver<StreamEvent>,
+    id: String,
+    on_lag: F,
+) -> impl futures::Stream<Item = StreamEvent>
+where
+    F: Fn() -> Option<StreamEvent> + Send + 'static,
+{
+    stream::unfold(
+        (BroadcastStream::new(rx), id, on_lag, false),
+        |(mut rx, id, on_lag, done)| async move {
+            if done {
+                return None;
+            }
+            loop {
+                match rx.next().await {
+                    None => return None, // bus closed (app shutting down)
+                    Some(Err(lagged)) => {
+                        // The dropped batch may have held THIS id's terminal — re-check the durable
+                        // status so a lagged client still gets a close instead of hanging forever.
+                        eprintln!("SSE stream（{id}）滞后：{lagged}（按当前会话状态决定是否关闭）");
+                        match on_lag() {
+                            Some(term) => return Some((term, (rx, id, on_lag, true))),
+                            None => continue,
+                        }
+                    }
+                    Some(Ok(StreamEvent::Review(r)))
+                        if review_thread_id(&r) == Some(id.as_str()) =>
+                    {
+                        let terminal = is_terminal_review(&r, &id);
+                        return Some((StreamEvent::Review(r), (rx, id, on_lag, terminal)));
+                    }
+                    Some(Ok(_)) => continue, // another id / the action domain — not this stream
+                }
+            }
+        },
+    )
+}
+
+async fn handle_stream<R: tauri::Runtime>(
+    State(ctx): State<Arc<Ctx<R>>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(resp) = check_request(&ctx, &headers) {
+        return resp;
+    }
+    let state = ctx.app.state::<AppState>();
+    // Subscribe BEFORE the existence check so no event for `id` slips between the status read and
+    // the subscription (race-free, mirroring `SessionRegistry::subscribe_completion`'s ordering).
+    let rx = state.stream.subscribe();
+    let lookup = resolve_session(state.sessions.get(&id), || {
+        super::history_store::get_session(ctx.app.state::<Database>().inner(), &id)
+    });
+    let info = match lookup {
+        Ok(Some(info)) => info,
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "未找到指定的 review 会话"),
+        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "查询 review 会话失败"),
+    };
+
+    // Already finished before connect: the bus won't replay, so emit ONE synthetic terminal event
+    // from the durable status and close. The `once` stream exhausts after that single frame, so
+    // axum closes the connection immediately — `KeepAlive` never fires (there is no idle gap), so
+    // the client is not left hanging on a finished review.
+    if matches!(info.status, SessionStatus::Done | SessionStatus::Failed) {
+        let ev = terminal_stream_event(&info);
+        let once = stream::once(async move { sse_data(&ev) });
+        return Sse::new(once)
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
+
+    // Live: stream this id's review events until its terminal `turnCompleted` closes it. The
+    // `on_lag` fail-safe re-reads the durable status if the bus ring overflows (the dropped batch
+    // may have held the terminal), so a slow client still gets a close instead of hanging.
+    let app_for_lag = ctx.app.clone();
+    let id_for_lag = id.clone();
+    let on_lag = move || -> Option<StreamEvent> {
+        let st = app_for_lag.state::<AppState>();
+        let lookup = resolve_session(st.sessions.get(&id_for_lag), || {
+            super::history_store::get_session(app_for_lag.state::<Database>().inner(), &id_for_lag)
+        });
+        match lookup {
+            // Terminal now → synthesize the close event. Still running / gone / lookup error →
+            // `None` (keep streaming; the next live terminal still closes the stream).
+            Ok(Some(info))
+                if matches!(info.status, SessionStatus::Done | SessionStatus::Failed) =>
+            {
+                Some(terminal_stream_event(&info))
+            }
+            _ => None,
+        }
+    };
+    let live = review_event_stream(rx, id, on_lag).map(|ev| sse_data(&ev));
+
+    Sse::new(live)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+// ===========================================================================================
 // Router builder — the local-api router, mounted by the listener supervisor (AB#1225).
 // ===========================================================================================
 
@@ -372,6 +550,7 @@ pub(crate) fn build_router<R: tauri::Runtime>(ctx: Arc<Ctx<R>>) -> Router {
     Router::new()
         .route("/reviews", post(handle_create::<R>))
         .route("/reviews/:id", get(handle_status::<R>))
+        .route("/reviews/:id/stream", get(handle_stream::<R>))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(ctx)
 }
@@ -646,5 +825,227 @@ mod tests {
             Ok(Some(_))
         ));
         assert!(matches!(resolve_session(None, || Ok(None)), Ok(None)));
+    }
+
+    // --- SSE stream helpers (AB#1072 / #1373): pure id-filter / terminal-detect / synthetic-
+    //     terminal mapping. The handler wiring (subscribe→filter→close) is exercised manually. ----
+
+    #[test]
+    fn review_thread_id_some_for_session_scoped_none_for_dispatch() {
+        let delta = ReviewEvent::MessageDelta {
+            project_id: "p".to_string(),
+            thread_id: "t9".to_string(),
+            item_id: "i".to_string(),
+            text: "x".to_string(),
+        };
+        assert_eq!(review_thread_id(&delta), Some("t9"));
+        let term = ReviewEvent::TurnCompleted {
+            project_id: "p".to_string(),
+            thread_id: "t9".to_string(),
+            status: "completed".to_string(),
+            comment_url: None,
+        };
+        assert_eq!(review_thread_id(&term), Some("t9"));
+        // The session-less DispatchError carries no thread id → never matches an id filter.
+        let dispatch = ReviewEvent::DispatchError {
+            project_id: "p".to_string(),
+            message: "m".to_string(),
+        };
+        assert_eq!(review_thread_id(&dispatch), None);
+    }
+
+    #[test]
+    fn is_terminal_review_true_only_for_matching_turn_completed() {
+        let term = ReviewEvent::TurnCompleted {
+            project_id: "p".to_string(),
+            thread_id: "t9".to_string(),
+            status: "completed".to_string(),
+            comment_url: None,
+        };
+        assert!(is_terminal_review(&term, "t9"));
+        assert!(!is_terminal_review(&term, "other")); // wrong id → keep streaming
+        let delta = ReviewEvent::MessageDelta {
+            project_id: "p".to_string(),
+            thread_id: "t9".to_string(),
+            item_id: "i".to_string(),
+            text: "x".to_string(),
+        };
+        assert!(!is_terminal_review(&delta, "t9")); // a delta is not terminal
+    }
+
+    #[test]
+    fn terminal_stream_event_maps_terminal_status_to_wire_string() {
+        // Done + URL → a `completed` TurnCompleted carrying the comment URL (the reconnect payload).
+        let done = terminal_stream_event(&SessionInfo {
+            comment_url: Some("https://x/c".to_string()),
+            ..sample_info("t9")
+        });
+        match done {
+            StreamEvent::Review(ReviewEvent::TurnCompleted {
+                thread_id,
+                status,
+                comment_url,
+                ..
+            }) => {
+                assert_eq!(thread_id, "t9");
+                assert_eq!(status, "completed");
+                assert_eq!(comment_url.as_deref(), Some("https://x/c"));
+            }
+            _ => panic!("expected a Review TurnCompleted"),
+        }
+        // Failed + no URL → a `failed` TurnCompleted with no comment URL.
+        let failed = terminal_stream_event(&SessionInfo {
+            status: SessionStatus::Failed,
+            ..sample_info("t9")
+        });
+        match failed {
+            StreamEvent::Review(ReviewEvent::TurnCompleted {
+                status,
+                comment_url,
+                ..
+            }) => {
+                assert_eq!(status, "failed");
+                assert!(comment_url.is_none());
+            }
+            _ => panic!("expected a Review TurnCompleted"),
+        }
+    }
+
+    // --- review_event_stream (the SSE stream state machine: id-filter, terminal-close, lag fail-
+    //     safe). Covers the `handle_stream` orchestration the pure helpers couldn't reach. ---------
+
+    fn delta(tid: &str, text: &str) -> StreamEvent {
+        StreamEvent::Review(ReviewEvent::MessageDelta {
+            project_id: "p".to_string(),
+            thread_id: tid.to_string(),
+            item_id: "i".to_string(),
+            text: text.to_string(),
+        })
+    }
+
+    fn turn_completed(tid: &str, status: &str) -> StreamEvent {
+        StreamEvent::Review(ReviewEvent::TurnCompleted {
+            project_id: "p".to_string(),
+            thread_id: tid.to_string(),
+            status: status.to_string(),
+            comment_url: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn review_event_stream_filters_by_id_and_closes_after_terminal() {
+        use tokio::sync::broadcast;
+        let (tx, rx) = broadcast::channel(16);
+        // No lag on this happy path → on_lag must never fire.
+        let s = review_event_stream(rx, "t1".to_string(), || {
+            panic!("on_lag must not fire without a lag")
+        });
+        tokio::pin!(s);
+
+        tx.send(delta("t1", "a")).unwrap();
+        tx.send(delta("other", "b")).unwrap(); // different id → filtered out
+        tx.send(StreamEvent::Action(crate::events::OutboxEvent::Error {
+            operation: "claim".to_string(),
+            message: "x".to_string(),
+        }))
+        .unwrap(); // action domain → filtered out of a per-review stream
+        tx.send(turn_completed("t1", "completed")).unwrap();
+
+        // First yielded: the t1 delta (the other-id delta + the action event are filtered out).
+        match s.next().await {
+            Some(StreamEvent::Review(ReviewEvent::MessageDelta {
+                thread_id, text, ..
+            })) => {
+                assert_eq!(thread_id, "t1");
+                assert_eq!(text, "a");
+            }
+            other => panic!("expected t1 delta, got {other:?}"),
+        }
+        // Then the t1 terminal.
+        match s.next().await {
+            Some(StreamEvent::Review(ReviewEvent::TurnCompleted { thread_id, .. })) => {
+                assert_eq!(thread_id, "t1");
+            }
+            other => panic!("expected t1 terminal, got {other:?}"),
+        }
+        // Closes right after the terminal — no hang waiting for further events.
+        assert!(s.next().await.is_none(), "stream closes after the terminal");
+    }
+
+    #[tokio::test]
+    async fn review_event_stream_on_lag_closes_via_synthetic_terminal() {
+        use tokio::sync::broadcast;
+        // Tiny ring so the receiver lags; the terminal could be among the dropped batch.
+        let (tx, rx) = broadcast::channel(2);
+        let synth = turn_completed("t1", "failed");
+        // Simulate "the session is now terminal": on_lag yields the synthetic close event.
+        let s = review_event_stream(rx, "t1".to_string(), move || Some(synth.clone()));
+        tokio::pin!(s);
+
+        // 5 sends into a ring of 2, before any recv → the receiver is behind by 3 → first recv is
+        // a `Lagged`, exercising the fail-safe (without it the stream would hang forever).
+        for i in 0..5 {
+            tx.send(delta("t1", &i.to_string())).unwrap();
+        }
+
+        match s.next().await {
+            Some(StreamEvent::Review(ReviewEvent::TurnCompleted { status, .. })) => {
+                assert_eq!(status, "failed");
+            }
+            other => panic!("expected the synthetic terminal on lag, got {other:?}"),
+        }
+        assert!(
+            s.next().await.is_none(),
+            "stream closes after the synthetic terminal (no infinite hang on a dropped terminal)"
+        );
+    }
+
+    // --- HTTP request-level gate (AB#1072 / #1373 reviewer F2): bind the REAL router on a loopback
+    //     port and drive it with reqwest, locking that the new `/reviews/:id/stream` route is
+    //     registered AND enforces the same three-layer gate. The pure gate fns (host/origin/bearer)
+    //     are unit-tested above; this is the only request-level test that proves they are WIRED into
+    //     the SSE route (a regression that forgot the gate would surface here, not in a pure test).
+    #[test]
+    fn stream_route_is_registered_and_gated() {
+        let app = tauri::test::mock_app();
+        // The token gate reads the live config via `app.state::<Database>()`; manage an empty
+        // in-memory DB so config load returns a default (empty token) rather than panicking.
+        app.handle()
+            .manage(crate::db::Database::open_in_memory().expect("open db"));
+
+        tauri::async_runtime::block_on(async move {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind loopback");
+            let port = listener.local_addr().expect("addr").port();
+            let ctx = Arc::new(Ctx {
+                app: app.handle().clone(),
+                port,
+            });
+            let server = tauri::async_runtime::spawn(async move {
+                let _ = axum::serve(listener, build_router(ctx).into_make_service()).await;
+            });
+
+            let url = format!("http://127.0.0.1:{port}/reviews/abc/stream");
+            let client = reqwest::Client::new();
+
+            // Route IS registered + the host gate runs on it: a non-loopback `Host` (DNS-rebinding
+            // shape) is rejected 403 — a 404 here would mean the route was never wired.
+            let forbidden = client
+                .get(&url)
+                .header("host", "evil.com")
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+
+            // The token gate runs on it too: a loopback request with no `Authorization` is rejected
+            // 401 (the empty configured token fail-closes EVERY request — the charter default, now
+            // proven to cover the SSE route).
+            let unauthorized = client.get(&url).send().await.expect("send");
+            assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+            server.abort();
+        });
     }
 }

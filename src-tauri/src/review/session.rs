@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tokio::sync::{broadcast, watch};
 
 use super::engines::codex::process;
@@ -25,7 +25,7 @@ use super::engines::codex::protocol::{
 use super::engines::codex::CodexManager;
 use super::history_store::HistoryItemKind;
 use crate::error::{AppError, AppResult};
-use crate::events::{ReviewEvent, REVIEW_EVENT};
+use crate::events::{ReviewEvent, StreamEvent};
 use crate::model::EngineKind;
 use crate::review::engine::StartReviewOutcome;
 
@@ -1048,13 +1048,13 @@ pub(super) fn notify_persist_failure_once<R: tauri::Runtime>(
     if PERSIST_FAILURE_NOTIFIED.swap(true, Ordering::Relaxed) {
         return;
     }
-    let _ = app.emit(
-        REVIEW_EVENT,
-        &ReviewEvent::DispatchError {
+    crate::stream::emit(
+        app,
+        StreamEvent::Review(ReviewEvent::DispatchError {
             project_id: project_id.to_string(),
             message: "review 会话持久化失败——重启后历史可能丢失（请检查磁盘空间 / 数据库文件权限）。后续失败仅记录日志。"
                 .to_string(),
-        },
+        }),
     );
 }
 
@@ -1178,8 +1178,10 @@ async fn pump<R: tauri::Runtime>(
                 };
                 // Emit FIRST (streaming latency must not wait on the DB), THEN persist the
                 // delta to the session history (#70) best-effort — a persist error is
-                // logged, never breaks the live stream.
-                let _ = app.emit(REVIEW_EVENT, &event);
+                // logged, never breaks the live stream. `emit` clones for the bus envelope
+                // (a few short strings — negligible beside the IPC serialization it already
+                // does) so the owned `event` stays available for the persist borrow below.
+                crate::stream::emit(&app, StreamEvent::Review(event.clone()));
                 persist_delta(&app, &thread_id, &event);
             }
             // The pump fell behind the shared ring and `n` notifications were
@@ -1315,23 +1317,23 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
 
     // 4. Optional Error, then the terminal TurnCompleted carrying the URL.
     if let Some(message) = error {
-        let _ = app.emit(
-            REVIEW_EVENT,
-            &ReviewEvent::Error {
+        crate::stream::emit(
+            app,
+            StreamEvent::Review(ReviewEvent::Error {
                 project_id: project_id.to_string(),
                 thread_id: thread_id.to_string(),
                 message,
-            },
+            }),
         );
     }
-    let _ = app.emit(
-        REVIEW_EVENT,
-        &ReviewEvent::TurnCompleted {
+    crate::stream::emit(
+        app,
+        StreamEvent::Review(ReviewEvent::TurnCompleted {
             project_id: project_id.to_string(),
             thread_id: thread_id.to_string(),
             status: wire_status.to_string(),
             comment_url: comment_url.clone(),
-        },
+        }),
     );
 
     // 5. Signal LAST — subscribers wake to an already-settled registry/DB.

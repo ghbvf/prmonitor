@@ -50,6 +50,11 @@ subtle = "2"
 # review would require `'static` owned handles; `join_all` over borrowing futures
 # keeps the shared-borrow design. Only `futures` (no extra runtime) is pulled.
 futures = "0.3"
+# Realtime stream bus (AB#1072 / #1373): `tokio_stream::wrappers::BroadcastStream` adapts the
+# `StreamBus`'s `tokio::sync::broadcast` receiver into a `Stream` the local-api SSE endpoint maps
+# to axum `Sse` events. `sync` is the only feature needed (the broadcast/watch stream wrappers);
+# `default-features = false` drops the unused `time` wrapper.
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 # Unified local SQLite store (#70): the single persistence backend for config /
 # tracked PRs / dispatch ledger / review sessions + history / webhook PRs. `bundled`
 # compiles a pinned libsqlite3 from source (no system sqlite dependency), and the

@@ -92,4 +92,9 @@ pub struct AppState {
     /// `set_config` take effect on the listener runtime WITHOUT naming `crate::remote` (the closure,
     /// installed in `lib.rs`, is the sole bridge config→remote). Methods take `&self`.
     pub config_saved: ConfigSavedHook,
+    /// The realtime stream bus (AB#1072 / #1373): the in-process broadcast hub the
+    /// [`crate::stream::emit`] funnel publishes review/action [`crate::events::StreamEvent`]s to,
+    /// and that the local-api SSE endpoint subscribes to. `Default` (empty channel until the first
+    /// `subscribe`); methods take `&self`.
+    pub stream: crate::stream::StreamBus,
 }
