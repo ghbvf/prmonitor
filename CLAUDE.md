@@ -1,6 +1,6 @@
 # prmonitor
 
-PR 监控 + AI review 桌面应用（Tauri v2 + Vue 3 + Rust）。仓库：github.com/ghbvf/prmonitor；Azure DevOps 主远端：`https://dev.azure.com/shengming0923/gocell/_git/prmonitor`；base 分支 `develop`。
+PR 监控 + AI review 桌面应用（Tauri v2 + Vue 3 + Rust）。仓库：github.com/ghbvf/prmonitor；Azure DevOps 主远端：`https://dev.azure.com/shengming0923/prmonitor/_git/prmonitor`；base 分支 `develop`。
 
 > 本文件是 Claude Code 与 codex 的**共享指令入口**（codex 经 `AGENTS.md` 指向此）。只做索引指针——章程与技能正文是单源，本文件不复制。
 
