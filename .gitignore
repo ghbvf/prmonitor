@@ -20,6 +20,10 @@ dist-web
 # ship-flow worktrees (feature branches checked out under here)
 worktrees/
 
+# Python bytecode (e.g. `python3 -m py_compile` on the bundled iTerm daemon)
+__pycache__/
+*.pyc
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

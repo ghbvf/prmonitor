@@ -404,3 +404,53 @@ export interface OutboxEntry {
 export type OutboxEvent =
   | { kind: "updated"; projectId: string; entry: OutboxEntry }
   | { kind: "error"; operation: string; message: string };
+
+// ── Remote terminal contracts (#1383) ─────────────────────────────────────────────
+// Mirror `src-tauri/src/model.rs` (TerminalSession / CreateSessionOpts) + `events.rs`
+// (TerminalEvent), serde camelCase, locked by the model.rs / events.rs golden tests
+// (the open downstream end of those funnels; a Rust-side rename surfaces in those goldens,
+// and this mirror must be synced in lockstep — future Hard path = codegen this from Rust).
+
+// One addressable iTerm session — the leaf the xterm panel attaches to. `sessionId` is the
+// iTerm session GUID (the attach key); `windowId`/`tabId` group it in the picker (the slice
+// flattens this list then re-groups window → tab → session client-side); `rows`/`cols` are
+// iTerm's current grid. Single iTerm backend this PR, so no `backend` field (the UI labels it
+// "iTerm" statically; a 2nd backend adds the field). Mirrors `model.rs::TerminalSession`.
+export interface TerminalSession {
+  sessionId: string;
+  windowId: string;
+  tabId: string;
+  title: string;
+  isActive: boolean;
+  rows: number;
+  cols: number;
+}
+
+// Options for `create_terminal_session`. Both optional (omitted = daemon picks a fresh window
+// with the default profile). Mirrors `model.rs::CreateSessionOpts` (serde `skip_serializing_if`
+// → an absent key, not null).
+export interface CreateSessionOpts {
+  windowId?: string;
+  profile?: string;
+}
+
+// One streamed unit on the `terminal:event` Tauri channel. Tagged `kind` (mirrors
+// ReviewEvent / PrEvent), camelCase. `screenUpdate` carries a FULL visible-screen snapshot
+// (`contents` is the rendered grid) — the panel renders each frame with `term.reset()` +
+// `term.write(contents)`, then repositions the cursor when `cursorRow`/`cursorCol` are present.
+// Keep this in lockstep with `events.rs::TerminalEvent`; the store's `applyEvent` `assertNever`
+// default is the Medium exhaustiveness carrier.
+export type TerminalEvent =
+  | { kind: "attached"; sessionId: string; cols: number; rows: number }
+  | {
+      kind: "screenUpdate";
+      sessionId: string;
+      cols: number;
+      rows: number;
+      contents: string;
+      cursorRow?: number;
+      cursorCol?: number;
+    }
+  | { kind: "sessionEnded"; sessionId: string; reason: string }
+  // `sessionId` omitted for a connection-level error not tied to one session.
+  | { kind: "error"; sessionId?: string; message: string };

@@ -24,7 +24,7 @@
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::broadcast;
 
-use crate::events::{StreamEvent, OUTBOX_UPDATED_EVENT, REVIEW_EVENT};
+use crate::events::{StreamEvent, OUTBOX_UPDATED_EVENT, REVIEW_EVENT, TERMINAL_EVENT};
 use crate::state::AppState;
 
 /// Bus ring capacity. Generous so a brief consumer stall (an SSE client on a slow link, the
@@ -75,8 +75,8 @@ impl StreamBus {
 /// - **DOWNSTREAM = Hard**: the `match` over the sealed [`StreamEvent`] is a compile error if a new
 ///   domain has no arm, forcing it to declare its desktop channel here.
 /// - **UPSTREAM = Medium**: a producer could otherwise BYPASS the bus with a direct
-///   `app.emit(REVIEW_EVENT / OUTBOX_UPDATED_EVENT, …)` (the channel-name consts are `pub`),
-///   silently starving SSE. The scan test [`tests::no_direct_emit_of_funnelled_channels_outside_stream`]
+///   `app.emit(REVIEW_EVENT / OUTBOX_UPDATED_EVENT / TERMINAL_EVENT, …)` (the channel-name consts
+///   are `pub`), silently starving SSE. The scan test [`tests::no_direct_emit_of_funnelled_channels_outside_stream`]
 ///   closes that open end: a reference to either channel const ANYWHERE outside `stream.rs` /
 ///   `events.rs` is a CI-caught violation. (Was Soft — a reviewer P2 — until that guard landed.)
 pub fn emit<R: Runtime>(app: &AppHandle<R>, event: StreamEvent) {
@@ -87,6 +87,9 @@ pub fn emit<R: Runtime>(app: &AppHandle<R>, event: StreamEvent) {
         }
         StreamEvent::Action(e) => {
             let _ = app.emit(OUTBOX_UPDATED_EVENT, e);
+        }
+        StreamEvent::Terminal(e) => {
+            let _ = app.emit(TERMINAL_EVENT, e);
         }
     }
     app.state::<AppState>().stream.publish(event);
@@ -158,11 +161,13 @@ mod tests {
         // `events.rs` defines + golden-tests the consts (and their wire literals); `stream.rs` is
         // the funnel that emits them. Every other file naming the const OR the literal is a bypass.
         const ALLOWED: [&str; 2] = ["events.rs", "stream.rs"];
-        const FUNNELLED: [&str; 4] = [
+        const FUNNELLED: [&str; 6] = [
             "REVIEW_EVENT",
             "OUTBOX_UPDATED_EVENT",
+            "TERMINAL_EVENT",
             "\"review:event\"",
             "\"outbox:updated\"",
+            "\"terminal:event\"",
         ];
 
         fn scan(dir: &Path, violations: &mut Vec<String>, scanned: &mut usize) {

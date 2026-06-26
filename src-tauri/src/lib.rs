@@ -32,6 +32,7 @@ pub mod remote;
 pub mod review;
 pub mod state;
 pub mod stream;
+pub mod terminal;
 
 /// Rust slice-boundary enforcement test (AB#1066 F1, Medium carrier) — test-only module.
 #[cfg(test)]
@@ -434,6 +435,14 @@ fn build_app() {
             review::commands::get_pr_sessions,
             config::commands::set_active_project,
             remote::commands::get_listener_runtime_status,
+            terminal::commands::list_terminal_sessions,
+            terminal::commands::create_terminal_session,
+            terminal::commands::attach_terminal,
+            terminal::commands::detach_terminal,
+            terminal::commands::send_terminal_input,
+            terminal::commands::resize_terminal,
+            terminal::commands::get_terminal_status,
+            terminal::commands::stop_terminal_daemon,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -457,6 +466,9 @@ fn build_app() {
                 // Stop the action-outbox worker (AB#1066): signal + abort the task so it never
                 // outlives the app (same "软件关闭时一起关闭" contract).
                 state.outbox.shutdown();
+                // Kill the resident iTerm daemon (#1383): same "软件关闭时一起关闭" contract as
+                // codex — the python child never outlives the app.
+                state.terminal.shutdown();
             }
         });
 }

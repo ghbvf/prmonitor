@@ -29,7 +29,7 @@ use std::fs;
 use std::path::Path;
 
 /// The backend vertical slices scanned for boundary violations.
-const SLICES: [&str; 5] = ["config", "pr", "review", "inbox", "outbox"];
+const SLICES: [&str; 6] = ["config", "pr", "review", "inbox", "outbox", "terminal"];
 
 /// The ONE cross-slice consumable. `config` is the shared configuration provider consumed by
 /// `pr`/`review`/`outbox`; widening this is a deliberate architecture decision, not a silent

@@ -1,6 +1,6 @@
 // Slice-boundary enforcement test (Medium, per .claude/rules/prmonitor/ai-robust.md).
 //
-// The vertical slices (config / pr / review / inbox / outbox) must be self-contained: a file in
+// The vertical slices (config / pr / review / inbox / outbox / terminal) must be self-contained: a file in
 // one slice must NOT have a runtime (value) import that resolves into a SIBLING
 // slice's directory. Cross-slice wiring is the composition root's job (App.vue, which
 // lives at the `src/` root, not inside any slice). Before this test, the only carrier
@@ -31,13 +31,13 @@
 //   - The composition root `App.vue` (at `src/`, not in a slice) may cross slices.
 import { describe, expect, it } from "vitest";
 
-const SLICES = ["config", "pr", "review", "inbox", "outbox"] as const;
+const SLICES = ["config", "pr", "review", "inbox", "outbox", "terminal"] as const;
 type Slice = (typeof SLICES)[number];
 
 // Eager-load every slice source file as raw text. Keys are paths relative to THIS
 // file, e.g. "./pr/WebhookPanel.vue". Vue SFCs are plain text here — import
 // statements only ever appear inside <script>, so scanning the whole file is safe.
-const sources = import.meta.glob("./{config,pr,review,inbox,outbox}/**/*.{ts,vue}", {
+const sources = import.meta.glob("./{config,pr,review,inbox,outbox,terminal}/**/*.{ts,vue}", {
   query: "?raw",
   import: "default",
   eager: true,
@@ -129,7 +129,7 @@ function crossSliceTarget(fromSlice: Slice, spec: string): Slice | null {
   return null; // resolves to src/ root (shared) or same slice — allowed
 }
 
-describe("vertical slice boundary (config / pr / review / inbox / outbox)", () => {
+describe("vertical slice boundary (config / pr / review / inbox / outbox / terminal)", () => {
   it("loaded slice sources for all declared slices", () => {
     // Guard against the glob silently matching nothing (which would make the next
     // assertion vacuously pass and let a real violation through).

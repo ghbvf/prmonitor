@@ -97,4 +97,8 @@ pub struct AppState {
     /// and that the local-api SSE endpoint subscribes to. `Default` (empty channel until the first
     /// `subscribe`); methods take `&self`.
     pub stream: crate::stream::StreamBus,
+    /// The resident iTerm daemon connection (#1383). Lazily started, kept alive so terminal
+    /// commands are fast; killed on app shutdown. Owns one per-connection notification pump that
+    /// pushes `TerminalEvent`s through the `crate::stream::emit` funnel. Methods take `&self`.
+    pub terminal: crate::terminal::manager::ITermDaemonManager,
 }

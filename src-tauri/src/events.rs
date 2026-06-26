@@ -14,6 +14,12 @@ pub const PRS_UPDATED_EVENT: &str = "prs:updated";
 /// session). Mirrored by `REVIEW_EVENT` in `src/review/api.ts`.
 pub const REVIEW_EVENT: &str = "review:event";
 
+/// Tauri event name carrying a [`TerminalEvent`] (#1383): one streamed unit of an
+/// iTerm-backed terminal session (live screen snapshot / attach / end / error).
+/// Mirrored by `TERMINAL_EVENT` in `src/terminal/api.ts`. The `terminal` domain was
+/// anticipated by the [`StreamEvent`] doc below — this lands its producer.
+pub const TERMINAL_EVENT: &str = "terminal:event";
+
 /// Tauri event name carrying an [`InboxEvent`] (AB#1065): one inbox row was added or
 /// re-processed (a webhook delivery persisted / replayed). Mirrored by
 /// `INBOX_UPDATED_EVENT` in `src/inbox/api.ts`.
@@ -160,6 +166,58 @@ pub enum ReviewEvent {
     DispatchError { project_id: String, message: String },
 }
 
+/// A single streamed unit of an iTerm-backed terminal session (#1383), forwarded to the
+/// frontend xterm panel.
+///
+/// Like [`ReviewEvent`], the container `rename_all` camelCases the variant names into the
+/// `kind` tag and each struct variant carries its own `rename_all` (serde does not propagate
+/// the container rule to a variant's fields) — without it the field keys would serialize
+/// snake_case and diverge from the `src/terminal` TS `TerminalEvent` discriminated union.
+///
+/// `ScreenUpdate` carries a FULL visible-screen snapshot (`contents` is the rendered grid),
+/// not a PTY byte delta: iTerm's Python API `ScreenStreamer` yields the visible screen, so the
+/// component renders each frame with `term.reset()` + `term.write(contents)`. A future true-delta
+/// adapter can add an `output { bytes }` variant without reshaping the others.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum TerminalEvent {
+    /// The stream attached to a session; the panel flips to a connected state and the first
+    /// `ScreenUpdate` follows. `cols`/`rows` seed the xterm grid size.
+    #[serde(rename_all = "camelCase")]
+    Attached {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// A full visible-screen snapshot. `contents` is the rendered grid text; `cursor_row`/
+    /// `cursor_col` (0-based, omitted when the daemon can't resolve them) reposition the xterm
+    /// cursor after the snapshot write.
+    #[serde(rename_all = "camelCase")]
+    ScreenUpdate {
+        session_id: String,
+        cols: u16,
+        rows: u16,
+        contents: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cursor_row: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cursor_col: Option<u16>,
+    },
+    /// The iTerm session/tab closed (the daemon's screen streamer ended); the panel marks the
+    /// connection closed. `reason` is a short human label.
+    #[serde(rename_all = "camelCase")]
+    SessionEnded { session_id: String, reason: String },
+    /// A per-session streaming error; the daemon connection survives. `session_id` is OMITTED
+    /// for a connection-level error not tied to one session (matching the optional `sessionId?`
+    /// TS mirror — an absent key, not a JSON `null`).
+    #[serde(rename_all = "camelCase")]
+    Error {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        message: String,
+    },
+}
+
 /// The unified realtime-stream envelope (AB#1072 / #1373) — the single type the in-process
 /// [`crate::stream::StreamBus`] broadcasts. It wraps the existing per-domain event unions so a
 /// SECOND consumer (the local-api SSE endpoint) can subscribe to ONE typed stream, while the
@@ -187,6 +245,11 @@ pub enum StreamEvent {
     /// An action-outbox event (row enqueued / transitioned / cycle error). Desktop channel:
     /// `outbox:updated`.
     Action(OutboxEvent),
+    /// An iTerm-backed terminal-session event (#1383): the `terminal` domain the doc above
+    /// anticipated, now that its producer (`crate::terminal`) has landed. Desktop channel:
+    /// `terminal:event`. The bus broadcast also feeds the PR2 terminal SSE consumer with no
+    /// producer change.
+    Terminal(TerminalEvent),
 }
 
 /// Serde wire-shape lock for the `ReviewEvent` discriminated union.
@@ -569,5 +632,123 @@ mod tests {
         assert_eq!(v["kind"], "error");
         assert!(v.get("operation").is_some());
         assert!(v.get("message").is_some());
+    }
+
+    #[test]
+    fn terminal_event_name_is_pinned() {
+        // Mirrored by `TERMINAL_EVENT` in `src/terminal/api.ts`; a drift breaks the frontend's
+        // `listen` registration for the terminal panel.
+        assert_eq!(TERMINAL_EVENT, "terminal:event");
+    }
+
+    // Serde wire-shape lock for the #1383 `TerminalEvent` discriminated union (Medium carrier per
+    // ai-robust.md): the `kind` tag is camelCase, fields are camelCase, and optional cursor/session
+    // keys are OMITTED (not null) when absent. The downstream `src/terminal` TS `TerminalEvent` union
+    // must be synced in lockstep (the open end of this funnel; future Hard path = codegen from
+    // `events.rs`).
+    #[test]
+    fn terminal_screen_update_wire_shape_is_camel_case() {
+        let event = TerminalEvent::ScreenUpdate {
+            session_id: "p0".to_string(),
+            cols: 80,
+            rows: 24,
+            contents: "$ ".to_string(),
+            cursor_row: Some(0),
+            cursor_col: Some(2),
+        };
+        let v = serde_json::to_value(&event).expect("TerminalEvent serializes");
+        assert_eq!(v["kind"], "screenUpdate");
+        assert!(v.get("sessionId").is_some());
+        assert!(v.get("cols").is_some());
+        assert!(v.get("rows").is_some());
+        assert!(v.get("contents").is_some());
+        assert!(v.get("cursorRow").is_some());
+        assert!(v.get("cursorCol").is_some());
+        assert!(v.get("session_id").is_none());
+        assert!(v.get("cursor_row").is_none());
+
+        // Absent cursor → keys OMITTED (matches the optional `cursorRow?`/`cursorCol?` TS mirror).
+        let no_cursor = serde_json::to_value(TerminalEvent::ScreenUpdate {
+            session_id: "p0".to_string(),
+            cols: 80,
+            rows: 24,
+            contents: String::new(),
+            cursor_row: None,
+            cursor_col: None,
+        })
+        .expect("serializes");
+        assert!(no_cursor.get("cursorRow").is_none(), "None omits cursorRow");
+        assert!(no_cursor.get("cursorCol").is_none(), "None omits cursorCol");
+    }
+
+    #[test]
+    fn terminal_attached_and_session_ended_wire_shape_is_camel_case() {
+        let attached = serde_json::to_value(TerminalEvent::Attached {
+            session_id: "p0".to_string(),
+            cols: 80,
+            rows: 24,
+        })
+        .expect("serializes");
+        assert_eq!(attached["kind"], "attached");
+        assert!(attached.get("sessionId").is_some());
+        assert!(attached.get("session_id").is_none());
+
+        let ended = serde_json::to_value(TerminalEvent::SessionEnded {
+            session_id: "p0".to_string(),
+            reason: "closed".to_string(),
+        })
+        .expect("serializes");
+        assert_eq!(ended["kind"], "sessionEnded");
+        assert!(ended.get("sessionId").is_some());
+        assert!(ended.get("reason").is_some());
+    }
+
+    #[test]
+    fn terminal_error_wire_shape_omits_absent_session_id() {
+        let with_session = serde_json::to_value(TerminalEvent::Error {
+            session_id: Some("p0".to_string()),
+            message: "boom".to_string(),
+        })
+        .expect("serializes");
+        assert_eq!(with_session["kind"], "error");
+        assert_eq!(with_session["sessionId"], "p0");
+        assert!(with_session.get("message").is_some());
+
+        // Connection-level error → `sessionId` OMITTED (matches the optional `sessionId?` TS mirror).
+        let no_session = serde_json::to_value(TerminalEvent::Error {
+            session_id: None,
+            message: "daemon down".to_string(),
+        })
+        .expect("serializes");
+        assert!(
+            no_session.get("sessionId").is_none(),
+            "None omits sessionId"
+        );
+        assert!(no_session.get("session_id").is_none());
+    }
+
+    // Serde wire-shape lock for the #1383 `StreamEvent::Terminal` envelope (Medium carrier): the
+    // `domain` discriminant is `"terminal"` + camelCase, and the inner `TerminalEvent`'s own `kind`
+    // tag + camelCase fields coexist in the SAME object (serde internal tagging merges `domain`).
+    // This is the SSE wire contract for the PR2 terminal consumer — the goldens above lock the
+    // desktop Tauri-channel shape; this locks the bus-envelope shape.
+    #[test]
+    fn stream_event_terminal_wire_shape_has_domain_and_inner_kind() {
+        let event = StreamEvent::Terminal(TerminalEvent::ScreenUpdate {
+            session_id: "p0".to_string(),
+            cols: 80,
+            rows: 24,
+            contents: "$ ".to_string(),
+            cursor_row: None,
+            cursor_col: None,
+        });
+
+        let v = serde_json::to_value(&event).expect("StreamEvent serializes");
+
+        assert_eq!(v["domain"], "terminal");
+        // The inner TerminalEvent is FLATTENED: its own `kind` tag + camelCase fields coexist.
+        assert_eq!(v["kind"], "screenUpdate");
+        assert!(v.get("sessionId").is_some());
+        assert!(v.get("session_id").is_none());
     }
 }

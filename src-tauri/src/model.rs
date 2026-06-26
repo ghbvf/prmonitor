@@ -19,6 +19,47 @@ pub struct Candidate {
     pub kind: String,
 }
 
+/// One addressable terminal session in the user's iTerm (#1383). The leaf the
+/// frontend xterm panel attaches to: `session_id` is the iTerm session GUID (the
+/// attach key); `window_id` / `tab_id` group it in the picker (the frontend
+/// flattens this list then re-groups window → tab → session client-side);
+/// `rows` / `cols` are iTerm's current grid (seed the xterm size + validate a
+/// fit-driven resize).
+///
+/// Front/back contract (UNLIKE backend-internal [`Candidate`]): the `terminal`
+/// slice returns `Vec<TerminalSession>` over the `list_terminal_sessions` Tauri
+/// command, so it IS mirrored in `src/types.ts` and the golden below locks the
+/// camelCase wire shape both sides depend on. Single iTerm backend this PR, so
+/// no `backend` discriminator field (the frontend labels it "iTerm" statically;
+/// a 2nd backend adds the field). `Deserialize` too: the Python daemon returns
+/// this exact camelCase shape, Rust parses then re-serializes to the frontend
+/// (same dual-derive rationale as [`Candidate`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSession {
+    pub session_id: String,
+    pub window_id: String,
+    pub tab_id: String,
+    pub title: String,
+    pub is_active: bool,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+/// Options for `create_terminal_session` (#1383). Both optional: `None` lets the
+/// daemon pick (a fresh window with the default profile). `skip_serializing_if`
+/// OMITS an absent key so the daemon-side JSON matches the optional `windowId?` /
+/// `profile?` the frontend `CreateSessionOpts` mirror declares (an absent key,
+/// not a JSON `null`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSessionOpts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
 /// Which PR source backs the monitor.
 ///
 /// **Hard carrier** (sealed enum): once PR3+ wires source selection through an
@@ -632,6 +673,61 @@ mod tests {
         assert!(v.get("head_ref").is_none());
         assert!(v.get("is_cross_repository").is_none());
         assert!(v.get("is_draft").is_none());
+    }
+
+    // Serde wire-shape lock for the #1383 terminal listing contract (Medium carrier per
+    // ai-robust.md): UNLIKE `Candidate`, `TerminalSession` IS a front/back contract (returned
+    // by `list_terminal_sessions`), so `src/types.ts` mirrors it in lockstep — this golden is
+    // the upstream lock; the TS interface is the open downstream end (future Hard path = codegen
+    // `types.ts` from `model.rs` + `git diff --exit-code`). Locks camelCase keys present /
+    // snake_case absent so a Rust-side rename surfaces here before it silently breaks the panel.
+    #[test]
+    fn terminal_session_wire_shape_is_camel_case() {
+        let session = TerminalSession {
+            session_id: "w0t0p0".to_string(),
+            window_id: "w0".to_string(),
+            tab_id: "t0".to_string(),
+            title: "zsh".to_string(),
+            is_active: true,
+            rows: 24,
+            cols: 80,
+        };
+
+        let v = serde_json::to_value(&session).expect("TerminalSession serializes");
+
+        // camelCase keys present.
+        assert!(v.get("sessionId").is_some());
+        assert!(v.get("windowId").is_some());
+        assert!(v.get("tabId").is_some());
+        assert!(v.get("title").is_some());
+        assert!(v.get("isActive").is_some());
+        assert!(v.get("rows").is_some());
+        assert!(v.get("cols").is_some());
+
+        // snake_case forms absent — a rename would surface here.
+        assert!(v.get("session_id").is_none());
+        assert!(v.get("window_id").is_none());
+        assert!(v.get("tab_id").is_none());
+        assert!(v.get("is_active").is_none());
+    }
+
+    // `CreateSessionOpts`: camelCase + `skip_serializing_if` OMITS absent keys (an absent key,
+    // not a JSON null), matching the optional `windowId?` / `profile?` TS mirror.
+    #[test]
+    fn create_session_opts_wire_shape_omits_none() {
+        let full = CreateSessionOpts {
+            window_id: Some("w0".to_string()),
+            profile: Some("Default".to_string()),
+        };
+        let v = serde_json::to_value(&full).expect("CreateSessionOpts serializes");
+        assert_eq!(v["windowId"], "w0");
+        assert_eq!(v["profile"], "Default");
+        assert!(v.get("window_id").is_none());
+
+        // None → the key is OMITTED entirely (not a JSON null).
+        let empty = serde_json::to_value(CreateSessionOpts::default()).expect("serializes");
+        assert!(empty.get("windowId").is_none(), "None omits windowId");
+        assert!(empty.get("profile").is_none(), "None omits profile");
     }
 
     // Cross-agent wire contract lock: the frontend mirrors these exact strings.
