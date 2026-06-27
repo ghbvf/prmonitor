@@ -123,6 +123,38 @@ pub fn enqueue(
     enqueue_inner(db, project_id, kind, summary, payload, None, now)
 }
 
+pub(crate) struct EnqueueInput<'a> {
+    pub(crate) project_id: &'a str,
+    pub(crate) kind: ActionKind,
+    pub(crate) summary: &'a str,
+    pub(crate) payload: &'a str,
+    pub(crate) dedupe_key: Option<&'a str>,
+}
+
+/// Enqueue several produced actions atomically. Either every pending row is present and the caller
+/// receives every id, or the transaction rolls back and no partial multi-channel action remains.
+pub(crate) fn enqueue_many(
+    db: &Database,
+    rows: &[EnqueueInput<'_>],
+    now: u64,
+) -> AppResult<Vec<i64>> {
+    db.with_tx(|tx| {
+        let mut ids = Vec::with_capacity(rows.len());
+        for row in rows {
+            ids.push(enqueue_inner_tx(
+                tx,
+                row.project_id,
+                row.kind,
+                row.summary,
+                row.payload,
+                row.dedupe_key,
+                now,
+            )?);
+        }
+        Ok(ids)
+    })
+}
+
 /// Enqueue one produced action with a live-pending dedupe key (#1379). If the same project already
 /// has a pending row for `dedupe_key`, return that row id instead of inserting another pending
 /// action. Once the row reaches `done`/`dead`, the partial unique index no longer applies and a new

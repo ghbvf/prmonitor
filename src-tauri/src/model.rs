@@ -432,6 +432,15 @@ impl RedactedNotificationBody {
         Self(url)
     }
 
+    /// Text deliberately authored by a user/API caller for a notification body.
+    ///
+    /// This constructor keeps the Hard redaction carrier closed: notification send funnels must
+    /// still make an explicit typed choice, rather than passing arbitrary error strings into the
+    /// persisted/exposed notification body by accident.
+    pub fn user_supplied(text: String) -> Self {
+        Self(text)
+    }
+
     /// Fixed deeplink failure text whose only dynamic component is the validated PR number.
     pub fn review_trigger_rejected(pr_number: u64) -> Self {
         Self(format!("PR #{pr_number}：项目无效或该 review 已在进行中"))
@@ -498,6 +507,7 @@ impl Notification {
 /// Severity of a [`Notification`] (AB#1070). Sealed enum; the serde golden
 /// (`notification_enums_serialize_to_pinned_wire_strings`) is the **Medium** carrier
 /// pinning the camelCase wire strings. Default `Info`.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum NotificationLevel {
@@ -505,6 +515,15 @@ pub enum NotificationLevel {
     Info,
     Warning,
     Error,
+}
+
+impl std::str::FromStr for NotificationLevel {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        serde_json::from_value(serde_json::Value::String(value.to_string()))
+            .map_err(|_| "level must be one of: info, warning, error".to_string())
+    }
 }
 
 /// Which channel a [`Notification`] is delivered through (AB#1070).
@@ -545,6 +564,40 @@ pub struct NotificationDeliveryPayload {
     pub notification: Notification,
     pub channel_id: String,
     pub kind: NotificationKind,
+}
+
+/// Transport-agnostic user-authored notification intent (#1460).
+///
+/// **Hard carrier for secret exclusion:** this request has no provider-config fields and
+/// `deny_unknown_fields` rejects secret-looking extras (`webhookUrl`, `token`, `smtpPassword`,
+/// `authorization`, …) at the serde boundary instead of silently accepting a shape that could be
+/// accidentally persisted later. The funnel turns this into [`NotificationDeliveryPayload`] rows.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SendNotificationRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<NotificationLevel>,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channel_ids: Vec<String>,
+}
+
+/// Result of enqueueing one user-authored notification (#1460).
+///
+/// Success means durable enqueue succeeded. Provider delivery happens later through the outbox
+/// worker and is observable through the existing outbox status surface.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendNotificationResponse {
+    pub outbox_ids: Vec<i64>,
 }
 
 /// Runtime delivery config for one notification channel (AB#1459).
@@ -1310,6 +1363,50 @@ mod tests {
         assert_eq!(back.project_id, "p1");
     }
 
+    #[test]
+    fn send_notification_request_response_wire_shape_and_unknown_reject() {
+        let req = SendNotificationRequest {
+            level: Some(NotificationLevel::Warning),
+            title: "Deploy done".to_string(),
+            body: Some("Build 42 finished".to_string()),
+            url: Some("https://example.com/build/42".to_string()),
+            project_id: Some("p1".to_string()),
+            channel_ids: vec!["desktop".to_string(), "slack-main".to_string()],
+        };
+
+        let v = serde_json::to_value(&req).expect("SendNotificationRequest serializes");
+        assert_eq!(v["level"], "warning");
+        assert_eq!(v["projectId"], "p1");
+        assert_eq!(v["channelIds"][1], "slack-main");
+        assert!(v.get("project_id").is_none());
+        assert!(v.get("channel_ids").is_none());
+
+        let back: SendNotificationRequest =
+            serde_json::from_value(v).expect("SendNotificationRequest deserializes");
+        assert_eq!(back, req);
+
+        let minimal: SendNotificationRequest =
+            serde_json::from_value(serde_json::json!({"title":"t","body":"b"}))
+                .expect("minimal request deserializes");
+        assert_eq!(minimal.level, None);
+        assert!(minimal.channel_ids.is_empty());
+
+        let err = serde_json::from_value::<SendNotificationRequest>(serde_json::json!({
+            "title": "t",
+            "body": "b",
+            "webhookUrl": "https://hooks.example.com/secret"
+        }))
+        .expect_err("unknown secret-looking fields are rejected");
+        assert!(err.to_string().contains("unknown field"), "{err}");
+
+        let response = SendNotificationResponse {
+            outbox_ids: vec![10, 11],
+        };
+        let rv = serde_json::to_value(&response).expect("SendNotificationResponse serializes");
+        assert_eq!(rv["outboxIds"], serde_json::json!([10, 11]));
+        assert!(rv.get("outbox_ids").is_none());
+    }
+
     // Cross-Rust-slice wire contract lock for `NotificationLevel` / `NotificationKind`
     // (AB#1070, Medium carrier): a variant rename or `rename_all` change surfaces here. The
     // exhaustive `match NotificationKind` in `review::notify::deliver` is the Hard carrier.
@@ -1365,6 +1462,23 @@ mod tests {
             serde_json::to_value(NotificationKind::default()).expect("NotificationKind serializes"),
             "desktop"
         );
+    }
+
+    #[test]
+    fn notification_level_from_str_uses_wire_values() {
+        assert_eq!(
+            "info".parse::<NotificationLevel>(),
+            Ok(NotificationLevel::Info)
+        );
+        assert_eq!(
+            "warning".parse::<NotificationLevel>(),
+            Ok(NotificationLevel::Warning)
+        );
+        assert_eq!(
+            "error".parse::<NotificationLevel>(),
+            Ok(NotificationLevel::Error)
+        );
+        assert!("critical".parse::<NotificationLevel>().is_err());
     }
 
     #[test]

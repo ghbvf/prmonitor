@@ -26,6 +26,7 @@ pub mod error;
 pub mod events;
 pub mod inbox;
 pub mod model;
+pub mod notification;
 pub mod outbox;
 pub mod pr;
 pub mod remote;
@@ -96,6 +97,7 @@ pub fn run() {
     // the GUI. Anything else (no/unknown subcommand) is a normal GUI launch.
     match cli::parse() {
         cli::Invocation::Review(args) => std::process::exit(cli::run_client_blocking(&args)),
+        cli::Invocation::Notify(args) => std::process::exit(cli::run_notify_client_blocking(&args)),
         cli::Invocation::Gui => build_app(),
     }
 }
@@ -141,6 +143,16 @@ fn build_app() {
             // passed to `outbox.start` and `OutboxManager::start`'s doc.
 
             let state = app.state::<AppState>();
+            state.notification_sender.set_sink(Arc::new({
+                let app = app.handle().clone();
+                move |request, dedupe_prefix| {
+                    notification::enqueue_notification_with_dedupe_prefix(
+                        &app,
+                        request,
+                        dedupe_prefix.as_deref(),
+                    )
+                }
+            }));
             // Install the auto-trigger dispatcher BEFORE starting the loop, so the
             // immediate first tick already persists dispatchable reviews/checks into
             // inbox + outbox. The closure is the `pr` slice's review-agnostic
@@ -539,6 +551,7 @@ fn build_app() {
             config::commands::get_config,
             config::commands::set_config,
             notification_test_send,
+            notification::send_notification,
             pr::commands::start_polling,
             pr::commands::stop_polling,
             pr::commands::poll_now,

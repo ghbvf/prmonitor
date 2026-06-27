@@ -6,10 +6,21 @@ export {
   ENGINE_KINDS,
   EVENT_TYPES,
   LABEL_SOURCES,
+  NOTIFICATION_LEVELS,
   SOURCE_KINDS,
   UPDATE_MODES,
 } from "./types.generated";
-export type { EngineKind, EventType, LabelSource, SourceKind, UpdateMode } from "./types.generated";
+export type {
+  EngineKind,
+  EventType,
+  LabelSource,
+  NotificationLevel,
+  RuleMatchEntry,
+  SendNotificationRequest,
+  SendNotificationResponse,
+  SourceKind,
+  UpdateMode,
+} from "./types.generated";
 
 // Exhaustiveness guard for discriminated unions / string-literal enums: in a
 // `default`/`else` branch, `assertNever(x)` only type-checks if `x` has been

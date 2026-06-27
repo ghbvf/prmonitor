@@ -18,4 +18,11 @@ export const EVENT_TYPES = ["pullRequest","issue","comment","label","generic"] a
 export type NotificationKind = "desktop" | "email" | "slack" | "telegram" | "weChatWork" | "feishu" | "dingTalk";
 export const NOTIFICATION_KINDS = ["desktop","email","slack","telegram","weChatWork","feishu","dingTalk"] as const;
 
+export type NotificationLevel = "info" | "warning" | "error";
+export const NOTIFICATION_LEVELS = ["info","warning","error"] as const;
+
+export type SendNotificationRequest = { level?: NotificationLevel | null, title: string, body?: string | null, url?: string | null, projectId?: string | null, channelIds?: Array<string>, };
+
+export type SendNotificationResponse = { outboxIds: Array<number>, };
+
 export type RuleMatchEntry = { id: number, ruleId: string, ruleName: string, inboxEventId: number, projectId: string, actionCount: number, error: string | null, createdAt: number, actionOutboxIds: Array<number>, };

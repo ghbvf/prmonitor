@@ -26,6 +26,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::config::service as config_service;
 use crate::db::Database;
+use crate::model::{NotificationLevel, SendNotificationRequest, SendNotificationResponse};
 use crate::review::local_api::{ErrorBody, StatusResponse, TriggerRequest, TriggerResponse};
 use crate::review::session::SessionStatus;
 
@@ -54,6 +55,8 @@ struct Cli {
 enum Command {
     /// Trigger a PR review on the running prmonitor app (or launch it, then trigger).
     Review(ReviewArgs),
+    /// Enqueue a user-authored notification through the running prmonitor app.
+    Notify(NotifyArgs),
 }
 
 /// `prmonitor review` arguments. Exactly one of `--repo` / `--project-id` identifies the project
@@ -93,6 +96,39 @@ pub struct ReviewArgs {
     pub token: Option<String>,
 }
 
+/// `prmonitor notify` arguments. The command enqueues, then exits; provider delivery happens later
+/// through the action outbox.
+#[derive(Args, Clone)]
+pub struct NotifyArgs {
+    /// Notification title.
+    #[arg(long)]
+    pub title: String,
+    /// Notification body text.
+    #[arg(long)]
+    pub body: Option<String>,
+    /// Actionable URL shown with the notification.
+    #[arg(long)]
+    pub url: Option<String>,
+    /// Severity level (`info`, `warning`, `error`). Defaults to `info`.
+    #[arg(long, value_parser = parse_notification_level)]
+    pub level: Option<NotificationLevel>,
+    /// Optional project routing key for the outbox row.
+    #[arg(long = "project-id")]
+    pub project_id: Option<String>,
+    /// Restrict delivery to a configured notification channel id. Repeatable.
+    #[arg(long = "channel")]
+    pub channel_ids: Vec<String>,
+    /// Emit machine JSON.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub json: Option<String>,
+    /// Override the local API port (else `PRMONITOR_LOCAL_API_PORT`, else saved config).
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// Override the bearer token (else `PRMONITOR_LOCAL_API_TOKEN`, else saved config).
+    #[arg(long)]
+    pub token: Option<String>,
+}
+
 impl ReviewArgs {
     /// The free-form `reference` the trigger funnel resolves (id-or-repo). The clap `target`
     /// group guarantees exactly one of repo / project_id is set.
@@ -124,6 +160,23 @@ impl ReviewArgs {
     }
 }
 
+impl NotifyArgs {
+    fn notification_request(&self) -> SendNotificationRequest {
+        SendNotificationRequest {
+            level: self.level,
+            title: self.title.clone(),
+            body: self.body.clone(),
+            url: self.url.clone(),
+            project_id: self.project_id.clone(),
+            channel_ids: self.channel_ids.clone(),
+        }
+    }
+}
+
+fn parse_notification_level(value: &str) -> Result<NotificationLevel, String> {
+    value.parse()
+}
+
 /// Hand-written so the bearer `token` never appears in debug output (only whether one is set).
 impl std::fmt::Debug for ReviewArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -141,10 +194,29 @@ impl std::fmt::Debug for ReviewArgs {
     }
 }
 
+/// Hand-written so the bearer `token` and user-authored `body` never appear in debug output.
+impl std::fmt::Debug for NotifyArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotifyArgs")
+            .field("title", &self.title)
+            .field("body", &self.body.as_ref().map(|_| "[REDACTED]"))
+            .field("url", &self.url)
+            .field("level", &self.level)
+            .field("project_id", &self.project_id)
+            .field("channel_ids", &self.channel_ids)
+            .field("json", &self.json)
+            .field("port", &self.port)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
 /// What [`parse`] resolved the process invocation to.
 pub enum Invocation {
     /// `prmonitor review …` — run the CLI client (which itself launches the app on a cold start).
     Review(ReviewArgs),
+    /// `prmonitor notify …` — enqueue a notification through the same local API client path.
+    Notify(NotifyArgs),
     /// Anything else — boot the GUI normally.
     Gui,
 }
@@ -154,12 +226,14 @@ pub enum Invocation {
 /// On a malformed `review` invocation clap prints usage + exits (its default), which is correct
 /// for a CLI.
 pub fn parse() -> Invocation {
-    let is_review = std::env::args().nth(1).as_deref() == Some("review");
-    if !is_review {
+    let first = std::env::args().nth(1);
+    let is_cli = matches!(first.as_deref(), Some("review" | "notify"));
+    if !is_cli {
         return Invocation::Gui;
     }
     match Cli::parse().command {
         Some(Command::Review(args)) => Invocation::Review(args),
+        Some(Command::Notify(args)) => Invocation::Notify(args),
         None => Invocation::Gui,
     }
 }
@@ -196,8 +270,23 @@ pub fn run_client_blocking(args: &ReviewArgs) -> i32 {
     rt.block_on(run_client(args))
 }
 
+/// Synchronous entry for `prmonitor notify`.
+pub fn run_notify_client_blocking(args: &NotifyArgs) -> i32 {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("无法创建运行时: {e}");
+            return 1;
+        }
+    };
+    rt.block_on(run_notify_client(args))
+}
+
 async fn run_client(args: &ReviewArgs) -> i32 {
-    let endpoint = resolve_endpoint(args);
+    let endpoint = resolve_endpoint(args.port, args.token.clone());
     if endpoint.port == 0 {
         // Single non-zero error code for every failure (gh: non-zero = failed); a CI `&&` chain
         // only cares that it is not 0.
@@ -261,6 +350,103 @@ async fn run_client(args: &ReviewArgs) -> i32 {
         return 1;
     }
     watch_to_terminal(&client, &endpoint.token, &trigger.status_url, args).await
+}
+
+async fn run_notify_client(args: &NotifyArgs) -> i32 {
+    let endpoint = resolve_endpoint(args.port, args.token.clone());
+    if endpoint.port == 0 {
+        eprintln!("本地 API 已禁用（端口为 0）；请在「设置 → 远程访问」中为 local-api 监听器设置端口并启用后重试");
+        return 1;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("无法创建 HTTP 客户端: {e}");
+            return 1;
+        }
+    };
+    let base = format!("http://127.0.0.1:{}", endpoint.port);
+    match post_notification(&client, &base, &endpoint.token, args).await {
+        NotifyPost::Ok(response) => {
+            let value = serde_json::to_value(&response).unwrap_or(serde_json::Value::Null);
+            emit(&args.json, &value, || {
+                format!("notification 已入队：{:?}", response.outbox_ids)
+            });
+            0
+        }
+        NotifyPost::Failed(code) => code,
+        NotifyPost::NotRunning => {
+            eprintln!("app 未运行：正在启动 app…");
+            if let Err(e) = spawn_detached_gui() {
+                eprintln!("启动 app 失败：{e}");
+                return 1;
+            }
+            let mut waited = Duration::ZERO;
+            loop {
+                match post_notification(&client, &base, &endpoint.token, args).await {
+                    NotifyPost::NotRunning => {
+                        if waited >= COLD_START_DEADLINE {
+                            eprintln!("启动 app 后本地 API 未在 {COLD_START_DEADLINE:?} 内就绪");
+                            return 1;
+                        }
+                        tokio::time::sleep(COLD_START_POLL).await;
+                        waited += COLD_START_POLL;
+                    }
+                    NotifyPost::Ok(response) => {
+                        let value =
+                            serde_json::to_value(&response).unwrap_or(serde_json::Value::Null);
+                        emit(&args.json, &value, || {
+                            format!("notification 已入队：{:?}", response.outbox_ids)
+                        });
+                        return 0;
+                    }
+                    NotifyPost::Failed(code) => return code,
+                }
+            }
+        }
+    }
+}
+
+enum NotifyPost {
+    Ok(SendNotificationResponse),
+    NotRunning,
+    Failed(i32),
+}
+
+async fn post_notification(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    args: &NotifyArgs,
+) -> NotifyPost {
+    let resp = client
+        .post(format!("{base}/notifications"))
+        .bearer_auth(token)
+        .json(&args.notification_request())
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) if e.is_connect() => return NotifyPost::NotRunning,
+        Err(e) => {
+            eprintln!("通知请求失败: {e}");
+            return NotifyPost::Failed(1);
+        }
+    };
+    if !resp.status().is_success() {
+        return NotifyPost::Failed(report_http_error(resp).await);
+    }
+    match resp.json::<SendNotificationResponse>().await {
+        Ok(response) => NotifyPost::Ok(response),
+        Err(e) => {
+            eprintln!("解析通知响应失败: {e}");
+            NotifyPost::Failed(1)
+        }
+    }
 }
 
 /// One trigger POST. Connection-refused is reported distinctly ([`Trigger::NotRunning`]) so the
@@ -404,15 +590,12 @@ struct Endpoint {
 /// the POST result disambiguates: connection-refused ⇒ app not running (cold start); 401 ⇒ token
 /// unset/wrong. (`port == 0` is handled by the caller as "API disabled".) The port now comes from
 /// the local-api `listeners[]` entry via `config::service::local_api_port` (AB#1225 single source).
-fn resolve_endpoint(args: &ReviewArgs) -> Endpoint {
+fn resolve_endpoint(port: Option<u16>, token: Option<String>) -> Endpoint {
     let cfg = load_saved_config().unwrap_or_default();
-    let port = args
-        .port
+    let port = port
         .or_else(env_port)
         .unwrap_or(crate::config::service::local_api_port(&cfg));
-    let token = args
-        .token
-        .clone()
+    let token = token
         .or_else(|| std::env::var("PRMONITOR_LOCAL_API_TOKEN").ok())
         .unwrap_or(cfg.local_api_token);
     Endpoint { port, token }
@@ -532,7 +715,14 @@ mod tests {
     fn parse_review(argv: &[&str]) -> Result<ReviewArgs, clap::Error> {
         match Cli::try_parse_from(argv)?.command {
             Some(Command::Review(a)) => Ok(a),
-            None => panic!("expected a review subcommand"),
+            _ => panic!("expected a review subcommand"),
+        }
+    }
+
+    fn parse_notify(argv: &[&str]) -> Result<NotifyArgs, clap::Error> {
+        match Cli::try_parse_from(argv)?.command {
+            Some(Command::Notify(a)) => Ok(a),
+            _ => panic!("expected a notify subcommand"),
         }
     }
 
@@ -686,6 +876,75 @@ mod tests {
             "token must not appear in Debug: {dbg}"
         );
         assert!(dbg.contains("[REDACTED]"), "token field redacted: {dbg}");
+    }
+
+    #[test]
+    fn parses_notify_request_and_repeated_channels() {
+        let a = parse_notify(&[
+            "prmonitor",
+            "notify",
+            "--title",
+            "Deploy done",
+            "--body",
+            "Build 42 finished",
+            "--url",
+            "https://example.com/build/42",
+            "--level",
+            "warning",
+            "--project-id",
+            "p1",
+            "--channel",
+            "desktop",
+            "--channel",
+            "slack-main",
+            "--json",
+        ])
+        .expect("valid");
+        let body = a.notification_request();
+        assert_eq!(body.title, "Deploy done");
+        assert_eq!(body.body.as_deref(), Some("Build 42 finished"));
+        assert_eq!(body.url.as_deref(), Some("https://example.com/build/42"));
+        assert_eq!(body.level, Some(NotificationLevel::Warning));
+        assert_eq!(body.project_id.as_deref(), Some("p1"));
+        assert_eq!(body.channel_ids, vec!["desktop", "slack-main"]);
+        assert_eq!(a.json.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn notify_rejects_unknown_level_and_redacts_debug() {
+        assert!(parse_notify(&[
+            "prmonitor",
+            "notify",
+            "--title",
+            "Deploy done",
+            "--level",
+            "critical",
+        ])
+        .is_err());
+        let a = parse_notify(&[
+            "prmonitor",
+            "notify",
+            "--title",
+            "Deploy done",
+            "--body",
+            "private body",
+            "--token",
+            "supersecret",
+        ])
+        .expect("valid");
+        let dbg = format!("{a:?}");
+        assert!(
+            !dbg.contains("private body"),
+            "body must be redacted: {dbg}"
+        );
+        assert!(
+            !dbg.contains("supersecret"),
+            "token must be redacted: {dbg}"
+        );
+        assert!(
+            dbg.contains("[REDACTED]"),
+            "redaction marker present: {dbg}"
+        );
     }
 
     #[test]

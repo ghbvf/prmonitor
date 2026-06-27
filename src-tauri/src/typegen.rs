@@ -15,7 +15,8 @@ use crate::{
         NotificationSettings, OutboxConfig, Project, RuleActionKind, RuleConfig, Tunnel,
     },
     model::{
-        EngineKind, EventType, LabelSource, NotificationKind, SourceKind, UpdateMode,
+        EngineKind, EventType, LabelSource, NotificationKind, NotificationLevel,
+        SendNotificationRequest, SendNotificationResponse, SourceKind, UpdateMode,
         WebhookTunnelMode,
     },
     remote::status::{ListenerRuntimeStatus, ListenerState},
@@ -102,6 +103,13 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push('\n');
     shared.push_str(&declaration::<NotificationKind>(&cfg));
     shared.push_str(&option_array::<NotificationKind>("NOTIFICATION_KINDS"));
+    shared.push('\n');
+    shared.push_str(&declaration::<NotificationLevel>(&cfg));
+    shared.push_str(&option_array::<NotificationLevel>("NOTIFICATION_LEVELS"));
+    shared.push('\n');
+    shared.push_str(&declaration::<SendNotificationRequest>(&cfg));
+    shared.push('\n');
+    shared.push_str(&declaration::<SendNotificationResponse>(&cfg));
     shared.push('\n');
     shared.push_str(&declaration::<RuleMatchEntry>(&cfg));
 

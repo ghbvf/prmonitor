@@ -7,12 +7,19 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use crate::config::model::AppConfig;
+use crate::error::{AppError, AppResult};
+use crate::model::{SendNotificationRequest, SendNotificationResponse};
 
 /// The composition-root-injected post-save reconcile closure. Given the just-saved config, it
 /// drives Remote Access listener and tunnel reconcile. OPAQUE on purpose (an `Arc<dyn Fn>`
 /// mirroring `review::notify::NotificationSink`): the `config` slice holds only this type, never
 /// references `crate::remote`. Aliased so the field type stays simple (clippy `type_complexity`).
 pub type ConfigSavedSink = Arc<dyn Fn(AppConfig) + Send + Sync>;
+pub type NotificationSendSink = Arc<
+    dyn Fn(SendNotificationRequest, Option<String>) -> AppResult<SendNotificationResponse>
+        + Send
+        + Sync,
+>;
 
 /// The post-`set_config`-save hook seam (AB#1225 F4): a composition-root-injected closure the
 /// `config` slice fires AFTER a successful save, so config never names a sibling horizontal
@@ -42,6 +49,32 @@ impl ConfigSavedHook {
         if let Some(hook) = hook {
             hook(config);
         }
+    }
+}
+
+/// Composition-root-injected user-notification send seam (#1460). Transports that live inside an
+/// existing slice (local API / deeplink) call this opaque sender instead of naming the horizontal
+/// notification module directly; `lib.rs` installs the concrete outbox-backed funnel.
+#[derive(Default)]
+pub struct NotificationSender {
+    sink: StdMutex<Option<NotificationSendSink>>,
+}
+
+impl NotificationSender {
+    pub fn set_sink(&self, sink: NotificationSendSink) {
+        *self.sink.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+    }
+
+    pub fn send(
+        &self,
+        request: SendNotificationRequest,
+        dedupe_prefix: Option<String>,
+    ) -> AppResult<SendNotificationResponse> {
+        let sink = self.sink.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let Some(sink) = sink else {
+            return Err(AppError::new("notification sender 未初始化".to_string()));
+        };
+        sink(request, dedupe_prefix)
     }
 }
 
@@ -87,6 +120,9 @@ pub struct AppState {
     /// produce durable notifications WITHOUT naming the `outbox` slice (the sink closure, installed in
     /// `lib.rs`, is the only place that bridges review→outbox). Methods take `&self`.
     pub notify_outbox: crate::review::notify::NotificationOutbox,
+    /// The user-authored notification send funnel (#1460), injected by the composition root so
+    /// transports can share one sender without reaching across slice boundaries.
+    pub notification_sender: NotificationSender,
     /// The post-`set_config`-save hook (AB#1225 F4): holds the composition-root-injected closure
     /// that reconciles the Remote Access listener runtime after a save. Lets the `config` slice's
     /// `set_config` take effect on the listener runtime WITHOUT naming `crate::remote` (the closure,

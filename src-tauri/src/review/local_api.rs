@@ -55,6 +55,7 @@ use crate::config::service as config_service;
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, StreamEvent};
+use crate::model::SendNotificationRequest;
 use crate::state::AppState;
 
 /// Trigger bodies are tiny (`{projectId, pr, kind}`). Cap what an unauthenticated POST can
@@ -308,6 +309,25 @@ async fn handle_create<R: tauri::Runtime>(
     }
 }
 
+async fn handle_notify<R: tauri::Runtime>(
+    State(ctx): State<Arc<Ctx<R>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(resp) = check_request(&ctx, &headers) {
+        return resp;
+    }
+    let req: SendNotificationRequest = match serde_json::from_slice(body.as_ref()) {
+        Ok(r) => r,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, format!("请求体解析失败: {e}")),
+    };
+    let state = ctx.app.state::<AppState>();
+    match state.notification_sender.send(req, None) {
+        Ok(response) => json_response(StatusCode::ACCEPTED, &response),
+        Err(e) => error_response(StatusCode::BAD_REQUEST, e.message),
+    }
+}
+
 /// GET status resolution (AB#1043, codex F1): an in-memory hit short-circuits (the durable
 /// thunk never runs); otherwise the durable read's result passes through UNCHANGED. A
 /// persistence `Err` (DB locked / IO / schema) must reach the caller as a `500`, NEVER be
@@ -549,6 +569,7 @@ pub(crate) struct Ctx<R: tauri::Runtime> {
 pub(crate) fn build_router<R: tauri::Runtime>(ctx: Arc<Ctx<R>>) -> Router {
     Router::new()
         .route("/reviews", post(handle_create::<R>))
+        .route("/notifications", post(handle_notify::<R>))
         .route("/reviews/:id", get(handle_status::<R>))
         .route("/reviews/:id/stream", get(handle_stream::<R>))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
@@ -733,6 +754,45 @@ mod tests {
         .expect("serializes");
         assert_eq!(running["status"], "running");
         assert!(running.get("commentUrl").is_none());
+    }
+
+    #[test]
+    fn notify_request_response_wire_shape_and_unknown_fields() {
+        let req: SendNotificationRequest = serde_json::from_value(serde_json::json!({
+            "level": "error",
+            "title": "Deploy failed",
+            "body": "Build 42 failed",
+            "url": "https://example.com/build/42",
+            "projectId": "p1",
+            "channelIds": ["desktop"]
+        }))
+        .expect("notify request deserializes");
+        assert_eq!(req.level, Some(crate::model::NotificationLevel::Error));
+        assert_eq!(req.project_id.as_deref(), Some("p1"));
+        assert_eq!(req.channel_ids, vec!["desktop"]);
+
+        let snake = serde_json::from_value::<SendNotificationRequest>(serde_json::json!({
+            "title": "Deploy failed",
+            "body": "Build 42 failed",
+            "project_id": "p1"
+        }))
+        .expect_err("deny_unknown_fields rejects snake_case");
+        assert!(snake.to_string().contains("unknown field"), "{snake}");
+
+        let secret = serde_json::from_value::<SendNotificationRequest>(serde_json::json!({
+            "title": "Deploy failed",
+            "body": "Build 42 failed",
+            "authorization": "Bearer secret"
+        }))
+        .expect_err("secret-looking extras are rejected");
+        assert!(secret.to_string().contains("unknown field"), "{secret}");
+
+        let response = crate::model::SendNotificationResponse {
+            outbox_ids: vec![1, 2],
+        };
+        let v = serde_json::to_value(&response).expect("notify response serializes");
+        assert_eq!(v["outboxIds"], serde_json::json!([1, 2]));
+        assert!(v.get("outbox_ids").is_none());
     }
 
     // --- shared-struct round-trip goldens (AB#1044: the CLI client reuses these exact structs
@@ -1027,6 +1087,7 @@ mod tests {
             });
 
             let url = format!("http://127.0.0.1:{port}/reviews/abc/stream");
+            let notify_url = format!("http://127.0.0.1:{port}/notifications");
             let client = reqwest::Client::new();
 
             // Route IS registered + the host gate runs on it: a non-loopback `Host` (DNS-rebinding
@@ -1044,6 +1105,26 @@ mod tests {
             // proven to cover the SSE route).
             let unauthorized = client.get(&url).send().await.expect("send");
             assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+            let forbidden_notify = client
+                .post(&notify_url)
+                .header("host", "evil.com")
+                .json(&serde_json::json!({"title":"t","body":"b"}))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(forbidden_notify.status(), reqwest::StatusCode::FORBIDDEN);
+
+            let unauthorized_notify = client
+                .post(&notify_url)
+                .json(&serde_json::json!({"title":"t","body":"b"}))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(
+                unauthorized_notify.status(),
+                reqwest::StatusCode::UNAUTHORIZED
+            );
 
             server.abort();
         });

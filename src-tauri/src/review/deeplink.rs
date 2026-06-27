@@ -24,11 +24,20 @@
 //!   `cli.rs::app_identifier_matches_tauri_conf`), so a drift that would silently break every
 //!   deeplink fails CI instead.
 
+use std::collections::VecDeque;
+use std::sync::{Mutex as StdMutex, OnceLock};
+
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, Runtime};
 use url::Url;
 
+use crate::config::service as config_service;
 use crate::error::{AppError, AppResult};
-use crate::model::{Notification, NotificationKind, NotificationLevel, RedactedNotificationBody};
+use crate::model::{
+    Notification, NotificationKind, NotificationLevel, RedactedNotificationBody,
+    SendNotificationRequest,
+};
 use crate::review::commands::{self, validate_kind, validate_pr_number};
 use crate::review::notify;
 use crate::review::session::CompletionOutcome;
@@ -41,6 +50,7 @@ pub(crate) const SCHEME: &str = "prmonitor";
 /// The only supported action (the URL's host slot: `prmonitor://review?…`). A second action would
 /// be added here + routed in [`parse_review_deeplink`]; an unknown action is rejected.
 const ACTION_REVIEW: &str = "review";
+const ACTION_NOTIFY: &str = "notify";
 
 /// Default `kind` when the deeplink omits `?kind=` (parity with the CLI, where the absence of
 /// `--check` means a review). Kept distinct from [`ACTION_REVIEW`]: they coincide as `"review"`
@@ -56,6 +66,16 @@ pub(crate) struct ParsedTrigger {
     pub(crate) pr_number: u64,
     pub(crate) kind: String,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ParsedNotify {
+    pub(crate) request: SendNotificationRequest,
+    pub(crate) signature: String,
+}
+
+type HmacSha256 = Hmac<Sha256>;
+const NOTIFY_DEEPLINK_DEDUPE_CAP: usize = 256;
+static SEEN_NOTIFY_DEEPLINK_KEYS: OnceLock<StdMutex<VecDeque<String>>> = OnceLock::new();
 
 /// Parse + validate a `prmonitor://review?pr=N&repo=R&kind=review` deeplink into the funnel inputs.
 ///
@@ -142,6 +162,112 @@ pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedTrigger> {
     })
 }
 
+/// Parse + validate a `prmonitor://notify?title=...&body=...&sig=...` deeplink.
+///
+/// Reuses the same external-input discipline as review deeplinks: wrong scheme/action rejects,
+/// duplicate recognized scalar keys reject, and unknown keys are ignored. Notification deeplinks
+/// require a scoped HMAC signature rather than carrying the global local API bearer token in the
+/// URL. Channel selection is expressed as either `channelId=<id>` or comma-separated
+/// `channelIds=a,b`.
+pub(crate) fn parse_notify_deeplink(url: &Url) -> AppResult<ParsedNotify> {
+    if url.scheme() != SCHEME {
+        return Err(AppError::new(format!(
+            "deeplink scheme 非法（期望 {SCHEME}://）: {:?}",
+            url.scheme()
+        )));
+    }
+    if url.host_str() != Some(ACTION_NOTIFY) {
+        return Err(AppError::new(format!(
+            "deeplink action 非法（仅支持 {ACTION_NOTIFY}）: {:?}",
+            url.host_str()
+        )));
+    }
+
+    let mut title: Option<String> = None;
+    let mut body: Option<String> = None;
+    let mut link_url: Option<String> = None;
+    let mut project_id: Option<String> = None;
+    let mut level: Option<String> = None;
+    let mut channel_id: Option<String> = None;
+    let mut channel_ids: Option<String> = None;
+    let mut signature: Option<String> = None;
+    for (key, value) in url.query_pairs() {
+        if key == "token" {
+            return Err(AppError::new(
+                "deeplink notify 不支持 token 参数，请使用 sig 签名",
+            ));
+        }
+        let slot = match key.as_ref() {
+            "title" => &mut title,
+            "body" => &mut body,
+            "url" => &mut link_url,
+            "projectId" => &mut project_id,
+            "level" => &mut level,
+            "channelId" => &mut channel_id,
+            "channelIds" => &mut channel_ids,
+            "sig" => &mut signature,
+            _ => continue,
+        };
+        if slot.is_some() {
+            return Err(AppError::new(format!("deeplink 重复参数: {key}")));
+        }
+        *slot = Some(value.into_owned());
+    }
+
+    let title = title
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| AppError::new("deeplink notify 缺少 title 参数"))?;
+    let body = body.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let link_url = link_url
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    if body.is_none() && link_url.is_none() {
+        return Err(AppError::new("deeplink notify 缺少 body 或 url"));
+    }
+    let level = match level
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        None => None,
+        Some(value) => Some(value.parse().map_err(AppError::new)?),
+    };
+    let project_id = project_id
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let channel_ids = match (channel_id, channel_ids) {
+        (Some(_), Some(_)) => {
+            return Err(AppError::new(
+                "deeplink notify 同时给了 channelId 与 channelIds（只能其一）",
+            ))
+        }
+        (Some(id), None) => vec![id.trim().to_string()],
+        (None, Some(ids)) => ids
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .collect(),
+        (None, None) => Vec::new(),
+    };
+    let signature = signature
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| AppError::new("deeplink notify 缺少 sig 参数"))?;
+
+    Ok(ParsedNotify {
+        request: SendNotificationRequest {
+            level,
+            title,
+            body,
+            url: link_url,
+            project_id,
+            channel_ids,
+        },
+        signature,
+    })
+}
+
 /// Handle a batch of opened deeplink URLs (the `on_open_url` payload). Pulls the window forward
 /// immediately (GitButler's show/focus on open), then triggers each URL on its OWN task so a
 /// long-running review for `urls[0]` never blocks triggering `urls[1]` (multiple URLs in one
@@ -156,6 +282,141 @@ pub(crate) fn handle_review_deeplink<R: Runtime>(app: AppHandle<R>, urls: Vec<Ur
 
 /// Trigger one deeplink URL through the funnel, then await its terminal completion and notify.
 async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
+    match url.host_str() {
+        Some(ACTION_REVIEW) => handle_review_one(app, url).await,
+        Some(ACTION_NOTIFY) => handle_notify_one(app, url).await,
+        _ => {
+            eprintln!(
+                "deeplink 拒绝（scheme={} action={:?}）: unsupported action",
+                url.scheme(),
+                url.host_str()
+            );
+            notify_failure(
+                &app,
+                "prmonitor deeplink 无效",
+                RedactedNotificationBody::fixed("链接格式或参数无效，未触发操作"),
+            )
+            .await;
+        }
+    }
+}
+
+async fn handle_notify_one<R: Runtime>(app: AppHandle<R>, url: Url) {
+    let parsed = match parse_notify_deeplink(&url) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!(
+                "deeplink notify 拒绝（scheme={} action={:?}）: {}",
+                url.scheme(),
+                url.host_str(),
+                e.message
+            );
+            notify_failure(
+                &app,
+                "prmonitor notification 未入队",
+                RedactedNotificationBody::fixed("通知链接格式或参数无效，未入队通知"),
+            )
+            .await;
+            return;
+        }
+    };
+    if let Err(e) = verify_notify_deeplink_signature(&app, &parsed.request, &parsed.signature) {
+        eprintln!("deeplink notify 鉴权失败: {}", e.message);
+        notify_failure(
+            &app,
+            "prmonitor notification 未入队",
+            RedactedNotificationBody::fixed("通知链接未授权，未入队通知"),
+        )
+        .await;
+        return;
+    }
+    let dedupe_prefix = notify_deeplink_dedupe_prefix(&parsed.request);
+    if notify_deeplink_key_seen(&dedupe_prefix) {
+        eprintln!("deeplink notify 重复打开，已忽略");
+        return;
+    }
+    let state = app.state::<AppState>();
+    match state
+        .notification_sender
+        .send(parsed.request, Some(dedupe_prefix.clone()))
+    {
+        Ok(_) => {
+            remember_notify_deeplink_key(&dedupe_prefix);
+        }
+        Err(e) => {
+            eprintln!("deeplink notify 入队失败: {}", e.message);
+            notify_failure(
+                &app,
+                "prmonitor notification 未入队",
+                RedactedNotificationBody::fixed("通知参数无效或渠道不可用，未入队通知"),
+            )
+            .await;
+        }
+    }
+}
+
+fn notify_deeplink_mac(request: &SendNotificationRequest, secret: &str) -> AppResult<HmacSha256> {
+    let secret = secret.trim();
+    if secret.is_empty() {
+        return Err(AppError::new("deeplink notify 签名密钥为空".to_string()));
+    }
+    let bytes = serde_json::to_vec(request)
+        .map_err(|e| AppError::new(format!("deeplink notify 签名载荷序列化失败：{e}")))?;
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        .map_err(|_| AppError::new("deeplink notify 签名密钥无效".to_string()))?;
+    mac.update(&bytes);
+    Ok(mac)
+}
+
+#[cfg(test)]
+fn notify_deeplink_signature(request: &SendNotificationRequest, secret: &str) -> AppResult<String> {
+    Ok(hex::encode(
+        notify_deeplink_mac(request, secret)?
+            .finalize()
+            .into_bytes(),
+    ))
+}
+
+fn verify_notify_deeplink_signature<R: Runtime>(
+    app: &AppHandle<R>,
+    request: &SendNotificationRequest,
+    supplied: &str,
+) -> AppResult<()> {
+    let configured = config_service::load(app)?.local_api_token;
+    let configured = configured.trim();
+    let supplied =
+        hex::decode(supplied).map_err(|_| AppError::new("deeplink notify sig 非法".to_string()))?;
+    let mac = notify_deeplink_mac(request, configured)?;
+    mac.verify_slice(&supplied)
+        .map_err(|_| AppError::new("deeplink notify sig 无效".to_string()))
+}
+
+fn notify_deeplink_dedupe_prefix(request: &SendNotificationRequest) -> String {
+    let bytes = serde_json::to_vec(request).unwrap_or_default();
+    let digest = Sha256::digest(bytes);
+    format!("deeplink-notify:{}", hex::encode(digest))
+}
+
+fn remember_notify_deeplink_key(key: &str) -> bool {
+    let seen = SEEN_NOTIFY_DEEPLINK_KEYS.get_or_init(|| StdMutex::new(VecDeque::new()));
+    let mut seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+    if seen.iter().any(|existing| existing == key) {
+        return false;
+    }
+    if seen.len() >= NOTIFY_DEEPLINK_DEDUPE_CAP {
+        seen.pop_front();
+    }
+    seen.push_back(key.to_string());
+    true
+}
+
+fn notify_deeplink_key_seen(key: &str) -> bool {
+    let seen = SEEN_NOTIFY_DEEPLINK_KEYS.get_or_init(|| StdMutex::new(VecDeque::new()));
+    let seen = seen.lock().unwrap_or_else(|p| p.into_inner());
+    seen.iter().any(|existing| existing == key)
+}
+
+async fn handle_review_one<R: Runtime>(app: AppHandle<R>, url: Url) {
     let trigger = match parse_review_deeplink(&url) {
         Ok(t) => t,
         // Malformed / forged URL: reject — no trigger, no panic (acceptance ③). Fire-and-forget
@@ -337,10 +598,45 @@ fn focus_main_window<R: Runtime>(app: &AppHandle<R>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn parse(s: &str) -> AppResult<ParsedTrigger> {
         let url = Url::parse(s).unwrap_or_else(|e| panic!("test url {s:?} is malformed: {e}"));
         parse_review_deeplink(&url)
+    }
+
+    fn parse_notify(s: &str) -> AppResult<ParsedNotify> {
+        let url = Url::parse(s).unwrap_or_else(|e| panic!("test url {s:?} is malformed: {e}"));
+        parse_notify_deeplink(&url)
+    }
+
+    fn notify_request(title: &str) -> SendNotificationRequest {
+        SendNotificationRequest {
+            level: Some(NotificationLevel::Warning),
+            title: title.to_string(),
+            body: Some("Build 42".to_string()),
+            url: Some("https://example.com/build/42".to_string()),
+            project_id: Some("p1".to_string()),
+            channel_ids: vec!["desktop".to_string(), "slack-main".to_string()],
+        }
+    }
+
+    fn signed_notify_url(request: &SendNotificationRequest, secret: &str) -> Url {
+        let sig = notify_deeplink_signature(request, secret).expect("sign notify deeplink");
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query
+            .append_pair("title", &request.title)
+            .append_pair("body", request.body.as_deref().unwrap_or_default())
+            .append_pair("url", request.url.as_deref().unwrap_or_default())
+            .append_pair(
+                "projectId",
+                request.project_id.as_deref().unwrap_or_default(),
+            )
+            .append_pair("level", "warning")
+            .append_pair("channelIds", &request.channel_ids.join(","))
+            .append_pair("sig", &sig);
+        Url::parse(&format!("prmonitor://notify?{}", query.finish())).expect("signed notify url")
     }
 
     #[test]
@@ -443,6 +739,99 @@ mod tests {
         let p = parse("prmonitor://review?pr=7&projectId=proj-123").expect("ok");
         assert_eq!(p.reference, "proj-123");
         assert_eq!(p.pr_number, 7);
+    }
+
+    #[test]
+    fn parses_notify_deeplink() {
+        let request = notify_request("Deploy done");
+        let sig = notify_deeplink_signature(&request, "secret-token").expect("sign");
+        let p = parse_notify(&format!(
+            "prmonitor://notify?title=%20Deploy%20done%20&body=Build%2042&url=https://example.com/build/42&projectId=p1&level=warning&channelIds=desktop,slack-main&sig={sig}",
+        ))
+        .expect("ok");
+        assert_eq!(p.request.title, "Deploy done");
+        assert_eq!(p.request.body.as_deref(), Some("Build 42"));
+        assert_eq!(
+            p.request.url.as_deref(),
+            Some("https://example.com/build/42")
+        );
+        assert_eq!(p.request.project_id.as_deref(), Some("p1"));
+        assert_eq!(p.request.level, Some(NotificationLevel::Warning));
+        assert_eq!(p.request.channel_ids, vec!["desktop", "slack-main"]);
+        assert_eq!(p.signature, sig);
+    }
+
+    #[test]
+    fn notify_deeplink_rejects_duplicate_keys_invalid_level_and_empty_title() {
+        assert!(parse_notify("prmonitor://notify?title=a&title=b&body=x&sig=t").is_err());
+        assert!(parse_notify("prmonitor://notify?title=a&body=x&sig=t&sig=u").is_err());
+        assert!(parse_notify("prmonitor://notify?title=a&body=x&level=critical&sig=t").is_err());
+        assert!(parse_notify("prmonitor://notify?title=%20%20&body=x&sig=t").is_err());
+        assert!(parse_notify("prmonitor://notify?title=a&sig=t").is_err());
+        assert!(parse_notify("prmonitor://notify?title=a&body=x").is_err());
+        assert!(parse_notify("prmonitor://notify?title=a&body=x&token=t").is_err());
+        assert!(parse_notify("prmonitor://review?title=a&body=x").is_err());
+    }
+
+    #[test]
+    fn notify_deeplink_dedupe_key_is_one_shot() {
+        let key = format!(
+            "test-notify-dedupe:{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        );
+        assert!(remember_notify_deeplink_key(&key));
+        assert!(!remember_notify_deeplink_key(&key));
+    }
+
+    #[tokio::test]
+    async fn failed_notify_deeplink_enqueue_does_not_mark_seen() {
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_notification::init())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build mock app");
+        let db = crate::db::Database::open_in_memory().expect("open db");
+        let secret = "secret-token-0123456789";
+        let config_json = serde_json::json!({
+            "projects": [],
+            "activeProjectId": "",
+            "localApiToken": secret,
+        })
+        .to_string();
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO config_blob (id, json) VALUES (1, ?1)",
+                [config_json],
+            )?;
+            Ok(())
+        })
+        .expect("seed config");
+        app.manage(db);
+        let state = AppState::default();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        state.notification_sender.set_sink(Arc::new({
+            let attempts = attempts.clone();
+            move |_, _| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(AppError::new("db down"))
+            }
+        }));
+        app.manage(state);
+        let request = notify_request(&format!(
+            "Deploy done {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let url = signed_notify_url(&request, secret);
+
+        handle_notify_one(app.handle().clone(), url.clone()).await;
+        handle_notify_one(app.handle().clone(), url).await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[test]
