@@ -30,6 +30,7 @@ pub mod outbox;
 pub mod pr;
 pub mod remote;
 pub mod review;
+pub mod rule;
 pub mod state;
 pub mod stream;
 pub mod terminal;
@@ -42,9 +43,10 @@ mod typegen;
 
 use std::sync::Arc;
 
-use model::Candidate;
+use model::{Candidate, Event};
+use pr::source::DiscoveredEvent;
 use state::AppState;
-use tauri::Manager;
+use tauri::{Manager, Runtime};
 
 enum NotificationActionPayload {
     Delivery(model::NotificationDeliveryPayload),
@@ -183,8 +185,7 @@ fn build_app() {
                                     "重放/再投递时 WebhookEvent 反序列化失败：{e}"
                                 ))
                             })?;
-                        pr::commands::ingest_webhook(&app, &dispatcher, ev).await;
-                        Ok(())
+                        pr::commands::ingest_webhook(&app, &dispatcher, ev).await
                     })
                 }
             });
@@ -208,21 +209,22 @@ fn build_app() {
                     })
                 }
             });
-            // The default-rule candidate replay hook (#1379): re-produce the stored candidate as
-            // the same review/check outbox action the live auto-dispatch producer creates.
-            let candidate_dispatch: inbox::CandidateDispatch = Arc::new(
-                move |app: tauri::AppHandle, project_id: String, candidate: Candidate| {
+            let rule_processor: inbox::RuleProcessor = Arc::new(
+                move |app: tauri::AppHandle,
+                      inbox_event_id: i64,
+                      event: Event,
+                      candidate: Option<Candidate>| {
                     Box::pin(async move {
-                        enqueue_candidate_action(&app, &project_id, &candidate).map(|_| ())
+                        process_rule_event(&app, inbox_event_id, event, candidate).map(|_| ())
                     })
                 },
             );
-            // Install the inbox replay hooks (AB#1065/#1379) so the `inbox_replay` command re-uses
-            // the SAME re-feed + Azure re-discovery + candidate action producer as live ingress.
+            // Install the inbox replay hooks (AB#1065/#1379) so `inbox_replay` re-uses the SAME
+            // re-feed + Azure re-discovery + rule processor as live ingress.
             state.inbox.set_hooks(
                 github_refeed.clone(),
                 azure_refresh.clone(),
-                candidate_dispatch,
+                rule_processor.clone(),
             );
             // The GitHub ingestor: normalize the `WebhookEvent` → neutral `model::Event` HERE (pr
             // owns `WebhookEvent`), then hand the inbox the neutral event + the verbatim body + the
@@ -231,9 +233,11 @@ fn build_app() {
             state.webhook.set_ingestor(Arc::new({
                 let app = app.handle().clone();
                 let github_refeed = github_refeed.clone();
+                let rule_processor = rule_processor.clone();
                 move |raw: String, guid: Option<String>, ev: pr::webhook::WebhookEvent| {
                     let app = app.clone();
                     let github_refeed = github_refeed.clone();
+                    let rule_processor = rule_processor.clone();
                     Box::pin(async move {
                         use tauri::Manager;
                         // Normalize at the seam (the composition root owns the pr↔inbox boundary):
@@ -253,7 +257,10 @@ fn build_app() {
                         inbox::service::ingest_github(
                             &app,
                             db.inner(),
-                            &github_refeed,
+                            inbox::service::GithubIngestHooks {
+                                github_refeed: &github_refeed,
+                                rule_processor: &rule_processor,
+                            },
                             event,
                             raw,
                             webhook_event_json,
@@ -267,9 +274,11 @@ fn build_app() {
             state.webhook.set_refresher(Arc::new({
                 let app = app.handle().clone();
                 let azure_refresh = azure_refresh.clone();
+                let rule_processor = rule_processor.clone();
                 move |raw, project_id, repo| {
                     let app = app.clone();
                     let azure_refresh = azure_refresh.clone();
+                    let rule_processor = rule_processor.clone();
                     Box::pin(async move {
                         use tauri::Manager;
                         let db = app.state::<db::Database>();
@@ -278,6 +287,7 @@ fn build_app() {
                             &app,
                             db.inner(),
                             &azure_refresh,
+                            &rule_processor,
                             raw,
                             project_id,
                             repo,
@@ -548,6 +558,7 @@ fn build_app() {
             outbox::commands::outbox_list,
             outbox::commands::outbox_get_raw,
             outbox::commands::outbox_retry,
+            rule::commands::rule_matches_for_inbox,
             review::commands::get_codex_status,
             review::commands::get_claude_status,
             review::commands::start_codex,
@@ -784,9 +795,9 @@ async fn run_stop_action(
 async fn run_auto_dispatch<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     project_id: String,
-    candidates: Vec<Candidate>,
+    events: Vec<DiscoveredEvent>,
 ) {
-    if candidates.is_empty() {
+    if events.is_empty() {
         return;
     }
 
@@ -808,32 +819,124 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
         eprintln!("auto-dispatch 跳过本轮（{project_id}）：codex app-server 已停止");
         return;
     }
-    // The review slice owns "what counts as active"; the pr slice owns the ledger.
-    // Both are scoped to this project (#35) so a PR number active in one project does
-    // not gate the same number in another, and dedup writes land in the right partition.
-    let active = state.sessions.active_pairs(&project_id);
-    let report = |msg: String| emit_dispatch_error(&app, &project_id, msg);
-    let enqueue = |_: &Candidate,
-                   kind: model::ActionKind,
-                   summary: &str,
-                   payload: &str,
-                   dedupe_key: &str| {
-        let inbox_id =
-            persist_auto_dispatch_inbox(&app, &project_id, &project, payload, dedupe_key)?;
-        let db = app.state::<db::Database>();
-        if let Some(id) = inbox_id {
-            inbox::service::emit_for_id(&app, db.inner(), &project_id, id);
+    let db = app.state::<db::Database>();
+    for mut discovered in events {
+        discovered.event.project_id = project_id.clone();
+        discovered.event.received_at_epoch = inbox::store::now_epoch();
+        if discovered.event.repo.is_empty() {
+            discovered.event.repo = project.repo.clone();
         }
-        let result =
-            outbox::service::enqueue_deduped(&app, &project_id, kind, summary, payload, dedupe_key);
-        if let Some(id) = inbox_id {
-            let terminal = result.as_ref().map(|_| ()).map_err(|e| e.clone());
-            inbox::service::record_terminal(db.inner(), id, &terminal)?;
-            inbox::service::emit_for_id(&app, db.inner(), &project_id, id);
+        let inserted = match inbox::store::insert_dedup(
+            db.inner(),
+            &discovered.event,
+            "rule-engine-discovery",
+            None,
+            Some(&discovered.candidate),
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                emit_dispatch_error(
+                    &app,
+                    &project_id,
+                    format!("规则引擎 inbox 持久化失败：{}", e.message),
+                );
+                continue;
+            }
+        };
+        let Some(inbox_id) = inserted else {
+            continue;
+        };
+        inbox::service::emit_for_id(&app, db.inner(), &project_id, inbox_id);
+        let result = process_rule_event(
+            &app,
+            inbox_id,
+            discovered.event.clone(),
+            Some(discovered.candidate.clone()),
+        );
+        if let Err(e) = inbox::service::record_terminal(db.inner(), inbox_id, &result) {
+            eprintln!(
+                "rule-engine: 记录 inbox 终态失败（id={inbox_id}）：{}",
+                e.message
+            );
         }
-        result
-    };
-    dispatch::auto_dispatch(candidates, &active, &enqueue, &report);
+        if let Err(e) = result {
+            emit_dispatch_error(&app, &project_id, format!("规则执行失败：{}", e.message));
+        }
+        inbox::service::emit_for_id(&app, db.inner(), &project_id, inbox_id);
+    }
+}
+
+fn process_rule_event<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    inbox_event_id: i64,
+    event: Event,
+    candidate: Option<Candidate>,
+) -> error::AppResult<()> {
+    let cfg = config::service::load(app)?;
+    let plans = rule::service::plan_event(&cfg.rules, &event, candidate.as_ref());
+    if plans.is_empty() {
+        return Ok(());
+    }
+
+    let db = app.state::<db::Database>();
+    let mut announced_action_ids = Vec::new();
+    let mut blocking_errors = Vec::new();
+    for plan in plans {
+        let now = rule::store::now_epoch();
+        let (action_ids, plan_blocking_errors) = db.inner().with_tx(|tx| {
+            let mut action_ids = Vec::new();
+            let mut errors = plan.errors.clone();
+            let mut blocking = plan.errors.clone();
+            for action in &plan.actions {
+                match outbox::store::enqueue_deduped_in_tx(
+                    tx,
+                    &plan.project_id,
+                    action.kind,
+                    &action.summary,
+                    &action.payload,
+                    &action.dedupe_key,
+                    now,
+                ) {
+                    Ok(id) => action_ids.push(id),
+                    Err(e) => {
+                        errors.push(e.message.clone());
+                        blocking.push(e.message);
+                    }
+                }
+            }
+            let error = (!errors.is_empty()).then(|| errors.join("; "));
+            rule::store::insert_match_in_tx(
+                tx,
+                rule::store::NewRuleMatch {
+                    rule_id: &plan.rule_id,
+                    rule_name: &plan.rule_name,
+                    inbox_event_id,
+                    project_id: &plan.project_id,
+                    action_ids: &action_ids,
+                    error: error.as_deref(),
+                    now,
+                },
+            )?;
+            Ok((action_ids, blocking))
+        })?;
+        announced_action_ids.extend(action_ids);
+        blocking_errors.extend(plan_blocking_errors);
+    }
+
+    for id in &announced_action_ids {
+        outbox::service::announce_updated(app, db.inner(), *id);
+    }
+    if !announced_action_ids.is_empty() {
+        app.state::<AppState>().outbox.wake();
+    }
+    if blocking_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(error::AppError::new(format!(
+            "规则动作入队失败：{}",
+            blocking_errors.join("; ")
+        )))
+    }
 }
 
 fn should_skip_auto_dispatch_for_stopped_codex(
@@ -841,49 +944,6 @@ fn should_skip_auto_dispatch_for_stopped_codex(
     codex_stopped: bool,
 ) -> bool {
     engine_kind == model::EngineKind::Codex && codex_stopped
-}
-
-fn enqueue_candidate_action<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    project_id: &str,
-    candidate: &Candidate,
-) -> error::AppResult<i64> {
-    let kind = dispatch::action_kind_for_candidate(candidate)?;
-    let payload = serde_json::to_string(&model::ReviewActionPayload {
-        candidate: candidate.clone(),
-    })
-    .map_err(|e| error::AppError::new(format!("auto-dispatch action 序列化失败：{e}")))?;
-    let summary = dispatch::review_action_summary(candidate);
-    let dedupe_key = dispatch::review_action_dedupe_key(candidate);
-    outbox::service::enqueue_deduped(app, project_id, kind, &summary, &payload, &dedupe_key)
-}
-
-fn persist_auto_dispatch_inbox<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    project_id: &str,
-    project: &config::service::Project,
-    payload: &str,
-    dedupe_key: &str,
-) -> error::AppResult<Option<i64>> {
-    let action: model::ReviewActionPayload = serde_json::from_str(payload)
-        .map_err(|e| error::AppError::new(format!("auto-dispatch action 反序列化失败：{e}")))?;
-    let candidate = action.candidate;
-    let now = inbox::store::now_epoch();
-    let event = model::Event {
-        dedupe_key: format!("auto-dispatch:{project_id}:{dedupe_key}"),
-        source: project.source_kind,
-        event_type: model::EventType::PullRequest,
-        project_id: project_id.to_string(),
-        repo: project.repo.clone(),
-        number: Some(candidate.number),
-        title: format!("PR #{} {}", candidate.number, candidate.kind),
-        body: String::new(),
-        labels: Vec::new(),
-        url: String::new(),
-        received_at_epoch: now,
-    };
-    let db = app.state::<db::Database>();
-    inbox::store::insert_dedup(db.inner(), &event, payload, None, Some(&candidate))
 }
 
 /// Emit a session-less [`events::ReviewEvent::DispatchError`] to the review area
@@ -923,6 +983,159 @@ mod tests {
             !should_skip_auto_dispatch_for_stopped_codex(model::EngineKind::Claude, true),
             "Claude has no resident codex stop flag"
         );
+    }
+
+    #[test]
+    fn process_rule_event_enqueues_actions_and_links_trace() {
+        let app = tauri::test::mock_app();
+        let db = Database::open_in_memory().expect("open db");
+        let config = config::model::AppConfig {
+            projects: vec![config::model::Project {
+                id: "p1".to_string(),
+                repo: "owner/repo".to_string(),
+                enabled: false,
+                ..config::model::Project::default()
+            }],
+            active_project_id: "p1".to_string(),
+            rules: vec![config::model::RuleConfig {
+                id: "r1".to_string(),
+                name: "Ready".to_string(),
+                enabled: true,
+                event_type: Some(model::EventType::PullRequest),
+                project_id: "p1".to_string(),
+                labels_any: vec!["ready".to_string()],
+                actions: vec![
+                    config::model::RuleActionKind::Review,
+                    config::model::RuleActionKind::Check,
+                    config::model::RuleActionKind::Notify,
+                ],
+                ..config::model::RuleConfig::default()
+            }],
+            ..config::model::AppConfig::default()
+        };
+        let config_json = serde_json::to_string(&config).expect("config serializes");
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO config_blob (id, json) VALUES (1, ?1)",
+                [config_json],
+            )?;
+            Ok(())
+        })
+        .expect("seed config");
+        let event = model::Event {
+            dedupe_key: "delivery-1".to_string(),
+            source: model::SourceKind::Github,
+            event_type: model::EventType::PullRequest,
+            project_id: "p1".to_string(),
+            repo: "owner/repo".to_string(),
+            number: Some(7),
+            title: "Ready to ship".to_string(),
+            body: String::new(),
+            labels: vec!["ready".to_string()],
+            url: "https://example.com/pull/7".to_string(),
+            received_at_epoch: 10,
+        };
+        let inbox_id = inbox::store::insert_dedup(&db, &event, "raw", None, None)
+            .expect("insert inbox")
+            .expect("new inbox");
+        app.manage(db);
+        app.manage(AppState::default());
+        let candidate = Candidate {
+            number: 7,
+            head_sha: "sha".to_string(),
+            head_ref: "feature/rules".to_string(),
+            author: "octocat".to_string(),
+            is_cross_repository: false,
+            is_draft: false,
+            kind: "review".to_string(),
+        };
+
+        process_rule_event(app.handle(), inbox_id, event, Some(candidate)).expect("process rules");
+
+        let db = app.state::<Database>();
+        let kinds: Vec<String> = db
+            .inner()
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare("SELECT kind FROM action_outbox ORDER BY id")?;
+                let rows = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .expect("read outbox");
+        assert_eq!(kinds, vec!["review", "check", "notification"]);
+
+        let trace = rule::store::list_by_inbox(db.inner(), inbox_id).expect("trace");
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].rule_id, "r1");
+        assert_eq!(trace[0].action_count, 3);
+        assert_eq!(trace[0].action_outbox_ids.len(), 3);
+        assert_eq!(trace[0].error, None);
+    }
+
+    #[test]
+    fn process_rule_event_plan_errors_fail_inbox_lifecycle() {
+        let app = tauri::test::mock_app();
+        let db = Database::open_in_memory().expect("open db");
+        let config = config::model::AppConfig {
+            projects: vec![config::model::Project {
+                id: "p1".to_string(),
+                repo: "owner/repo".to_string(),
+                enabled: false,
+                ..config::model::Project::default()
+            }],
+            active_project_id: "p1".to_string(),
+            rules: vec![config::model::RuleConfig {
+                id: "r1".to_string(),
+                name: "Needs candidate".to_string(),
+                enabled: true,
+                event_type: Some(model::EventType::PullRequest),
+                project_id: "p1".to_string(),
+                labels_any: vec!["ready".to_string()],
+                actions: vec![config::model::RuleActionKind::Review],
+                ..config::model::RuleConfig::default()
+            }],
+            ..config::model::AppConfig::default()
+        };
+        let config_json = serde_json::to_string(&config).expect("config serializes");
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO config_blob (id, json) VALUES (1, ?1)",
+                [config_json],
+            )?;
+            Ok(())
+        })
+        .expect("seed config");
+        let event = model::Event {
+            dedupe_key: "delivery-1".to_string(),
+            source: model::SourceKind::Github,
+            event_type: model::EventType::PullRequest,
+            project_id: "p1".to_string(),
+            repo: "owner/repo".to_string(),
+            number: Some(7),
+            title: "Ready to ship".to_string(),
+            body: String::new(),
+            labels: vec!["ready".to_string()],
+            url: "https://example.com/pull/7".to_string(),
+            received_at_epoch: 10,
+        };
+        let inbox_id = inbox::store::insert_dedup(&db, &event, "raw", None, None)
+            .expect("insert inbox")
+            .expect("new inbox");
+        app.manage(db);
+        app.manage(AppState::default());
+
+        let err = process_rule_event(app.handle(), inbox_id, event, None).unwrap_err();
+
+        assert!(err.message.contains("需要 PR candidate"), "{}", err.message);
+        let db = app.state::<Database>();
+        let trace = rule::store::list_by_inbox(db.inner(), inbox_id).expect("trace");
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].action_count, 0);
+        assert!(trace[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("需要 PR candidate")));
     }
 
     #[test]

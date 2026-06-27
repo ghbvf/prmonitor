@@ -9,7 +9,7 @@
 //! status/kind ↔ column-string mapping (a new variant is a compile error here, like
 //! `inbox::store::status_as_wire`).
 
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, Transaction};
 
 use crate::db::{map_err, Database};
 use crate::error::AppResult;
@@ -147,6 +147,29 @@ pub fn enqueue_deduped(
     )
 }
 
+/// Transaction-scoped variant used by composition-root producers that must create a related
+/// trace row in the SAME commit as the outbox action. It intentionally does not emit or wake the
+/// worker; callers do that after the outer transaction commits.
+pub(crate) fn enqueue_deduped_in_tx(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    kind: ActionKind,
+    summary: &str,
+    payload: &str,
+    dedupe_key: &str,
+    now: u64,
+) -> AppResult<i64> {
+    enqueue_inner_tx(
+        tx,
+        project_id,
+        kind,
+        summary,
+        payload,
+        Some(dedupe_key),
+        now,
+    )
+}
+
 fn enqueue_inner(
     db: &Database,
     project_id: &str,
@@ -156,47 +179,57 @@ fn enqueue_inner(
     dedupe_key: Option<&str>,
     now: u64,
 ) -> AppResult<i64> {
-    db.with_tx(|tx| {
-        tx.execute(
-            "INSERT OR IGNORE INTO action_outbox \
-             (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, \
-              last_error, created_at, updated_at, dedupe_key) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, ?6, ?6, ?7)",
-            rusqlite::params![
-                project_id,
-                kind_as_wire(kind),
-                summary,
-                payload,
-                status_as_wire(ActionStatus::Pending),
-                now as i64,
-                dedupe_key,
-            ],
+    db.with_tx(|tx| enqueue_inner_tx(tx, project_id, kind, summary, payload, dedupe_key, now))
+}
+
+fn enqueue_inner_tx(
+    tx: &Transaction<'_>,
+    project_id: &str,
+    kind: ActionKind,
+    summary: &str,
+    payload: &str,
+    dedupe_key: Option<&str>,
+    now: u64,
+) -> AppResult<i64> {
+    tx.execute(
+        "INSERT OR IGNORE INTO action_outbox \
+         (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, \
+          last_error, created_at, updated_at, dedupe_key) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, ?6, ?6, ?7)",
+        rusqlite::params![
+            project_id,
+            kind_as_wire(kind),
+            summary,
+            payload,
+            status_as_wire(ActionStatus::Pending),
+            now as i64,
+            dedupe_key,
+        ],
+    )
+    .map_err(map_err)?;
+    let id = if tx.changes() == 1 {
+        tx.last_insert_rowid()
+    } else {
+        tx.query_row(
+            "SELECT id FROM action_outbox \
+             WHERE project_id = ?1 AND dedupe_key = ?2 AND status = 'pending' \
+             ORDER BY id LIMIT 1",
+            rusqlite::params![project_id, dedupe_key],
+            |r| r.get::<_, i64>(0),
         )
-        .map_err(map_err)?;
-        let id = if tx.changes() == 1 {
-            tx.last_insert_rowid()
-        } else {
-            tx.query_row(
-                "SELECT id FROM action_outbox \
-                 WHERE project_id = ?1 AND dedupe_key = ?2 AND status = 'pending' \
-                 ORDER BY id LIMIT 1",
-                rusqlite::params![project_id, dedupe_key],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(map_err)?
-        };
-        // Cap stored history: drop the oldest TERMINAL rows beyond MAX_OUTBOX_TERMINAL (never a
-        // `pending` row — that is an un-run action). The `LIMIT -1 OFFSET ?` no-ops cheaply when
-        // under the cap.
-        tx.execute(
-            "DELETE FROM action_outbox WHERE id IN ( \
-                 SELECT id FROM action_outbox WHERE status IN ('done', 'dead') \
-                 ORDER BY id DESC LIMIT -1 OFFSET ?1)",
-            rusqlite::params![MAX_OUTBOX_TERMINAL],
-        )
-        .map_err(map_err)?;
-        Ok(id)
-    })
+        .map_err(map_err)?
+    };
+    // Cap stored history: drop the oldest TERMINAL rows beyond MAX_OUTBOX_TERMINAL (never a
+    // `pending` row — that is an un-run action). The `LIMIT -1 OFFSET ?` no-ops cheaply when
+    // under the cap.
+    tx.execute(
+        "DELETE FROM action_outbox WHERE id IN ( \
+             SELECT id FROM action_outbox WHERE status IN ('done', 'dead') \
+             ORDER BY id DESC LIMIT -1 OFFSET ?1)",
+        rusqlite::params![MAX_OUTBOX_TERMINAL],
+    )
+    .map_err(map_err)?;
+    Ok(id)
 }
 
 /// Claim the due actions (AB#1066): `pending` rows whose `next_attempt_at <= now`, OLDEST FIRST

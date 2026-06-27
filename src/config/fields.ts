@@ -149,12 +149,6 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         hint: "默认 Webhook；选 pull/hybrid 才启动 CLI 定时拉取（可能触发账号风控）",
       },
       {
-        key: "autoReview",
-        label: "自动 review",
-        kind: "checkbox",
-        hint: "勾选=发现 dispatchable PR 自动起 review；取消=仅手动「开始 review」触发",
-      },
-      {
         key: "pollIntervalSecs",
         label: "轮询间隔（秒）",
         kind: "number",
@@ -182,8 +176,6 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         optionLabels: { native: "PR 原生标签", title: "从标题解析 [..]" },
         hint: "native=用 PR 提供方自带标签；title=从标题方括号解析（如 [pr-status/need-fix]）。Bitbucket 源无原生标签，必须选「从标题解析」",
       },
-      { key: "reviewLabel", label: "Review 触发标签", kind: "text", hint: "命中即触发 review" },
-      { key: "checkLabel", label: "Check 触发标签", kind: "text", hint: "命中即触发 check 修复" },
     ],
   },
   {
@@ -531,16 +523,15 @@ export const TUNNEL_GROUPS: FieldGroup<TunnelFieldKey>[] = [
 // gated before the user picked the source, a valid Bitbucket/Azure bare slug would be
 // checked against the default github `owner/name` rule and the user could never advance.
 // Picking the source first means the repo step always validates against the right shape.
-export type StepId = "repo" | "repoRoot" | "skill" | "source" | "autoReview" | "done";
-export const STEPS: StepId[] = ["source", "repo", "repoRoot", "skill", "autoReview", "done"];
+export type StepId = "repo" | "repoRoot" | "skill" | "source" | "update" | "done";
+export const STEPS: StepId[] = ["source", "repo", "repoRoot", "skill", "update", "done"];
 
 // Which per-project fields each onboarding step renders (818 F2/F3; 717). Single-sourced
 // here (not in OnboardingWizard.vue) so the wizard and these unit tests agree. Keys are
 // `keyof Project`; the FieldDefs come from PROJECT_GROUPS. `source` lists the azure +
 // bitbucket connection fields too — they only render under their matching source via the
-// FieldDef `visibleWhen` predicate (see visibleStepFields). `autoReview` surfaces
-// `updateMode` (so the user picks the data-update mode during onboarding instead of
-// silently defaulting, F3) and `labelSource` (717, alongside the trigger labels).
+// FieldDef `visibleWhen` predicate (see visibleStepFields). `update` surfaces
+// update cadence and label-source controls; action triggering is configured in rules.
 export const STEP_FIELDS: Record<StepId, ProjectFieldKey[]> = {
   repo: ["repo"],
   repoRoot: ["repoRoot"],
@@ -556,14 +547,11 @@ export const STEP_FIELDS: Record<StepId, ProjectFieldKey[]> = {
     "bitbucketProject",
     "bitbucketToken",
   ],
-  autoReview: [
+  update: [
     "updateMode",
-    "autoReview",
     "pollIntervalSecs",
     "prCooldownSeconds",
     "labelSource",
-    "reviewLabel",
-    "checkLabel",
     "authors",
   ],
   done: [],
@@ -661,7 +649,7 @@ export function validateStep(step: StepId, draft: Project): string | null {
           return "bitbucketToken 不能为空（bitbucket 源需填 access token）";
       }
       return null;
-    case "autoReview": {
+    case "update": {
       // `Number.isFinite` rejects NaN (a blank number input yields NaN, and
       // `NaN <= 0` is false — without this guard NaN would pass the frontend gate
       // and then break the backend deserializer).
@@ -673,11 +661,6 @@ export function validateStep(step: StepId, draft: Project): string | null {
         cooldown <= 0
       ) {
         return "轮询间隔与冷却必须大于 0";
-      }
-      // Labels feed `gh pr list --label`; a blank one matches nothing. Early
-      // feedback here mirrors the backend validate() boundary (the source of truth).
-      if (draft.reviewLabel.trim() === "" || draft.checkLabel.trim() === "") {
-        return "Review 与 Check 触发标签不能为空";
       }
       // Bitbucket source (717): the backend `validate_project` enforces two extra
       // constraints, surfaced in this step (labelSource lives in the labels group;
@@ -738,9 +721,9 @@ export function validateStep(step: StepId, draft: Project): string | null {
 // Bitbucket fields (`bitbucketHost` / `bitbucketProject` / `bitbucketToken`, 717): same
 // story — owned by the source step (visibleWhen sourceKind==="bitbucket", gated by
 // validateStep) so backend rejections route to source. `labelSource` and `updateMode`
-// (717) route to the autoReview step: labelSource sits beside its labels-group siblings
+// (717) route to the update step: labelSource sits beside its labels-group siblings
 // (reviewLabel/checkLabel), and updateMode sits in the polling group — both surfaced in
-// the autoReview step, where the backend's Bitbucket-only constraints (labelSource must be
+// the update step, where the backend's Bitbucket-only constraints (labelSource must be
 // "title"; updateMode may not be webhook-only/hybrid) are also pre-gated by validateStep.
 // Locked by fields.test.ts.
 export function errorToStep(message: string): StepId | null {
@@ -761,17 +744,14 @@ export function errorToStep(message: string): StepId | null {
   if (
     m.startsWith("pollIntervalSecs") ||
     m.startsWith("prCooldownSeconds") ||
-    m.startsWith("reviewLabel") ||
-    m.startsWith("checkLabel") ||
-    // labelSource (717) lives in the labels group, surfaced in the autoReview step
-    // alongside reviewLabel/checkLabel (see STEP_FIELDS).
+    // labelSource (717) lives in the labels group, surfaced in the update step.
     m.startsWith("labelSource") ||
-    // updateMode (717) lives in the polling group, surfaced in the autoReview step;
+    // updateMode (717) lives in the polling group, surfaced in the update step;
     // the backend rejects webhook-only/hybrid for a Bitbucket source (no inbound
     // webhook), so its rejection routes back here.
     m.startsWith("updateMode")
   ) {
-    return "autoReview";
+    return "update";
   }
   return null;
 }

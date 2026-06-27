@@ -23,8 +23,6 @@ pub const BOTH_TRIGGER_LABELS_REASON: &str = "both review and check trigger labe
 #[derive(Debug, Clone)]
 pub struct MonitorParams {
     pub repo: String,
-    pub review_label: String,
-    pub check_label: String,
     pub authors: Vec<String>,
     pub pr_cooldown_seconds: u64,
 }
@@ -99,17 +97,7 @@ pub fn live_gate_skip(
     if live_is_draft {
         return Some("draft PR".to_string());
     }
-    let (want, other) = if cand.kind == "review" {
-        (&params.review_label, &params.check_label)
-    } else {
-        (&params.check_label, &params.review_label)
-    };
-    if !live_labels.iter().any(|l| l == want) {
-        return Some(format!("trigger label {want:?} no longer present"));
-    }
-    if live_labels.iter().any(|l| l == other) {
-        return Some(BOTH_TRIGGER_LABELS_REASON.to_string());
-    }
+    let _ = (params, live_labels);
     None
 }
 
@@ -128,8 +116,6 @@ mod tests {
     fn params() -> MonitorParams {
         MonitorParams {
             repo: "o/r".to_string(),
-            review_label: "pr-status/needs-review-again".to_string(),
-            check_label: "pr-status/needs-check-fix".to_string(),
             authors: vec![],
             pr_cooldown_seconds: 1800,
         }
@@ -254,91 +240,19 @@ mod tests {
     #[test]
     fn live_gate_skip_head_moved() {
         let c = cand("review");
-        let labels = vec![params().review_label];
+        let labels = vec!["pr-status/needs-review-again".to_string()];
         let reason = live_gate_skip(&c, &params(), "999999999999zzz", false, &labels).unwrap();
         assert!(reason.starts_with("head moved"), "{reason}");
     }
 
     #[test]
-    fn live_gate_skip_draft_and_label_states() {
+    fn live_gate_skip_draft_only() {
         let c = cand("review");
         let p = params();
-        // draft now.
         assert_eq!(
-            live_gate_skip(
-                &c,
-                &p,
-                &c.head_sha,
-                true,
-                std::slice::from_ref(&p.review_label)
-            ),
+            live_gate_skip(&c, &p, &c.head_sha, true, &[]),
             Some("draft PR".to_string())
         );
-        // trigger label gone.
-        assert_eq!(
-            live_gate_skip(&c, &p, &c.head_sha, false, &["other".to_string()]),
-            Some(format!(
-                "trigger label {:?} no longer present",
-                p.review_label
-            ))
-        );
-        // both labels present.
-        assert_eq!(
-            live_gate_skip(
-                &c,
-                &p,
-                &c.head_sha,
-                false,
-                &[p.review_label.clone(), p.check_label.clone()]
-            ),
-            Some("both review and check trigger labels are present".to_string())
-        );
-        // clean live state → pass.
-        assert_eq!(
-            live_gate_skip(
-                &c,
-                &p,
-                &c.head_sha,
-                false,
-                std::slice::from_ref(&p.review_label)
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn live_gate_skip_check_kind_uses_check_label() {
-        let c = cand("check");
-        let p = params();
-        // check label present, review absent → pass.
-        assert_eq!(
-            live_gate_skip(
-                &c,
-                &p,
-                &c.head_sha,
-                false,
-                std::slice::from_ref(&p.check_label)
-            ),
-            None
-        );
-        // check label gone → skip (the `else` branch wires `want` to check_label).
-        assert_eq!(
-            live_gate_skip(&c, &p, &c.head_sha, false, &["other".to_string()]),
-            Some(format!(
-                "trigger label {:?} no longer present",
-                p.check_label
-            ))
-        );
-        // both labels present → conflict.
-        assert_eq!(
-            live_gate_skip(
-                &c,
-                &p,
-                &c.head_sha,
-                false,
-                &[p.check_label.clone(), p.review_label.clone()]
-            ),
-            Some(BOTH_TRIGGER_LABELS_REASON.to_string())
-        );
+        assert_eq!(live_gate_skip(&c, &p, &c.head_sha, false, &[]), None);
     }
 }

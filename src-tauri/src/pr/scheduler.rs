@@ -51,9 +51,9 @@ use tokio::time::MissedTickBehavior;
 use crate::config::service::{self as config_service, Project};
 use crate::error::AppResult;
 use crate::events::{PrEvent, PRS_UPDATED_EVENT};
-use crate::model::{Candidate, TrackedPrView, UpdateMode};
+use crate::model::{TrackedPrView, UpdateMode};
 
-use super::registry;
+use super::{registry, source::DiscoveredEvent};
 
 /// Internal poll-loop diagnostics (#62): timestamps + counters the panel reads to
 /// answer "is the loop alive, when did it last run, and what happened". Pure data with
@@ -140,8 +140,9 @@ pub struct PollStatus {
 /// scheduler's cycle closure and erased of the review slice's types — the `pr` slice
 /// stays review-agnostic (the only cross-slice contract it sees is `Candidate`). The
 /// real implementation lives in the composition root ([`crate::dispatch`]).
-pub type ProjectDispatcher =
-    Arc<dyn Fn(String, Vec<Candidate>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+pub type ProjectDispatcher = Arc<
+    dyn Fn(String, Vec<DiscoveredEvent>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
+>;
 
 /// Default poll period when config is unreadable or non-positive. Mirrors
 /// `AppConfig::default().poll_interval_secs`. A 0 period would make
@@ -489,8 +490,8 @@ impl SchedulerSet {
     /// (#818). The `Manual` mode's "立即拉取" path: `poll_now` calls this when no scheduler
     /// exists for the project (manual has no periodic loop). Drives the same per-cycle body
     /// the loop runs — [`discover_emit_dispatch`] — so a manual pull discovers, persists,
-    /// emits `prs:updated`, and (when autoReview is on) dispatches exactly like a periodic
-    /// cycle. Uses the set's shared dispatcher (the same one `reconcile` clones into each
+    /// emits `prs:updated`, and hands gated events to the rule-engine dispatcher exactly like a
+    /// periodic cycle. Uses the set's shared dispatcher (the same one `reconcile` clones into each
     /// scheduler).
     ///
     /// Records the cycle into the RETAINED per-project [`PollDiag`] sidecar (#818 F15) so
@@ -745,7 +746,7 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
     let _ = app.emit(PRS_UPDATED_EVENT, &event); // ignore emit error (window may be gone)
 
     if let Some(d) = dispatcher {
-        if !dispatchable.is_empty() && auto_review_enabled(app, project_id) {
+        if !dispatchable.is_empty() {
             // Spawn the dispatch DETACHED rather than awaiting it inline. This cycle
             // runs inside the loop's stop-cancellable `select!` (the F1 cancellation
             // domain that lets a stop reap the in-flight `gh` child). Awaiting
@@ -766,22 +767,6 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
             )));
         }
     }
-}
-
-/// 每轮重读 `project_id` 的自动 review 开关（运行时切换无需重启，#35 按项目）。
-/// 这是 pr→config 的**函数级跨切片读**（走 config 公有 service `project`，`AppConfig`
-/// 仍 config 私有；`auto_review` 现为 [`Project`] 字段）。load / 找不到项目 → 返回 false
-/// （不派发）：config 不可读或项目缺失时不擅自消耗 review 额度/算力，宁可漏触发也不误触发；
-/// 下一轮 load 成功即恢复。
-/// `pub(crate)`：webhook trigger（[`crate::pr::webhook`]）的派发闭包复用同一开关，
-/// 与本轮询调用点一致——两条 auto-trigger 路径共用同一 per-project autoReview gate。
-pub(crate) fn auto_review_enabled<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
-    project_id: &str,
-) -> bool {
-    config_service::project(app, project_id)
-        .map(|p| p.auto_review)
-        .unwrap_or(false)
 }
 
 /// Maps the locked persist seam's result to the cycle event (F2), scoped to
@@ -820,6 +805,7 @@ pub(crate) fn resolve_period(loaded: AppResult<u64>) -> u64 {
 mod tests {
     use super::*;
     use crate::error::AppError;
+    use crate::model::{Candidate, Event, EventType, SourceKind};
     use tokio::sync::mpsc;
 
     #[test]
@@ -950,7 +936,7 @@ mod tests {
             let count = Arc::clone(&count);
             let seen = Arc::clone(&seen);
             let seen_pid = Arc::clone(&seen_pid);
-            Arc::new(move |project_id: String, cands: Vec<Candidate>| {
+            Arc::new(move |project_id: String, cands: Vec<DiscoveredEvent>| {
                 let count = Arc::clone(&count);
                 let seen = Arc::clone(&seen);
                 let seen_pid = Arc::clone(&seen_pid);
@@ -1020,7 +1006,7 @@ mod tests {
         // inherit auto-dispatch.
         let set = SchedulerSet::default();
         let dispatcher: ProjectDispatcher =
-            Arc::new(|_pid: String, _cands: Vec<Candidate>| Box::pin(async {}));
+            Arc::new(|_pid: String, _cands: Vec<DiscoveredEvent>| Box::pin(async {}));
         set.set_dispatcher(dispatcher);
         assert!(set.dispatcher.lock().unwrap().is_some());
     }
@@ -1150,8 +1136,8 @@ mod tests {
         );
     }
 
-    fn candidate(number: u64, kind: &str) -> Candidate {
-        Candidate {
+    fn candidate(number: u64, kind: &str) -> DiscoveredEvent {
+        let candidate = Candidate {
             number,
             head_sha: "sha".to_string(),
             head_ref: "ref".to_string(),
@@ -1159,6 +1145,23 @@ mod tests {
             is_cross_repository: false,
             is_draft: false,
             kind: kind.to_string(),
+        };
+        DiscoveredEvent {
+            event: Event {
+                dedupe_key: format!("github:pullRequest:owner/repo#{number}@sha"),
+                source: SourceKind::Github,
+                event_type: EventType::PullRequest,
+                project_id: "p1".to_string(),
+                repo: "owner/repo".to_string(),
+                number: Some(number),
+                title: format!("PR {number}"),
+                body: String::new(),
+                labels: Vec::new(),
+                url: format!("https://github.com/owner/repo/pull/{number}"),
+                received_at_epoch: 0,
+            },
+            candidate,
+            conflict: false,
         }
     }
 

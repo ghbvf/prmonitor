@@ -12,10 +12,14 @@ use ts_rs::{Config, TS};
 use crate::{
     config::model::{
         AppConfig, Listener, ListenerAuthMode, ListenerKind, NotificationChannel,
-        NotificationSettings, OutboxConfig, Project, Tunnel,
+        NotificationSettings, OutboxConfig, Project, RuleActionKind, RuleConfig, Tunnel,
     },
-    model::{EngineKind, LabelSource, NotificationKind, SourceKind, UpdateMode, WebhookTunnelMode},
+    model::{
+        EngineKind, EventType, LabelSource, NotificationKind, SourceKind, UpdateMode,
+        WebhookTunnelMode,
+    },
     remote::status::{ListenerRuntimeStatus, ListenerState},
+    rule::store::RuleMatchEntry,
 };
 
 const HEADER: &str =
@@ -93,12 +97,17 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push_str(&declaration::<UpdateMode>(&cfg));
     shared.push_str(&option_array::<UpdateMode>("UPDATE_MODES"));
     shared.push('\n');
+    shared.push_str(&declaration::<EventType>(&cfg));
+    shared.push_str(&option_array::<EventType>("EVENT_TYPES"));
+    shared.push('\n');
     shared.push_str(&declaration::<NotificationKind>(&cfg));
     shared.push_str(&option_array::<NotificationKind>("NOTIFICATION_KINDS"));
+    shared.push('\n');
+    shared.push_str(&declaration::<RuleMatchEntry>(&cfg));
 
     let mut config_types = String::from(HEADER);
     config_types.push_str(
-        "import type { EngineKind, LabelSource, NotificationKind, SourceKind, UpdateMode } from \"../types.generated\";\n\n",
+        "import type { EngineKind, EventType, LabelSource, NotificationKind, SourceKind, UpdateMode } from \"../types.generated\";\n\n",
     );
     config_types.push_str(&declaration::<WebhookTunnelMode>(&cfg));
     config_types.push_str(&option_array::<WebhookTunnelMode>("WEBHOOK_TUNNEL_MODES"));
@@ -113,6 +122,11 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     config_types.push_str(&option_array::<ListenerAuthMode>("LISTENER_AUTH_MODES"));
     config_types.push('\n');
     config_types.push_str(&declaration::<OutboxConfig>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<RuleActionKind>(&cfg));
+    config_types.push_str(&option_array::<RuleActionKind>("RULE_ACTION_KINDS"));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<RuleConfig>(&cfg));
     config_types.push('\n');
     config_types.push_str(&declaration::<NotificationChannel>(&cfg));
     config_types.push('\n');

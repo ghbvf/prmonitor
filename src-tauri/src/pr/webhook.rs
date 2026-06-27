@@ -43,8 +43,8 @@
 //! (bare repo name) can never match a GitHub `owner/name` route and vice-versa.
 //!
 //! **Layering.** The axum handler is runtime-agnostic — it never names
-//! `AppHandle<R>`. The list upsert + `prs:updated` emit (#61) and the autoReview +
-//! static/cooldown gates (parity with the poll path) live in the [`WebhookIngestor`]
+//! `AppHandle<R>`. The list upsert + `prs:updated` emit (#61) and the static/cooldown
+//! gates (parity with the poll path) live in the [`WebhookIngestor`]
 //! closure the root installs via [`WebhookManager::set_ingestor`] (which holds the
 //! concrete app handle), exactly as [`super::scheduler::Scheduler`] does. The handler's
 //! only job is verify → parse → route → hand off (and record the early-exit delivery
@@ -92,8 +92,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// The webhook ingest hook the composition root installs. Called with one parsed, routed
 /// [`WebhookEvent`]; its body (the root's `ingest_webhook` wrapper in `commands.rs`)
-/// upserts the persisted PR list, emits `prs:updated`, and dispatches the gated candidate
-/// — keeping the axum handler runtime-agnostic (the closure holds the concrete
+/// upserts the persisted PR list, emits `prs:updated`, and returns the gated candidate for rule
+/// processing — keeping the axum handler runtime-agnostic (the closure holds the concrete
 /// `AppHandle<R>`, the handler never names it). Boxed-future + `Arc` so it is `Clone`able
 /// into the `WebhookCtx` the handler shares. Installed once as a closure and Arc-shared —
 /// the same lifecycle convention as [`super::scheduler::ProjectDispatcher`] (their
@@ -171,20 +171,20 @@ pub enum DeliveryStatus {
     Ignored,
     /// Verified but the event's repo matches no enabled project's route (fail-closed).
     WrongRepo,
-    /// Open PR carrying neither trigger label (label removed) — list updated, no dispatch.
+    /// Open PR carrying neither trigger label (label removed) — list updated, no rule action.
     NoTriggerLabel,
-    /// PR not open (closed/merged) — list updated to reflect it, never dispatched.
+    /// PR not open (closed/merged) — list updated to reflect it, never sent to rules.
     NotOpen,
     /// A single trigger label, but a gate (conflict / draft / fork / author / cooldown)
-    /// blocked dispatch — list updated, review NOT auto-started.
+    /// blocked rule processing — list updated, review NOT auto-started.
     Gated,
-    /// A clean candidate with autoReview ON — review auto-dispatched.
+    /// Historical terminal value for an older auto-dispatch path.
     Dispatched,
-    /// A clean candidate with autoReview OFF — list updated only (no dispatch by design).
+    /// A clean candidate entered the list; the rule engine decides follow-up actions.
     ListUpdated,
     /// An Azure DevOps PR Service Hook (created/updated) was received and triggered a
     /// re-discovery (AB#822). Azure hooks carry no labels and don't fire on label changes, so
-    /// the webhook is only a refresh signal — the actual list-update / dispatch outcome is
+    /// the webhook is only a refresh signal — the actual list-update / rule outcome is
     /// recorded by the poll path's `PollStatus` (via `discover_once`), not here.
     Refreshed,
 }
@@ -507,10 +507,6 @@ pub struct ProjectRoute {
     /// (config already rejects duplicate bare repo names, so repo is globally unique; this
     /// is the extra provider-scoped guard). Empty for GitHub projects.
     pub azure_project: String,
-    /// Label that classifies an event as a `review` turn (this project's).
-    pub review_label: String,
-    /// Label that classifies an event as a `check` turn (this project's).
-    pub check_label: String,
     /// Where this project's trigger labels come from (AB#717). The GitHub path
     /// ([`parse_delivery`]) resolves effective labels (native vs title-parsed) from the
     /// payload via this before classifying, so a `title`-source project classifies a
@@ -1421,42 +1417,7 @@ fn verify_azure_token(secret: &str, header: &str) -> bool {
     token.as_bytes().ct_eq(secret.as_bytes()).into()
 }
 
-/// Classify an OPEN GitHub PR's trigger labels into an [`IngestIntent`] for [`parse_delivery`]
-/// — the (review/check/both/neither) → intent mapping kept out of the main parser for clarity.
-/// `base` carries the candidate fields EXCEPT `kind`, which this stamps (`"review"`/`"check"`)
-/// for the single trigger-label cases; both labels → conflict Track (no candidate); neither →
-/// StatusOnly. (The Azure path doesn't classify from the payload — it re-discovers via `az`.)
-fn classify_intent(has_review: bool, has_check: bool, base: Candidate) -> IngestIntent {
-    match (has_review, has_check) {
-        // Both trigger labels → conflict: track as a skipped row, never dispatch (mirrors the
-        // poll path's discovery-stage conflict drop).
-        (true, true) => IngestIntent::Track {
-            candidate: None,
-            conflict: true,
-        },
-        (true, false) => IngestIntent::Track {
-            candidate: Some(Candidate {
-                kind: "review".to_string(),
-                ..base
-            }),
-            conflict: false,
-        },
-        (false, true) => IngestIntent::Track {
-            candidate: Some(Candidate {
-                kind: "check".to_string(),
-                ..base
-            }),
-            conflict: false,
-        },
-        // Neither trigger label (e.g. an `unlabeled` delivery removing the trigger): the PR
-        // should still appear in the list with a skip reason, but never dispatch.
-        (false, false) => IngestIntent::StatusOnly {
-            kind: StatusOnlyKind::TriggerLabelRemoved,
-        },
-    }
-}
-
-/// Parse + route + classify a GitHub `pull_request` webhook payload (#61) into a
+/// Parse + route a GitHub `pull_request` webhook payload (#61) into a
 /// [`ParseResult`]. PURE (no `AppHandle`) so the whole classification is unit-tested
 /// without a server; the `AppHandle`-bound ingest (`commands::ingest_webhook`) consumes
 /// the `Routable` arm.
@@ -1474,11 +1435,9 @@ fn classify_intent(has_review: bool, has_check: bool, base: Candidate) -> Ingest
 /// - PR not open (closed/merged) → `Routable` with [`IngestIntent::StatusOnly`]
 ///   ("PR 已关闭或合并") so the list row reflects it (the poll path never lists closed
 ///   PRs; this is the push-path equivalent — list-only, never dispatched);
-/// - open, BOTH trigger labels → `Track { candidate: None, conflict: true }` (mirrors
-///   the poll path's discovery-stage conflict drop — upserted as a skipped row);
-/// - open, exactly one trigger label → `Track { candidate: Some(..), conflict: false }`
-///   (the remaining static/cooldown gates run downstream in `webhook_view`);
-/// - open, NEITHER trigger label → `StatusOnly` ("触发 label 已移除").
+/// - open PR → `Track { candidate: Some(..), conflict: false }` (the remaining
+///   static/cooldown gates run downstream in `webhook_view`; rule matching decides whether
+///   labels produce review/check/notify actions).
 ///
 /// The metadata (title / labels / url) is extracted for the list row regardless of the
 /// dispatch decision — the webhook payload carries it, so the ingest never re-fetches
@@ -1630,24 +1589,19 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
         })));
     }
 
-    // Classify with the MATCHED project's labels (#35) — review/check labels are per-project,
-    // so a payload routed to project B is classified by B's labels. The (review/check) → intent
-    // mapping is shared with the Azure path via `classify_intent`.
-    let has_review = labels.iter().any(|l| l == &route.review_label);
-    let has_check = labels.iter().any(|l| l == &route.check_label);
-    let intent = classify_intent(
-        has_review,
-        has_check,
-        Candidate {
+    let intent = IngestIntent::Track {
+        candidate: Some(Candidate {
             number,
             head_sha,
             head_ref,
             author,
             is_cross_repository,
             is_draft,
-            kind: String::new(), // classify_intent stamps "review"/"check"
-        },
-    );
+            // The rule engine stamps the concrete review/check action kind later.
+            kind: "review".to_string(),
+        }),
+        conflict: false,
+    };
     ParseResult::Routable(Box::new(event(intent)))
 }
 
@@ -2094,14 +2048,12 @@ mod tests {
         serde_json::json!({ "action": "labeled", "pull_request": pr })
     }
 
-    fn route(id: &str, repo: &str, review_label: &str, check_label: &str) -> ProjectRoute {
+    fn route(id: &str, repo: &str, _review_label: &str, _check_label: &str) -> ProjectRoute {
         ProjectRoute {
             id: id.to_string(),
             source_kind: SourceKind::Github,
             repo: repo.to_string(),
             azure_project: String::new(),
-            review_label: review_label.to_string(),
-            check_label: check_label.to_string(),
             label_source: LabelSource::Native,
         }
     }
@@ -2112,16 +2064,14 @@ mod tests {
         id: &str,
         project: &str,
         repo: &str,
-        review_label: &str,
-        check_label: &str,
+        _review_label: &str,
+        _check_label: &str,
     ) -> ProjectRoute {
         ProjectRoute {
             id: id.to_string(),
             source_kind: SourceKind::Azure,
             repo: repo.to_string(),
             azure_project: project.to_string(),
-            review_label: review_label.to_string(),
-            check_label: check_label.to_string(),
             label_source: LabelSource::Native,
         }
     }
@@ -2240,24 +2190,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_delivery_title_source_classifies_from_title_tags() {
-        // AB#717: a title-source project classifies a webhook PR by bracketed title tags,
-        // ignoring native labels — parity with the poll path. The effective labels also
-        // become the tracked row's display labels.
+    fn parse_delivery_title_source_uses_title_tags_as_effective_labels() {
+        // AB#717: a title-source project resolves effective labels from bracketed title tags,
+        // ignoring native labels. Rules consume those labels later.
         let routes = vec![ProjectRoute {
             label_source: LabelSource::Title,
             ..route("default", "owner/repo", "needs-review", "needs-check")
         }];
-        // Native label carries the trigger, but the title does NOT → not dispatched.
+        // Native label carries a trigger-like value, but the title does NOT → still Track,
+        // with no effective labels.
         let native_only = pr_payload(&["needs-review"], serde_json::json!({ "title": "No tags" }));
-        assert!(
-            matches!(
-                routable(&native_only, &routes).intent,
-                IngestIntent::StatusOnly { .. }
-            ),
-            "native label is ignored under Title mode → StatusOnly"
-        );
-        // Title carries the trigger tag → dispatched as review; effective labels from title.
+        let ev = routable(&native_only, &routes);
+        assert!(matches!(ev.intent, IngestIntent::Track { .. }));
+        assert!(ev.labels.is_empty());
+        // Title carries the tag → effective labels from title.
         let title_tagged = pr_payload(
             &[],
             serde_json::json!({ "title": "Fix login [needs-review]" }),
@@ -2274,40 +2220,39 @@ mod tests {
         let ev = routable(&p, &single_route("needs-review", "needs-check"));
         assert_eq!(ev.project_id, "default");
         let c = dispatch_candidate(&p, &single_route("needs-review", "needs-check"));
-        assert_eq!(c.kind, "check");
+        assert_eq!(c.kind, "review");
     }
 
     #[test]
-    fn parse_delivery_conflict_tracks_without_a_candidate() {
-        // Both trigger labels → conflict → Track { candidate: None, conflict: true }
-        // (mirrors the poll path's discovery-stage conflict drop; upserted as a skipped
-        // row but never dispatched).
+    fn parse_delivery_multiple_labels_tracks_one_candidate() {
+        // Multiple labels are rule match input only; they no longer create an ingest conflict.
         let both = pr_payload(&["needs-review", "needs-check"], serde_json::json!({}));
         match routable(&both, &single_route("needs-review", "needs-check")).intent {
             IngestIntent::Track {
                 candidate,
                 conflict,
             } => {
-                assert!(candidate.is_none(), "conflict yields no dispatch candidate");
-                assert!(conflict, "both labels → conflict");
+                assert!(candidate.is_some());
+                assert!(!conflict);
             }
             other => panic!("expected a conflict Track, got something else: {other:?}"),
         }
     }
 
     #[test]
-    fn parse_delivery_no_trigger_label_is_status_only() {
-        // No trigger label (e.g. an `unlabeled` removing the trigger) → StatusOnly so
-        // the row still appears with a skip reason, never dispatched (#61). Assert via the
-        // type-locked `StatusOnlyKind` (no bare string coupling — the reason text lives on
-        // the enum), and that the kind's `reason()` is the expected one.
+    fn parse_delivery_no_trigger_label_still_tracks_open_pr() {
+        // Label matching is now the rule engine's job. Webhook ingest keeps the normalized
+        // open PR event even when no configured trigger label can be inferred here.
         let none = pr_payload(&["unrelated"], serde_json::json!({}));
         match routable(&none, &single_route("needs-review", "needs-check")).intent {
-            IngestIntent::StatusOnly { kind } => {
-                assert!(matches!(kind, StatusOnlyKind::TriggerLabelRemoved));
-                assert_eq!(kind.reason(), "触发 label 已移除");
+            IngestIntent::Track {
+                candidate,
+                conflict,
+            } => {
+                assert!(candidate.is_some());
+                assert!(!conflict);
             }
-            other => panic!("expected StatusOnly, got {other:?}"),
+            other => panic!("expected Track, got {other:?}"),
         }
 
         // F3: a `null` or non-array `labels`, and the `labels` key entirely absent, are
@@ -2339,15 +2284,19 @@ mod tests {
         );
 
         // …but an EXPLICIT empty array `[]` is the GENUINE "no trigger label" case and stays
-        // valid: an OPEN PR with `[]` → StatusOnly { TriggerLabelRemoved } (list-only, no
-        // dispatch). This is the case the absent/null subcases above must NOT be conflated
-        // with — `[]` is a real "labels were removed" state, absent `labels` is malformed.
+        // valid: an OPEN PR with `[]` → Track with no effective labels. This is the case the
+        // absent/null subcases above must NOT be conflated with — `[]` is a real empty-label
+        // state, absent `labels` is malformed.
         let empty_open = pr_payload(&[], serde_json::json!({}));
         match routable(&empty_open, &single_route("needs-review", "needs-check")).intent {
-            IngestIntent::StatusOnly { kind } => {
-                assert!(matches!(kind, StatusOnlyKind::TriggerLabelRemoved));
+            IngestIntent::Track {
+                candidate,
+                conflict,
+            } => {
+                assert!(candidate.is_some());
+                assert!(!conflict);
             }
-            other => panic!("empty [] on open PR: expected StatusOnly, got {other:?}"),
+            other => panic!("empty [] on open PR: expected Track, got {other:?}"),
         }
         // An EXPLICIT empty array `[]` on a CLOSED PR → StatusOnly { ClosedOrMerged } (the
         // closed-state check precedes label classification, so `[]` doesn't shadow it).
@@ -3049,9 +2998,8 @@ mod tests {
         );
         assert_eq!(dispatch_candidate(&for_b, &routes).kind, "review");
 
-        // The SAME repo with project A's label is NOT a B trigger → StatusOnly (labels are
-        // per-project; B doesn't classify on A's labels). The repo matched, so it routes to
-        // proj-b but yields no dispatch candidate.
+        // The SAME repo with project A's label still routes to proj-b. Label-to-action
+        // matching is rule-engine work, not webhook routing work.
         let mut wrong_label = pr_payload(&["a-review"], serde_json::json!({}));
         wrong_label.as_object_mut().unwrap().insert(
             "repository".to_string(),
@@ -3060,13 +3008,12 @@ mod tests {
         let wl = routable(&wrong_label, &routes);
         assert_eq!(wl.project_id, "proj-b");
         assert!(
-            matches!(wl.intent, IngestIntent::StatusOnly { .. }),
-            "project B does not classify on project A's labels → StatusOnly, not a candidate"
+            matches!(wl.intent, IngestIntent::Track { .. }),
+            "project B routing keeps the event; rules decide whether A's label matters"
         );
 
-        // A payload for owner/a with B's check label is classified by A's labels (none
-        // match) → StatusOnly under proj-a — confirms classification uses the ROUTED
-        // project's labels.
+        // A payload for owner/a with B's check label routes to proj-a and preserves the label
+        // as event data for the rule engine.
         let mut for_a = pr_payload(&["b-check"], serde_json::json!({}));
         for_a.as_object_mut().unwrap().insert(
             "repository".to_string(),
@@ -3075,8 +3022,8 @@ mod tests {
         let fa = routable(&for_a, &routes);
         assert_eq!(fa.project_id, "proj-a");
         assert!(
-            matches!(fa.intent, IngestIntent::StatusOnly { .. }),
-            "owner/a is classified by A's labels, not B's"
+            matches!(fa.intent, IngestIntent::Track { .. }),
+            "owner/a routing keeps labels as rule input"
         );
     }
 

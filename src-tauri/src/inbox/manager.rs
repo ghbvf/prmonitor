@@ -1,20 +1,20 @@
 //! Inbox composition handles (AB#1065/#1379): the replay-time re-feed / Azure refresh /
-//! candidate-dispatch hooks,
+//! rule-processing hooks,
 //! installed once by the composition root and read by the `inbox_replay` command.
 //!
 //! `inbox_replay` is a Tauri command (NOT a webhook delivery), so it has no live route snapshot
 //! and no in-flight dispatcher/refresher. It re-feeds a GitHub entry through the SAME dispatch path
 //! the scheduler/webhook use (via the OPAQUE [`GithubRefeed`] closure the root installs — which
 //! captures the `ProjectDispatcher` in `lib.rs`), and re-invokes the SAME `az` re-discovery (via
-//! [`AzureRefresh`]). Candidate-backed auto-dispatch rows replay through [`CandidateDispatch`],
-//! which re-produces the outbox action without the inbox naming outbox internals. The composition
+//! [`AzureRefresh`]). Candidate-backed rows replay through [`RuleProcessor`], so replay uses the
+//! same rule-engine funnel as first processing. The composition
 //! root installs these at `setup` time, exactly as it installs the webhook ingestor/refresher on the
 //! pr slice's WebhookManager; the slice reads them back through this manager — a `tauri::State`
 //! field on [`crate::state::AppState`].
 
 use std::sync::Mutex as StdMutex;
 
-use crate::inbox::{AzureRefresh, CandidateDispatch, GithubRefeed};
+use crate::inbox::{AzureRefresh, GithubRefeed, RuleProcessor};
 
 /// Holds the replay-time hooks the composition root installs (AB#1065). `&self` methods +
 /// interior mutability so it lives in [`crate::state::AppState`] (which stays `Default`),
@@ -28,8 +28,8 @@ pub struct InboxManager {
     github_refeed: StdMutex<Option<GithubRefeed>>,
     /// The Azure re-discovery hook (the SAME `discover_once` wrapper the Azure refresh uses).
     refresher: StdMutex<Option<AzureRefresh>>,
-    /// The default-rule candidate hook (re-produces a review/check outbox action).
-    candidate_dispatch: StdMutex<Option<CandidateDispatch>>,
+    /// The rule processor hook (composition root owns rule/outbox wiring).
+    rule_processor: StdMutex<Option<RuleProcessor>>,
 }
 
 impl InboxManager {
@@ -39,11 +39,11 @@ impl InboxManager {
         &self,
         github_refeed: GithubRefeed,
         refresher: AzureRefresh,
-        candidate_dispatch: CandidateDispatch,
+        rule_processor: RuleProcessor,
     ) {
         *self.github_refeed.lock().unwrap() = Some(github_refeed);
         *self.refresher.lock().unwrap() = Some(refresher);
-        *self.candidate_dispatch.lock().unwrap() = Some(candidate_dispatch);
+        *self.rule_processor.lock().unwrap() = Some(rule_processor);
     }
 
     /// The installed GitHub re-feed hook, or `None` if the root hasn't wired it yet (a replay then
@@ -57,8 +57,8 @@ impl InboxManager {
         self.refresher.lock().unwrap().clone()
     }
 
-    /// The installed candidate replay hook, or `None` if not wired yet.
-    pub fn candidate_dispatch(&self) -> Option<CandidateDispatch> {
-        self.candidate_dispatch.lock().unwrap().clone()
+    /// The installed rule processor hook, or `None` if not wired yet.
+    pub fn rule_processor(&self) -> Option<RuleProcessor> {
+        self.rule_processor.lock().unwrap().clone()
     }
 }

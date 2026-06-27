@@ -199,8 +199,7 @@ fn map_rows(
     host: &str,
     project: &str,
     repo: &str,
-    review_label: &str,
-    check_label: &str,
+    trigger_labels: &[String],
     label_source: LabelSource,
 ) -> Vec<BbRow> {
     let base = host.trim_end_matches('/');
@@ -208,9 +207,13 @@ fn map_rows(
     for pr in prs {
         // Bitbucket has no native labels → resolve from the title (the only viable source).
         let labels = labels::effective_labels(Vec::new(), &pr.title, label_source);
-        let Some((kind, conflict)) = labels::classify(&labels, review_label, check_label) else {
-            continue; // no trigger label: not a monitored PR
-        };
+        if !trigger_labels.is_empty()
+            && !trigger_labels
+                .iter()
+                .any(|wanted| labels.iter().any(|label| label == wanted))
+        {
+            continue;
+        }
 
         // F2 (fail-closed): a real open PR always carries `fromRef` with a `latestCommit`
         // (→ head_sha, the dispatch key) and `displayId` (→ head_ref). A missing/empty one
@@ -266,12 +269,12 @@ fn map_rows(
                 author,
                 is_cross_repository,
                 is_draft: pr.draft,
-                kind: kind.to_string(),
+                kind: "review".to_string(),
             },
             title: pr.title,
             labels,
             url,
-            conflict,
+            conflict: false,
         });
     }
     rows
@@ -287,8 +290,7 @@ fn parse_rows(
     host: &str,
     project: &str,
     repo: &str,
-    review_label: &str,
-    check_label: &str,
+    trigger_labels: &[String],
     label_source: LabelSource,
 ) -> AppResult<Vec<BbRow>> {
     let page: BbPage = serde_json::from_str(page_json)
@@ -298,8 +300,7 @@ fn parse_rows(
         host,
         project,
         repo,
-        review_label,
-        check_label,
+        trigger_labels,
         label_source,
     ))
 }
@@ -329,8 +330,7 @@ pub struct BitbucketSourceConfig {
     pub repo: String,
     /// HTTP access token (PAT) → `Authorization: Bearer <token>`.
     pub token: String,
-    pub review_label: String,
-    pub check_label: String,
+    pub trigger_labels: Vec<String>,
     pub label_source: LabelSource,
 }
 
@@ -340,8 +340,7 @@ pub struct BitbucketServer {
     project: String,
     repo: String,
     token: String,
-    review_label: String,
-    check_label: String,
+    trigger_labels: Vec<String>,
     label_source: LabelSource,
 }
 
@@ -352,8 +351,7 @@ impl BitbucketServer {
             project: cfg.project,
             repo: cfg.repo,
             token: cfg.token,
-            review_label: cfg.review_label,
-            check_label: cfg.check_label,
+            trigger_labels: cfg.trigger_labels,
             label_source: cfg.label_source,
         }
     }
@@ -463,8 +461,7 @@ impl BitbucketServer {
             &self.host,
             &self.project,
             &self.repo,
-            &self.review_label,
-            &self.check_label,
+            &self.trigger_labels,
             self.label_source,
         ))
     }
@@ -530,8 +527,19 @@ mod tests {
     const PROJECT: &str = "GOCELL";
     const REPO: &str = "myrepo";
 
+    fn trigger_labels() -> Vec<String> {
+        vec![REVIEW.to_string(), CHECK.to_string()]
+    }
+
     fn rows(json: &str) -> AppResult<Vec<BbRow>> {
-        parse_rows(json, HOST, PROJECT, REPO, REVIEW, CHECK, LabelSource::Title)
+        parse_rows(
+            json,
+            HOST,
+            PROJECT,
+            REPO,
+            &trigger_labels(),
+            LabelSource::Title,
+        )
     }
 
     fn candidates(json: &str) -> AppResult<Vec<Candidate>> {
@@ -609,7 +617,7 @@ mod tests {
         );
         let r = rows(&json).expect("parses");
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].candidate.kind, "check");
+        assert_eq!(r[0].candidate.kind, "review");
         assert_eq!(
             r[0].url,
             "https://bitbucket.example.com/projects/GOCELL/repos/myrepo/pull-requests/7"
@@ -626,8 +634,7 @@ mod tests {
             "https://bitbucket.example.com/",
             PROJECT,
             REPO,
-            REVIEW,
-            CHECK,
+            &trigger_labels(),
             LabelSource::Title,
         )
         .expect("parses");
@@ -638,8 +645,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_rows_keeps_both_tag_conflict_with_review_kind() {
-        // Both trigger tags in the title → conflict, kept (kind review), dropped from dispatch.
+    fn parse_rows_keeps_pr_with_multiple_trigger_tags() {
+        // Trigger tags are rule-interest filters only; action kind is decided by rules.
         let json = format!(
             r#"{{ "isLastPage": true, "values": [
                 {{ "id": 9, "title": "[{REVIEW}][{CHECK}] both", "fromRef": {{ "displayId": "b", "latestCommit": "s" }} }}
@@ -647,11 +654,10 @@ mod tests {
         );
         let r = rows(&json).expect("parses");
         assert_eq!(r.len(), 1);
-        assert!(r[0].conflict);
+        assert!(!r[0].conflict);
         assert_eq!(r[0].candidate.kind, "review");
         assert_eq!(r[0].labels, vec![REVIEW.to_string(), CHECK.to_string()]);
-        // The gating view drops the conflict.
-        assert!(candidates(&json).expect("parses").is_empty());
+        assert_eq!(candidates(&json).expect("parses").len(), 1);
     }
 
     #[test]
@@ -768,8 +774,7 @@ mod tests {
             HOST,
             PROJECT,
             REPO,
-            REVIEW,
-            CHECK,
+            &trigger_labels(),
             LabelSource::Native
         )
         .expect("parses")

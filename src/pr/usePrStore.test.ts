@@ -98,8 +98,6 @@ const project = (id: string): Project => ({
   repoRoot: "/tmp/repo",
   pollIntervalSecs: 60,
   authors: [],
-  reviewLabel: "review",
-  checkLabel: "check",
   labelSource: "native",
   skillRelPath: ".claude/skills/pr-review",
   prCooldownSeconds: 0,
@@ -113,7 +111,6 @@ const project = (id: string): Project => ({
   engineKind: "codex",
   codexModel: "",
   claudeModel: "",
-  autoReview: false,
 });
 
 beforeEach(() => {
@@ -149,6 +146,7 @@ beforeEach(() => {
     notifications: { channels: [] },
     listeners: [],
     tunnels: [],
+    rules: [],
   });
 });
 
@@ -295,6 +293,7 @@ describe("usePrStore toggle()", () => {
       notifications: { channels: [] },
       listeners: [],
       tunnels: [],
+      rules: [],
     });
     const store = usePrStore();
     // Start the active project paused so toggle() takes the resume branch.

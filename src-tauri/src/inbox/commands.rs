@@ -37,7 +37,7 @@ pub async fn inbox_get_raw<R: tauri::Runtime>(
 }
 
 /// Re-process a stored inbox entry by id (AB#1065/#1379): re-feed a GitHub delivery through the
-/// vetted dispatch path, re-invoke the Azure refresh, or re-produce a candidate-backed outbox action;
+/// vetted dispatch path, re-invoke the Azure refresh, or re-run a candidate-backed rule event;
 /// then mark the entry Processed/Failed and re-emit `inbox:updated`. Works on ANY entry. Fails
 /// closed if the composition root hasn't installed the replay hooks yet.
 #[tauri::command]
@@ -52,13 +52,11 @@ pub async fn inbox_replay(app: tauri::AppHandle, id: i64) -> AppResult<()> {
         .inbox
         .refresher()
         .ok_or_else(|| AppError::new("inbox 重放未初始化（refresher 未安装）".to_string()))?;
-    let candidate_dispatch = app
+    let rule_processor = app
         .state::<AppState>()
         .inbox
-        .candidate_dispatch()
-        .ok_or_else(|| {
-            AppError::new("inbox 重放未初始化（candidate_dispatch 未安装）".to_string())
-        })?;
+        .rule_processor()
+        .ok_or_else(|| AppError::new("inbox 重放未初始化（rule_processor 未安装）".to_string()))?;
     // Resolve the DB handle, then delegate. Cloning the handle out of `State` is not needed — the
     // service borrows `&Database` for the duration of the await (the connection mutex is internal).
     let db = app.state::<Database>();
@@ -67,7 +65,7 @@ pub async fn inbox_replay(app: tauri::AppHandle, id: i64) -> AppResult<()> {
         db.inner(),
         &github_refeed,
         &refresher,
-        &candidate_dispatch,
+        &rule_processor,
         id,
     )
     .await

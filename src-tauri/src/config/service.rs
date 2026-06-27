@@ -21,8 +21,9 @@ use crate::model::NotificationDeliveryChannel;
 /// coupling is to the service (the slice's public API), keeping the model an internal
 /// detail the service mediates. The functions below (`project` / `project_validated`)
 /// use `Project` through this same re-export.
-pub use super::model::Project;
-pub use super::model::{NotificationChannel, NotificationSettings};
+pub use super::model::{
+    NotificationChannel, NotificationSettings, Project, RuleActionKind, RuleConfig,
+};
 
 /// The DEFAULT outbox worker policy, exposed THROUGH the config public service surface (AB#1182
 /// F1) — the seam the `outbox` worker uses as its config-read-failure FALLBACK. The worker reads
@@ -33,6 +34,28 @@ pub use super::model::{NotificationChannel, NotificationSettings};
 /// `DEFAULT_NOTIFICATION_TTL_SECS`, so a future outbox-policy field is picked up here for free.
 pub fn default_outbox_config() -> super::model::OutboxConfig {
     super::model::OutboxConfig::default()
+}
+
+/// Labels a project's PR source should watch because a rule mentions them.
+///
+/// Disabled rules are included on purpose: legacy `autoReview=false` migrates to disabled
+/// review/check rules, and those labels must still keep the old "list matching PRs, enqueue no
+/// action" behavior. Rule execution itself still checks `enabled`, so disabled rules never create
+/// outbox actions.
+pub fn rule_interest_labels(rules: &[RuleConfig], project_id: &str) -> Vec<String> {
+    let mut labels = Vec::new();
+    for rule in rules {
+        if !rule.project_id.is_empty() && rule.project_id != project_id {
+            continue;
+        }
+        for label in rule.labels_any.iter().chain(rule.labels_all.iter()) {
+            let label = label.trim();
+            if !label.is_empty() && !labels.iter().any(|existing| existing == label) {
+                labels.push(label.to_string());
+            }
+        }
+    }
+    labels
 }
 
 pub fn default_notification_settings() -> NotificationSettings {
@@ -69,7 +92,7 @@ pub fn validate_notification_channel_for_test(channel: &NotificationChannel) -> 
 /// id the active-project pointer (`activeProjectId`) is also set to.
 const MIGRATED_PROJECT_ID: &str = "default";
 
-/// The 11 per-project keys lifted out of the legacy flat single-project config
+/// The per-project keys lifted out of the legacy flat single-project config
 /// into the migrated [`Project`] object (#35). camelCase wire names (the persisted
 /// shape — `save` writes `serde_json::to_value(&AppConfig)`, which is camelCase).
 const PROJECT_KEYS: &[&str] = &[
@@ -77,6 +100,8 @@ const PROJECT_KEYS: &[&str] = &[
     "repoRoot",
     "pollIntervalSecs",
     "authors",
+    // Legacy trigger fields are lifted only so `seed_rule_configs` can convert them
+    // into rules. They are stripped from the migrated project JSON before deserialization.
     "reviewLabel",
     "checkLabel",
     "skillRelPath",
@@ -123,7 +148,7 @@ const WEBHOOK_KEYS: &[&str] = &[
 /// [`seed_local_api_listener`] (AB#1225) so the local-api `listeners[]` seed applies to BOTH
 /// legacy-flat configs and already-new ones (the latter early-return out of the first pass).
 fn migrate_value(raw: Value) -> Value {
-    seed_local_api_listener(normalize_multiproject(raw))
+    seed_rule_configs(seed_local_api_listener(normalize_multiproject(raw)))
 }
 
 /// First migration pass: normalize the raw persisted value to the #35 multi-project shape.
@@ -253,6 +278,86 @@ fn seed_local_api_listener(value: Value) -> Value {
         }
     }
 
+    Value::Object(obj)
+}
+
+/// Seed the v1 rule-engine config (#1371) from legacy per-project trigger fields.
+///
+/// Detect-by-key: if `rules` already exists, leave it untouched. Otherwise, each project that still
+/// carries old `reviewLabel` / `checkLabel` JSON fields becomes two rules. `autoReview` maps to the
+/// rule `enabled` bit, preserving the old "listed but not dispatched" default as disabled rules.
+/// The old fields are intentionally not copied into Rust `Project`, so after the next save the blob
+/// is rule-only with no runtime compatibility path.
+fn seed_rule_configs(value: Value) -> Value {
+    let Value::Object(mut obj) = value else {
+        return value;
+    };
+    if obj.contains_key("rules") {
+        return Value::Object(obj);
+    }
+
+    let mut rules = Vec::new();
+    if let Some(projects) = obj.get("projects").and_then(Value::as_array) {
+        for project in projects {
+            let Some(pid) = project.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let auto = project
+                .get("autoReview")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let repo = project
+                .get("repo")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(label) = project.get("reviewLabel").and_then(Value::as_str) {
+                if !label.trim().is_empty() {
+                    rules.push(json!({
+                        "id": format!("{pid}-review"),
+                        "name": format!("{pid} review"),
+                        "enabled": auto,
+                        "source": null,
+                        "eventType": "pullRequest",
+                        "projectId": pid,
+                        "repo": repo,
+                        "labelsAny": [label],
+                        "labelsAll": [],
+                        "titleContains": "",
+                        "bodyContains": "",
+                        "actions": ["review"]
+                    }));
+                }
+            }
+            if let Some(label) = project.get("checkLabel").and_then(Value::as_str) {
+                if !label.trim().is_empty() {
+                    rules.push(json!({
+                        "id": format!("{pid}-check"),
+                        "name": format!("{pid} check"),
+                        "enabled": auto,
+                        "source": null,
+                        "eventType": "pullRequest",
+                        "projectId": pid,
+                        "repo": repo,
+                        "labelsAny": [label],
+                        "labelsAll": [],
+                        "titleContains": "",
+                        "bodyContains": "",
+                        "actions": ["check"]
+                    }));
+                }
+            }
+        }
+    }
+    if let Some(projects) = obj.get_mut("projects").and_then(Value::as_array_mut) {
+        for project in projects {
+            if let Some(project) = project.as_object_mut() {
+                project.remove("reviewLabel");
+                project.remove("checkLabel");
+                project.remove("autoReview");
+            }
+        }
+    }
+    obj.insert("rules".to_string(), Value::Array(rules));
     Value::Object(obj)
 }
 
@@ -544,7 +649,11 @@ mod tests {
         assert_eq!(config.projects.len(), 1, "flat shape lifted to one project");
         assert_eq!(config.projects[0].repo, "octocat/hello");
         assert_eq!(config.active_project_id, MIGRATED_PROJECT_ID);
-        assert!(config.projects[0].auto_review);
+        assert_eq!(
+            config.rules.len(),
+            0,
+            "no legacy labels means no migrated rules"
+        );
     }
 
     #[test]
@@ -594,18 +703,31 @@ mod tests {
         assert_eq!(project["id"], MIGRATED_PROJECT_ID);
         assert_eq!(project["name"], MIGRATED_PROJECT_ID);
         assert_eq!(project["enabled"], true);
-        // The 11 lifted per-project keys carried over verbatim.
+        // The lifted per-project keys carried over verbatim; legacy trigger fields
+        // move to rules instead of remaining on the project runtime shape.
         assert_eq!(project["repo"], "octocat/hello");
         assert_eq!(project["repoRoot"], "/tmp/hello");
         assert_eq!(project["pollIntervalSecs"], 60);
         assert_eq!(project["authors"], json!(["octocat"]));
-        assert_eq!(project["reviewLabel"], "needs-review");
-        assert_eq!(project["checkLabel"], "needs-check");
+        assert!(project.get("reviewLabel").is_none());
+        assert!(project.get("checkLabel").is_none());
         assert_eq!(project["skillRelPath"], ".codex/skills/pr-review/SKILL.md");
         assert_eq!(project["prCooldownSeconds"], 900);
         assert_eq!(project["sourceKind"], "github");
         assert_eq!(project["engineKind"], "codex");
-        assert_eq!(project["autoReview"], true);
+        assert!(project.get("autoReview").is_none());
+
+        let rules = migrated["rules"].as_array().expect("rules array");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["id"], "default-review");
+        assert_eq!(rules[0]["enabled"], true);
+        assert_eq!(rules[0]["projectId"], MIGRATED_PROJECT_ID);
+        assert_eq!(rules[0]["repo"], "octocat/hello");
+        assert_eq!(rules[0]["labelsAny"], json!(["needs-review"]));
+        assert_eq!(rules[0]["actions"], json!(["review"]));
+        assert_eq!(rules[1]["id"], "default-check");
+        assert_eq!(rules[1]["labelsAny"], json!(["needs-check"]));
+        assert_eq!(rules[1]["actions"], json!(["check"]));
 
         // The migrated shape must deserialize into a real `AppConfig` (lenient path
         // `load` uses) with the lifted values intact.
@@ -614,7 +736,59 @@ mod tests {
         assert_eq!(config.active_project_id, MIGRATED_PROJECT_ID);
         assert_eq!(config.projects.len(), 1);
         assert_eq!(config.projects[0].repo, "octocat/hello");
-        assert!(config.projects[0].auto_review);
+        assert_eq!(config.rules.len(), 2);
+        assert!(config.rules.iter().all(|rule| rule.enabled));
+    }
+
+    #[test]
+    fn rule_interest_labels_include_disabled_rules_for_list_only_migration() {
+        let rules = vec![
+            RuleConfig {
+                enabled: true,
+                project_id: "p1".to_string(),
+                labels_any: vec!["a".to_string()],
+                labels_all: vec!["b".to_string(), "a".to_string()],
+                ..RuleConfig::default()
+            },
+            RuleConfig {
+                enabled: false,
+                project_id: "p1".to_string(),
+                labels_any: vec!["disabled-list-only".to_string()],
+                ..RuleConfig::default()
+            },
+            RuleConfig {
+                enabled: true,
+                project_id: "p2".to_string(),
+                labels_any: vec!["other-project".to_string()],
+                ..RuleConfig::default()
+            },
+        ];
+        assert_eq!(
+            rule_interest_labels(&rules, "p1"),
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "disabled-list-only".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn migrate_auto_review_false_rules_still_feed_interest_labels() {
+        let config: AppConfig = serde_json::from_value(migrate_value(json!({
+            "repo": "octocat/hello",
+            "reviewLabel": "needs-review",
+            "checkLabel": "needs-check",
+            "autoReview": false
+        })))
+        .expect("migrated shape deserializes");
+
+        assert_eq!(config.rules.len(), 2);
+        assert!(config.rules.iter().all(|rule| !rule.enabled));
+        assert_eq!(
+            rule_interest_labels(&config.rules, MIGRATED_PROJECT_ID),
+            vec!["needs-review".to_string(), "needs-check".to_string()]
+        );
     }
 
     #[test]
@@ -628,7 +802,13 @@ mod tests {
             "activeProjectId": "p1",
             "webhookEnabled": false
         });
-        assert_eq!(migrate_value(raw.clone()), raw);
+        let expected = json!({
+            "projects": [{ "id": "p1", "repo": "owner/name" }],
+            "activeProjectId": "p1",
+            "webhookEnabled": false,
+            "rules": []
+        });
+        assert_eq!(migrate_value(raw), expected);
     }
 
     /// F10: a NEW-shape input (`projects` present) that ALSO carries a legacy top-level

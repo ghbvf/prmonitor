@@ -201,14 +201,11 @@ function deliveryTime(epochSecs: number): string {
 }
 
 // Per-delivery explanatory line: prefer the backend message; otherwise, for a
-// listUpdated delivery with no message, explain the #61 core scenario (autoReview off
-// → enqueued but not dispatched) so the green status isn't reasonless. Mode-agnostic
-// wording (#66 F6): a delivery may carry kind "review" OR "check", so the hardcoded
-// "未派发 review" was wrong for check-kind PRs — say "自动任务" instead. Empty string =
-// nothing to show.
+// listUpdated delivery with no message, explain that the webhook updated the list and
+// rule execution owns any follow-up action enqueue. Empty string = nothing to show.
 function deliveryDetail(d: WebhookDelivery): string {
   if (d.message) return d.message;
-  if (d.status === "listUpdated") return "autoReview 关闭：已入列表，未派发自动任务";
+  if (d.status === "listUpdated") return "已入列表；后续动作不会在此处展示";
   return "";
 }
 

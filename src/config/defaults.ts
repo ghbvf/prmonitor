@@ -36,8 +36,6 @@ export const NEW_PROJECT_DEFAULTS: Omit<Project, "id" | "name"> = {
   repoRoot: "",
   pollIntervalSecs: 120,
   authors: [],
-  reviewLabel: "pr-status/needs-review-again",
-  checkLabel: "pr-status/needs-check-fix",
   // Label source defaults to "native" (717): use the provider's own PR labels. A
   // bitbucket source must switch this to "title" (no native labels).
   labelSource: "native",
@@ -57,7 +55,6 @@ export const NEW_PROJECT_DEFAULTS: Omit<Project, "id" | "name"> = {
   // Empty = each engine uses its own default model (no --model / turn model injected).
   codexModel: "",
   claudeModel: "",
-  autoReview: false,
 };
 
 // Auto-correct the project fields a Bitbucket source REQUIRES (717), applied in-place

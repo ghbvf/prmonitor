@@ -39,16 +39,16 @@ enum WriteKind {
 /// one — so the caller partitions the cycle's rows into the emit list (all views)
 /// and the dispatch list (clean candidates) in one pass.
 fn build_view(
-    de: DiscoveredEvent,
+    de: &DiscoveredEvent,
     params: &MonitorParams,
     ledger: &Ledger,
     now: u64,
 ) -> (PullRequestView, Option<Candidate>) {
     build_view_parts(
-        de.candidate,
-        de.event.title,
-        de.event.labels,
-        de.event.url,
+        de.candidate.clone(),
+        de.event.title.clone(),
+        de.event.labels.clone(),
+        de.event.url.clone(),
         de.conflict,
         params,
         ledger,
@@ -107,13 +107,13 @@ fn partition_events(
     params: &MonitorParams,
     ledger: &Ledger,
     now: u64,
-) -> (Vec<PullRequestView>, Vec<Candidate>) {
+) -> (Vec<PullRequestView>, Vec<DiscoveredEvent>) {
     let mut views = Vec::with_capacity(events.len());
     let mut dispatchable = Vec::new();
     for de in events {
-        let (view, cand) = build_view(de, params, ledger, now);
-        if let Some(cand) = cand {
-            dispatchable.push(cand);
+        let (view, cand) = build_view(&de, params, ledger, now);
+        if cand.is_some() {
+            dispatchable.push(de);
         }
         views.push(view);
     }
@@ -134,7 +134,7 @@ fn partition_events(
 pub(crate) async fn discover<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     project_id: &str,
-) -> AppResult<(Vec<PullRequestView>, Vec<Candidate>)> {
+) -> AppResult<(Vec<PullRequestView>, Vec<DiscoveredEvent>)> {
     // Cross-slice read of the config slice's public service (function-level, not
     // a type contract — `AppConfig` stays config-private; we resolve THIS project by
     // id and snapshot the fields the pr slice needs into `MonitorParams`).
@@ -151,11 +151,11 @@ pub(crate) async fn discover<R: tauri::Runtime>(
     let bitbucket_token = project.bitbucket_token.clone();
     let params = MonitorParams {
         repo: project.repo,
-        review_label: project.review_label,
-        check_label: project.check_label,
         authors: project.authors,
         pr_cooldown_seconds: project.pr_cooldown_seconds,
     };
+    let cfg = config_service::load(app)?;
+    let trigger_labels = config_service::rule_interest_labels(&cfg.rules, project_id);
 
     // Lock-free ledger read (no `LEDGER_WRITE_LOCK`): a stale-by-one-round snapshot is
     // fine here — this gate is an optimization, and the session registry's atomic
@@ -172,12 +172,7 @@ pub(crate) async fn discover<R: tauri::Runtime>(
     // its events to `build_view`.
     let (views, dispatchable) = match source_kind {
         SourceKind::Github => {
-            let source = GithubCli::new(
-                params.repo.clone(),
-                params.review_label.clone(),
-                params.check_label.clone(),
-                label_source,
-            );
+            let source = GithubCli::new(params.repo.clone(), trigger_labels.clone(), label_source);
             partition_events(source.discover_events().await?, &params, &ledger, now)
         }
         SourceKind::Azure => {
@@ -195,8 +190,7 @@ pub(crate) async fn discover<R: tauri::Runtime>(
                 azure_org,
                 azure_project,
                 params.repo.clone(),
-                params.review_label.clone(),
-                params.check_label.clone(),
+                trigger_labels.clone(),
                 label_source,
             );
             partition_events(source.discover_events().await?, &params, &ledger, now)
@@ -221,8 +215,7 @@ pub(crate) async fn discover<R: tauri::Runtime>(
                 project: bitbucket_project,
                 repo: params.repo.clone(),
                 token: bitbucket_token,
-                review_label: params.review_label.clone(),
-                check_label: params.check_label.clone(),
+                trigger_labels: trigger_labels.clone(),
                 label_source,
             });
             partition_events(source.discover_events().await?, &params, &ledger, now)
@@ -497,21 +490,18 @@ fn webhook_view(
 /// The full ingest decision for ONE routed [`WebhookEvent`], computed PURELY from plain
 /// data by [`decide_ingest`] (no `AppHandle`) so EVERY branch is unit-tested. The
 /// AppHandle-bound [`ingest_webhook`] becomes a thin shell that just performs the IO this
-/// describes: `write` the row through the serialized seam, emit, spawn the dispatch when
-/// `dispatchable` is `Some` AND autoReview is on, and record the delivery with `status` /
-/// `message`.
+/// describes: `write` the row through the serialized seam, emit, return the gated candidate for
+/// rule processing, and record the delivery with `status` / `message`.
 struct IngestDecision {
     /// The list-row view to persist (Upsert) or refresh (UpdatePresent).
     view: PullRequestView,
     /// Which registry write to perform for `view`.
     write: WriteKind,
-    /// The candidate to auto-dispatch when autoReview is on; `None` = nothing to dispatch
-    /// (gated / conflict / status-only). Whether a `Some` is actually spawned is the
-    /// shell's call (it depends on autoReview), but the TERMINAL `status` below already
-    /// reflects the autoReview gate, so the shell never re-decides the status.
+    /// The candidate that passed the same static + cooldown gate as polling. Rule execution may
+    /// consume this; gated / conflict / status-only paths return `None`.
     dispatchable: Option<Candidate>,
-    /// The single terminal delivery diagnostic status (#62) — finalized HERE from the
-    /// dispatch decision + autoReview, so the shell records it verbatim.
+    /// The single terminal delivery diagnostic status (#62) — finalized HERE from the gate/list
+    /// decision, so the shell records it verbatim.
     status: DeliveryStatus,
     /// The delivery diagnostic's human-readable note (skip reason / `None` for a clean
     /// dispatch).
@@ -519,24 +509,19 @@ struct IngestDecision {
 }
 
 /// PURE webhook-ingest decision (#61/#62): maps a parsed [`IngestIntent`] + the project's
-/// gating inputs to the FULL [`IngestDecision`] (view + write + dispatch + terminal
+/// gating inputs to the FULL [`IngestDecision`] (view + write + gated candidate + terminal
 /// delivery status + message), WITHOUT any `AppHandle` so every branch is unit-tested.
 /// Extracted from the old inline `ingest_webhook` body so the decision path — including the
-/// #61 core "autoReview off still LISTS the PR" — has automated coverage rather than only a
-/// "verified via integration / manual verify" note. Behavior-preserving: the IO shell
+/// #61 core "webhook still LISTS the PR before rule actions" — has automated coverage rather than
+/// only a "verified via integration / manual verify" note. Behavior-preserving: the IO shell
 /// ([`ingest_webhook`]) feeds it the same data the inline match consumed and acts on its
 /// output verbatim.
-///
-/// `auto_review` is the project's resolved autoReview flag (the shell reads it ONCE off the
-/// loaded project — the SAME per-project gate `scheduler::auto_review_enabled` resolves —
-/// and passes it here so the dispatch decision and the terminal status agree on one value).
 ///
 /// Branch semantics (each preserved from the inline body):
 /// - `Track { candidate: Some(cand), .. }`: run the SAME static + cooldown gates as the
 ///   poll path (via [`webhook_view`]). `write = Upsert`. Gated (skip_reason `Some`) →
 ///   `dispatchable = None`, `status = Gated`, `message = skip_reason`. Clean (skip_reason
-///   `None`) → `dispatchable = Some(cand)`; `status = if auto_review { Dispatched } else
-///   { ListUpdated }` (#61: autoReview off still lists), `message = None`.
+///   `None`) → `dispatchable = Some(cand)`, `status = ListUpdated`, `message = None`.
 /// - `Track { candidate: None, conflict: .. }`: both trigger labels → a skipped "review"
 ///   row with the conflict reason; `write = Upsert`; no dispatch; `status = Gated`.
 /// - `StatusOnly { kind }`: refresh an EXISTING row's status (`write = UpdatePresent`),
@@ -557,7 +542,6 @@ fn decide_ingest(
     params: &MonitorParams,
     ledger: &Ledger,
     now: u64,
-    auto_review: bool,
 ) -> IngestDecision {
     match intent {
         IngestIntent::Track {
@@ -566,27 +550,21 @@ fn decide_ingest(
         } => {
             let (view, dispatchable) = webhook_view(cand, title, labels, url, params, ledger, now);
             // A single trigger label. A gated one (draft/fork/author/cooldown) is a `Gated`
-            // row carrying the reason. A clean (dispatchable) one's terminal status is
-            // decided HERE by the autoReview flag — Dispatched (on) vs ListUpdated (off, the
-            // #61 core "PR enters the list even with autoReview off"); the shell only acts on
-            // `dispatchable` + `auto_review`, it never re-derives the status.
+            // row carrying the reason. A clean candidate enters the list and is returned to the
+            // rule engine; rules decide whether to enqueue review/check/notify.
             match (dispatchable, &view.skip_reason) {
                 (Some(cand), _) => IngestDecision {
-                    status: if auto_review {
-                        DeliveryStatus::Dispatched
-                    } else {
-                        DeliveryStatus::ListUpdated
-                    },
+                    status: DeliveryStatus::ListUpdated,
                     message: None,
-                    dispatchable: Some(cand),
                     write: WriteKind::Upsert,
+                    dispatchable: Some(cand),
                     view,
                 },
                 (None, reason) => IngestDecision {
                     status: DeliveryStatus::Gated,
                     message: reason.clone(),
-                    dispatchable: None,
                     write: WriteKind::Upsert,
+                    dispatchable: None,
                     view,
                 },
             }
@@ -618,18 +596,13 @@ fn decide_ingest(
             // never insert, never dispatch. `kind` from the current labels (check vs the
             // review default). The reason text + terminal delivery status both come from the
             // type-locked `StatusOnlyKind` (no string compare — see FIX 1 / ai-robust.md).
-            let kind = if labels.iter().any(|l| l == &params.check_label) {
-                "check"
-            } else {
-                "review"
-            };
             let reason = status_kind.reason().to_string();
             let view = PullRequestView {
                 number,
                 title,
                 labels,
                 url,
-                kind: kind.to_string(),
+                kind: "review".to_string(),
                 skip_reason: Some(reason.clone()),
             };
             IngestDecision {
@@ -646,21 +619,20 @@ fn decide_ingest(
 /// The AppHandle-bound webhook ingest (#61): the body of the [`WebhookIngestor`] the
 /// composition root installs. A THIN IO shell around the pure [`decide_ingest`]: it
 /// resolves config + ledger (fail-closed), calls `decide_ingest`, then performs only the
-/// AppHandle-bound IO — the registry `write`, the `prs:updated` emit, the detached dispatch
-/// spawn, and the single delivery record. The branch LOGIC (view + write + dispatchable +
+/// AppHandle-bound IO — the registry `write`, the `prs:updated` emit, and the single delivery
+/// record. The branch LOGIC (view + write + dispatchable +
 /// terminal status + message) lives in `decide_ingest` and is unit-tested there; the
-/// remaining `mutate_tracked` / `emit` / `spawn` here is the untestable AppHandle shell.
+/// remaining `mutate_tracked` / `emit` here is the untestable AppHandle shell.
 /// Takes ONE parsed, routed [`WebhookEvent`] and (a) upserts /
 /// updates the persisted PR list row, (b) emits `prs:updated` so the list reflects the
-/// push WITHOUT waiting for the next poll round (the #61 fix — webhook PRs now enter the
-/// list even when autoReview is off), and (c) dispatches the gated-clean candidate iff
-/// that project's autoReview is on. Records EXACTLY ONE delivery diagnostic at the end
+/// push WITHOUT waiting for the next poll round, and (c) returns the gated-clean candidate to the
+/// composition root for rule processing. Records EXACTLY ONE delivery diagnostic at the end
 /// (#62) — the handler records the early-exit classifications, this records the routable
 /// terminal status.
 ///
 /// **Fail-closed (parity with the deleted `gate_dispatchable`'s fail-closed reads):** an
 /// unresolvable project / unreadable config OR an unreadable ledger records a `Gated`
-/// delivery with the error message and RETURNS without upsert/emit/dispatch. The ledger
+/// delivery with the error message and RETURNS without upsert/emit/rule processing. The ledger
 /// is the dedup/cooldown source of truth — degrading it to an empty ledger would pass
 /// EVERY cooldown/dedup gate and re-review storm, so an unprovable "not a recent
 /// duplicate" must fail closed, matching the poll path (`discover` uses
@@ -668,14 +640,12 @@ fn decide_ingest(
 ///
 /// Reuses the registry's single serialized write seam ([`registry::mutate_tracked`]) for
 /// the upsert + emit (so this can't interleave with a poll-cycle upsert / `set_pr_archived`
-/// and lose a write). The dispatch decision uses the project's `auto_review` flag — read
-/// ONCE off the same loaded project that `scheduler::auto_review_enabled` resolves from, so
-/// both auto-trigger paths share the SAME per-project autoReview gate.
+/// and lose a write).
 pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    dispatcher: &ProjectDispatcher,
+    _dispatcher: &ProjectDispatcher,
     ev: WebhookEvent,
-) {
+) -> AppResult<Option<Candidate>> {
     let WebhookEvent {
         project_id,
         received_at,
@@ -712,27 +682,19 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
         Ok(p) => p,
         Err(e) => {
             record_failclosed(app, format!("项目配置不可读：{}", e.message));
-            return;
+            return Ok(None);
         }
     };
     let params = MonitorParams {
         repo: project.repo,
-        review_label: project.review_label,
-        check_label: project.check_label,
         authors: project.authors,
         pr_cooldown_seconds: project.pr_cooldown_seconds,
     };
-    // The project's autoReview flag, read ONCE off the SAME loaded project (the per-project
-    // gate `scheduler::auto_review_enabled` resolves from the same `config_service::project`).
-    // Reading it here — rather than re-loading config via `auto_review_enabled` after persist —
-    // ties the dispatch decision and the terminal delivery status to one consistent value and
-    // lets the pure `decide_ingest` finalize both.
-    let auto_review = project.auto_review;
     let ledger = match Ledger::load(app, &project_id) {
         Ok(l) => l,
         Err(e) => {
             record_failclosed(app, format!("ledger 不可读：{}", e.message));
-            return;
+            return Ok(None);
         }
     };
     let now = now_epoch();
@@ -746,17 +708,7 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
         dispatchable,
         status: final_status,
         message,
-    } = decide_ingest(
-        intent,
-        number,
-        title,
-        labels,
-        url,
-        &params,
-        &ledger,
-        now,
-        auto_review,
-    );
+    } = decide_ingest(intent, number, title, labels, url, &params, &ledger, now);
 
     // Persist + emit through the single serialized write seam. The Upsert path always
     // persists + emits (an upsert always changes the set); the UpdatePresent path persists
@@ -795,9 +747,8 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
         Ok(None) => {}
         // A store failure surfaces via `PrEvent::Error` (the project's error banner) —
         // SYMMETRIC with the poll path (`scheduler::persist_event` emits `PrEvent::Error`
-        // on a persist failure). The delivery record below still reflects the dispatch
-        // decision: dispatch is INDEPENDENT of persistence (it still runs if
-        // dispatchable + autoReview), the same contract as the poll path. The list is
+        // on a persist failure). The delivery record below still reflects the gate decision; rule
+        // processing happens in the composition root after this function returns. The list is
         // unchanged, but the banner tells the user the persist failed.
         Err(e) => {
             let _ = app.emit(
@@ -807,23 +758,6 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
                     message: format!("PR 列表持久化失败：{}", e.message),
                 },
             );
-        }
-    }
-
-    // Dispatch the gated-clean candidate iff autoReview is on. `decide_ingest` already
-    // gates `dispatchable` to `Some` ONLY for a clean (un-skipped) candidate AND already
-    // baked the autoReview flag into `final_status` (Dispatched on / ListUpdated off, the
-    // #61 core "PR enters the list even with autoReview off"), so the shell just spawns
-    // when both hold — it never re-decides the status. The same `auto_review` value drives
-    // both, so the spawn and the recorded status can't disagree. Detached spawn, mirroring
-    // the scheduler's detached dispatch (a stop must not cancel a start in flight); the
-    // JoinHandle is dropped explicitly so the task runs to completion regardless of caller.
-    if let Some(cand) = dispatchable {
-        if auto_review {
-            drop(tauri::async_runtime::spawn(dispatcher(
-                project_id.clone(),
-                vec![cand],
-            )));
         }
     }
 
@@ -843,6 +777,7 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
             message,
         },
     );
+    Ok(dispatchable)
 }
 
 /// Record one webhook-delivery diagnostic into the manager's ring (#62) via `AppState`. A thin
@@ -927,8 +862,6 @@ pub async fn start_webhook<R: tauri::Runtime>(
             source_kind: p.source_kind,
             repo: p.repo.clone(),
             azure_project: p.azure_project.clone(),
-            review_label: p.review_label.clone(),
-            check_label: p.check_label.clone(),
             // AB#717: the GitHub webhook path classifies from the payload, so it must honor
             // the project's label source (native vs title-parsed). The Azure path re-runs
             // `az` discovery (which already honors labelSource in `parse_rows`), so it does
@@ -1012,8 +945,6 @@ mod tests {
     fn params() -> MonitorParams {
         MonitorParams {
             repo: "o/r".to_string(),
-            review_label: "review-label".to_string(),
-            check_label: "check-label".to_string(),
             authors: vec![],
             pr_cooldown_seconds: 1800,
         }
@@ -1170,7 +1101,7 @@ mod tests {
 
     #[test]
     fn build_view_clean_row_has_no_skip_reason_and_is_dispatchable() {
-        let (view, cand) = build_view(row(1, "review", false), &params(), &Ledger::default(), 0);
+        let (view, cand) = build_view(&row(1, "review", false), &params(), &Ledger::default(), 0);
         assert_eq!(view.number, 1);
         assert_eq!(view.kind, "review");
         // AB#1070: display fields (title / url / labels) come from the `DiscoveredEvent.event`,
@@ -1187,7 +1118,7 @@ mod tests {
 
     #[test]
     fn build_view_conflict_row_skips_and_is_not_dispatchable() {
-        let (view, cand) = build_view(row(2, "check", true), &params(), &Ledger::default(), 0);
+        let (view, cand) = build_view(&row(2, "check", true), &params(), &Ledger::default(), 0);
         assert_eq!(
             view.skip_reason,
             Some("both review and check trigger labels are present".to_string())
@@ -1200,7 +1131,7 @@ mod tests {
     fn build_view_propagates_static_gate_skip_and_omits_candidate() {
         let mut r = row(3, "review", false);
         r.candidate.is_draft = true;
-        let (view, cand) = build_view(r, &params(), &Ledger::default(), 0);
+        let (view, cand) = build_view(&r, &params(), &Ledger::default(), 0);
         assert_eq!(view.skip_reason, Some("draft PR".to_string()));
         assert!(cand.is_none());
     }
@@ -1223,7 +1154,7 @@ mod tests {
             }],
         };
         // 1800s cooldown, dispatched 500s before `now` → within window.
-        let (view, cand) = build_view(r, &params(), &ledger, 1_500);
+        let (view, cand) = build_view(&r, &params(), &ledger, 1_500);
         assert!(
             view.skip_reason
                 .as_deref()
@@ -1316,15 +1247,14 @@ mod tests {
     }
 
     // ── `decide_ingest` (F7): the PURE ingest-decision seam extracted from the
-    // AppHandle-bound `ingest_webhook` body so EVERY branch (incl. the #61 core
-    // "autoReview off still LISTS the PR") has automated coverage rather than only the old
-    // "verified via integration / NOT a unit test" note. Each test asserts the FULL
-    // decision: view fields + write + dispatchable + terminal status + message.
+    // AppHandle-bound `ingest_webhook` body so EVERY branch has automated coverage rather
+    // than only the old "verified via integration / NOT a unit test" note. Each test asserts
+    // the FULL decision: view fields + write + terminal status + message.
     use super::super::webhook::StatusOnlyKind;
 
     /// A clean single-label candidate wrapped as `IngestIntent::Track { candidate: Some }`.
     /// `row` builds a non-draft, non-fork, allowed-author candidate → clean under the
-    /// empty-ledger `params()` gates, so the only thing left to vary is autoReview.
+    /// empty-ledger `params()` gates.
     fn wrap_some(number: u64) -> IngestIntent {
         IngestIntent::Track {
             candidate: Some(row(number, "review", false).candidate),
@@ -1333,9 +1263,9 @@ mod tests {
     }
 
     #[test]
-    fn decide_ingest_clean_candidate_auto_review_on_dispatches() {
-        // #61: a clean candidate with autoReview ON → Upsert row, dispatch the candidate,
-        // status Dispatched, no message.
+    fn decide_ingest_clean_candidate_lists_for_rule_engine() {
+        // A clean candidate updates the list. Action enqueueing is owned by the rule engine,
+        // so webhook ingest itself no longer reports Dispatched.
         let d = decide_ingest(
             wrap_some(1),
             1,
@@ -1345,51 +1275,19 @@ mod tests {
             &params(),
             &Ledger::default(),
             0,
-            true,
         );
         assert_eq!(d.view.number, 1);
         assert_eq!(d.view.kind, "review");
         assert_eq!(d.view.skip_reason, None);
         assert!(matches!(d.write, WriteKind::Upsert));
-        assert!(d.dispatchable.is_some(), "clean candidate is dispatchable");
-        assert!(matches!(d.status, DeliveryStatus::Dispatched));
-        assert_eq!(d.message, None);
-    }
-
-    #[test]
-    fn decide_ingest_clean_candidate_auto_review_off_lists_without_dispatch() {
-        // THE #61 CORE: a clean candidate with autoReview OFF → still Upserts the row +
-        // surfaces a dispatchable (the shell just won't spawn it), status ListUpdated (NOT
-        // Dispatched), no message. This is the branch that previously had no unit test.
-        let d = decide_ingest(
-            wrap_some(2),
-            2,
-            "PR 2".to_string(),
-            vec!["review-label".to_string()],
-            "https://x/2".to_string(),
-            &params(),
-            &Ledger::default(),
-            0,
-            false,
-        );
-        assert_eq!(d.view.number, 2);
-        assert_eq!(d.view.skip_reason, None);
-        assert!(matches!(d.write, WriteKind::Upsert));
-        assert!(
-            d.dispatchable.is_some(),
-            "autoReview-off still surfaces the candidate (the shell gates the spawn)"
-        );
-        assert!(
-            matches!(d.status, DeliveryStatus::ListUpdated),
-            "autoReview off → ListUpdated, not Dispatched"
-        );
+        assert!(matches!(d.status, DeliveryStatus::ListUpdated));
         assert_eq!(d.message, None);
     }
 
     #[test]
     fn decide_ingest_static_gated_candidate_is_gated_no_dispatch() {
-        // A draft candidate is gated by `should_skip` → Upsert a skipped row, NO dispatch,
-        // status Gated, message = the skip reason. autoReview on must NOT override the gate.
+        // A draft candidate is gated by `should_skip` → Upsert a skipped row, no candidate for
+        // rule processing, status Gated, message = the skip reason.
         let mut cand = row(3, "review", false).candidate;
         cand.is_draft = true;
         let intent = IngestIntent::Track {
@@ -1405,14 +1303,9 @@ mod tests {
             &params(),
             &Ledger::default(),
             0,
-            true,
         );
         assert_eq!(d.view.skip_reason, Some("draft PR".to_string()));
         assert!(matches!(d.write, WriteKind::Upsert));
-        assert!(
-            d.dispatchable.is_none(),
-            "a gated candidate never dispatches"
-        );
         assert!(matches!(d.status, DeliveryStatus::Gated));
         assert_eq!(d.message, Some("draft PR".to_string()));
     }
@@ -1420,7 +1313,7 @@ mod tests {
     #[test]
     fn decide_ingest_cooldown_gated_candidate_is_gated_no_dispatch() {
         // A candidate within its dispatch cooldown is gated by `cooldown_skip` → Gated row,
-        // no dispatch, message = the cooldown reason (even with autoReview on).
+        // no candidate for rule processing, message = the cooldown reason.
         use crate::pr::ledger::{dispatch_key, DispatchEvent};
         use std::collections::HashSet;
 
@@ -1449,7 +1342,6 @@ mod tests {
             &params(),
             &ledger,
             1_500,
-            true,
         );
         assert!(
             d.view
@@ -1460,7 +1352,6 @@ mod tests {
             d.view.skip_reason
         );
         assert!(matches!(d.write, WriteKind::Upsert));
-        assert!(d.dispatchable.is_none());
         assert!(matches!(d.status, DeliveryStatus::Gated));
         assert!(d
             .message
@@ -1485,7 +1376,6 @@ mod tests {
             &params(),
             &Ledger::default(),
             0,
-            true,
         );
         assert_eq!(d.view.number, 5);
         assert_eq!(d.view.kind, "review");
@@ -1494,7 +1384,6 @@ mod tests {
             Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string())
         );
         assert!(matches!(d.write, WriteKind::Upsert));
-        assert!(d.dispatchable.is_none());
         assert!(matches!(d.status, DeliveryStatus::Gated));
         assert_eq!(
             d.message,
@@ -1518,13 +1407,11 @@ mod tests {
             &params(),
             &Ledger::default(),
             0,
-            true,
         );
         assert_eq!(d.view.number, 6);
         assert_eq!(d.view.kind, "review");
         assert_eq!(d.view.skip_reason, Some("PR 已关闭或合并".to_string()));
         assert!(matches!(d.write, WriteKind::UpdatePresent));
-        assert!(d.dispatchable.is_none());
         assert!(matches!(d.status, DeliveryStatus::NotOpen));
         assert_eq!(d.message, Some("PR 已关闭或合并".to_string()));
     }
@@ -1532,8 +1419,8 @@ mod tests {
     #[test]
     fn decide_ingest_status_only_trigger_label_removed_is_no_trigger_label_update_present() {
         // An open PR with the trigger label removed → StatusOnly { TriggerLabelRemoved }:
-        // UpdatePresent, status NoTriggerLabel, reason "触发 label 已移除". With ONLY the
-        // check label present, the view kind is "check" (the labels-derived kind).
+        // UpdatePresent, status NoTriggerLabel, reason "触发 label 已移除". The action kind is
+        // no longer inferred from labels at ingest time.
         let intent = IngestIntent::StatusOnly {
             kind: StatusOnlyKind::TriggerLabelRemoved,
         };
@@ -1546,13 +1433,11 @@ mod tests {
             &params(),
             &Ledger::default(),
             0,
-            false,
         );
         assert_eq!(d.view.number, 7);
-        assert_eq!(d.view.kind, "check", "check label present → kind check");
+        assert_eq!(d.view.kind, "review");
         assert_eq!(d.view.skip_reason, Some("触发 label 已移除".to_string()));
         assert!(matches!(d.write, WriteKind::UpdatePresent));
-        assert!(d.dispatchable.is_none());
         assert!(matches!(d.status, DeliveryStatus::NoTriggerLabel));
         assert_eq!(d.message, Some("触发 label 已移除".to_string()));
     }

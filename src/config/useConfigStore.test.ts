@@ -26,8 +26,6 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
       repoRoot: "/abs/path",
       pollIntervalSecs: 120,
       authors: [],
-      reviewLabel: "pr-status/needs-review-again",
-      checkLabel: "pr-status/needs-check-fix",
       labelSource: "native",
       skillRelPath: ".codex/skills/pr-review/SKILL.md",
       prCooldownSeconds: 1800,
@@ -41,7 +39,6 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
       engineKind: "codex",
       codexModel: "",
       claudeModel: "",
-      autoReview: false,
     },
   ],
   activeProjectId: "default",
@@ -57,6 +54,7 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
   notifications: { channels: [] },
   listeners: [],
   tunnels: [],
+  rules: [],
   ...over,
 });
 

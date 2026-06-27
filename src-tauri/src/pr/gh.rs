@@ -94,7 +94,7 @@ fn parse_pr_list(json: &str) -> AppResult<Vec<RawPr>> {
 /// Maps one raw gh row + its trigger `kind` into a [`GhRow`] (mirrors
 /// `router.py` `candidate_from_json`: author is the nested `login`, defaulting
 /// to empty when the author object is null).
-fn to_row(raw: RawPr, kind: &str) -> GhRow {
+fn to_row(raw: RawPr) -> GhRow {
     let author = raw.author.map(|a| a.login).unwrap_or_default();
     let labels = raw
         .labels
@@ -110,7 +110,7 @@ fn to_row(raw: RawPr, kind: &str) -> GhRow {
             author,
             is_cross_repository: raw.is_cross_repository,
             is_draft: raw.is_draft,
-            kind: kind.to_string(),
+            kind: "review".to_string(),
         },
         title: raw.title,
         url: raw.url,
@@ -127,8 +127,7 @@ fn to_row(raw: RawPr, kind: &str) -> GhRow {
 /// gets from `merge_rows`, but from a single all-open-PRs fetch.
 fn to_row_classified(
     raw: RawPr,
-    review_label: &str,
-    check_label: &str,
+    trigger_labels: &[String],
     label_source: crate::model::LabelSource,
 ) -> Option<GhRow> {
     let native: Vec<String> = raw
@@ -138,7 +137,13 @@ fn to_row_classified(
         .filter(|n| !n.is_empty())
         .collect();
     let labels = labels::effective_labels(native, &raw.title, label_source);
-    let (kind, conflict) = labels::classify(&labels, review_label, check_label)?;
+    if !trigger_labels.is_empty()
+        && !trigger_labels
+            .iter()
+            .any(|wanted| labels.iter().any(|label| label == wanted))
+    {
+        return None;
+    }
     let author = raw.author.map(|a| a.login).unwrap_or_default();
     Some(GhRow {
         candidate: Candidate {
@@ -148,12 +153,12 @@ fn to_row_classified(
             author,
             is_cross_repository: raw.is_cross_repository,
             is_draft: raw.is_draft,
-            kind: kind.to_string(),
+            kind: "review".to_string(),
         },
         title: raw.title,
         url: raw.url,
         labels,
-        conflict,
+        conflict: false,
     })
 }
 
@@ -228,23 +233,16 @@ pub struct GhStatus {
 pub struct GithubCli {
     gh_bin: String,
     repo: String,
-    review_label: String,
-    check_label: String,
+    trigger_labels: Vec<String>,
     label_source: LabelSource,
 }
 
 impl GithubCli {
-    pub fn new(
-        repo: String,
-        review_label: String,
-        check_label: String,
-        label_source: LabelSource,
-    ) -> Self {
+    pub fn new(repo: String, trigger_labels: Vec<String>, label_source: LabelSource) -> Self {
         Self {
             gh_bin: "gh".to_string(),
             repo,
-            review_label,
-            check_label,
+            trigger_labels,
             label_source,
         }
     }
@@ -301,26 +299,27 @@ impl GithubCli {
     async fn discover_rows(&self) -> AppResult<Vec<GhRow>> {
         match self.label_source {
             LabelSource::Native => {
-                let review = parse_pr_list(&self.run_pr_list(Some(&self.review_label)).await?)?
-                    .into_iter()
-                    .map(|r| to_row(r, "review"))
-                    .collect();
-                let check = parse_pr_list(&self.run_pr_list(Some(&self.check_label)).await?)?
-                    .into_iter()
-                    .map(|r| to_row(r, "check"))
-                    .collect();
-                Ok(merge_rows(review, check))
+                if self.trigger_labels.is_empty() {
+                    return Ok(parse_pr_list(&self.run_pr_list(None).await?)?
+                        .into_iter()
+                        .map(to_row)
+                        .collect());
+                }
+                let mut rows = Vec::new();
+                for label in &self.trigger_labels {
+                    rows.extend(
+                        parse_pr_list(&self.run_pr_list(Some(label)).await?)?
+                            .into_iter()
+                            .map(to_row),
+                    );
+                }
+                Ok(merge_rows(rows, Vec::new()))
             }
             LabelSource::Title => {
                 let mut rows: Vec<GhRow> = parse_pr_list(&self.run_pr_list(None).await?)?
                     .into_iter()
                     .filter_map(|raw| {
-                        to_row_classified(
-                            raw,
-                            &self.review_label,
-                            &self.check_label,
-                            self.label_source,
-                        )
+                        to_row_classified(raw, &self.trigger_labels, self.label_source)
                     })
                     .collect();
                 // Sort by PR number for parity with the native path's BTreeMap order.
@@ -407,7 +406,7 @@ mod tests {
         let rows: Vec<GhRow> = parse_pr_list(json)
             .expect("parses")
             .into_iter()
-            .map(|r| to_row(r, "review"))
+            .map(to_row)
             .collect();
 
         assert_eq!(rows.len(), 1);
@@ -454,11 +453,11 @@ mod tests {
                 "isDraft": true
             }
         ]"#;
-        let row = to_row(parse_pr_list(json).expect("parses").pop().unwrap(), "check");
+        let row = to_row(parse_pr_list(json).expect("parses").pop().unwrap());
         assert_eq!(row.candidate.author, ""); // null author → empty login
         assert!(row.candidate.is_cross_repository);
         assert!(row.candidate.is_draft);
-        assert_eq!(row.candidate.kind, "check");
+        assert_eq!(row.candidate.kind, "review");
         assert_eq!(row.title, ""); // missing optional display fields default empty
         assert!(row.labels.is_empty());
     }
@@ -476,22 +475,21 @@ mod tests {
     }
 
     fn row(number: u64, kind: &str) -> GhRow {
-        to_row(
-            RawPr {
-                number,
-                title: format!("PR {number}"),
-                url: format!("https://x/{number}"),
-                head_ref_name: "ref".to_string(),
-                head_ref_oid: "sha".to_string(),
-                author: Some(RawAuthor {
-                    login: "octocat".to_string(),
-                }),
-                is_cross_repository: false,
-                is_draft: false,
-                labels: vec![],
-            },
-            kind,
-        )
+        let mut row = to_row(RawPr {
+            number,
+            title: format!("PR {number}"),
+            url: format!("https://x/{number}"),
+            head_ref_name: "ref".to_string(),
+            head_ref_oid: "sha".to_string(),
+            author: Some(RawAuthor {
+                login: "octocat".to_string(),
+            }),
+            is_cross_repository: false,
+            is_draft: false,
+            labels: vec![],
+        });
+        row.candidate.kind = kind.to_string();
+        row
     }
 
     #[test]
@@ -546,6 +544,7 @@ mod tests {
         use crate::model::LabelSource;
         const REVIEW: &str = "pr-status/needs-review-again";
         const CHECK: &str = "pr-status/needs-check-fix";
+        let trigger_labels = vec![REVIEW.to_string(), CHECK.to_string()];
 
         let raw = RawPr {
             number: 7,
@@ -563,7 +562,7 @@ mod tests {
                 name: "area/ui".to_string(),
             }],
         };
-        let row = to_row_classified(raw, REVIEW, CHECK, LabelSource::Title).expect("monitored");
+        let row = to_row_classified(raw, &trigger_labels, LabelSource::Title).expect("monitored");
         assert_eq!(row.candidate.kind, "review");
         assert_eq!(row.labels, vec![REVIEW.to_string()]);
         assert!(!row.conflict);
@@ -582,7 +581,7 @@ mod tests {
                 name: REVIEW.to_string(),
             }],
         };
-        assert!(to_row_classified(raw_native_only, REVIEW, CHECK, LabelSource::Title).is_none());
+        assert!(to_row_classified(raw_native_only, &trigger_labels, LabelSource::Title).is_none());
 
         // Both trigger tags in the title → conflict, kept with kind "review".
         let raw_both = RawPr {
@@ -597,8 +596,8 @@ mod tests {
             labels: vec![],
         };
         let row_both =
-            to_row_classified(raw_both, REVIEW, CHECK, LabelSource::Title).expect("kept");
-        assert!(row_both.conflict);
+            to_row_classified(raw_both, &trigger_labels, LabelSource::Title).expect("kept");
+        assert!(!row_both.conflict);
         assert_eq!(row_both.candidate.kind, "review");
     }
 

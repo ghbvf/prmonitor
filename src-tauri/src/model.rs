@@ -291,6 +291,7 @@ pub struct TrackedPrView {
 /// "generic"`) — a cross-agent contract the frontend's `EVENT_TYPES` (`src/types.ts`)
 /// mirrors; the serde golden test below (`event_type_serializes_to_pinned_wire_strings`)
 /// is the **Medium** carrier locking them against a `rename_all` / variant drift.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum EventType {

@@ -34,6 +34,7 @@ function draft(): AppConfig {
     notifications: { channels: [] },
     listeners: [],
     tunnels: [],
+    rules: [],
   };
 }
 

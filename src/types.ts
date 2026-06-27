@@ -1,14 +1,15 @@
 // Shared cross-slice contracts mirroring `src-tauri/src/model.rs` (the contract
 // boundary). Slices import from here; they do not import each other's internals.
-import type { SourceKind, UpdateMode } from "./types.generated";
+import type { EventType, SourceKind, UpdateMode } from "./types.generated";
 
 export {
   ENGINE_KINDS,
+  EVENT_TYPES,
   LABEL_SOURCES,
   SOURCE_KINDS,
   UPDATE_MODES,
 } from "./types.generated";
-export type { EngineKind, LabelSource, SourceKind, UpdateMode } from "./types.generated";
+export type { EngineKind, EventType, LabelSource, SourceKind, UpdateMode } from "./types.generated";
 
 // Exhaustiveness guard for discriminated unions / string-literal enums: in a
 // `default`/`else` branch, `assertNever(x)` only type-checks if `x` has been
@@ -182,13 +183,6 @@ export type PrEvent =
 // ── Event pipeline contracts (AB#1079, epic AB#1078) ──────────────────────────────
 // The normalized inbound-event envelope shared by the inbox (1065) / rule engine (1068) /
 // outbox (1066). Mirrors `model.rs::Event` + `EventType` (the event-pipeline keystone).
-
-// The class of a normalized event — mirrors the Rust `EventType` enum's camelCase wire
-// values (locked by the model.rs golden test). Single-sourced as an `as const` array
-// (mirrors SOURCE_KINDS / ENGINE_KINDS): the type is DERIVED from the array. Default is
-// "pullRequest" (the only class the current webhook path emits).
-export const EVENT_TYPES = ["pullRequest", "issue", "comment", "label", "generic"] as const;
-export type EventType = (typeof EVENT_TYPES)[number];
 
 // A normalized inbound event (AB#1079) — mirrors `model.rs::Event` (serde camelCase; locked
 // by the model.rs golden test). Generalizes the webhook event with a cross-source identity

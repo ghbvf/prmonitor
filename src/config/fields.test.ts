@@ -38,8 +38,6 @@ function validProject(): Project {
     repoRoot: "/abs/path",
     pollIntervalSecs: 120,
     authors: [],
-    reviewLabel: "pr-status/needs-review-again",
-    checkLabel: "pr-status/needs-check-fix",
     labelSource: "native",
     skillRelPath: ".codex/skills/pr-review/SKILL.md",
     prCooldownSeconds: 1800,
@@ -53,7 +51,6 @@ function validProject(): Project {
     engineKind: "codex",
     codexModel: "",
     claudeModel: "",
-    autoReview: false,
   };
 }
 
@@ -128,9 +125,11 @@ describe("PROJECT_GROUPS", () => {
     expect(keys).toEqual(expected);
   });
 
-  it("autoReview is a checkbox in the polling group", () => {
-    const f = PROJECT_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "autoReview");
-    expect(f?.kind).toBe("checkbox");
+  it("legacy trigger controls are not project fields", () => {
+    const keys = PROJECT_GROUPS.flatMap((g) => g.fields.map((f) => f.key));
+    expect(keys).not.toContain("autoReview");
+    expect(keys).not.toContain("reviewLabel");
+    expect(keys).not.toContain("checkLabel");
   });
 
   it("engine group: sourceKind selectable (818), engineKind selectable (#718)", () => {
@@ -497,9 +496,9 @@ describe("skillRelPath field is codex-only (#718)", () => {
   });
 });
 
-describe("validateStep — autoReview (intervals)", () => {
+describe("validateStep — update (intervals)", () => {
   it("accepts positive intervals", () => {
-    expect(validateStep("autoReview", validProject())).toBeNull();
+    expect(validateStep("update", validProject())).toBeNull();
   });
   it.each([
     { pollIntervalSecs: 0 },
@@ -509,15 +508,7 @@ describe("validateStep — autoReview (intervals)", () => {
     { pollIntervalSecs: NaN },
     { prCooldownSeconds: NaN },
   ])("rejects non-positive / NaN %o", (patch) => {
-    expect(validateStep("autoReview", { ...validProject(), ...patch })).toBeTruthy();
-  });
-  it.each([
-    { reviewLabel: "" },
-    { reviewLabel: "   " },
-    { checkLabel: "" },
-    { checkLabel: "  " },
-  ])("rejects blank trigger label %o", (patch) => {
-    expect(validateStep("autoReview", { ...validProject(), ...patch })).toBeTruthy();
+    expect(validateStep("update", { ...validProject(), ...patch })).toBeTruthy();
   });
 });
 
@@ -589,13 +580,13 @@ describe("validateStep — source (717 bitbucket)", () => {
   });
 });
 
-// Bitbucket-only autoReview gates (717): the backend `validate_project` enforces two
+// Bitbucket-only update gates (717): the backend `validate_project` enforces two
 // extra constraints for a Bitbucket source — labels must be title-parsed (no native
 // labels) and webhook-driven update modes are invalid (no inbound webhook). validateStep
-// pre-gates both in the autoReview step (where labelSource + updateMode are surfaced), so
+// pre-gates both in the update step (where labelSource + updateMode are surfaced), so
 // the user is caught before submit. Error tokens (`labelSource`/`updateMode`) route via
 // errorToStep back to this step. Backend remains the source of truth.
-describe("validateStep — autoReview (717 bitbucket gates)", () => {
+describe("validateStep — update (717 bitbucket gates)", () => {
   function bitbucketProject(): Project {
     return {
       ...validProject(),
@@ -609,10 +600,10 @@ describe("validateStep — autoReview (717 bitbucket gates)", () => {
     };
   }
   it("accepts a bitbucket source with labelSource=title + updateMode=pull-only", () => {
-    expect(validateStep("autoReview", bitbucketProject())).toBeNull();
+    expect(validateStep("update", bitbucketProject())).toBeNull();
   });
   it("blocks a bitbucket source whose labelSource is native (no native labels)", () => {
-    const err = validateStep("autoReview", {
+    const err = validateStep("update", {
       ...bitbucketProject(),
       labelSource: "native",
     });
@@ -623,7 +614,7 @@ describe("validateStep — autoReview (717 bitbucket gates)", () => {
   it.each(["webhook-only", "hybrid"] as const)(
     "blocks a bitbucket source whose updateMode is %s (no inbound webhook)",
     (updateMode) => {
-      const err = validateStep("autoReview", {
+      const err = validateStep("update", {
         ...bitbucketProject(),
         updateMode,
       });
@@ -634,13 +625,13 @@ describe("validateStep — autoReview (717 bitbucket gates)", () => {
   );
   it("does not impose the bitbucket gates on a github source", () => {
     // validProject() is github with labelSource=native + updateMode=webhook-only —
-    // those are fine for github, so the autoReview step must still pass.
-    expect(validateStep("autoReview", validProject())).toBeNull();
+    // those are fine for github, so the update step must still pass.
+    expect(validateStep("update", validProject())).toBeNull();
   });
 });
 
 describe("STEPS ordering", () => {
-  it("is the wizard sequence source→repo→repoRoot→skill→autoReview→done (717 F8)", () => {
+  it("is the wizard sequence source→repo→repoRoot→skill→update→done (717 F8)", () => {
     // `source` comes BEFORE `repo` so the source is chosen before validateStep("repo")
     // branches the repo-shape check on draft.sourceKind — otherwise a Bitbucket/Azure
     // bare slug would be checked against the default github owner/name rule and the user
@@ -650,7 +641,7 @@ describe("STEPS ordering", () => {
       "repo",
       "repoRoot",
       "skill",
-      "autoReview",
+      "update",
       "done",
     ]);
   });
@@ -670,9 +661,9 @@ describe("STEP_FIELDS — onboarding wizard step → field wiring (818 F2/F3)", 
     expect(STEP_FIELDS.source).toContain("bitbucketToken");
   });
 
-  it("the autoReview step surfaces updateMode (818 F3) + labelSource (717)", () => {
-    expect(STEP_FIELDS.autoReview).toContain("updateMode");
-    expect(STEP_FIELDS.autoReview).toContain("labelSource");
+  it("the update step surfaces updateMode (818 F3) + labelSource (717)", () => {
+    expect(STEP_FIELDS.update).toContain("updateMode");
+    expect(STEP_FIELDS.update).toContain("labelSource");
   });
 
   it("every STEP_FIELDS key is a real PROJECT_GROUPS field", () => {
@@ -721,13 +712,9 @@ describe("errorToStep — routes backend AppError messages", () => {
   it("path-escape message (names both fields) → skill step, not repoRoot", () => {
     expect(errorToStep("skillRelPath 不能逃逸 repoRoot: ../x")).toBe("skill");
   });
-  it("interval messages → autoReview step", () => {
-    expect(errorToStep("pollIntervalSecs 必须大于 0")).toBe("autoReview");
-    expect(errorToStep("prCooldownSeconds 必须大于 0")).toBe("autoReview");
-  });
-  it("label messages → autoReview step", () => {
-    expect(errorToStep("reviewLabel 不能为空")).toBe("autoReview");
-    expect(errorToStep("checkLabel 不能为空")).toBe("autoReview");
+  it("interval messages → update step", () => {
+    expect(errorToStep("pollIntervalSecs 必须大于 0")).toBe("update");
+    expect(errorToStep("prCooldownSeconds 必须大于 0")).toBe("update");
   });
   // Prefix-match (not substring) so an interpolated VALUE can't hijack routing.
   it("does not let an interpolated value hijack the route", () => {
@@ -774,16 +761,16 @@ describe("errorToStep — routes backend AppError messages", () => {
     expect(errorToStep("bitbucketProject 不能为空（bitbucket 源需填项目 key）")).toBe("source");
     expect(errorToStep("bitbucketToken 不能为空（bitbucket 源需填 access token）")).toBe("source");
   });
-  // labelSource (717) lives in the labels group, surfaced in the autoReview step alongside
+  // labelSource (717) lives in the labels group, surfaced in the update step alongside
   // reviewLabel/checkLabel, so a backend rejection routes there.
-  it("labelSource message → autoReview step (717)", () => {
-    expect(errorToStep("labelSource 取值非法")).toBe("autoReview");
-    expect(errorToStep("labelSource 必须为 title（Bitbucket 源无原生标签）")).toBe("autoReview");
+  it("labelSource message → update step (717)", () => {
+    expect(errorToStep("labelSource 取值非法")).toBe("update");
+    expect(errorToStep("labelSource 必须为 title（Bitbucket 源无原生标签）")).toBe("update");
   });
-  // updateMode (717) lives in the polling group, surfaced in the autoReview step. The
+  // updateMode (717) lives in the polling group, surfaced in the update step. The
   // backend rejects webhook-only/hybrid for a Bitbucket source (no inbound webhook), so
-  // its rejection routes back to the autoReview step too.
-  it("updateMode message → autoReview step (717)", () => {
-    expect(errorToStep("updateMode Bitbucket 源不支持 webhook（无入站）")).toBe("autoReview");
+  // its rejection routes back to the update step too.
+  it("updateMode message → update step (717)", () => {
+    expect(errorToStep("updateMode Bitbucket 源不支持 webhook（无入站）")).toBe("update");
   });
 });

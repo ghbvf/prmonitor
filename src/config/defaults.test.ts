@@ -24,8 +24,6 @@ function githubProject(): Project {
     repoRoot: "/abs/path",
     pollIntervalSecs: 120,
     authors: [],
-    reviewLabel: "pr-status/needs-review-again",
-    checkLabel: "pr-status/needs-check-fix",
     labelSource: "native",
     skillRelPath: ".codex/skills/pr-review/SKILL.md",
     prCooldownSeconds: 1800,
@@ -39,7 +37,6 @@ function githubProject(): Project {
     engineKind: "codex",
     codexModel: "",
     claudeModel: "",
-    autoReview: false,
   };
 }
 

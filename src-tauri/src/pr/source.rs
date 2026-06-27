@@ -23,6 +23,7 @@ use crate::error::AppResult;
 /// only to carry both the `Event` and the `Candidate` out of `discover_events`
 /// without flattening one into the other. The cross-slice contract types it wraps
 /// (`Event` / `Candidate`) live in `crate::model`.
+#[derive(Clone)]
 pub struct DiscoveredEvent {
     pub event: crate::model::Event,
     pub candidate: crate::model::Candidate,

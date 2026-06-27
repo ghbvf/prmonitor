@@ -8,7 +8,7 @@ use url::Url;
 
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    EngineKind, LabelSource, NotificationKind, SourceKind, UpdateMode, WebhookTunnelMode,
+    EngineKind, EventType, LabelSource, NotificationKind, SourceKind, UpdateMode, WebhookTunnelMode,
 };
 
 /// One monitored project (#35). What was previously the flat per-repo subset of
@@ -45,10 +45,6 @@ pub struct Project {
     pub poll_interval_secs: u64,
     /// PR author allowlist (mirrors the dispatcher's author gate).
     pub authors: Vec<String>,
-    /// Label that triggers a `review` turn.
-    pub review_label: String,
-    /// Label that triggers a `check` turn.
-    pub check_label: String,
     /// Path (relative to `repo_root`) of the codex pr-review skill to invoke.
     pub skill_rel_path: String,
     /// Per-PR cooldown between dispatches of the same `(pr, kind)`.
@@ -67,8 +63,6 @@ pub struct Project {
     /// 手填的 claude 模型名（仅 [`EngineKind::Claude`] 用）。非空时作为 `claude -p` 的
     /// `--model` 参数；留空=claude CLI 默认。自由文本不校验。
     pub claude_model: String,
-    /// 是否在发现 dispatchable PR 时自动派发 review（false=仅手动「开始 review」触发）。
-    pub auto_review: bool,
     /// 本项目 PR 列表的更新模式（#818）。默认 [`UpdateMode::WebhookOnly`]：**启动不自动
     /// 轮询 CLI**，列表仅由 webhook 推送更新。`pull-only`/`hybrid` 才起周期轮询；`manual`
     /// 只在「立即拉取」时跑一次性发现。调度器据此 gate 是否为本项目起轮询 loop。
@@ -105,8 +99,6 @@ impl Default for Project {
             repo_root: String::new(),
             poll_interval_secs: 120,
             authors: Vec::new(),
-            review_label: "pr-status/needs-review-again".to_string(),
-            check_label: "pr-status/needs-check-fix".to_string(),
             skill_rel_path: ".codex/skills/pr-review/SKILL.md".to_string(),
             pr_cooldown_seconds: 1800,
             source_kind: SourceKind::default(),
@@ -114,10 +106,6 @@ impl Default for Project {
             // 模型留空 = 各引擎用自身默认（不注入 --model / turn model）。
             codex_model: String::new(),
             claude_model: String::new(),
-            // Boot defaults to manual review: scheduler polls/emits but does NOT
-            // auto-dispatch codex at startup (avoids clashing with other review
-            // processes). Flip-back guarded by `default_auto_review_is_off`.
-            auto_review: false,
             // #818: boot defaults to webhook-only — NO automatic CLI polling at startup
             // (the scheduler does not start a loop for this mode). Flip-back guarded by
             // `default_update_mode_is_webhook_only`.
@@ -166,6 +154,43 @@ impl Default for OutboxConfig {
             notification_ttl_secs: DEFAULT_NOTIFICATION_TTL_SECS,
         }
     }
+}
+
+/// The action a rule produces when it matches an inbound event (#1371).
+///
+/// Exhaustive routing is intentionally split: the rule engine plans one or more
+/// [`RuleActionKind`] values, then the outbox executor's existing exhaustive
+/// `match ActionKind` in `lib.rs` remains the Hard carrier for actual side effects.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RuleActionKind {
+    Review,
+    Check,
+    Notify,
+}
+
+/// One configurable event→action rule (#1371).
+///
+/// Empty matcher fields are wildcards. Text matchers are case-insensitive `contains`;
+/// no regex/expr/DSL is accepted in v1. This keeps the form shape small and makes the
+/// matcher deterministic and testable.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RuleConfig {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub source: Option<SourceKind>,
+    pub event_type: Option<EventType>,
+    pub project_id: String,
+    pub repo: String,
+    pub labels_any: Vec<String>,
+    pub labels_all: Vec<String>,
+    pub title_contains: String,
+    pub body_contains: String,
+    pub actions: Vec<RuleActionKind>,
 }
 
 /// Global notification delivery configuration (AB#1459). The outbox stores only a channel id and
@@ -294,6 +319,10 @@ pub struct AppConfig {
     /// Outbox worker policy (AB#1182): per-kind staleness TTLs for the durable action queue. Global
     /// (one policy serves every project). Forward-compat via the nested `#[serde(default)]`.
     pub outbox: OutboxConfig,
+    /// Configurable Event → Action rules (#1371). This replaces the old per-project
+    /// `reviewLabel` / `checkLabel` / `autoReview` runtime path; old persisted fields are
+    /// migrated into rules on load.
+    pub rules: Vec<RuleConfig>,
     /// Outbound notification channels (AB#1459). Forward-compatible default seeds a local desktop
     /// channel; external channels are user-added/disabled until configured.
     pub notifications: NotificationSettings,
@@ -319,6 +348,7 @@ impl Default for AppConfig {
             webhook_public_url: String::new(),
             local_api_token: String::new(),
             outbox: OutboxConfig::default(),
+            rules: Vec::new(),
             notifications: NotificationSettings::default(),
             // AB#1225: 全新安装默认开启本地触发 API（端口 8788 = webhook 默认 8787 + 1，避免
             // 两端口同默认时冲突），现以 `listeners[]` 的 local-api 条目表达——supervisor 绑定的
@@ -803,13 +833,32 @@ pub fn validate_project(project: &Project) -> AppResult<()> {
         return Err(AppError::new("prCooldownSeconds 必须大于 0"));
     }
 
-    if project.review_label.trim().is_empty() {
-        return Err(AppError::new("reviewLabel 不能为空"));
-    }
-    if project.check_label.trim().is_empty() {
-        return Err(AppError::new("checkLabel 不能为空"));
-    }
+    Ok(())
+}
 
+fn validate_rule(rule: &RuleConfig) -> AppResult<()> {
+    if rule.id.trim().is_empty()
+        || rule.id.contains(':')
+        || rule.id.chars().any(char::is_whitespace)
+    {
+        return Err(AppError::new(format!(
+            "id 非法（不能为空、含 `:` 或空白字符）: {:?}",
+            rule.id
+        )));
+    }
+    if rule.name.trim().is_empty() {
+        return Err(AppError::new("name 不能为空"));
+    }
+    if rule.enabled && rule.actions.is_empty() {
+        return Err(AppError::new(
+            "actions 不能为空（启用规则至少需要一个动作）",
+        ));
+    }
+    for (idx, action) in rule.actions.iter().enumerate() {
+        if rule.actions[..idx].contains(action) {
+            return Err(AppError::new(format!("actions 不能重复: {:?}", action)));
+        }
+    }
     Ok(())
 }
 
@@ -922,6 +971,23 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
         }
         if project.enabled {
             validate_project(project)?;
+        }
+    }
+
+    let mut seen_rule_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (idx, rule) in config.rules.iter().enumerate() {
+        validate_rule(rule).map_err(|e| AppError::new(format!("rules[{idx}].{}", e.message)))?;
+        if !seen_rule_ids.insert(rule.id.as_str()) {
+            return Err(AppError::new(format!(
+                "rules[{idx}].id 规则 id 重复: {}（每条规则的 id 必须唯一）",
+                rule.id
+            )));
+        }
+        if !rule.project_id.is_empty() && !seen_ids.contains(rule.project_id.as_str()) {
+            return Err(AppError::new(format!(
+                "rules[{idx}].projectId 不指向任何现有项目: {:?}",
+                rule.project_id
+            )));
         }
     }
 
@@ -1212,6 +1278,7 @@ mod tests {
             notifications: NotificationSettings::default(),
             listeners: Vec::new(),
             tunnels: Vec::new(),
+            rules: Vec::new(),
         };
 
         let v = serde_json::to_value(&config).expect("AppConfig serializes");
@@ -1252,6 +1319,7 @@ mod tests {
         // AB#1064: Remote Access collections present at the top level.
         assert!(v.get("listeners").is_some());
         assert!(v.get("tunnels").is_some());
+        assert!(v.get("rules").is_some());
 
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("active_project_id").is_none());
@@ -1269,6 +1337,53 @@ mod tests {
         assert!(v.get("repo").is_none());
         assert!(v.get("repoRoot").is_none());
         assert!(v.get("autoReview").is_none());
+    }
+
+    #[test]
+    fn rule_config_wire_shape_is_camel_case_and_round_trips() {
+        let rule = RuleConfig {
+            id: "r1".to_string(),
+            name: "Ready".to_string(),
+            enabled: true,
+            source: None,
+            event_type: Some(EventType::PullRequest),
+            project_id: "p1".to_string(),
+            repo: "owner/repo".to_string(),
+            labels_any: vec!["needs-review".to_string()],
+            labels_all: vec!["ready".to_string()],
+            title_contains: "ship".to_string(),
+            body_contains: "details".to_string(),
+            actions: vec![
+                RuleActionKind::Review,
+                RuleActionKind::Check,
+                RuleActionKind::Notify,
+            ],
+        };
+
+        let v = serde_json::to_value(&rule).expect("RuleConfig serializes");
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "id": "r1",
+                "name": "Ready",
+                "enabled": true,
+                "source": null,
+                "eventType": "pullRequest",
+                "projectId": "p1",
+                "repo": "owner/repo",
+                "labelsAny": ["needs-review"],
+                "labelsAll": ["ready"],
+                "titleContains": "ship",
+                "bodyContains": "details",
+                "actions": ["review", "check", "notify"]
+            })
+        );
+
+        let parsed: RuleConfig = serde_json::from_value(v).expect("RuleConfig deserializes");
+        assert_eq!(parsed.id, rule.id);
+        assert_eq!(parsed.source, None);
+        assert_eq!(parsed.event_type, Some(EventType::PullRequest));
+        assert_eq!(parsed.actions, rule.actions);
     }
 
     // AB#1182 forward-compat lock: a config persisted BEFORE the `outbox` field existed (key
@@ -1387,15 +1502,12 @@ mod tests {
             repo_root: "/path/to/repo".to_string(),
             poll_interval_secs: 120,
             authors: vec!["octocat".to_string()],
-            review_label: "needs-review".to_string(),
-            check_label: "needs-check".to_string(),
             skill_rel_path: ".codex/skills/pr-review/SKILL.md".to_string(),
             pr_cooldown_seconds: 1800,
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
             codex_model: "gpt-5.1-codex".to_string(),
             claude_model: "claude-opus-4-1".to_string(),
-            auto_review: false,
             update_mode: UpdateMode::WebhookOnly,
             azure_org: "myorg".to_string(),
             azure_project: "myproject".to_string(),
@@ -1415,8 +1527,8 @@ mod tests {
         assert!(v.get("repoRoot").is_some());
         assert!(v.get("pollIntervalSecs").is_some());
         assert!(v.get("authors").is_some());
-        assert!(v.get("reviewLabel").is_some());
-        assert!(v.get("checkLabel").is_some());
+        assert!(v.get("reviewLabel").is_none());
+        assert!(v.get("checkLabel").is_none());
         assert!(v.get("skillRelPath").is_some());
         assert!(v.get("prCooldownSeconds").is_some());
         assert!(v.get("sourceKind").is_some());
@@ -1426,7 +1538,7 @@ mod tests {
         // 手填模型字段 wire camelCase + 值（Medium 载体；与 engineKind 的值断言风格一致）。
         assert_eq!(v["codexModel"], "gpt-5.1-codex");
         assert_eq!(v["claudeModel"], "claude-opus-4-1");
-        assert!(v.get("autoReview").is_some());
+        assert!(v.get("autoReview").is_none());
         // #818: the new data-source-mode fields.
         assert!(v.get("updateMode").is_some());
         assert_eq!(v["updateMode"], "webhook-only");
@@ -1657,15 +1769,11 @@ mod tests {
         assert!(err.starts_with("port"), "{err}");
     }
 
-    /// Default-manual-review lock (Medium). A fresh project must NOT auto-dispatch
-    /// codex review at boot: `Project::auto_review` defaults off, so the scheduler
-    /// only polls/emits PRs and codex is left to the explicit triggers
-    /// (`start_review` / `start_codex`). Locking the default here makes that intent
-    /// machine-checked — a silent flip back to `true` would reintroduce the
-    /// boot-time review-process clash this guards against, and fails CI first.
+    /// Default-rule lock (Medium). A fresh config must not auto-dispatch unless
+    /// rules have been explicitly configured or migrated from legacy settings.
     #[test]
-    fn default_auto_review_is_off() {
-        assert!(!Project::default().auto_review);
+    fn default_rules_are_empty() {
+        assert!(AppConfig::default().rules.is_empty());
     }
 
     /// Default-update-mode lock (#818, Medium). A fresh project must default to
@@ -1941,21 +2049,70 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_empty_labels() {
-        // Each label feeds `gh pr list --label`; a blank one makes every poll
-        // match nothing / fail (PR #41 F2).
-        for blank in ["", "   "] {
-            assert!(validate(&with_project(Project {
-                review_label: blank.to_string(),
-                ..valid_project()
-            }))
-            .is_err());
-            assert!(validate(&with_project(Project {
-                check_label: blank.to_string(),
-                ..valid_project()
-            }))
-            .is_err());
-        }
+    fn validate_rejects_bad_rules() {
+        let mut config = valid_base();
+        config.rules.push(RuleConfig {
+            id: " ".to_string(),
+            name: "Rule".to_string(),
+            enabled: false,
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .starts_with("rules[0].id"));
+
+        let mut config = valid_base();
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: String::new(),
+            enabled: false,
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .starts_with("rules[0].name"));
+
+        let mut config = valid_base();
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: "No action".to_string(),
+            enabled: true,
+            actions: Vec::new(),
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .starts_with("rules[0].actions"));
+
+        let mut config = valid_base();
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: "Duplicate action".to_string(),
+            enabled: true,
+            actions: vec![RuleActionKind::Review, RuleActionKind::Review],
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .starts_with("rules[0].actions"));
+
+        let mut config = valid_base();
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: "Dangling project".to_string(),
+            enabled: true,
+            project_id: "missing".to_string(),
+            actions: vec![RuleActionKind::Notify],
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .starts_with("rules[0].projectId"));
     }
 
     #[test]
@@ -2370,16 +2527,6 @@ mod tests {
             ..base.clone()
         })
         .starts_with("prCooldownSeconds"));
-        assert!(msg(Project {
-            review_label: "  ".to_string(),
-            ..base.clone()
-        })
-        .starts_with("reviewLabel"));
-        assert!(msg(Project {
-            check_label: String::new(),
-            ..base
-        })
-        .starts_with("checkLabel"));
     }
 
     // Locks the serde-ignores-unknown-fields behavior the #11 reservation relies

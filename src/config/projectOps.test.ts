@@ -31,6 +31,7 @@ function draft(projects: Project[], activeProjectId: string): AppConfig {
     notifications: { channels: [] },
     listeners: [],
     tunnels: [],
+    rules: [],
   };
 }
 

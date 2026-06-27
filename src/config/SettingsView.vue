@@ -15,6 +15,7 @@ import ConfigField from "./ConfigField.vue";
 import NotificationChannelsManager from "./NotificationChannelsManager.vue";
 import ProjectsManager from "./ProjectsManager.vue";
 import RemoteAccessManager from "./RemoteAccessManager.vue";
+import RulesManager from "./RulesManager.vue";
 // The webhook control panel lives in the `pr` slice; mounting it here would be a
 // config→pr edge. Instead we expose a `webhook` scoped slot (saved config + live
 // draft + saving flag) and let the composition root (App.vue) fill it — keeping
@@ -36,6 +37,7 @@ const PROJECTS_NAV_ID = "projects";
 // Like PROJECTS_NAV_ID it routes to a dedicated array-of-objects editor
 // (RemoteAccessManager) instead of the scalar GLOBAL_GROUPS ConfigField path.
 const REMOTE_ACCESS_NAV_ID = "remoteAccess";
+const RULES_NAV_ID = "rules";
 
 const NOTIFICATIONS_NAV_ID = "notifications";
 
@@ -64,6 +66,7 @@ const draft = reactive<AppConfig>({
   notifications: { channels: DEFAULT_NOTIFICATION_SETTINGS.channels.map((c) => ({ ...c })) },
   listeners: [],
   tunnels: [],
+  rules: [],
 });
 
 function hydrate(cfg: AppConfig) {
@@ -83,6 +86,12 @@ function hydrate(cfg: AppConfig) {
   // whole draft, so a missed copy here would silently reset the TTL on every settings save. Fall
   // back to the default if an older cached config lacks the field.
   draft.outbox = { ...(cfg.outbox ?? DEFAULT_OUTBOX_CONFIG) };
+  draft.rules = (cfg.rules ?? []).map((r) => ({
+    ...r,
+    labelsAny: [...r.labelsAny],
+    labelsAll: [...r.labelsAll],
+    actions: [...r.actions],
+  }));
   draft.notifications = {
     ...(cfg.notifications ?? DEFAULT_NOTIFICATION_SETTINGS),
     channels: (cfg.notifications?.channels ?? DEFAULT_NOTIFICATION_SETTINGS.channels).map((c) => ({
@@ -154,10 +163,19 @@ async function onSave() {
       allowedOrigins: [...l.allowedOrigins],
     })),
     tunnels: draft.tunnels.map((t) => ({ ...t })),
+    rules: draft.rules.map((r) => ({
+      ...r,
+      labelsAny: [...r.labelsAny],
+      labelsAll: [...r.labelsAll],
+      actions: [...r.actions],
+    })),
   });
   if (store.savedOk) {
     emit("saved");
     remoteAccessRefreshKey.value += 1;
+  }
+  else if (store.error?.startsWith("rules[")) {
+    activeGroupId.value = RULES_NAV_ID;
   }
   // On a failed save, route to the page that owns the offending field.
   else if (store.error) {
@@ -219,6 +237,14 @@ async function onSave() {
         <button
           type="button"
           class="nav-item"
+          :class="{ active: activeGroupId === RULES_NAV_ID }"
+          @click="activeGroupId = RULES_NAV_ID"
+        >
+          规则
+        </button>
+        <button
+          type="button"
+          class="nav-item"
           :class="{ active: activeGroupId === NOTIFICATIONS_NAV_ID }"
           @click="activeGroupId = NOTIFICATIONS_NAV_ID"
         >
@@ -246,6 +272,10 @@ async function onSave() {
           class="group projects-group"
         >
           <RemoteAccessManager :draft="draft" :refresh-key="remoteAccessRefreshKey" @edit="onEdit" />
+        </div>
+
+        <div v-if="activeGroupId === RULES_NAV_ID" class="group rules-group">
+          <RulesManager :draft="draft" @edit="onEdit" />
         </div>
 
         <div
@@ -360,6 +390,9 @@ async function onSave() {
 /* The projects section hosts a full-width list of cards — let it use the pane width. */
 .projects-group {
   max-width: 720px;
+}
+.rules-group {
+  max-width: 960px;
 }
 .actions {
   display: flex;

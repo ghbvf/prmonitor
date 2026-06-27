@@ -1,6 +1,6 @@
 <script setup lang="ts">
-// First-launch onboarding wizard (#34, multi-project #35): walks STEPS (repo →
-// repoRoot → skill → source → autoReview → done), reusing the fields.ts PROJECT_GROUPS
+// First-launch onboarding wizard (#34, multi-project #35): walks STEPS (source →
+// repo → repoRoot → skill → update → done), reusing the fields.ts PROJECT_GROUPS
 // FieldDefs so labels/hints match Settings. It builds the FIRST project: the `draft`
 // is a single reactive `Project`, seeded from the persisted config's first project
 // (defaults prefill; on a first launch repoRoot is ""). "下一步" runs validateStep and
@@ -59,13 +59,10 @@ function hydrate(cfg: AppConfig) {
   draft.repoRoot = p.repoRoot;
   draft.pollIntervalSecs = p.pollIntervalSecs;
   draft.authors = [...p.authors];
-  draft.reviewLabel = p.reviewLabel;
-  draft.checkLabel = p.checkLabel;
   draft.skillRelPath = p.skillRelPath;
   draft.prCooldownSeconds = p.prCooldownSeconds;
   draft.sourceKind = p.sourceKind;
   draft.engineKind = p.engineKind;
-  draft.autoReview = p.autoReview;
   draft.updateMode = p.updateMode;
   draft.labelSource = p.labelSource;
   draft.azureOrg = p.azureOrg;
@@ -95,7 +92,7 @@ const stepError = ref<string | null>(null);
 // The FieldDefs the current step renders, driven by the shared STEP_FIELDS wiring in
 // fields.ts and filtered by each FieldDef's `visibleWhen` predicate against the live
 // draft (818 F2): so the source step shows azureOrg/azureProject only for an azure
-// source, and the autoReview step now also surfaces updateMode (F3). Single-sourcing
+// source, and the update step surfaces updateMode. Single-sourcing
 // STEP_FIELDS in fields.ts keeps this in lockstep with validateStep + the unit tests.
 const currentFields = computed<FieldDef<ProjectFieldKey>[]>(() =>
   visibleStepFields(currentStep.value, draft),
@@ -171,6 +168,14 @@ function composeConfig(): AppConfig {
     webhookPublicUrl: "",
     localApiToken: "",
     outbox: { ...DEFAULT_OUTBOX_CONFIG },
+    rules: store.config?.rules
+      ? store.config.rules.map((r) => ({
+          ...r,
+          labelsAny: [...r.labelsAny],
+          labelsAll: [...r.labelsAll],
+          actions: [...r.actions],
+        }))
+      : [],
     notifications: {
       ...DEFAULT_NOTIFICATION_SETTINGS,
       channels: DEFAULT_NOTIFICATION_SETTINGS.channels.map((c) => ({ ...c })),
@@ -237,9 +242,9 @@ async function finish() {
           <h2>PR 来源</h2>
           <p class="lead">选择 PR 来源；Azure 源需填写组织 / 项目；Bitbucket 源需填写 Host / 项目 Key / Token。</p>
         </template>
-        <template v-else-if="currentStep === 'autoReview'">
-          <h2>自动 review</h2>
-          <p class="lead">设置轮询节奏与触发标签（已填入默认值，可按需调整）。</p>
+        <template v-else-if="currentStep === 'update'">
+          <h2>更新与过滤</h2>
+          <p class="lead">设置列表更新节奏、标签来源与基础过滤。</p>
         </template>
         <template v-else>
           <h2>准备就绪</h2>
@@ -273,11 +278,8 @@ async function finish() {
           </template>
           <div><dt>标签来源</dt><dd>{{ draft.labelSource }}</dd></div>
           <div><dt>数据更新模式</dt><dd>{{ draft.updateMode }}</dd></div>
-          <div><dt>自动 review</dt><dd>{{ draft.autoReview ? "自动" : "手动" }}</dd></div>
           <div><dt>轮询间隔</dt><dd>{{ draft.pollIntervalSecs }} 秒</dd></div>
           <div><dt>PR 冷却</dt><dd>{{ draft.prCooldownSeconds }} 秒</dd></div>
-          <div><dt>Review 标签</dt><dd>{{ draft.reviewLabel || "—" }}</dd></div>
-          <div><dt>Check 标签</dt><dd>{{ draft.checkLabel || "—" }}</dd></div>
           <div><dt>作者过滤</dt><dd>{{ authorsInput || "（不过滤）" }}</dd></div>
         </dl>
 

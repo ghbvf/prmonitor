@@ -14,12 +14,12 @@
 //! horizontal [`crate::db::Database`] handle — not a cross-slice import). `service` is the
 //! ingress/replay logic: it works ONLY on the neutral [`crate::model::Event`] envelope and two
 //! OPAQUE composition-root-injected closures ([`GithubRefeed`] / [`AzureRefresh`] /
-//! [`CandidateDispatch`]) — so the inbox slice names NO `pr`/`outbox` internal type. The composition
+//! [`RuleProcessor`]) — so the inbox slice names NO `pr`/`outbox` internal type. The composition
 //! root (`lib.rs`) is the only place that knows both `pr` and `inbox`: it normalizes a
 //! `pr::webhook::WebhookEvent` into a `model::Event` (via `pr::webhook::event_from_webhook`) at the
 //! webhook seam, and installs the closures that re-feed a GitHub delivery through
-//! `pr::commands::ingest_webhook`, re-run the `az` discovery, or re-produce a candidate-backed
-//! review/check action. `commands` exposes the `inbox_list` / `inbox_get_raw` / `inbox_replay` Tauri
+//! `pr::commands::ingest_webhook`, re-run the `az` discovery, or process a candidate-backed
+//! rule event. `commands` exposes the `inbox_list` / `inbox_get_raw` / `inbox_replay` Tauri
 //! commands.
 //!
 //! The cross-slice contract types ([`crate::model::InboxStatus`] / [`crate::model::InboxEntry`])
@@ -31,7 +31,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::error::AppResult;
-use crate::model::Candidate;
+use crate::model::{Candidate, Event};
 
 pub mod commands;
 pub mod manager;
@@ -50,7 +50,10 @@ pub mod store;
 /// `Failed` rather than falsely `Processed`. This drives the inbox ROW STATUS, NOT the HTTP ACK
 /// (which F1 ties to durable persist only — the process runs post-ACK in a spawned task).
 pub type GithubRefeed = Arc<
-    dyn Fn(tauri::AppHandle, String) -> Pin<Box<dyn Future<Output = AppResult<()>> + Send>>
+    dyn Fn(
+            tauri::AppHandle,
+            String,
+        ) -> Pin<Box<dyn Future<Output = AppResult<Option<Candidate>>> + Send>>
         + Send
         + Sync,
 >;
@@ -62,14 +65,14 @@ pub type GithubRefeed = Arc<
 pub type AzureRefresh =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = AppResult<()>> + Send>> + Send + Sync>;
 
-/// The default-rule candidate replay hook (#1379). Given a project id and the stored
-/// backend-only [`Candidate`], the composition root re-produces the same review/check outbox action
-/// via the durable producer path. OPAQUE so the inbox never imports `outbox`.
-pub type CandidateDispatch = Arc<
+/// The rule processor hook installed by the composition root. It consumes a persisted inbox row
+/// plus the neutral event and an optional PR candidate that already passed source-specific gates.
+pub type RuleProcessor = Arc<
     dyn Fn(
             tauri::AppHandle,
-            String,
-            Candidate,
+            i64,
+            Event,
+            Option<Candidate>,
         ) -> Pin<Box<dyn Future<Output = AppResult<()>> + Send>>
         + Send
         + Sync,

@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -197,6 +197,9 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 9 {
         apply_v9(conn)?;
     }
+    if version < 10 {
+        apply_v10(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -291,6 +294,13 @@ fn apply_v8(conn: &Connection) -> AppResult<()> {
 /// actions need a dedupe key while pending so repeated auto-dispatch cannot enqueue duplicates.
 fn apply_v9(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(SCHEMA_V9).map_err(map_err)?;
+    Ok(())
+}
+
+/// v10 (#1371): rule-engine match audit. The FK chain makes inbox→rule match→outbox trace
+/// non-optional at the DB layer.
+fn apply_v10(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(SCHEMA_V10).map_err(map_err)?;
     Ok(())
 }
 
@@ -517,6 +527,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_action_outbox_dedupe
     WHERE dedupe_key IS NOT NULL AND status = 'pending';
 "#;
 
+const SCHEMA_V10: &str = r#"
+CREATE TABLE IF NOT EXISTS rule_match (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id        TEXT    NOT NULL,
+    rule_name      TEXT    NOT NULL,
+    inbox_event_id INTEGER NOT NULL,
+    project_id     TEXT    NOT NULL,
+    action_count   INTEGER NOT NULL DEFAULT 0,
+    error          TEXT,
+    created_at     INTEGER NOT NULL,
+    FOREIGN KEY(inbox_event_id) REFERENCES inbox_event(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rule_match_inbox ON rule_match(inbox_event_id, id);
+CREATE INDEX IF NOT EXISTS idx_rule_match_project ON rule_match(project_id, id DESC);
+
+CREATE TABLE IF NOT EXISTS rule_match_action (
+    rule_match_id    INTEGER NOT NULL,
+    action_outbox_id INTEGER NOT NULL,
+    PRIMARY KEY(rule_match_id, action_outbox_id),
+    FOREIGN KEY(rule_match_id) REFERENCES rule_match(id) ON DELETE CASCADE,
+    FOREIGN KEY(action_outbox_id) REFERENCES action_outbox(id) ON DELETE CASCADE
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,7 +654,7 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 9, "current schema is v9");
+            assert_eq!(SCHEMA_VERSION, 10, "current schema is v10");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"
@@ -664,6 +698,22 @@ mod tests {
             assert!(
                 index_exists(conn, "idx_action_outbox_dedupe"),
                 "fresh v0 → v9 has pending-action dedupe index"
+            );
+            assert!(
+                table_exists(conn, "rule_match"),
+                "fresh v0 → v10 has the rule_match table"
+            );
+            assert!(
+                table_has_fk(conn, "rule_match"),
+                "fresh v0 → v10 links rule_match to inbox_event"
+            );
+            assert!(
+                table_exists(conn, "rule_match_action"),
+                "fresh v0 → v10 has the rule_match_action table"
+            );
+            assert!(
+                table_has_fk(conn, "rule_match_action"),
+                "fresh v0 → v10 links rule_match_action to match/outbox rows"
             );
             Ok(())
         })

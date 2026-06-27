@@ -216,8 +216,7 @@ fn parse_rows(
     org: &str,
     project: &str,
     repo: &str,
-    review_label: &str,
-    check_label: &str,
+    trigger_labels: &[String],
     label_source: LabelSource,
 ) -> AppResult<Vec<AzRow>> {
     let raw: Vec<RawPr> = serde_json::from_str(json)
@@ -235,12 +234,15 @@ fn parse_rows(
             .filter(|n| !n.is_empty())
             .collect();
         // AB#717: resolve effective labels (native vs title-parsed) then classify by
-        // trigger label via the shared helper — both labels → conflict (kept, kind
-        // "review", gh parity); neither → not monitored, dropped; one → that kind.
+        // rule-interest labels. The action kind is decided later by the rule engine.
         let labels = labels::effective_labels(native, &pr.title, label_source);
-        let Some((kind, conflict)) = labels::classify(&labels, review_label, check_label) else {
-            continue; // no trigger label: not a monitored PR
-        };
+        if !trigger_labels.is_empty()
+            && !trigger_labels
+                .iter()
+                .any(|wanted| labels.iter().any(|label| label == wanted))
+        {
+            continue;
+        }
 
         let head_sha = pr
             .last_merge_source_commit
@@ -285,12 +287,12 @@ fn parse_rows(
                 author,
                 is_cross_repository: pr.fork_source.is_some(),
                 is_draft: pr.is_draft,
-                kind: kind.to_string(),
+                kind: "review".to_string(),
             },
             title: pr.title,
             labels,
             url,
-            conflict,
+            conflict: false,
         });
     }
     Ok(rows)
@@ -322,8 +324,7 @@ fn parse_pr_list(
     org: &str,
     project: &str,
     repo: &str,
-    review_label: &str,
-    check_label: &str,
+    trigger_labels: &[String],
     label_source: LabelSource,
 ) -> AppResult<Vec<Candidate>> {
     Ok(rows_into_candidates(parse_rows(
@@ -331,8 +332,7 @@ fn parse_pr_list(
         org,
         project,
         repo,
-        review_label,
-        check_label,
+        trigger_labels,
         label_source,
     )?))
 }
@@ -343,8 +343,7 @@ pub struct AzureDevOpsCli {
     org: String,
     project: String,
     repo: String,
-    review_label: String,
-    check_label: String,
+    trigger_labels: Vec<String>,
     label_source: LabelSource,
 }
 
@@ -353,8 +352,7 @@ impl AzureDevOpsCli {
         org: String,
         project: String,
         repo: String,
-        review_label: String,
-        check_label: String,
+        trigger_labels: Vec<String>,
         label_source: LabelSource,
     ) -> Self {
         Self {
@@ -362,8 +360,7 @@ impl AzureDevOpsCli {
             org,
             project,
             repo,
-            review_label,
-            check_label,
+            trigger_labels,
             label_source,
         }
     }
@@ -462,8 +459,7 @@ impl AzureDevOpsCli {
             &self.org,
             &self.project,
             &self.repo,
-            &self.review_label,
-            &self.check_label,
+            &self.trigger_labels,
             self.label_source,
         )
     }
@@ -594,16 +590,34 @@ mod tests {
     const PROJECT: &str = "myproject";
     const REPO: &str = "myrepo";
 
+    fn trigger_labels() -> Vec<String> {
+        vec![REVIEW.to_string(), CHECK.to_string()]
+    }
+
     /// `parse_rows` with the test org/project/repo wired in (so each case only passes the
     /// JSON + labels). The single Azure parser under test.
     fn rows(json: &str) -> AppResult<Vec<AzRow>> {
-        parse_rows(json, ORG, PROJECT, REPO, REVIEW, CHECK, LabelSource::Native)
+        parse_rows(
+            json,
+            ORG,
+            PROJECT,
+            REPO,
+            &trigger_labels(),
+            LabelSource::Native,
+        )
     }
 
     /// `parse_pr_list` (the trait gating view: rows minus conflict → candidates) with the
     /// test org/project/repo wired in.
     fn candidates(json: &str) -> AppResult<Vec<Candidate>> {
-        parse_pr_list(json, ORG, PROJECT, REPO, REVIEW, CHECK, LabelSource::Native)
+        parse_pr_list(
+            json,
+            ORG,
+            PROJECT,
+            REPO,
+            &trigger_labels(),
+            LabelSource::Native,
+        )
     }
 
     #[test]
@@ -700,8 +714,7 @@ mod tests {
             "my org",
             "my project",
             "my repo",
-            REVIEW,
-            CHECK,
+            &trigger_labels(),
             LabelSource::Native,
         )
         .expect("parses");
@@ -713,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_rows_classifies_check_label() {
+    fn parse_rows_filters_check_label() {
         let json = format!(
             r#"[
                 {{
@@ -730,7 +743,7 @@ mod tests {
         let r = rows(&json).expect("parses");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].candidate.number, 5);
-        assert_eq!(r[0].candidate.kind, "check");
+        assert_eq!(r[0].candidate.kind, "review");
         assert_eq!(r[0].title, "Fix it");
         assert_eq!(
             r[0].url,
@@ -740,10 +753,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_rows_keeps_both_label_conflict_with_review_kind() {
-        // gh `merge_rows` parity: a PR carrying BOTH trigger labels is KEPT as a row, flagged
-        // `conflict`, with kind "review" (the review row gh keeps). `commands::build_view`
-        // turns the flag into a skip reason — the list surfaces it rather than hiding it.
+    fn parse_rows_keeps_pr_with_multiple_trigger_labels() {
+        // Trigger labels are now rule-interest filters only. A PR carrying multiple
+        // interesting labels is still one clean event; rule actions decide what to enqueue.
         let json = format!(
             r#"[
                 {{
@@ -763,20 +775,13 @@ mod tests {
             1,
             "a conflict row is KEPT (not dropped) by parse_rows"
         );
-        assert!(r[0].conflict, "both labels → conflict flagged");
-        assert_eq!(
-            r[0].candidate.kind, "review",
-            "conflict keeps review kind (gh parity)"
-        );
+        assert!(!r[0].conflict);
+        assert_eq!(r[0].candidate.kind, "review");
         // Both labels surface in the row's labels.
         assert_eq!(r[0].labels, vec![REVIEW.to_string(), CHECK.to_string()]);
 
-        // The trait gating view (parse_pr_list) DROPS the conflict → no candidate dispatched.
         let cands = candidates(&json).expect("parses");
-        assert!(
-            cands.is_empty(),
-            "the trait discover drops conflict before dispatch"
-        );
+        assert_eq!(cands.len(), 1);
     }
 
     #[test]
@@ -859,8 +864,15 @@ mod tests {
                 }}
             ]"#
         );
-        let r = parse_rows(&json, ORG, PROJECT, REPO, REVIEW, CHECK, LabelSource::Title)
-            .expect("parses");
+        let r = parse_rows(
+            &json,
+            ORG,
+            PROJECT,
+            REPO,
+            &trigger_labels(),
+            LabelSource::Title,
+        )
+        .expect("parses");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].candidate.kind, "review");
         // Effective labels come from the title, NOT the native `area/ui`.
@@ -886,8 +898,7 @@ mod tests {
                 ORG,
                 PROJECT,
                 REPO,
-                REVIEW,
-                CHECK,
+                &trigger_labels(),
                 LabelSource::Title
             )
             .expect("parses")
