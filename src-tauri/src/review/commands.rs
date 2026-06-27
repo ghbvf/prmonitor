@@ -118,16 +118,15 @@ enum StartTrigger {
 /// engine-selection-and-start body behind [`dispatch_engine`] (manual UI/CLI start, `Explicit`) AND
 /// the outbox action executor's [`start_for_outbox`] (`Auto`). Builds the concrete engine for
 /// `project.engine_kind` and starts the review, returning the RAW [`StartReviewOutcome`] — each
-/// caller maps the outcome differently (a dedup is a benign error on the manual path, but a SUCCESS
-/// on the at-least-once outbox path — see [`ok_on_started_or_deduped`]). `trigger` decides the codex
+/// caller maps the outcome differently (a dedup is a benign error on the manual path, but a DONE
+/// outbox row without ledger landing on the at-least-once path — see [`outbox_start_outcome`]).
+/// `trigger` decides the codex
 /// stop-flag handling: `Explicit` resumes a user-stopped codex; `Auto` does not (PR #47 F1).
 ///
-/// The AUTO-POLL dispatch path has its OWN engine selection in `lib.rs::run_auto_dispatch`
-/// (monomorphizes `dispatch::auto_dispatch` per concrete engine), and the follow-up chat path its own
-/// in [`send_review_message`]. All are INDEPENDENTLY exhaustive `match …engine_kind` over the sealed
-/// [`EngineKind`] (model.rs) — that exhaustiveness is the **Hard** carrier: a new variant without an
-/// arm in ANY of them is a compile error. This is the only START-path `match EngineKind` (manual
-/// UI/CLI AND the outbox executor route through it) — don't add another start-path match.
+/// Follow-up chat has its own engine selection in [`send_review_message`]. This is the only
+/// START-path `match EngineKind` (manual UI/CLI AND the outbox executor route through it) — don't add
+/// another start-path match. That exhaustiveness is the **Hard** carrier: a new variant without an
+/// arm here is a compile error.
 ///
 /// `kind` is pre-validated by the caller (`"review"` | `"check"`).
 async fn start_via_engine<R: tauri::Runtime>(
@@ -206,7 +205,8 @@ async fn start_via_engine<R: tauri::Runtime>(
 /// registry already has an in-flight review for this `(project_id, pr, kind)`) → a benign "already in
 /// flight" error — a re-start does NOT double-start; stop the running one first to re-review. This
 /// `Deduped → Err` is correct for a USER action (a re-click deserves the message); the outbox path
-/// maps the same `Deduped` to `Ok` instead (see [`ok_on_started_or_deduped`]).
+/// maps the same `Deduped` to a done-but-not-ledgered outcome instead (see
+/// [`outbox_start_outcome`]).
 ///
 /// `kind` is pre-validated by the caller (both validate before resolving the project).
 async fn dispatch_engine<R: tauri::Runtime>(
@@ -238,12 +238,13 @@ async fn dispatch_engine<R: tauri::Runtime>(
 /// The outbox action executor's entry into the review funnel (AB#1069): the same funnel
 /// [`start_review`] goes through (`validate_kind` + `validate_pr_number` → `project_validated` →
 /// [`start_via_engine`]), so a replayed `review`/`check` action CANNOT bypass any guard. Folds the
-/// outcome mapping in ([`ok_on_started_or_deduped`]) so it returns a plain `AppResult<()>` the worker
-/// consumes directly: `Ok` → the row is `done`, `Err` → retry / dead-letter.
+/// outcome mapping in ([`outbox_start_outcome`]) so the worker can mark `Ok` rows done while the
+/// composition root can still distinguish a real start / suppressed replay from an active-session
+/// dedupe for ledger landing.
 ///
 /// **AUTO trigger (PR #47 F1)**: an outbox review is produced by the automatic rule engine, not a
 /// user click — so it runs via [`StartTrigger::Auto`] (NO `resume()`), respecting a user's
-/// `stop_codex` exactly like `run_auto_dispatch`. If the user stopped codex, `engine.start`'s
+/// `stop_codex`. If the user stopped codex, `engine.start`'s
 /// `connection()` funnel refuses with an `Err` (it does NOT revive) — which propagates as a RETRYABLE
 /// failure: the row stays `pending` and re-runs on a later sweep (so it executes once codex resumes),
 /// or dead-letters at the attempt cap if codex stays stopped. We do NOT short-circuit a stopped codex
@@ -286,7 +287,7 @@ pub(crate) async fn start_for_outbox<R: tauri::Runtime>(
     pr_number: u64,
     kind: &str,
     outbox_id: i64,
-) -> AppResult<()> {
+) -> AppResult<OutboxReviewStartOutcome> {
     // Fail-closed on a replayed payload (parity with `start_review` / `stop_for_outbox`): a bogus
     // `kind` or a `pr = 0` would otherwise reach the engine and start a bogus review.
     validate_kind(kind)?;
@@ -304,7 +305,7 @@ pub(crate) async fn start_for_outbox<R: tauri::Runtime>(
         claim_store::begin_claim(db.inner(), outbox_id, project_id, pr_number, kind)?
     {
         if replayed_review_should_suppress(db.inner(), &prior_thread_id)? {
-            return Ok(());
+            return Ok(OutboxReviewStartOutcome::SuppressedReplay);
         }
     }
 
@@ -326,7 +327,7 @@ pub(crate) async fn start_for_outbox<R: tauri::Runtime>(
         Some(outbox_id),
     )
     .await?;
-    ok_on_started_or_deduped(outcome)
+    Ok(outbox_start_outcome(outcome))
 }
 
 /// Decide whether a crash-replayed outbox review (whose claim already carries a `thread_id`) should
@@ -361,19 +362,37 @@ fn replayed_review_should_suppress(db: &Database, thread_id: &str) -> AppResult<
     })
 }
 
-/// Map a [`StartReviewOutcome`] to the OUTBOX action result (AB#1069): BOTH `Started` AND `Deduped`
-/// are `Ok(())`. This is the load-bearing semantics of the action executor — the OPPOSITE of the
-/// manual path's [`dispatch_engine`] (`Deduped → Err`). A `Deduped` means the registry already has an
-/// in-flight review for this `(project, pr, kind)`, so the action's intent ("this PR is being
-/// reviewed") already holds — it is NOT a failure. Mapping it to `Err` would make the outbox worker
-/// retry with backoff and, across enough crash-replays, DEAD-LETTER a review that started
-/// successfully (the worker's terminal decision is `Ok → done` / `Err → retry/dead`). This mirrors
-/// `dispatch::auto_dispatch`, where a `Deduped` candidate is a silent skip, never an error banner.
-/// Pure (no `AppHandle`) so the contract is unit-tested without a Tauri runtime — see the test below.
-pub(crate) fn ok_on_started_or_deduped(outcome: StartReviewOutcome) -> AppResult<()> {
+/// The executor-visible outcome of a review/check outbox action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutboxReviewStartOutcome {
+    /// This row started a new review session for its candidate.
+    Started,
+    /// This row is a crash replay whose prior started review is already durably visible; no duplicate
+    /// start was needed, but the candidate was reviewed and may be ledgered.
+    SuppressedReplay,
+    /// A live in-memory session already covers `(project, pr, kind)`. This makes the row `done`, but
+    /// it must NOT land this candidate's `(pr, head, kind)` ledger key because the active session may
+    /// be for a different head.
+    ActiveDeduped,
+}
+
+/// Map a [`StartReviewOutcome`] to the OUTBOX action outcome (AB#1069/#1379). `Deduped` is still a
+/// successful outbox execution (the row can be `done`), but it is no longer indistinguishable from a
+/// real start: the composition root uses [`should_record_dispatch_ledger`] to avoid recording a head
+/// key that may not have been reviewed.
+pub(crate) fn outbox_start_outcome(outcome: StartReviewOutcome) -> OutboxReviewStartOutcome {
     match outcome {
-        StartReviewOutcome::Started(_) | StartReviewOutcome::Deduped => Ok(()),
+        StartReviewOutcome::Started(_) => OutboxReviewStartOutcome::Started,
+        StartReviewOutcome::Deduped => OutboxReviewStartOutcome::ActiveDeduped,
     }
+}
+
+/// Whether this successful outbox executor outcome should land the PR dispatch ledger.
+pub(crate) fn should_record_dispatch_ledger(outcome: OutboxReviewStartOutcome) -> bool {
+    matches!(
+        outcome,
+        OutboxReviewStartOutcome::Started | OutboxReviewStartOutcome::SuppressedReplay
+    )
 }
 
 /// Build the IMMUTABLE comment-URL source context (AB#1042) from a project — the SINGLE
@@ -740,10 +759,8 @@ pub fn get_pr_sessions<R: tauri::Runtime>(
 /// turn. `repo_root` is an absolute dir and `skill_rel_path` a relative path under
 /// it (both config-validated), so the join is absolute and infallible.
 ///
-/// Single source for both codex callsites — the manual `start_review` here and the
-/// auto path's `run_auto_dispatch` in the composition root (`lib.rs`), which calls
-/// `review::commands::skill_abs_path` rather than keeping its own copy. The review
-/// slice owns the codex skill-path concept, so it lives here (`pub(crate)`).
+/// Single source for codex start callsites. The review slice owns the codex skill-path concept, so
+/// it lives here (`pub(crate)`).
 pub(crate) fn skill_abs_path(repo_root: &str, skill_rel_path: &str) -> String {
     std::path::Path::new(repo_root)
         .join(skill_rel_path)
@@ -780,20 +797,26 @@ mod tests {
         }
     }
 
-    // AB#1069 acceptance lock: the outbox executor maps BOTH `Started` AND `Deduped` to `Ok(())` —
-    // the OPPOSITE of the manual path (`dispatch_engine`, `Deduped → Err`). A `Deduped` means the
-    // review is already in flight, so the action's intent holds; mapping it to `Err` would make the
-    // worker retry and eventually DEAD-LETTER a review that started successfully. Mirrors
-    // `dispatch::auto_dispatch`'s "a dedup is not a failure" arm.
+    // AB#1069/#1379 acceptance lock: `Deduped` is still a successful outbox execution (done, no
+    // retry/dead-letter), but it is NOT ledgerable because the active in-memory session is keyed
+    // only by `(project, pr, kind)` and may be reviewing a different head.
     #[test]
-    fn ok_on_started_or_deduped_treats_both_as_success() {
+    fn outbox_start_outcome_distinguishes_ledgerable_from_active_deduped() {
+        let started = outbox_start_outcome(StartReviewOutcome::Started("t1".to_string()));
+        let deduped = outbox_start_outcome(StartReviewOutcome::Deduped);
+        assert_eq!(started, OutboxReviewStartOutcome::Started);
+        assert_eq!(deduped, OutboxReviewStartOutcome::ActiveDeduped);
         assert!(
-            ok_on_started_or_deduped(StartReviewOutcome::Started("t1".to_string())).is_ok(),
-            "Started → Ok"
+            should_record_dispatch_ledger(started),
+            "Started reviewed this candidate → ledger it"
         );
         assert!(
-            ok_on_started_or_deduped(StartReviewOutcome::Deduped).is_ok(),
-            "Deduped → Ok (NOT a failure → no retry/dead-letter)"
+            should_record_dispatch_ledger(OutboxReviewStartOutcome::SuppressedReplay),
+            "suppressed replay already started this row's candidate earlier → ledger it"
+        );
+        assert!(
+            !should_record_dispatch_ledger(deduped),
+            "active dedupe may be another head → do not ledger this candidate"
         );
     }
 

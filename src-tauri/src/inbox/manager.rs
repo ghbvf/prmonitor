@@ -1,18 +1,20 @@
-//! Inbox composition handles (AB#1065): the replay-time re-feed + Azure refresh hooks,
+//! Inbox composition handles (AB#1065/#1379): the replay-time re-feed / Azure refresh /
+//! candidate-dispatch hooks,
 //! installed once by the composition root and read by the `inbox_replay` command.
 //!
 //! `inbox_replay` is a Tauri command (NOT a webhook delivery), so it has no live route snapshot
 //! and no in-flight dispatcher/refresher. It re-feeds a GitHub entry through the SAME dispatch path
 //! the scheduler/webhook use (via the OPAQUE [`GithubRefeed`] closure the root installs — which
 //! captures the `ProjectDispatcher` in `lib.rs`), and re-invokes the SAME `az` re-discovery (via
-//! [`AzureRefresh`]). Holding only these neutral closures keeps the inbox slice from naming ANY
-//! pr-internal type. The composition root installs them at `setup` time, exactly as it installs
-//! the webhook ingestor/refresher on the pr slice's WebhookManager; the slice reads them back
-//! through this manager — a `tauri::State` field on [`crate::state::AppState`].
+//! [`AzureRefresh`]). Candidate-backed auto-dispatch rows replay through [`CandidateDispatch`],
+//! which re-produces the outbox action without the inbox naming outbox internals. The composition
+//! root installs these at `setup` time, exactly as it installs the webhook ingestor/refresher on the
+//! pr slice's WebhookManager; the slice reads them back through this manager — a `tauri::State`
+//! field on [`crate::state::AppState`].
 
 use std::sync::Mutex as StdMutex;
 
-use crate::inbox::{AzureRefresh, GithubRefeed};
+use crate::inbox::{AzureRefresh, CandidateDispatch, GithubRefeed};
 
 /// Holds the replay-time hooks the composition root installs (AB#1065). `&self` methods +
 /// interior mutability so it lives in [`crate::state::AppState`] (which stays `Default`),
@@ -26,14 +28,22 @@ pub struct InboxManager {
     github_refeed: StdMutex<Option<GithubRefeed>>,
     /// The Azure re-discovery hook (the SAME `discover_once` wrapper the Azure refresh uses).
     refresher: StdMutex<Option<AzureRefresh>>,
+    /// The default-rule candidate hook (re-produces a review/check outbox action).
+    candidate_dispatch: StdMutex<Option<CandidateDispatch>>,
 }
 
 impl InboxManager {
     /// Install the replay hooks (composition root, before any replay). Replaces any prior hooks
     /// (last writer wins), mirroring `WebhookManager::set_ingestor`.
-    pub fn set_hooks(&self, github_refeed: GithubRefeed, refresher: AzureRefresh) {
+    pub fn set_hooks(
+        &self,
+        github_refeed: GithubRefeed,
+        refresher: AzureRefresh,
+        candidate_dispatch: CandidateDispatch,
+    ) {
         *self.github_refeed.lock().unwrap() = Some(github_refeed);
         *self.refresher.lock().unwrap() = Some(refresher);
+        *self.candidate_dispatch.lock().unwrap() = Some(candidate_dispatch);
     }
 
     /// The installed GitHub re-feed hook, or `None` if the root hasn't wired it yet (a replay then
@@ -45,5 +55,10 @@ impl InboxManager {
     /// The installed Azure refresh hook, or `None` if not wired yet.
     pub fn refresher(&self) -> Option<AzureRefresh> {
         self.refresher.lock().unwrap().clone()
+    }
+
+    /// The installed candidate replay hook, or `None` if not wired yet.
+    pub fn candidate_dispatch(&self) -> Option<CandidateDispatch> {
+        self.candidate_dispatch.lock().unwrap().clone()
     }
 }

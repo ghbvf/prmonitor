@@ -15,12 +15,10 @@
 //!
 //! **Push, not pull — so it does NOT implement [`super::source::EventSourceProvider`].** That
 //! trait's `discover_events()` is pull-shaped (the scheduler asks `gh` for the current
-//! list); a webhook is push-shaped (GitHub hands us one event). Per the
-//! [`crate::dispatch`] doc, "a future webhook trigger calls the same `auto_dispatch`
-//! with the candidates a push event yields" — that is exactly this module: the
-//! handler maps a payload to a [`WebhookEvent`] and hands it to the injected
-//! [`WebhookIngestor`] (the composition root's upsert/emit + gate + `auto_dispatch`
-//! closure), reusing the entire vetted dispatch path with zero duplication.
+//! list); a webhook is push-shaped (GitHub hands us one event). The handler maps a payload to a
+//! [`WebhookEvent`] and hands it to the injected [`WebhookIngestor`] (the composition root's
+//! upsert/emit + gate + durable action producer), reusing the entire vetted dispatch path with zero
+//! duplication.
 //!
 //! **Multi-project routing (#35).** One global receiver / port / secret / tunnel
 //! serves EVERY monitored project. The handler routes each verified event to the

@@ -156,6 +156,33 @@ pub fn enqueue<R: Runtime>(
     Ok(id)
 }
 
+/// Enqueue a produced action with a live-pending dedupe key (#1379). Used by default rule
+/// production for review/check actions so repeated poll/webhook processing of the same candidate
+/// reuses one pending outbox row.
+pub fn enqueue_deduped<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_id: &str,
+    kind: ActionKind,
+    summary: &str,
+    payload: &str,
+    dedupe_key: &str,
+) -> AppResult<i64> {
+    let db = app.state::<Database>();
+    let now = store::now_epoch();
+    let id = store::enqueue_deduped(
+        db.inner(),
+        project_id,
+        kind,
+        summary,
+        payload,
+        dedupe_key,
+        now,
+    )?;
+    announce_updated(app, db.inner(), id);
+    app.state::<AppState>().outbox.wake();
+    Ok(id)
+}
+
 /// Persist one action's execution outcome (AB#1066): given the row's PRIOR `attempt_count` and the
 /// executor `result`, bump the count, [`decide_outcome`], and write the matching terminal/retry state
 /// (`mark_done` records the succeeding attempt's count too — consistent with the failure paths).

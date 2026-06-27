@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -194,6 +194,9 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 8 {
         apply_v8(conn)?;
     }
+    if version < 9 {
+        apply_v9(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -284,6 +287,13 @@ fn apply_v8(conn: &Connection) -> AppResult<()> {
     Ok(())
 }
 
+/// v9 (#1379): default rule production needs a persisted candidate on inbox rows, and review/check
+/// actions need a dedupe key while pending so repeated auto-dispatch cannot enqueue duplicates.
+fn apply_v9(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(SCHEMA_V9).map_err(map_err)?;
+    Ok(())
+}
+
 /// v1 schema — the unified store (#70). `review_session` precedes `review_history_item`
 /// (the FK target must exist first under `foreign_keys=ON`). Per-project partitioning
 /// is a real `project_id TEXT` column (replacing the JSON stores' `prefix:{pid}` keys).
@@ -364,8 +374,8 @@ CREATE INDEX IF NOT EXISTS idx_history_thread ON review_history_item(thread_id, 
 /// constraint makes a double-insert of the SAME delivery identity (a webhook retry / tunnel
 /// re-delivery) UNEXPRESSIBLE at the storage layer — `insert_dedup`'s
 /// `INSERT … ON CONFLICT(dedupe_key) DO NOTHING` relies on it to process each delivery
-/// exactly once (the upstream of the inbox funnel; the downstream authoritative gate stays
-/// the existing `dispatch_key` + `try_reserve_pair`, UNCHANGED — see `inbox::service`).
+/// exactly once (the upstream of the inbox funnel; the downstream review/check dedup is the outbox
+/// pending `dedupe_key` plus the review executor's durable claim — see `inbox::service`).
 ///
 /// `event_json` stores the serialized normalized [`crate::model::Event`] (the wire envelope
 /// the panel renders + replay reads back). `raw_payload` is the verbatim delivery body (the
@@ -499,6 +509,14 @@ CREATE INDEX IF NOT EXISTS idx_terminal_audit_listener_ts
     ON terminal_audit(listener_id, ts_ms);
 "#;
 
+const SCHEMA_V9: &str = r#"
+ALTER TABLE inbox_event ADD COLUMN candidate_json TEXT;
+ALTER TABLE action_outbox ADD COLUMN dedupe_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_action_outbox_dedupe
+    ON action_outbox(project_id, dedupe_key)
+    WHERE dedupe_key IS NOT NULL AND status = 'pending';
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,7 +620,7 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 8, "current schema is v8");
+            assert_eq!(SCHEMA_VERSION, 9, "current schema is v9");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"
@@ -626,6 +644,26 @@ mod tests {
             assert!(
                 table_has_fk(conn, "outbox_review_claim"),
                 "fresh v0 → v7 rebuilt outbox_review_claim WITH the action_outbox FK cascade"
+            );
+            assert!(
+                table_exists(conn, "terminal_audit"),
+                "fresh v0 → v8 has the terminal_audit table"
+            );
+            assert!(
+                index_exists(conn, "idx_terminal_audit_listener_ts"),
+                "fresh v0 → v8 has the terminal_audit listener/time index"
+            );
+            assert!(
+                table_has_column(conn, "inbox_event", "candidate_json"),
+                "fresh v0 → v9 has inbox_event.candidate_json"
+            );
+            assert!(
+                table_has_column(conn, "action_outbox", "dedupe_key"),
+                "fresh v0 → v9 has action_outbox.dedupe_key"
+            );
+            assert!(
+                index_exists(conn, "idx_action_outbox_dedupe"),
+                "fresh v0 → v9 has pending-action dedupe index"
             );
             Ok(())
         })
@@ -895,6 +933,89 @@ mod tests {
         assert_eq!(
             after, 0,
             "ON DELETE CASCADE reaps the claim when its owning outbox row is pruned"
+        );
+    }
+
+    #[test]
+    fn migrate_v7_to_v8_adds_terminal_audit_table() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .expect("enable fk");
+        apply_v1(&conn).expect("seed v1");
+        apply_v2(&conn).expect("seed v2");
+        apply_v3(&conn).expect("seed v3");
+        apply_v4(&conn).expect("seed v4");
+        apply_v5(&conn).expect("seed v5");
+        apply_v6(&conn).expect("seed v6");
+        apply_v7(&conn).expect("seed v7");
+        conn.pragma_update(None, "user_version", 7)
+            .expect("stamp v7");
+        assert!(
+            !table_exists(&conn, "terminal_audit"),
+            "v7 must not already have terminal_audit"
+        );
+
+        run_migrations(&conn).expect("v7 -> current migrates");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read version");
+        assert_eq!(version, SCHEMA_VERSION, "stamped to the current schema");
+        assert!(
+            table_exists(&conn, "terminal_audit"),
+            "v8 added the terminal_audit table"
+        );
+        assert!(
+            index_exists(&conn, "idx_terminal_audit_listener_ts"),
+            "v8 added the terminal_audit listener/time index"
+        );
+    }
+
+    #[test]
+    fn migrate_v8_to_v9_adds_candidate_and_outbox_dedupe_columns() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .expect("enable fk");
+        apply_v1(&conn).expect("seed v1");
+        apply_v2(&conn).expect("seed v2");
+        apply_v3(&conn).expect("seed v3");
+        apply_v4(&conn).expect("seed v4");
+        apply_v5(&conn).expect("seed v5");
+        apply_v6(&conn).expect("seed v6");
+        apply_v7(&conn).expect("seed v7");
+        apply_v8(&conn).expect("seed v8");
+        conn.pragma_update(None, "user_version", 8)
+            .expect("stamp v8");
+        assert!(
+            table_exists(&conn, "terminal_audit"),
+            "v8 has terminal_audit"
+        );
+        assert!(
+            !table_has_column(&conn, "inbox_event", "candidate_json"),
+            "v8 must not already have candidate_json"
+        );
+        assert!(
+            !table_has_column(&conn, "action_outbox", "dedupe_key"),
+            "v8 must not already have dedupe_key"
+        );
+
+        run_migrations(&conn).expect("v8 -> current migrates");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read version");
+        assert_eq!(version, SCHEMA_VERSION, "stamped to the current schema");
+        assert!(
+            table_has_column(&conn, "inbox_event", "candidate_json"),
+            "v9 added inbox_event.candidate_json"
+        );
+        assert!(
+            table_has_column(&conn, "action_outbox", "dedupe_key"),
+            "v9 added action_outbox.dedupe_key"
+        );
+        assert!(
+            index_exists(&conn, "idx_action_outbox_dedupe"),
+            "v9 added the pending outbox dedupe index"
         );
     }
 

@@ -13,7 +13,7 @@ use rusqlite::OptionalExtension;
 
 use crate::db::{map_err, Database};
 use crate::error::AppResult;
-use crate::model::{Event, InboxEntry, InboxStatus, SourceKind};
+use crate::model::{Candidate, Event, InboxEntry, InboxStatus, SourceKind};
 
 /// Bound on a single [`list_by_project`] page (AB#1065): the panel only ever needs a recent
 /// window, and the `idx_inbox_event_project` index makes the `ORDER BY id DESC LIMIT` a cheap
@@ -94,15 +94,20 @@ pub fn insert_dedup(
     event: &Event,
     raw: &str,
     webhook_event_json: Option<&str>,
+    candidate: Option<&Candidate>,
 ) -> AppResult<Option<i64>> {
     let event_json = serde_json::to_string(event)
         .map_err(|e| crate::error::AppError::new(format!("inbox 事件序列化失败: {e}")))?;
+    let candidate_json = candidate
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| crate::error::AppError::new(format!("inbox candidate 序列化失败: {e}")))?;
     db.with_tx(|tx| {
         tx.execute(
             "INSERT INTO inbox_event \
              (dedupe_key, source, event_type, project_id, repo, number, event_json, \
-              raw_payload, webhook_event_json, status, received_at_epoch) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+              raw_payload, webhook_event_json, candidate_json, status, received_at_epoch) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
              ON CONFLICT(dedupe_key) DO NOTHING",
             rusqlite::params![
                 event.dedupe_key,
@@ -116,6 +121,7 @@ pub fn insert_dedup(
                 event_json,
                 raw,
                 webhook_event_json,
+                candidate_json.as_deref(),
                 status_as_wire(InboxStatus::Received),
                 event.received_at_epoch as i64,
             ],
@@ -261,6 +267,7 @@ pub struct Replayable {
     pub source: SourceKind,
     pub status: InboxStatus,
     pub webhook_event_json: Option<String>,
+    pub candidate: Option<Candidate>,
 }
 
 /// The [`Replayable`] facts of an inbox entry by id (AB#1065), or `None` when unknown. A corrupt
@@ -268,7 +275,7 @@ pub struct Replayable {
 pub fn get_replayable(db: &Database, id: i64) -> AppResult<Option<Replayable>> {
     let row = db.with_conn(|conn| {
         conn.query_row(
-            "SELECT event_json, source, status, webhook_event_json FROM inbox_event WHERE id = ?1",
+            "SELECT event_json, source, status, webhook_event_json, candidate_json FROM inbox_event WHERE id = ?1",
             [id],
             |r| {
                 Ok((
@@ -276,6 +283,7 @@ pub fn get_replayable(db: &Database, id: i64) -> AppResult<Option<Replayable>> {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             },
         )
@@ -283,15 +291,25 @@ pub fn get_replayable(db: &Database, id: i64) -> AppResult<Option<Replayable>> {
     })?;
     match row {
         None => Ok(None),
-        Some((event_json, source, status, webhook_event_json)) => {
+        Some((event_json, source, status, webhook_event_json, candidate_json)) => {
             let event: Event = serde_json::from_str(&event_json).map_err(|e| {
                 crate::error::AppError::new(format!("inbox 行 {id} 的事件反序列化失败: {e}"))
             })?;
+            let candidate = candidate_json
+                .map(|json| {
+                    serde_json::from_str::<Candidate>(&json).map_err(|e| {
+                        crate::error::AppError::new(format!(
+                            "inbox 行 {id} 的 candidate 反序列化失败: {e}"
+                        ))
+                    })
+                })
+                .transpose()?;
             Ok(Some(Replayable {
                 event,
                 source: source_from_wire(&source)?,
                 status: status_from_wire(&status),
                 webhook_event_json,
+                candidate,
             }))
         }
     }
@@ -378,6 +396,18 @@ mod tests {
         }
     }
 
+    fn candidate(number: u64, kind: &str) -> Candidate {
+        Candidate {
+            number,
+            head_sha: "sha".to_string(),
+            head_ref: "main".to_string(),
+            author: "octocat".to_string(),
+            is_cross_repository: false,
+            is_draft: false,
+            kind: kind.to_string(),
+        }
+    }
+
     // Hard ingress-idempotency carrier (AB#1065): the FIRST insert of a `dedupe_key` returns
     // `Some(id)` (process it); a SECOND insert of the SAME key returns `None` (a duplicate — do
     // NOT re-process) and does not add a row. This is what makes a webhook retry exactly-once.
@@ -386,10 +416,10 @@ mod tests {
         let db = Database::open_in_memory().expect("open db");
         let ev = event("github:abc-123", "p1", Some(7));
 
-        let first = insert_dedup(&db, &ev, "{\"raw\":1}", None).expect("first insert");
+        let first = insert_dedup(&db, &ev, "{\"raw\":1}", None, None).expect("first insert");
         assert!(first.is_some(), "first delivery inserts a new row");
 
-        let second = insert_dedup(&db, &ev, "{\"raw\":1}", None).expect("second insert");
+        let second = insert_dedup(&db, &ev, "{\"raw\":1}", None, None).expect("second insert");
         assert!(second.is_none(), "duplicate dedupe_key is a no-op (None)");
 
         // Exactly one row exists for the key.
@@ -410,9 +440,9 @@ mod tests {
     #[test]
     fn list_by_project_scopes_and_orders_newest_first() {
         let db = Database::open_in_memory().expect("open db");
-        insert_dedup(&db, &event("k1", "p1", Some(1)), "r1", None).expect("k1");
-        insert_dedup(&db, &event("k2", "p2", Some(2)), "r2", None).expect("k2");
-        insert_dedup(&db, &event("k3", "p1", Some(3)), "r3", None).expect("k3");
+        insert_dedup(&db, &event("k1", "p1", Some(1)), "r1", None, None).expect("k1");
+        insert_dedup(&db, &event("k2", "p2", Some(2)), "r2", None, None).expect("k2");
+        insert_dedup(&db, &event("k3", "p1", Some(3)), "r3", None, None).expect("k3");
 
         // Scoped to p1: k3 (newest) then k1.
         let p1 = list_by_project(&db, Some("p1")).expect("list p1");
@@ -439,7 +469,7 @@ mod tests {
     fn get_raw_round_trips_and_unknown_is_none() {
         let db = Database::open_in_memory().expect("open db");
         let raw = "{\"delivery\":\"verbatim body\"}";
-        let id = insert_dedup(&db, &event("k1", "p1", Some(1)), raw, None)
+        let id = insert_dedup(&db, &event("k1", "p1", Some(1)), raw, None, None)
             .expect("insert")
             .expect("new id");
 
@@ -453,7 +483,7 @@ mod tests {
     fn event_json_round_trips_through_list_and_get_entry() {
         let db = Database::open_in_memory().expect("open db");
         let ev = event("k1", "p1", None); // no number
-        let id = insert_dedup(&db, &ev, "raw", None)
+        let id = insert_dedup(&db, &ev, "raw", None, None)
             .expect("insert")
             .expect("new id");
 
@@ -473,7 +503,7 @@ mod tests {
     #[test]
     fn mark_processed_and_failed_transition_status() {
         let db = Database::open_in_memory().expect("open db");
-        let id = insert_dedup(&db, &event("k1", "p1", Some(1)), "raw", None)
+        let id = insert_dedup(&db, &event("k1", "p1", Some(1)), "raw", None, None)
             .expect("insert")
             .expect("new id");
 
@@ -504,6 +534,7 @@ mod tests {
             &event("k1", "p1", Some(1)),
             "raw",
             Some("{\"projectId\":\"p1\"}"),
+            None,
         )
         .expect("insert")
         .expect("new id");
@@ -516,8 +547,27 @@ mod tests {
             r.webhook_event_json.as_deref(),
             Some("{\"projectId\":\"p1\"}")
         );
+        assert_eq!(r.candidate, None);
 
         assert!(get_replayable(&db, 99_999).expect("unknown").is_none());
+    }
+
+    #[test]
+    fn get_replayable_round_trips_candidate_json() {
+        let db = Database::open_in_memory().expect("open db");
+        let cand = candidate(7, "review");
+        let id = insert_dedup(
+            &db,
+            &event("k-candidate", "p1", Some(7)),
+            "raw",
+            Some("{\"projectId\":\"p1\"}"),
+            Some(&cand),
+        )
+        .expect("insert")
+        .expect("new id");
+
+        let r = get_replayable(&db, id).expect("get").expect("exists");
+        assert_eq!(r.candidate, Some(cand));
     }
 
     // `InboxStatus` lock (AB#1065, Medium carrier): the DB-stored `status_as_wire` string MUST
@@ -574,7 +624,7 @@ mod tests {
     #[test]
     fn get_replayable_errors_on_corrupt_source_but_list_stays_lenient() {
         let db = Database::open_in_memory().expect("open db");
-        let id = insert_dedup(&db, &event("k1", "p1", Some(1)), "raw", None)
+        let id = insert_dedup(&db, &event("k1", "p1", Some(1)), "raw", None, None)
             .expect("insert")
             .expect("new id");
         db.with_conn(|conn| {
@@ -619,7 +669,7 @@ mod tests {
         .expect("seed cap rows");
 
         // One more real insert through the capped path triggers the prune (cap + 1 → cap).
-        insert_dedup(&db, &event("overflow", "p1", Some(1)), "raw", None)
+        insert_dedup(&db, &event("overflow", "p1", Some(1)), "raw", None, None)
             .expect("insert")
             .expect("new id");
 
@@ -656,7 +706,7 @@ mod tests {
     #[test]
     fn list_by_project_skips_corrupt_event_json_row() {
         let db = Database::open_in_memory().expect("open db");
-        insert_dedup(&db, &event("good", "p1", Some(1)), "raw", None).expect("good");
+        insert_dedup(&db, &event("good", "p1", Some(1)), "raw", None, None).expect("good");
         db.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO inbox_event \

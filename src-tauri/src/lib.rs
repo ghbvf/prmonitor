@@ -9,8 +9,8 @@
 //! Slice *assembly* is the composition layer's job: this file (the root — it
 //! `manage`s [`state::AppState`], registers Tauri commands, and installs the
 //! scheduler's dispatch hook) plus the root-level horizontal modules it enables —
-//! notably [`dispatch`], which glues the `pr` slice's gating output to the
-//! `review` engine. Those composition modules may consume several slices' public
+//! notably [`dispatch`], which turns the `pr` slice's gating output into durable
+//! outbox actions. Those composition modules may consume several slices' public
 //! APIs (that is what makes them composition, not slices); the invariant that
 //! stays structural is that *slices* never cross slice lines — only the
 //! composition layer does.
@@ -40,7 +40,7 @@ mod slice_boundary_test;
 
 use std::sync::Arc;
 
-use model::{Candidate, EngineKind};
+use model::Candidate;
 use state::AppState;
 use tauri::Manager;
 
@@ -98,11 +98,11 @@ fn build_app() {
 
             let state = app.state::<AppState>();
             // Install the auto-trigger dispatcher BEFORE starting the loop, so the
-            // immediate first tick already auto-starts dispatchable reviews. The
-            // closure is the `pr` slice's review-agnostic `Dispatcher` seam; its body
-            // is [`run_auto_dispatch`], the composition-root assembly that picks the
-            // concrete engine and injects it into the engine-agnostic
-            // [`dispatch::auto_dispatch`] (so adding an engine never edits `dispatch`).
+            // immediate first tick already persists dispatchable reviews/checks into
+            // inbox + outbox. The closure is the `pr` slice's review-agnostic
+            // `Dispatcher` seam; its body is [`run_auto_dispatch`], the
+            // composition-root assembly that injects durable inbox/outbox writers into
+            // the default producer.
             state
                 .scheduler
                 .set_dispatcher(make_dispatcher(app.handle().clone()));
@@ -166,12 +166,22 @@ fn build_app() {
                     })
                 }
             });
-            // Install the inbox replay hooks (AB#1065) so the `inbox_replay` command re-uses the
-            // SAME re-feed + Azure re-discovery as the live ingress (it has no live route snapshot /
-            // in-flight dispatcher of its own).
-            state
-                .inbox
-                .set_hooks(github_refeed.clone(), azure_refresh.clone());
+            // The default-rule candidate replay hook (#1379): re-produce the stored candidate as
+            // the same review/check outbox action the live auto-dispatch producer creates.
+            let candidate_dispatch: inbox::CandidateDispatch = Arc::new(
+                move |app: tauri::AppHandle, project_id: String, candidate: Candidate| {
+                    Box::pin(async move {
+                        enqueue_candidate_action(&app, &project_id, &candidate).map(|_| ())
+                    })
+                },
+            );
+            // Install the inbox replay hooks (AB#1065/#1379) so the `inbox_replay` command re-uses
+            // the SAME re-feed + Azure re-discovery + candidate action producer as live ingress.
+            state.inbox.set_hooks(
+                github_refeed.clone(),
+                azure_refresh.clone(),
+                candidate_dispatch,
+            );
             // The GitHub ingestor: normalize the `WebhookEvent` → neutral `model::Event` HERE (pr
             // owns `WebhookEvent`), then hand the inbox the neutral event + the verbatim body + the
             // parsed JSON. The inbox persists+dedups and re-feeds via the injected `github_refeed` —
@@ -187,6 +197,13 @@ fn build_app() {
                         // Normalize at the seam (the composition root owns the pr↔inbox boundary):
                         // `WebhookEvent` → neutral `model::Event`, and serialize the parsed event
                         // for replay BEFORE handing it off.
+                        let candidate = match &ev.intent {
+                            pr::webhook::IngestIntent::Track {
+                                candidate: Some(candidate),
+                                ..
+                            } => Some(candidate.clone()),
+                            _ => None,
+                        };
                         let event = pr::webhook::event_from_webhook(&ev, guid.as_deref(), &raw);
                         let webhook_event_json = serde_json::to_string(&ev).unwrap_or_default();
                         let db = app.state::<db::Database>();
@@ -198,6 +215,7 @@ fn build_app() {
                             event,
                             raw,
                             webhook_event_json,
+                            candidate,
                         )
                         .await
                     })
@@ -235,7 +253,8 @@ fn build_app() {
             // action cannot be expressed. Each arm deserializes the stored payload; a deser/execute
             // Err propagates so the worker retries / dead-letters rather than marking the row falsely
             // `done`. The review arms map `Deduped → Ok` (a review already in flight is success, not a
-            // retry — `ok_on_started_or_deduped`), the OPPOSITE of the manual command path.
+            // retry — see `review::commands::outbox_start_outcome`), the OPPOSITE of the manual
+            // command path.
             let outbox_executor: outbox::ActionExecutor =
                 Arc::new(|app: tauri::AppHandle, action: outbox::OutboxAction| {
                     Box::pin(async move {
@@ -577,10 +596,9 @@ fn import_legacy_into_db(
 
 /// Build the per-cycle [`pr::scheduler::ProjectDispatcher`] both auto-trigger sources
 /// share — the poll scheduler and the webhook ingestor. Both drive a dispatchable
-/// `(project_id, candidates)` through the SAME [`run_auto_dispatch`] (the composition
-/// root's gate + concrete-engine assembly), so this single helper removes the duplicated
-/// `Arc::new(move |..| Box::pin(run_auto_dispatch(..)))` closure that was built verbatim
-/// at both wiring sites.
+/// `(project_id, candidates)` through the SAME [`run_auto_dispatch`] producer, so this
+/// single helper removes the duplicated `Arc::new(move |..| Box::pin(run_auto_dispatch(..)))`
+/// closure that was built verbatim at both wiring sites.
 fn make_dispatcher<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
 ) -> pr::scheduler::ProjectDispatcher {
@@ -592,18 +610,19 @@ fn make_dispatcher<R: tauri::Runtime>(
 
 /// Execute an AB#1069 `review` / `check` outbox action (the composition root's executor arm body):
 /// deserialize the routing payload and run it through the review funnel
-/// ([`review::commands::start_for_outbox`], which folds in the `Started`/`Deduped` → `Ok` mapping and
-/// the PR #47 F1 `stop_codex` skip). `kind` is the funnel string the executor derived from the sealed
+/// ([`review::commands::start_for_outbox`], which returns an executor outcome that separates a real
+/// start / suppressed replay from active-session dedupe). `kind` is the funnel string the executor derived from the sealed
 /// [`model::ActionKind`] variant (`Review` → `"review"`, `Check` → `"check"`), so it is valid by
 /// construction. A deser `Err` propagates so the worker retries / dead-letters rather than marking the
 /// row falsely `done`.
 ///
 /// Routing key is `action.project_id` — the outbox ROW's single-source key (AB#1069 F3), NOT a
-/// payload copy: the payload carries only `pr_number`, so a row shown under project A can't start
-/// project B's review. Retry semantics (at-least-once): a `Deduped` (review already in flight)
-/// resolves `Ok` so a crash-replay never dead-letters a running review. A prior attempt that FAILED
-/// mid-start leaves a `Failed` session, which does NOT block a re-dispatch (`try_reserve_pair`
-/// excludes `Failed`), so a retry genuinely re-runs the start — the intended at-least-once behavior.
+/// payload copy; the payload carries the backend-only [`model::Candidate`] so a successful executor
+/// pass can land the dispatch ledger. Retry semantics (at-least-once): a `Deduped` (review already
+/// in flight) resolves `Ok` so a crash-replay never dead-letters a running review. A prior attempt
+/// that FAILED mid-start leaves a `Failed` session, which does NOT block a re-dispatch
+/// (`try_reserve_pair` excludes `Failed`), so a retry genuinely re-runs the start — the intended
+/// at-least-once behavior.
 async fn run_review_action(
     app: &tauri::AppHandle,
     action: &outbox::OutboxAction,
@@ -611,18 +630,24 @@ async fn run_review_action(
 ) -> error::AppResult<()> {
     let payload: model::ReviewActionPayload = serde_json::from_str(&action.payload)
         .map_err(|e| error::AppError::new(format!("outbox review action 反序列化失败：{e}")))?;
+    let mut candidate = payload.candidate;
+    candidate.kind = kind.to_string();
     let state = app.state::<AppState>();
-    review::commands::start_for_outbox(
+    let outcome = review::commands::start_for_outbox(
         app,
         state.inner(),
         &action.project_id,
-        payload.pr_number,
+        candidate.number,
         kind,
         // AB#1204: the outbox ROW id is the dedup key — a crash-replay of this row resolves its
         // prior review's claim instead of starting a duplicate.
         action.id,
     )
-    .await
+    .await?;
+    if review::commands::should_record_dispatch_ledger(outcome) {
+        pr::ledger::record_dispatched(app, &action.project_id, &[candidate])?;
+    }
+    Ok(())
 }
 
 /// Execute an AB#1069 `stop-review` outbox action (the composition root's executor arm body):
@@ -651,14 +676,10 @@ async fn run_stop_action(
     .await
 }
 
-/// Composition-root assembly for one auto-trigger cycle: this is the ONE place that
-/// names the concrete review engine. It loads + validates config, builds the codex
-/// [`review::engines::codex::CodexEngine`] (the [`review::engine::ReviewEngine`] the
-/// root picks — a future Claude engine plugs in here), snapshots the registry's
-/// active `(pr, kind)` pairs, and injects a ledger recorder + UI error reporter into
-/// the engine-agnostic [`dispatch::auto_dispatch`]. Keeping the concrete names here
-/// (not in `dispatch`) is what makes the slice boundary structural rather than
-/// comment-only (PR #31 finding F1).
+/// Composition-root assembly for one auto-trigger cycle: validate config, snapshot active
+/// `(pr, kind)` pairs, and inject durable inbox/outbox writers + UI error reporting into the
+/// default [`dispatch::auto_dispatch`] producer. The executor is the only place that starts review
+/// work; this path only materializes replayable actions.
 async fn run_auto_dispatch<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     project_id: String,
@@ -681,81 +702,87 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
             return;
         }
     };
-    let skill_abs = review::commands::skill_abs_path(&project.repo_root, &project.skill_rel_path);
     let state = app.state::<AppState>();
+    if should_skip_auto_dispatch_for_stopped_codex(project.engine_kind, state.codex.is_stopped()) {
+        eprintln!("auto-dispatch 跳过本轮（{project_id}）：codex app-server 已停止");
+        return;
+    }
     // The review slice owns "what counts as active"; the pr slice owns the ledger.
     // Both are scoped to this project (#35) so a PR number active in one project does
     // not gate the same number in another, and dedup writes land in the right partition.
     let active = state.sessions.active_pairs(&project_id);
-    let record = |cands: &[Candidate]| pr::ledger::record_dispatched(&app, &project_id, cands);
     let report = |msg: String| emit_dispatch_error(&app, &project_id, msg);
-    // Snapshot the comment-URL source context from the project NOW (AB#1042), so each review
-    // this batch starts resolves its pr-review comment URL at the terminal against the project
-    // it ran against — never a config edited mid-review. Each engine `start` clones it per
-    // candidate (the engine `start` takes `&self`), so one snapshot covers the whole batch.
-    let url_ctx = review::session::CommentUrlContext {
-        source_kind: project.source_kind,
-        repo: project.repo.clone(),
-        azure_org: project.azure_org.clone(),
-        azure_project: project.azure_project.clone(),
+    let enqueue = |_: &Candidate,
+                   kind: model::ActionKind,
+                   summary: &str,
+                   payload: &str,
+                   dedupe_key: &str| {
+        let inbox_id =
+            persist_auto_dispatch_inbox(&app, &project_id, &project, payload, dedupe_key)?;
+        let db = app.state::<db::Database>();
+        if let Some(id) = inbox_id {
+            inbox::service::emit_for_id(&app, db.inner(), &project_id, id);
+        }
+        let result =
+            outbox::service::enqueue_deduped(&app, &project_id, kind, summary, payload, dedupe_key);
+        if let Some(id) = inbox_id {
+            let terminal = result.as_ref().map(|_| ()).map_err(|e| e.clone());
+            inbox::service::record_terminal(db.inner(), id, &terminal)?;
+            inbox::service::emit_for_id(&app, db.inner(), &project_id, id);
+        }
+        result
     };
-    // The ONE place that names a concrete engine for the auto-trigger path. The
-    // exhaustive `match` over the sealed `EngineKind` (model.rs) is the Hard carrier:
-    // adding a variant without an arm here is a compile error. Each arm monomorphizes
-    // `dispatch::auto_dispatch` with its concrete engine (the trait uses bare `async fn`,
-    // not dyn-safe, so we pick a concrete type per arm rather than box).
-    match project.engine_kind {
-        EngineKind::Codex => {
-            // Respect an explicit user `stop_codex`: a stopped codex is NOT auto-revived
-            // by a dispatchable PR. Skip this batch silently (same as the autoReview-off
-            // skip — no emit, no spawn). Only MANUAL review (`start_review`) and manual
-            // `start_codex` force a restart; auto-dispatch defers to the user's stop (PR
-            // #47 F1). Codex-specific: claude has no resident server / stop flag, so this
-            // gate lives in the codex arm — a `stop_codex` must not swallow claude reviews.
-            if state.codex.is_stopped() {
-                return;
-            }
-            let engine = review::engines::codex::CodexEngine {
-                app: &app,
-                codex: &state.codex,
-                registry: &state.sessions,
-                codex_bin: review::commands::CODEX_BIN,
-                project_id: &project_id,
-                repo: &project.repo,
-                repo_root: &project.repo_root,
-                skill_abs_path: &skill_abs,
-                codex_model: &project.codex_model,
-                url_ctx,
-                // Auto-dispatch only ever `start`s (which takes pr_number as a method arg);
-                // the field is the follow-up (`send_message`) path's.
-                pr_number: 0,
-                session_info: None,
-                // Auto-poll dispatch is NOT the outbox path → no AB#1204 claim breadcrumb.
-                outbox_claim_id: None,
-            };
-            dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
-        }
-        EngineKind::Claude => {
-            let engine = review::engines::claude::ClaudeEngine {
-                app: &app,
-                claude: &state.claude,
-                registry: &state.sessions,
-                claude_bin: review::engines::claude::process::CLAUDE_BIN,
-                project_id: &project_id,
-                repo: &project.repo,
-                repo_root: &project.repo_root,
-                claude_model: &project.claude_model,
-                url_ctx,
-                // Auto-dispatch only ever `start`s (pr_number is a method arg); the field is
-                // the follow-up (`send_message`) path's.
-                pr_number: 0,
-                session_info: None,
-                // Auto-poll dispatch is NOT the outbox path → no AB#1204 claim breadcrumb.
-                outbox_claim_id: None,
-            };
-            dispatch::auto_dispatch(candidates, &engine, &active, &record, &report).await;
-        }
-    }
+    dispatch::auto_dispatch(candidates, &active, &enqueue, &report);
+}
+
+fn should_skip_auto_dispatch_for_stopped_codex(
+    engine_kind: model::EngineKind,
+    codex_stopped: bool,
+) -> bool {
+    engine_kind == model::EngineKind::Codex && codex_stopped
+}
+
+fn enqueue_candidate_action<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_id: &str,
+    candidate: &Candidate,
+) -> error::AppResult<i64> {
+    let kind = dispatch::action_kind_for_candidate(candidate)?;
+    let payload = serde_json::to_string(&model::ReviewActionPayload {
+        candidate: candidate.clone(),
+    })
+    .map_err(|e| error::AppError::new(format!("auto-dispatch action 序列化失败：{e}")))?;
+    let summary = dispatch::review_action_summary(candidate);
+    let dedupe_key = dispatch::review_action_dedupe_key(candidate);
+    outbox::service::enqueue_deduped(app, project_id, kind, &summary, &payload, &dedupe_key)
+}
+
+fn persist_auto_dispatch_inbox<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_id: &str,
+    project: &config::service::Project,
+    payload: &str,
+    dedupe_key: &str,
+) -> error::AppResult<Option<i64>> {
+    let action: model::ReviewActionPayload = serde_json::from_str(payload)
+        .map_err(|e| error::AppError::new(format!("auto-dispatch action 反序列化失败：{e}")))?;
+    let candidate = action.candidate;
+    let now = inbox::store::now_epoch();
+    let event = model::Event {
+        dedupe_key: format!("auto-dispatch:{project_id}:{dedupe_key}"),
+        source: project.source_kind,
+        event_type: model::EventType::PullRequest,
+        project_id: project_id.to_string(),
+        repo: project.repo.clone(),
+        number: Some(candidate.number),
+        title: format!("PR #{} {}", candidate.number, candidate.kind),
+        body: String::new(),
+        labels: Vec::new(),
+        url: String::new(),
+        received_at_epoch: now,
+    };
+    let db = app.state::<db::Database>();
+    inbox::store::insert_dedup(db.inner(), &event, payload, None, Some(&candidate))
 }
 
 /// Emit a session-less [`events::ReviewEvent::DispatchError`] to the review area
@@ -780,6 +807,22 @@ fn emit_dispatch_error<R: tauri::Runtime>(
 mod tests {
     use super::*;
     use crate::db::Database;
+
+    #[test]
+    fn auto_dispatch_skips_only_stopped_codex_projects() {
+        assert!(
+            should_skip_auto_dispatch_for_stopped_codex(model::EngineKind::Codex, true),
+            "user-stopped codex should prevent automatic outbox production"
+        );
+        assert!(
+            !should_skip_auto_dispatch_for_stopped_codex(model::EngineKind::Codex, false),
+            "running codex projects can auto-dispatch"
+        );
+        assert!(
+            !should_skip_auto_dispatch_for_stopped_codex(model::EngineKind::Claude, true),
+            "Claude has no resident codex stop flag"
+        );
+    }
 
     // Cross-slice legacy-import ASSEMBLY + guard (review F11). The per-slice
     // `import_legacy_*` have their own round-trip tests; this covers what ONLY the

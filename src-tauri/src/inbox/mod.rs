@@ -2,23 +2,25 @@
 //! path. Every inbound delivery is persisted, deduped by its delivery identity, and kept with
 //! its raw payload so it can be listed, inspected, and REPLAYED.
 //!
-//! **Funnel (upstream Hard, downstream unchanged).** The inbox's own enforcement is the
+//! **Funnel (upstream Hard, downstream durable).** The inbox's own enforcement is the
 //! `UNIQUE(dedupe_key)` constraint on `inbox_event` (the **Hard** ingress-idempotency carrier,
 //! see [`crate::db`]'s `SCHEMA_V4`): a re-delivered webhook (a GitHub retry, a tunnel
 //! re-delivery) is UNEXPRESSIBLE as a second row, so each delivery is processed at most once.
-//! That is the UPSTREAM of the funnel; the DOWNSTREAM authoritative dedup gate stays the
-//! EXISTING `dispatch_key` + `try_reserve_pair` (UNCHANGED) — the inbox does NOT replace it
-//! (see [`service`]'s top doc).
+//! That is the UPSTREAM of the funnel; the DOWNSTREAM review/check dedup is now the outbox pending
+//! `dedupe_key` plus the review executor's durable claim. The inbox does NOT execute reviews; it
+//! stores replayable inputs in front of the vetted producer/executor path.
 //!
 //! `store` owns the `inbox_event` table's queries (the slice reaches SQLite only through the
 //! horizontal [`crate::db::Database`] handle — not a cross-slice import). `service` is the
 //! ingress/replay logic: it works ONLY on the neutral [`crate::model::Event`] envelope and two
-//! OPAQUE composition-root-injected closures ([`GithubRefeed`] / [`AzureRefresh`]) — so the inbox
-//! slice names NO `pr`-internal type. The composition root (`lib.rs`) is the only place that knows
-//! both `pr` and `inbox`: it normalizes a `pr::webhook::WebhookEvent` into a `model::Event` (via
-//! `pr::webhook::event_from_webhook`) at the webhook seam, and installs the closures that re-feed a
-//! GitHub delivery through `pr::commands::ingest_webhook` / re-run the `az` discovery. `commands`
-//! exposes the `inbox_list` / `inbox_get_raw` / `inbox_replay` Tauri commands.
+//! OPAQUE composition-root-injected closures ([`GithubRefeed`] / [`AzureRefresh`] /
+//! [`CandidateDispatch`]) — so the inbox slice names NO `pr`/`outbox` internal type. The composition
+//! root (`lib.rs`) is the only place that knows both `pr` and `inbox`: it normalizes a
+//! `pr::webhook::WebhookEvent` into a `model::Event` (via `pr::webhook::event_from_webhook`) at the
+//! webhook seam, and installs the closures that re-feed a GitHub delivery through
+//! `pr::commands::ingest_webhook`, re-run the `az` discovery, or re-produce a candidate-backed
+//! review/check action. `commands` exposes the `inbox_list` / `inbox_get_raw` / `inbox_replay` Tauri
+//! commands.
 //!
 //! The cross-slice contract types ([`crate::model::InboxStatus`] / [`crate::model::InboxEntry`])
 //! live in the root `model.rs`; the [`crate::events::InboxEvent`] tagged union is the
@@ -29,6 +31,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::error::AppResult;
+use crate::model::Candidate;
 
 pub mod commands;
 pub mod manager;
@@ -58,3 +61,16 @@ pub type GithubRefeed = Arc<
 /// [`AppResult`] (AB#1065 F2): a refresh failure marks the audit row `Failed`, not `Processed`.
 pub type AzureRefresh =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = AppResult<()>> + Send>> + Send + Sync>;
+
+/// The default-rule candidate replay hook (#1379). Given a project id and the stored
+/// backend-only [`Candidate`], the composition root re-produces the same review/check outbox action
+/// via the durable producer path. OPAQUE so the inbox never imports `outbox`.
+pub type CandidateDispatch = Arc<
+    dyn Fn(
+            tauri::AppHandle,
+            String,
+            Candidate,
+        ) -> Pin<Box<dyn Future<Output = AppResult<()>> + Send>>
+        + Send
+        + Sync,
+>;

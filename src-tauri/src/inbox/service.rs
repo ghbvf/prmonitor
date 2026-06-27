@@ -1,20 +1,21 @@
-//! Inbox ingress + replay logic (AB#1065): the composition-facing body the root installs as
-//! the webhook ingestor / refresher.
+//! Inbox ingress + replay logic (AB#1065/#1379): the composition-facing body the root installs as
+//! the webhook ingestor / refresher / candidate action producer.
 //!
 //! **Decoupled from `pr`.** This module names NO `pr`-internal type. It works only on the neutral
-//! [`crate::model::Event`] envelope and two OPAQUE composition-root-injected closures
-//! ([`crate::inbox::GithubRefeed`] / [`crate::inbox::AzureRefresh`]). The composition root
-//! normalizes a `pr::webhook::WebhookEvent` into a `model::Event` (via `pr::webhook::event_from_webhook`)
-//! BEFORE calling [`ingest_github`], and the closures it injects are the only path back into the
-//! `pr` slice (re-feed via `pr::commands::ingest_webhook`, re-discovery via `az`).
+//! [`crate::model::Event`] envelope and OPAQUE composition-root-injected closures
+//! ([`crate::inbox::GithubRefeed`] / [`crate::inbox::AzureRefresh`] /
+//! [`crate::inbox::CandidateDispatch`]). The composition root normalizes a
+//! `pr::webhook::WebhookEvent` into a `model::Event` (via `pr::webhook::event_from_webhook`) BEFORE
+//! calling [`ingest_github`], and the closures it injects are the only path back into other slices
+//! (re-feed via `pr::commands::ingest_webhook`, re-discovery via `az`, candidate action production
+//! via outbox).
 //!
-//! **Funnel (upstream Hard, downstream UNCHANGED).** The inbox's UPSTREAM gate is the
+//! **Funnel (upstream Hard, downstream durable).** The inbox's UPSTREAM gate is the
 //! `inbox_event.UNIQUE(dedupe_key)` constraint (the **Hard** ingress-idempotency carrier — a
 //! re-delivered webhook is unexpressible as a second row, see [`crate::inbox::store::insert_dedup`]).
-//! The DOWNSTREAM authoritative dedup gate stays the EXISTING `dispatch_key` + `try_reserve_pair`
-//! (UNCHANGED, inside `ingest_webhook` which the injected `GithubRefeed` calls): the inbox dedups
-//! DELIVERIES, while `dispatch_key` dedups REVIEW DISPATCHES. The inbox only adds durable
-//! persistence + replay in front of the vetted path; it does NOT replace the dispatch dedup.
+//! The DOWNSTREAM review/check dedup gate is the outbox pending `dedupe_key` plus the review
+//! executor's durable claim. The inbox dedups DELIVERIES / stored producer inputs; outbox + executor
+//! dedup REVIEW DISPATCHES.
 
 use sha2::{Digest, Sha256};
 use tauri::{async_runtime::spawn, Emitter, Manager};
@@ -23,8 +24,8 @@ use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::events::{InboxEvent, INBOX_UPDATED_EVENT};
 use crate::inbox::store;
-use crate::inbox::{AzureRefresh, GithubRefeed};
-use crate::model::{Event, EventType, InboxEntry, SourceKind};
+use crate::inbox::{AzureRefresh, CandidateDispatch, GithubRefeed};
+use crate::model::{Candidate, Event, EventType, InboxEntry, SourceKind};
 
 /// Lowercase hex SHA-256 of `bytes` — the Azure audit dedupe-key body hash (AB#1065). Reuses the
 /// `sha2` crate already in the dependency tree (no new dependency). The GitHub dedupe key is built
@@ -82,7 +83,7 @@ fn emit_updated<R: tauri::Runtime>(app: &tauri::AppHandle<R>, project_id: &str, 
 /// Load entry `id` and emit `inbox:updated` for it (best-effort). A missing row / store error does
 /// NOT fail the caller — the emit is a UI nicety, not a correctness gate — but a store ERROR is
 /// logged (not silently swallowed) so a persistent read failure is diagnosable.
-fn emit_for_id<R: tauri::Runtime>(
+pub(crate) fn emit_for_id<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     db: &Database,
     project_id: &str,
@@ -102,7 +103,7 @@ fn emit_for_id<R: tauri::Runtime>(
 /// `Processed`, `Err` → `Failed(message)`. The single decision shared by `process_github` /
 /// `process_azure` / `replay`, so a refeed failure can never be recorded as a false `Processed`.
 /// db-only (AppHandle-free) so the Ok→Processed / Err→Failed mapping is unit-tested directly.
-fn record_terminal(db: &Database, id: i64, result: &AppResult<()>) -> AppResult<()> {
+pub(crate) fn record_terminal(db: &Database, id: i64, result: &AppResult<()>) -> AppResult<()> {
     match result {
         Ok(()) => store::mark_processed(db, id),
         Err(e) => store::mark_failed(db, id, &e.message),
@@ -133,6 +134,7 @@ pub async fn ingest_github(
     event: Event,
     raw: String,
     webhook_event_json: String,
+    candidate: Option<Candidate>,
 ) -> AppResult<()> {
     let project_id = event.project_id.clone();
 
@@ -140,7 +142,13 @@ pub async fn ingest_github(
     // platform retry. (No additive "persist failed → still refeed" fallback anymore: a 5xx retry is
     // the correct durable semantics, and refeeding without a persisted row would re-dispatch
     // unbounded on a persistently-broken store.)
-    let inserted = store::insert_dedup(db, &event, &raw, Some(&webhook_event_json))?;
+    let inserted = store::insert_dedup(
+        db,
+        &event,
+        &raw,
+        Some(&webhook_event_json),
+        candidate.as_ref(),
+    )?;
 
     let Some(id) = inserted else {
         // Duplicate delivery (same dedupe_key): already persisted + processed on the first
@@ -208,7 +216,7 @@ pub async fn ingest_azure_refresh(
     // DURABLE PERSIST (awaited) — gates the ACK. Azure audit rows carry no parsed WebhookEvent
     // (replay re-invokes the refresher, not a re-feed), so `webhook_event_json` is None. `Some(id)`
     // = new audit row; `None` = duplicate (still durable-Ok). An Err propagates → handler 500.
-    let new_id = store::insert_dedup(db, &event, &raw, None)?;
+    let new_id = store::insert_dedup(db, &event, &raw, None, None)?;
 
     // Run the refresh + (for a new row) the status transition post-ACK in a detached task.
     let app = app.clone();
@@ -250,22 +258,27 @@ async fn process_azure(
     }
 }
 
-/// Re-process a stored inbox entry by id (AB#1065): GitHub entries re-feed the stored parsed
-/// `WebhookEvent` JSON through the injected [`GithubRefeed`]; Azure audit entries re-invoke the
-/// [`AzureRefresh`]. Works on ANY entry regardless of its current status. An unknown id is an
-/// error (the command surfaces it). The entry is marked `Processed` / `Failed` and re-announced.
+/// Re-process a stored inbox entry by id (AB#1065/#1379): GitHub entries re-feed the stored parsed
+/// `WebhookEvent` JSON through the injected [`GithubRefeed`], Azure audit entries re-invoke the
+/// [`AzureRefresh`], and candidate-backed auto-dispatch entries re-produce their review/check
+/// outbox action through [`CandidateDispatch`]. Works on ANY entry regardless of its current status.
+/// An unknown id is an error (the command surfaces it). The entry is marked `Processed` / `Failed`
+/// and re-announced.
 ///
 /// **Replay approach: persisted `WebhookEvent` JSON (not re-parse).** `pr::webhook::parse_delivery`
 /// is private AND route-snapshot-dependent (it needs the live `routes`, unavailable at replay
 /// time), so the inbox persists the parsed `WebhookEvent` JSON at ingress
 /// (`inbox_event.webhook_event_json`) and replays from THAT — handing the OPAQUE JSON to the
 /// `github_refeed` closure, which deserializes it back into a `WebhookEvent` in `lib.rs` (the only
-/// place that names that type). The inbox itself never sees a `pr` type.
+/// place that names that type). Candidate-backed rows instead use the stored backend-only
+/// `candidate_json`, so a replay can reconstruct the default producer action without a webhook JSON.
+/// The inbox itself never sees a `pr` or `outbox` type.
 pub async fn replay(
     app: &tauri::AppHandle,
     db: &Database,
     github_refeed: &GithubRefeed,
     refresher: &AzureRefresh,
+    candidate_dispatch: &CandidateDispatch,
     id: i64,
 ) -> AppResult<()> {
     // Load + decide the plan (db-only, AppHandle-free — `load_replay_plan` errors on an unknown
@@ -293,6 +306,9 @@ pub async fn replay(
             github_refeed(app.clone(), webhook_event_json).await
         }
         ReplayAction::RefreshAzure => refresher(project_id.clone()).await,
+        ReplayAction::DispatchCandidate(candidate) => {
+            candidate_dispatch(app.clone(), project_id.clone(), candidate).await
+        }
     };
 
     // F2: record the terminal status from the closure Result (Ok → Processed, Err → Failed), then
@@ -306,6 +322,9 @@ pub async fn replay(
 /// source-branch logic (incl. the error cases) is unit-tested without a Tauri runtime.
 #[derive(Debug)]
 enum ReplayAction {
+    /// A default-rule auto-dispatch entry: re-produce the stored candidate as a review/check outbox
+    /// action through the composition-injected producer.
+    DispatchCandidate(Candidate),
     /// A GitHub entry: re-feed the stored parsed-`WebhookEvent` JSON through the `github_refeed`
     /// closure. Carries the OPAQUE JSON String (NOT a `pr::webhook::WebhookEvent`) so the inbox
     /// stays decoupled — the closure deserializes it in `lib.rs`.
@@ -332,27 +351,29 @@ fn load_replay_plan(db: &Database, id: i64) -> AppResult<ReplayPlan> {
         source,
         status: _status,
         webhook_event_json,
+        candidate,
     } = store::get_replayable(db, id)?
         .ok_or_else(|| AppError::new(format!("inbox 条目不存在（id={id}）")))?;
     let project_id = event.project_id;
-    let action = match source {
-        SourceKind::Github => {
-            // The stored JSON is handed to the `github_refeed` closure VERBATIM (it deserializes
-            // the `WebhookEvent` in `lib.rs`); the inbox does not parse it, so it stays decoupled.
-            let json = webhook_event_json.ok_or_else(|| {
-                AppError::new(format!(
-                    "inbox 条目 {id} 缺少可重放的 WebhookEvent（GitHub 投递未保存解析结果）"
-                ))
-            })?;
-            ReplayAction::RefeedGithub(json)
+    let action = match (source, webhook_event_json, candidate) {
+        // A real GitHub webhook row can also carry candidate_json as producer metadata, but replay
+        // must re-feed the full WebhookEvent so list update + gates + ledger/cooldown semantics run.
+        (SourceKind::Github, Some(json), _) => ReplayAction::RefeedGithub(json),
+        // Synthetic auto-dispatch rows have no webhook payload; candidate_json is their replay fact.
+        (_, _, Some(candidate)) => ReplayAction::DispatchCandidate(candidate),
+        (SourceKind::Github, None, None) => {
+            return Err(AppError::new(format!(
+                "inbox 条目 {id} 缺少可重放的 WebhookEvent（GitHub 投递未保存解析结果）"
+            )));
         }
-        SourceKind::Azure => ReplayAction::RefreshAzure,
+        (SourceKind::Azure, _, None) => ReplayAction::RefreshAzure,
         // Bitbucket has no inbound webhook (poll/API discovery only — see `model::SourceKind`),
-        // so an inbox entry can never carry it; reject a replay rather than silently no-op.
-        SourceKind::Bitbucket => {
+        // so an inbox entry can never carry it unless it is a candidate-backed synthetic row (handled
+        // above); reject a replay rather than silently no-op.
+        (SourceKind::Bitbucket, _, None) => {
             return Err(AppError::new(format!(
                 "inbox 条目 {id} 来源 Bitbucket 不支持重放（无入站 webhook）"
-            )))
+            )));
         }
     };
     Ok(ReplayPlan { project_id, action })
@@ -378,6 +399,18 @@ mod tests {
             labels: vec!["pr-review".to_string()],
             url: "https://example.com/pr/7".to_string(),
             received_at_epoch: 1_700_000_000,
+        }
+    }
+
+    fn candidate(number: u64, kind: &str) -> Candidate {
+        Candidate {
+            number,
+            kind: kind.to_string(),
+            head_sha: format!("head-{number}-{kind}"),
+            head_ref: "main".to_string(),
+            author: "octocat".to_string(),
+            is_cross_repository: false,
+            is_draft: false,
         }
     }
 
@@ -412,8 +445,8 @@ mod tests {
         let db = Database::open_in_memory().expect("open db");
         let event = github_event("github:dup-guid", "p1", 7);
 
-        let first = store::insert_dedup(&db, &event, "raw", None).expect("first");
-        let second = store::insert_dedup(&db, &event, "raw", None).expect("second");
+        let first = store::insert_dedup(&db, &event, "raw", None, None).expect("first");
+        let second = store::insert_dedup(&db, &event, "raw", None, None).expect("second");
 
         assert!(should_process(first), "first delivery triggers processing");
         assert!(
@@ -439,7 +472,7 @@ mod tests {
         let db = Database::open_in_memory().expect("open db");
         let event = github_event("github:g1", "p1", 7);
         let webhook_json = "{\"projectId\":\"p1\",\"number\":7}".to_string();
-        let id = store::insert_dedup(&db, &event, "raw", Some(&webhook_json))
+        let id = store::insert_dedup(&db, &event, "raw", Some(&webhook_json), None)
             .expect("insert")
             .expect("new id");
         // Pretend a prior processing failed (replay works on ANY status).
@@ -465,12 +498,47 @@ mod tests {
     fn replay_azure_plans_a_refresh() {
         let db = Database::open_in_memory().expect("open db");
         let event = normalize_azure("azure-body", "p2", "myrepo", 1);
-        let id = store::insert_dedup(&db, &event, "azure-body", None)
+        let id = store::insert_dedup(&db, &event, "azure-body", None, None)
             .expect("insert")
             .expect("new id");
         let plan = load_replay_plan(&db, id).expect("plan");
         assert_eq!(plan.project_id, "p2");
         assert!(matches!(plan.action, ReplayAction::RefreshAzure));
+    }
+
+    #[test]
+    fn replay_candidate_json_reproduces_auto_dispatch_action() {
+        let db = Database::open_in_memory().expect("open db");
+        let event = github_event("auto-dispatch:p1:7@head-7-review:review", "p1", 7);
+        let cand = candidate(7, "review");
+        let id = store::insert_dedup(&db, &event, "payload", None, Some(&cand))
+            .expect("insert")
+            .expect("new id");
+
+        let plan = load_replay_plan(&db, id).expect("plan");
+        assert_eq!(plan.project_id, "p1");
+        match plan.action {
+            ReplayAction::DispatchCandidate(actual) => assert_eq!(actual, cand),
+            other => panic!("expected DispatchCandidate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_github_with_webhook_json_prefers_refeed_over_candidate_metadata() {
+        let db = Database::open_in_memory().expect("open db");
+        let event = github_event("github:g1", "p1", 7);
+        let webhook_json = "{\"projectId\":\"p1\",\"number\":7}".to_string();
+        let cand = candidate(7, "review");
+        let id = store::insert_dedup(&db, &event, "raw", Some(&webhook_json), Some(&cand))
+            .expect("insert")
+            .expect("new id");
+
+        let plan = load_replay_plan(&db, id).expect("plan");
+        assert_eq!(plan.project_id, "p1");
+        match plan.action {
+            ReplayAction::RefeedGithub(json) => assert_eq!(json, webhook_json),
+            other => panic!("expected RefeedGithub, got {other:?}"),
+        }
     }
 
     // Replay unknown id errors (AB#1065): an id with no row is an error, not a silent no-op —
@@ -488,7 +556,7 @@ mod tests {
     fn replay_github_without_webhook_event_errors() {
         let db = Database::open_in_memory().expect("open db");
         let event = github_event("github:g1", "p1", 7);
-        let id = store::insert_dedup(&db, &event, "raw", None)
+        let id = store::insert_dedup(&db, &event, "raw", None, None)
             .expect("insert")
             .expect("new id");
         let err = load_replay_plan(&db, id).expect_err("missing webhook event must error");
@@ -513,7 +581,7 @@ mod tests {
             url: String::new(),
             received_at_epoch: 1,
         };
-        let id = store::insert_dedup(&db, &bb_event, "raw", None)
+        let id = store::insert_dedup(&db, &bb_event, "raw", None, None)
             .expect("insert")
             .expect("new id");
         let err = load_replay_plan(&db, id).expect_err("bitbucket replay must error");
@@ -532,12 +600,12 @@ mod tests {
     fn duplicate_azure_delivery_does_not_change_existing_status() {
         let db = Database::open_in_memory().expect("open db");
         let event = normalize_azure("azure-body", "p2", "myrepo", 1);
-        let id = store::insert_dedup(&db, &event, "azure-body", None)
+        let id = store::insert_dedup(&db, &event, "azure-body", None, None)
             .expect("first insert")
             .expect("new id");
         store::mark_failed(&db, id, "earlier failure").expect("mark failed");
 
-        let dup = store::insert_dedup(&db, &event, "azure-body", None).expect("dup insert");
+        let dup = store::insert_dedup(&db, &event, "azure-body", None, None).expect("dup insert");
         assert!(dup.is_none(), "duplicate Azure delivery is a no-op insert");
 
         let entry = store::get_entry(&db, id).expect("get").expect("exists");
@@ -556,7 +624,7 @@ mod tests {
     fn record_terminal_maps_ok_to_processed_and_err_to_failed() {
         let db = Database::open_in_memory().expect("open db");
         let event = github_event("github:g1", "p1", 7);
-        let id = store::insert_dedup(&db, &event, "raw", Some("{}"))
+        let id = store::insert_dedup(&db, &event, "raw", Some("{}"), None)
             .expect("insert")
             .expect("new id");
 
@@ -584,7 +652,7 @@ mod tests {
         let event = github_event("github:g1", "p1", 7);
         // Store a structurally-present but (for the closure) un-replayable JSON; the plan still
         // carries it (the inbox doesn't parse it — lib.rs does), so the failure surfaces at refeed.
-        let id = store::insert_dedup(&db, &event, "raw", Some("not-a-webhook-event"))
+        let id = store::insert_dedup(&db, &event, "raw", Some("not-a-webhook-event"), None)
             .expect("insert")
             .expect("new id");
 

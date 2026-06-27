@@ -120,12 +120,48 @@ pub fn enqueue(
     payload: &str,
     now: u64,
 ) -> AppResult<i64> {
+    enqueue_inner(db, project_id, kind, summary, payload, None, now)
+}
+
+/// Enqueue one produced action with a live-pending dedupe key (#1379). If the same project already
+/// has a pending row for `dedupe_key`, return that row id instead of inserting another pending
+/// action. Once the row reaches `done`/`dead`, the partial unique index no longer applies and a new
+/// action for a new attempt can be queued intentionally.
+pub fn enqueue_deduped(
+    db: &Database,
+    project_id: &str,
+    kind: ActionKind,
+    summary: &str,
+    payload: &str,
+    dedupe_key: &str,
+    now: u64,
+) -> AppResult<i64> {
+    enqueue_inner(
+        db,
+        project_id,
+        kind,
+        summary,
+        payload,
+        Some(dedupe_key),
+        now,
+    )
+}
+
+fn enqueue_inner(
+    db: &Database,
+    project_id: &str,
+    kind: ActionKind,
+    summary: &str,
+    payload: &str,
+    dedupe_key: Option<&str>,
+    now: u64,
+) -> AppResult<i64> {
     db.with_tx(|tx| {
         tx.execute(
-            "INSERT INTO action_outbox \
+            "INSERT OR IGNORE INTO action_outbox \
              (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, \
-              last_error, created_at, updated_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, ?6, ?6)",
+              last_error, created_at, updated_at, dedupe_key) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, ?6, ?6, ?7)",
             rusqlite::params![
                 project_id,
                 kind_as_wire(kind),
@@ -133,10 +169,22 @@ pub fn enqueue(
                 payload,
                 status_as_wire(ActionStatus::Pending),
                 now as i64,
+                dedupe_key,
             ],
         )
         .map_err(map_err)?;
-        let id = tx.last_insert_rowid();
+        let id = if tx.changes() == 1 {
+            tx.last_insert_rowid()
+        } else {
+            tx.query_row(
+                "SELECT id FROM action_outbox \
+                 WHERE project_id = ?1 AND dedupe_key = ?2 AND status = 'pending' \
+                 ORDER BY id LIMIT 1",
+                rusqlite::params![project_id, dedupe_key],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(map_err)?
+        };
         // Cap stored history: drop the oldest TERMINAL rows beyond MAX_OUTBOX_TERMINAL (never a
         // `pending` row — that is an un-run action). The `LIMIT -1 OFFSET ?` no-ops cheaply when
         // under the cap.
@@ -482,6 +530,48 @@ mod tests {
         assert_eq!(entry.next_attempt_at, 1_000);
         assert_eq!(entry.created_at, 1_000);
         assert_eq!(entry.last_error, None);
+    }
+
+    #[test]
+    fn enqueue_deduped_reuses_live_pending_row_only() {
+        let db = Database::open_in_memory().expect("open db");
+        let first = enqueue_deduped(
+            &db,
+            "p1",
+            ActionKind::Review,
+            "PR #7 review",
+            "{}",
+            "7@sha:review",
+            100,
+        )
+        .expect("first enqueue");
+        let second = enqueue_deduped(
+            &db,
+            "p1",
+            ActionKind::Review,
+            "PR #7 review",
+            "{}",
+            "7@sha:review",
+            101,
+        )
+        .expect("second enqueue");
+        assert_eq!(second, first, "same live pending action is reused");
+
+        mark_done(&db, first, 1, 200).expect("done");
+        let after_done = enqueue_deduped(
+            &db,
+            "p1",
+            ActionKind::Review,
+            "PR #7 review",
+            "{}",
+            "7@sha:review",
+            201,
+        )
+        .expect("enqueue after done");
+        assert_ne!(
+            after_done, first,
+            "terminal row no longer blocks a deliberate future enqueue"
+        );
     }
 
     // `claim_due` returns ONLY pending rows whose next_attempt_at <= now, oldest first; it excludes

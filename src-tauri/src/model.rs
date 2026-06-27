@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A PR discovered by a [`crate::pr::source::EventSourceProvider`] that may need review.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Candidate {
     pub number: u64,
@@ -141,10 +141,9 @@ pub enum UpdateMode {
 /// Which review engine runs against a PR.
 ///
 /// **Hard carrier** (sealed enum): engine selection is wired through exhaustive
-/// `match EngineKind { ... }` at the composition root (`lib.rs::run_auto_dispatch`)
-/// and the review commands (`commands.rs::start_review`), so adding a variant
-/// without handling it is a compile error — the missing arm cannot be expressed.
-/// Now load-bearing (#718): `Claude` is dispatched alongside `Codex`.
+/// `match EngineKind { ... }` in the review start funnel (`commands.rs::start_via_engine`), so
+/// adding a variant without handling it is a compile error — the missing arm cannot be expressed.
+/// Now load-bearing (#718): `Claude` is available alongside `Codex`.
 ///
 /// Wire strings are a cross-agent contract the frontend mirrors (`ENGINE_KINDS`
 /// in `src/types.ts`): `Codex → "codex"`, `Claude → "claude"`. The serde golden
@@ -537,8 +536,9 @@ pub enum ActionKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewActionPayload {
-    /// The PR / MR number to review (re-validated `> 0` at the executor boundary).
-    pub pr_number: u64,
+    /// The candidate to review. Carries the dispatch key inputs (`pr_number`, `head_sha`, `kind`)
+    /// so the executor can land the ledger after the outbox action succeeds.
+    pub candidate: Candidate,
 }
 
 /// The outbox payload for a [`ActionKind::StopReview`] action (AB#1069): which in-flight session to
@@ -1296,11 +1296,23 @@ mod tests {
     // camelCase shape must stay stable. Round-trips (the executor deserializes it).
     #[test]
     fn review_action_payload_wire_shape_is_camel_case() {
-        let payload = ReviewActionPayload { pr_number: 7 };
+        let payload = ReviewActionPayload {
+            candidate: Candidate {
+                number: 7,
+                head_sha: "sha".to_string(),
+                head_ref: "main".to_string(),
+                author: "octocat".to_string(),
+                is_cross_repository: false,
+                is_draft: false,
+                kind: "review".to_string(),
+            },
+        };
         let v = serde_json::to_value(&payload).expect("ReviewActionPayload serializes");
         // camelCase present, snake_case absent.
-        assert!(v.get("prNumber").is_some());
-        assert!(v.get("pr_number").is_none());
+        assert!(v.get("candidate").is_some());
+        assert_eq!(v["candidate"]["headSha"], "sha");
+        assert!(v.get("prNumber").is_none());
+        assert!(v["candidate"].get("head_sha").is_none());
         // F3: the routing key is the outbox ROW's project_id, NOT a payload field — assert it is
         // absent so a producer can't reintroduce a dual project source.
         assert!(v.get("projectId").is_none());

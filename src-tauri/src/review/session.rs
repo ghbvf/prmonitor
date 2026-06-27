@@ -136,10 +136,9 @@ pub struct CompletionOutcome {
 ///
 /// Review-slice-internal: NOT serialized, NOT a DB column, NOT a wire type — it lives only in
 /// the in-memory [`RegistryState::url_contexts`] map, so it touches no wire/DB contract.
-/// `pub(crate)` (not `pub(super)`) ONLY because the auto-dispatch composition root
-/// (`crate::lib::run_auto_dispatch`) builds the engines directly and sits OUTSIDE the `review`
-/// module, so it must be able to name the type to set the engine's `url_ctx` field. It is
-/// still crate-internal — never crosses the Tauri command boundary nor the DB.
+/// `pub(crate)` (not `pub(super)`) because composition-level review start callers sit OUTSIDE the
+/// `review` module while still using this snapshot through the public funnel. It is still
+/// crate-internal — never crosses the Tauri command boundary nor the DB.
 #[derive(Debug, Clone)]
 pub(crate) struct CommentUrlContext {
     pub source_kind: crate::model::SourceKind,

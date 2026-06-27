@@ -32,8 +32,7 @@ pub struct CodexManager {
     /// 用户显式停止标记（来自 `stop`/`stop_codex`）。true 时：
     /// - 被动 `status` 探测短路为「已停止」，不自动拉起；
     /// - `connection`（每个 review start 的统一收口）直接拒绝（返回 Err），不复活——这是
-    ///   auto-dispatch「停止后不复活」的**race-free 真值源**（PR #47 F1）；`run_auto_dispatch`
-    ///   的 `is_stopped()` 仅作快路径优化；
+    ///   outbox executor「停止后不复活」的**race-free 真值源**（PR #47 F1）；
     /// - `ensure_started` 在装载进程前于 inner 锁内复查此位，停止则丢弃刚 spawn 的进程，
     ///   闭合 cold-start 竞态（PR #47 F1）；
     /// - 中断（`stop_review`）走 `existing_client()`，只对在跑的进程有意义、不复活（PR #47 F2）。
@@ -134,9 +133,8 @@ impl CodexManager {
         // The manual entries (`start_review` / `start_codex` commands) call `resume()`
         // BEFORE reaching here, so a manual review still force-starts (overrides a prior
         // `stop`). Auto-dispatch never calls `resume()`, so even if a `stop` lands after
-        // `run_auto_dispatch`'s upstream `is_stopped()` fast-path gate but before we get
-        // here (the old TOCTOU), this refusal blocks the revive. `ensure_started` adds
-        // the symmetric cold-start guard (re-check under the install lock). Interrupts
+        // an automatic outbox execution has been enqueued, this refusal blocks the revive.
+        // `ensure_started` adds the symmetric cold-start guard (re-check under the install lock). Interrupts
         // use `existing_client()` (no spawn, no flag change; PR #47 F2).
         if self.stopped.load(Ordering::SeqCst) {
             return Err(AppError::new("codex app-server 已停止".to_string()));
@@ -149,10 +147,9 @@ impl CodexManager {
         Ok(proc.client())
     }
 
-    /// Whether the user has explicitly stopped codex (`stop`/`stop_codex`). Read by
-    /// the composition root's `run_auto_dispatch` (PR #47 F1) to gate auto-dispatch:
-    /// a stopped codex is NOT auto-revived by a dispatchable PR — only manual review
-    /// (`connection`) and manual `start` force a restart.
+    /// Whether the user has explicitly stopped codex (`stop`/`stop_codex`). Production auto-dispatch
+    /// reads this as a producer-side skip gate, while every review start still enforces it inside
+    /// [`Self::connection`] as the race-free authority.
     pub(crate) fn is_stopped(&self) -> bool {
         self.stopped.load(Ordering::SeqCst)
     }
