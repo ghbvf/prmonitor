@@ -12,6 +12,7 @@ use crate::config::model::ListenerKind;
 
 /// One enabled listener's runtime state. Sealed enum; kebab-case wire values (mirror the
 /// `ListenerKind` style). This is the discriminated-union tag the TS `assertNever` switch covers.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ListenerState {
@@ -35,12 +36,14 @@ pub enum ListenerState {
 
 /// One enabled listener's runtime status snapshot. serde camelCase — golden-locked below;
 /// TS-mirrored in `src/config/types.ts`. `boundPort` is present only when actually bound.
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListenerRuntimeStatus {
     pub id: String,
     pub kind: ListenerKind,
     pub bound: bool,
+    #[cfg_attr(test, ts(optional))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bound_port: Option<u16>,
     pub state: ListenerState,

@@ -37,6 +37,8 @@ pub mod terminal;
 /// Rust slice-boundary enforcement test (AB#1066 F1, Medium carrier) — test-only module.
 #[cfg(test)]
 mod slice_boundary_test;
+#[cfg(test)]
+mod typegen;
 
 use std::sync::Arc;
 

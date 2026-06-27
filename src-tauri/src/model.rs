@@ -70,6 +70,7 @@ pub struct CreateSessionOpts {
 /// #11 design reservation: future variant `GitLab`. Wire strings for `Github` /
 /// `Azure` / `Bitbucket` are pinned to `"github"` / `"azure"` / `"bitbucket"`
 /// (cross-agent contract; the frontend mirrors them and a serde golden test locks them).
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SourceKind {
@@ -102,6 +103,7 @@ pub enum SourceKind {
 /// - [`Title`](Self::Title): labels are parsed from bracketed segments in the PR title
 ///   (`[pr-status/need-fix][wip]` → `["pr-status/need-fix", "wip"]`). The ONLY viable
 ///   mode for Bitbucket Server, which has no native PR labels.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum LabelSource {
@@ -128,6 +130,7 @@ pub enum LabelSource {
 /// - [`Hybrid`](Self::Hybrid): both a periodic CLI poll loop AND inbound webhooks.
 /// - [`Manual`](Self::Manual): no periodic loop; the list updates only on an explicit
 ///   "立即拉取" (one-shot CLI discovery) or inbound webhook.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum UpdateMode {
@@ -149,6 +152,7 @@ pub enum UpdateMode {
 /// in `src/types.ts`): `Codex → "codex"`, `Claude → "claude"`. The serde golden
 /// test below (`discriminator_enums_serialize_to_pinned_wire_strings`) is the
 /// **Medium** carrier locking those strings against a `rename_all` / variant drift.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum EngineKind {
@@ -177,6 +181,7 @@ pub enum EngineKind {
 ///   cloudflared tunnel, `ngrok`, …); `publicUrl` comes from config, not scraped.
 /// - [`Listener`](Self::Listener): only bind the local port; the tunnel is fully
 ///   external (no child process); `publicUrl` comes from config.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum WebhookTunnelMode {

@@ -18,6 +18,7 @@ use crate::model::{EngineKind, LabelSource, SourceKind, UpdateMode, WebhookTunne
 /// object missing fields fills them from [`Default`]. Field defaults match the
 /// historical single-project [`AppConfig`] defaults (the gocell repo the app was
 /// built to serve) so a migrated config keeps identical behavior.
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Project {
@@ -144,6 +145,7 @@ pub const DEFAULT_NOTIFICATION_TTL_SECS: u64 = 2 * 60 * 60;
 /// notifications). `#[serde(default)]` keeps it forward-compatible: a config persisted before this
 /// struct existed (or a partial `{"outbox":{}}`) fills absent fields from [`Default`] rather than
 /// failing to load.
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct OutboxConfig {
@@ -173,6 +175,7 @@ impl Default for OutboxConfig {
 /// `#[serde(deny_unknown_fields)]` — it would break that forward-compat. The
 /// legacy flat single-project shape is upgraded by `super::service::migrate_value`
 /// before deserialization, so old stored configs still load.
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AppConfig {
@@ -242,6 +245,7 @@ impl Default for AppConfig {
 }
 
 /// Listener kind (AB#1064). kebab-case wire values mirror the work item's literal naming.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ListenerKind {
@@ -254,6 +258,7 @@ pub enum ListenerKind {
 
 /// Per-listener auth mode. Terminal listeners require bearer auth plus a strong `authToken`;
 /// local-api still uses the legacy global `local_api_token` at runtime.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ListenerAuthMode {
@@ -264,6 +269,7 @@ pub enum ListenerAuthMode {
 
 /// A declarative network listener descriptor. Supported kinds are bound by the remote supervisor
 /// and must remain loopback-only.
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Listener {
@@ -330,6 +336,7 @@ pub(crate) fn default_local_api_listener() -> Listener {
 
 /// A declarative tunnel descriptor. Reuses WebhookTunnelMode (quick/command/listener); enabled
 /// tunnels are reconciled against currently bound target listeners.
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Tunnel {
