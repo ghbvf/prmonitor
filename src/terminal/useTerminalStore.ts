@@ -8,10 +8,11 @@
 // deep-track it and is a known footgun. So the screen sink + last frame are NON-reactive
 // module vars instead.
 import { ref } from "vue";
-import type { TerminalEvent, TerminalSession } from "../types";
+import type { TerminalBackend, TerminalEvent, TerminalSession } from "../types";
 import { assertNever } from "../types";
 import {
   attachTerminal,
+  closeTerminalSession,
   createTerminalSession,
   detachTerminal,
   listTerminalSessions,
@@ -37,23 +38,71 @@ const error = ref<string | null>(null);
 // `listenerError` surfaces a failed registration.
 const listenerReady = ref(false);
 const listenerError = ref<string | null>(null);
+// Re-entry guard for `stopSession` (PROD-5a): true while a `close_terminal_session` is in flight.
+// Gates the Stop button (`:disabled`) so a fast double-click can't fire a second close that would
+// hit the already-deregistered session and clobber the normal `"closed"` state with an error.
+const stopping = ref(false);
 
 // ── NON-reactive bridge to the xterm pane ───────────────────────────────────────────
-// The currently-mounted pane's frame sink (null when no pane is mounted), and the last
-// frame seen — replayed to a freshly-registered sink so a pane remount (or a late mount
-// after the first frame already arrived) restores the screen instead of showing blank.
+// The currently-mounted pane's sink (null when no pane is mounted), and the backend-specific
+// replay state — replayed to a freshly-registered sink so a pane remount (or a late mount after
+// output already arrived) restores the screen instead of showing blank. At most ONE of the two
+// replay states is populated per session (iTerm uses `latestScreen` frames; webPty uses the raw
+// `rawReplay` ring) — the backend picks the render model.
 type ScreenFrame = { data: string; cursorRow?: number; cursorCol?: number };
 let screenSink: ScreenSink | null = null;
 let latestScreen: ScreenFrame | null = null;
 
-// Register the pane's frame sink. Replays the last frame immediately so a remount restores
-// the visible screen (the backend doesn't re-send a frame just because a pane re-attached).
-function registerScreenSink(sink: ScreenSink) {
-  screenSink = sink;
-  if (latestScreen) sink(latestScreen);
+// Raw-PTY replay ring (#1372). A webPty backend streams incremental raw bytes (`output` events)
+// instead of full snapshots, so there's no single "last frame" to replay — keep a BOUNDED ring of
+// the recent raw chunks and replay them in order to a freshly-registered sink. Bounded (~256 KiB)
+// and NON-reactive, same rationale as `latestScreen`: a large byte buffer in a Vue ref would be
+// deep-tracked. Always retains at least the most-recent chunk (even one larger than the cap).
+// mirrors SCROLLBACK_CAP in src-tauri/src/terminal/webpty_manager.rs (the backend's scrollback ring).
+// Exported so the bounded-ring test asserts against the real cap (single source of truth).
+export const RAW_REPLAY_MAX_BYTES = 256 * 1024;
+let rawReplay: Uint8Array[] = [];
+let rawReplayBytes = 0;
+
+function pushRawReplay(bytes: Uint8Array) {
+  rawReplay.push(bytes);
+  rawReplayBytes += bytes.byteLength;
+  while (rawReplayBytes > RAW_REPLAY_MAX_BYTES && rawReplay.length > 1) {
+    const dropped = rawReplay.shift();
+    if (dropped) rawReplayBytes -= dropped.byteLength;
+  }
 }
 
-// Drop the pane's frame sink on unmount. Keeps `latestScreen` so the NEXT pane's
+function clearRawReplay() {
+  rawReplay = [];
+  rawReplayBytes = 0;
+}
+
+// Decode a base64 `output` payload to raw bytes. `atob` yields a binary string (one char per
+// byte); copy each char code into a Uint8Array. We pass BYTES straight to xterm (never a
+// per-chunk TextDecoder, which would corrupt a multi-byte UTF-8 sequence split across two
+// `output` chunks — xterm's own decoder stitches them). Throws on malformed base64; the caller
+// guards.
+function decodeBase64(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+// Register the pane's sink. Replays immediately so a remount restores the visible screen (the
+// backend doesn't re-send just because a pane re-attached): an iTerm `latestScreen` via
+// `writeFrame`, OR the buffered webPty `rawReplay` chunks via `writeRaw` — at most one is set.
+function registerScreenSink(sink: ScreenSink) {
+  screenSink = sink;
+  if (latestScreen) {
+    sink.writeFrame(latestScreen);
+  } else {
+    for (const chunk of rawReplay) sink.writeRaw(chunk);
+  }
+}
+
+// Drop the pane's sink on unmount. Keeps `latestScreen` / `rawReplay` so the NEXT pane's
 // registration can replay it (that's the whole point of the replay-on-register path).
 function unregisterScreenSink() {
   screenSink = null;
@@ -95,6 +144,7 @@ async function attach(sessionId: string) {
   connection.value = "attaching";
   error.value = null;
   latestScreen = null;
+  clearRawReplay();
   try {
     await attachTerminal(sessionId);
   } catch (err) {
@@ -104,11 +154,12 @@ async function attach(sessionId: string) {
   }
 }
 
-// Create a fresh session (default window/profile) and attach to it. Surfaces it in the
-// picker immediately (a later refresh reconciles) so the user sees it without waiting.
-async function createAndAttach() {
+// Create a fresh session and attach to it. `backend` (#1372) selects the backend (iterm vs
+// webPty); omitted ⇒ empty opts, so the daemon applies its default (iterm). Surfaces the new
+// session in the picker immediately (a later refresh reconciles) so the user sees it without waiting.
+async function createAndAttach(backend?: TerminalBackend) {
   try {
-    const created = await createTerminalSession();
+    const created = await createTerminalSession(backend ? { backend } : {});
     if (!sessions.value.some((s) => s.sessionId === created.sessionId)) {
       sessions.value = [...sessions.value, created];
     }
@@ -117,6 +168,32 @@ async function createAndAttach() {
     connection.value = "error";
     error.value = toMessage(err);
     console.error("创建 terminal 会话失败", err);
+  }
+}
+
+// Stop the focused session's PROCESS (#1372) — terminates it (used for a webPty shell; an iTerm
+// session can't be closed this way). Fires `close_terminal_session`; teardown rides on the
+// backend's subsequent `sessionEnded` event (the `sessionEnded` arm already does the full
+// teardown), so this does NOT touch local state on success. No-op with no active session.
+//
+// PROD-5a (re-entry + race): `stopping` drops a second call while one is in flight (a fast
+// double-click would otherwise fire a second close that hits the already-deregistered session).
+// And on reject we only flip connection="error" if a normal close did NOT already win the race
+// (sessionEnded → connection="closed"): clobbering "closed" with a confusing error banner is the
+// exact bug we're avoiding. A genuine failure still surfaces (banner + Retry), mirroring send/resize.
+async function stopSession() {
+  const id = activeSessionId.value;
+  if (!id || stopping.value) return;
+  stopping.value = true;
+  try {
+    await closeTerminalSession(id);
+  } catch (err) {
+    if (connection.value === "closed") return; // lost the race to a normal close — leave it closed
+    connection.value = "error";
+    error.value = toMessage(err);
+    console.error("停止 terminal 进程失败", err);
+  } finally {
+    stopping.value = false;
   }
 }
 
@@ -138,6 +215,7 @@ async function detach(options: { keepalive?: boolean } = {}) {
     activeSessionId.value = null;
     connection.value = "idle";
     latestScreen = null;
+    clearRawReplay();
   }
 }
 
@@ -191,6 +269,27 @@ function applyEvent(ev: TerminalEvent) {
     error.value = ev.message;
     return;
   }
+  // `sessionEnded` is a session-LIFECYCLE event, not a pane-private frame: a BACKGROUND session
+  // ending must STILL be dropped from the picker (F6 — otherwise the active-session guard below
+  // discards it and the ended shell lingers in the list). So handle it BEFORE that guard, always
+  // refreshing the list; the active-pane teardown runs only when the ENDED session is the focused one.
+  if (ev.kind === "sessionEnded") {
+    if (ev.sessionId === activeSessionId.value) {
+      // The FOCUSED session died: keep connection="closed" so TerminalView shows the "ended"
+      // banner, but DROP the dead session — clearing activeSessionId unmounts the now-frozen
+      // XtermPane + MobileToolbar (TerminalView gates the pane on activeSessionId !== null, and the
+      // closed banner is gated on connection==='closed'), and clearing the replay state stops a
+      // future pane replaying the dead screen.
+      connection.value = "closed";
+      activeSessionId.value = null;
+      latestScreen = null;
+      clearRawReplay();
+    }
+    // Always re-list so the picker no longer offers / highlights the gone session (active OR
+    // background); a background end leaves the focused pane's state untouched.
+    void refreshSessions();
+    return;
+  }
   // Session-scoped from here: drop anything not for the focused session (a background
   // session's frames must not bleed into the focused pane).
   if (ev.sessionId !== activeSessionId.value) return;
@@ -200,26 +299,29 @@ function applyEvent(ev: TerminalEvent) {
       connection.value = "attached";
       return;
     case "screenUpdate":
-      // Cache the full frame (for replay-on-register) THEN push it to the live pane.
+      // iTerm full snapshot: cache the frame (for replay-on-register) THEN push it to the live pane.
       latestScreen = {
         data: ev.contents,
         cursorRow: ev.cursorRow,
         cursorCol: ev.cursorCol,
       };
-      screenSink?.(latestScreen);
+      screenSink?.writeFrame(latestScreen);
       return;
-    case "sessionEnded":
-      // The session died. Keep connection="closed" so TerminalView shows the "ended"
-      // banner, but DROP the dead session: clearing activeSessionId unmounts the now-frozen
-      // XtermPane + MobileToolbar (TerminalView gates the pane on activeSessionId !== null,
-      // and the closed banner is gated on connection==='closed', not on activeSessionId),
-      // and clearing latestScreen stops a future pane replaying the dead screen. Refresh the
-      // list so the picker no longer offers / highlights the gone session.
-      connection.value = "closed";
-      activeSessionId.value = null;
-      latestScreen = null;
-      void refreshSessions();
+    case "output": {
+      // webPty raw incremental bytes (base64). Decode → append to the bounded replay ring → push
+      // to the live pane. A malformed base64 payload (atob throws) is dropped + logged rather than
+      // crashing the event fold (a single bad chunk must not wedge the whole stream).
+      let bytes: Uint8Array;
+      try {
+        bytes = decodeBase64(ev.data);
+      } catch (err) {
+        console.error("terminal output base64 解码失败（已丢弃该帧）", err);
+        return;
+      }
+      pushRawReplay(bytes);
+      screenSink?.writeRaw(bytes);
       return;
+    }
     case "error":
       connection.value = "error";
       error.value = ev.message;
@@ -260,11 +362,13 @@ export function useTerminalStore() {
     error,
     listenerReady,
     listenerError,
+    stopping,
     registerScreenSink,
     unregisterScreenSink,
     refreshSessions,
     attach,
     createAndAttach,
+    stopSession,
     detach,
     resetListener,
     sendInput,

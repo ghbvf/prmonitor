@@ -109,6 +109,17 @@ impl<R: Runtime> TerminalBackend for ITermBackend<'_, R> {
         let client = self.ensure().await?;
         request_resize(&client, session_id, cols, rows).await
     }
+
+    /// Unsupported for iTerm sessions: the daemon does not own a per-session process to kill (it
+    /// drives iTerm out-of-band over its Python API), so there is nothing to SIGKILL. Returns an
+    /// actionable error directing the user to close the tab/window in iTerm. The #1372 close path
+    /// only reaches this arm when the routing predicate found the id is iTerm-owned (the WebPty
+    /// backend owns the kill path).
+    async fn close_session(&self, _session_id: &str) -> AppResult<()> {
+        Err(AppError::new(
+            "iTerm 会话不支持单独停止进程：请在 iTerm 中关闭该标签页 / 窗口".to_string(),
+        ))
+    }
 }
 
 // ---- typed request bodies (generic over the write half so they're duplex-testable) ----
@@ -313,6 +324,25 @@ mod tests {
         ));
     }
 
+    /// #1372: an iTerm session has no per-session process the daemon owns to kill, so
+    /// `close_session` returns an actionable error (the WebPty backend owns the real kill path).
+    /// No daemon spawn — the impl errors before `ensure()`, so a bogus python bin is never reached.
+    #[tokio::test]
+    async fn iterm_close_session_is_unsupported() {
+        let app = tauri::test::mock_app();
+        let daemon = ITermDaemonManager::default();
+        let backend = ITermBackend::new(app.handle(), &daemon, "python3", "/nope.py");
+        let err = backend
+            .close_session("p0")
+            .await
+            .expect_err("iTerm close must be unsupported");
+        assert!(
+            err.message.contains("不支持"),
+            "error should be actionable, got: {}",
+            err.message
+        );
+    }
+
     #[test]
     fn map_notification_other_is_ignored() {
         let ev = map_notification(&ServerNotification::Other {
@@ -387,12 +417,19 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "p0");
         assert_eq!(sessions[0].cols, 80);
+        // #1372: the daemon row carries NO `backend` key, so `#[serde(default)]` fills `Iterm` —
+        // an iTerm-listed session re-serializes to the frontend as `backend: "iterm"`.
+        assert_eq!(
+            sessions[0].backend,
+            crate::model::TerminalBackendKind::Iterm
+        );
 
         let created = request_create_session(
             &client,
             &CreateSessionOpts {
                 window_id: Some("w9".to_string()),
                 profile: Some("Solarized".to_string()),
+                backend: None,
             },
         )
         .await
@@ -400,6 +437,8 @@ mod tests {
         // The echoed fields prove the camelCase params round-tripped through the daemon.
         assert_eq!(created.window_id, "w9");
         assert_eq!(created.title, "Solarized");
+        // The created row likewise defaults to `Iterm` (no `backend` key from the daemon).
+        assert_eq!(created.backend, crate::model::TerminalBackendKind::Iterm);
 
         request_send_text(&client, "p0", "ls\n")
             .await

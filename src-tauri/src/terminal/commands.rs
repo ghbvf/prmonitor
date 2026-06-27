@@ -13,8 +13,9 @@ use tauri::Manager;
 use super::backend::TerminalBackend;
 use super::iterm::ITermBackend;
 use super::process::TerminalDaemonStatus;
+use super::webpty::WebPtyBackend;
 use crate::error::{AppError, AppResult};
-use crate::model::{CreateSessionOpts, TerminalSession};
+use crate::model::{CreateSessionOpts, TerminalBackendKind, TerminalSession};
 use crate::state::AppState;
 
 /// The python interpreter that runs the daemon (PATH-resolved). Hardcoded — the slice
@@ -39,11 +40,71 @@ pub(crate) fn resolve_script_path<R: tauri::Runtime>(
     Ok(path.to_string_lossy().into_owned())
 }
 
-/// Build the backend for a single command. The 2nd-backend extension point lands HERE: a
-/// future `TerminalBackendKind` (sealed enum) would drive an exhaustive `match` selecting
-/// `ITermBackend` vs a WebPty backend — the Hard carrier forcing every command to handle the
-/// new variant. Single iTerm backend this PR, so the selection is direct.
-pub(crate) fn backend<'a, R: tauri::Runtime>(
+/// The backend ROUTING hub (#1372) — the **Hard carrier** for the second backend. Each session is
+/// owned by exactly one backend; this enum dispatches a per-session op to its owner via an
+/// exhaustive per-method `match`, so adding a third [`TerminalBackendKind`] variant without a
+/// `RoutedBackend` arm is a compile error (the missing arm cannot be expressed). Mirrors the
+/// `ReviewEngine`/`EventSourceProvider` seam style: a new backend is a new arm, not a changed call
+/// site.
+enum RoutedBackend<'a, R: tauri::Runtime> {
+    Iterm(ITermBackend<'a, R>),
+    WebPty(WebPtyBackend<'a, R>),
+}
+
+impl<R: tauri::Runtime> TerminalBackend for RoutedBackend<'_, R> {
+    /// ARCH-1: present ONLY to satisfy the trait — NEVER called through `RoutedBackend`. The `list`
+    /// command (`list_terminal_sessions_inner`) MERGES both backends directly; routing
+    /// `list_sessions` through one arm would return only ONE backend's sessions (a footgun for a
+    /// future caller). Use `list_terminal_sessions_inner`, not this.
+    async fn list_sessions(&self) -> AppResult<Vec<TerminalSession>> {
+        match self {
+            RoutedBackend::Iterm(b) => b.list_sessions().await,
+            RoutedBackend::WebPty(b) => b.list_sessions().await,
+        }
+    }
+    /// ARCH-1: present ONLY to satisfy the trait — NEVER called through `RoutedBackend`. Create
+    /// routes per-backend directly in `create_terminal_session_inner` (it matches `opts.backend`,
+    /// not a session id, so there is no owner to route to yet).
+    async fn create_session(&self, opts: CreateSessionOpts) -> AppResult<TerminalSession> {
+        match self {
+            RoutedBackend::Iterm(b) => b.create_session(opts).await,
+            RoutedBackend::WebPty(b) => b.create_session(opts).await,
+        }
+    }
+    async fn send_text(&self, session_id: &str, text: &str) -> AppResult<()> {
+        match self {
+            RoutedBackend::Iterm(b) => b.send_text(session_id, text).await,
+            RoutedBackend::WebPty(b) => b.send_text(session_id, text).await,
+        }
+    }
+    async fn subscribe(&self, session_id: &str) -> AppResult<()> {
+        match self {
+            RoutedBackend::Iterm(b) => b.subscribe(session_id).await,
+            RoutedBackend::WebPty(b) => b.subscribe(session_id).await,
+        }
+    }
+    async fn unsubscribe(&self, session_id: &str) -> AppResult<()> {
+        match self {
+            RoutedBackend::Iterm(b) => b.unsubscribe(session_id).await,
+            RoutedBackend::WebPty(b) => b.unsubscribe(session_id).await,
+        }
+    }
+    async fn resize(&self, session_id: &str, cols: u16, rows: u16) -> AppResult<()> {
+        match self {
+            RoutedBackend::Iterm(b) => b.resize(session_id, cols, rows).await,
+            RoutedBackend::WebPty(b) => b.resize(session_id, cols, rows).await,
+        }
+    }
+    async fn close_session(&self, session_id: &str) -> AppResult<()> {
+        match self {
+            RoutedBackend::Iterm(b) => b.close_session(session_id).await,
+            RoutedBackend::WebPty(b) => b.close_session(session_id).await,
+        }
+    }
+}
+
+/// Build the iTerm backend handle (borrows the resident daemon + the resolved daemon script).
+fn iterm_backend<'a, R: tauri::Runtime>(
     app: &'a tauri::AppHandle<R>,
     state: &'a AppState,
     script: &'a str,
@@ -51,13 +112,89 @@ pub(crate) fn backend<'a, R: tauri::Runtime>(
     ITermBackend::new(app, &state.terminal, PYTHON_BIN, script)
 }
 
+/// Build the Web PTY backend handle (borrows the resident PTY pool).
+fn webpty_backend<'a, R: tauri::Runtime>(
+    app: &'a tauri::AppHandle<R>,
+    state: &'a AppState,
+) -> WebPtyBackend<'a, R> {
+    WebPtyBackend::new(app, &state.web_pty)
+}
+
+/// Map the WebPty ownership predicate to the owning [`TerminalBackendKind`] (#1372). Pure (takes
+/// `state.web_pty.owns(id)`'s result), so it's unit-testable without a live app: a PTY-registry hit
+/// → `WebPty`, a miss → `Iterm` (iTerm session GUIDs aren't in the PTY registry).
+fn resolve_owner(is_pty: bool) -> TerminalBackendKind {
+    if is_pty {
+        TerminalBackendKind::WebPty
+    } else {
+        TerminalBackendKind::Iterm
+    }
+}
+
+/// A resolved per-session route: which backend owns the id, plus (iTerm only) the resolved daemon
+/// script the `ITermBackend` borrows. Resolving the script + `resume()`ing the iTerm daemon happens
+/// ONLY on the iTerm arm — a pure-PTY op must not revive the iTerm daemon.
+enum SessionRoute {
+    Iterm(String),
+    WebPty,
+}
+
+/// Resolve a session's route from the live PTY registry. iTerm arm: `resume()` (a user action
+/// overrides a prior stop) + resolve the bundled script. WebPty arm: nothing — the registry owns it.
+fn route_session<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    session_id: &str,
+) -> AppResult<SessionRoute> {
+    match resolve_owner(state.web_pty.owns(session_id)) {
+        TerminalBackendKind::Iterm => {
+            state.terminal.resume();
+            Ok(SessionRoute::Iterm(resolve_script_path(app)?))
+        }
+        TerminalBackendKind::WebPty => Ok(SessionRoute::WebPty),
+    }
+}
+
+/// Build the routing-hub backend for a resolved route (the `script` in the iTerm arm outlives the
+/// borrow because [`SessionRoute`] owns it).
+fn routed_for<'a, R: tauri::Runtime>(
+    app: &'a tauri::AppHandle<R>,
+    state: &'a AppState,
+    route: &'a SessionRoute,
+) -> RoutedBackend<'a, R> {
+    match route {
+        SessionRoute::Iterm(script) => RoutedBackend::Iterm(iterm_backend(app, state, script)),
+        SessionRoute::WebPty => RoutedBackend::WebPty(webpty_backend(app, state)),
+    }
+}
+
+/// List EVERY session across both backends (#1372). The PTY pool always contributes (its `list`
+/// can't fail); the iTerm daemon is best-effort. If iTerm errors but the PTY pool is non-empty,
+/// return just the PTY rows + log; propagate the iTerm error ONLY when BOTH are empty/failed.
 pub(crate) async fn list_terminal_sessions_inner<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppState,
 ) -> AppResult<Vec<TerminalSession>> {
-    state.terminal.resume();
-    let script = resolve_script_path(app)?;
-    backend(app, state, &script).list_sessions().await
+    let pty_sessions = state.web_pty.list();
+    // PROD-1: do NOT `resume()` here. Listing must not revive a user-stopped iTerm daemon (that
+    // would override an explicit stop + spuriously spawn python for PTY-only / Windows users). The
+    // iTerm enumeration stays best-effort — if the daemon is stopped/absent it errors and we fall
+    // back to the PTY rows. A per-session action still `resume()`s in its iTerm arm.
+    let iterm_result = match resolve_script_path(app) {
+        Ok(script) => iterm_backend(app, state, &script).list_sessions().await,
+        Err(e) => Err(e),
+    };
+    match iterm_result {
+        Ok(mut sessions) => {
+            sessions.extend(pty_sessions);
+            Ok(sessions)
+        }
+        Err(e) if pty_sessions.is_empty() => Err(e), // both failed/empty → surface the iTerm error.
+        Err(e) => {
+            eprintln!("iTerm 会话列举失败，仅返回 WebPty 会话: {}", e.message);
+            Ok(pty_sessions)
+        }
+    }
 }
 
 #[tauri::command]
@@ -73,15 +210,33 @@ pub(crate) async fn create_terminal_session_inner<R: tauri::Runtime>(
     state: &AppState,
     opts: CreateSessionOpts,
 ) -> AppResult<TerminalSession> {
-    if let Some(window_id) = opts.window_id.as_deref() {
-        check_identifier(window_id)?;
+    // Create-time backend pick (**Hard**: exhaustive over the sealed kind). `None` → `Iterm` (the
+    // pre-#1372 default). Opts validation is BACKEND-AWARE (F5): `window_id`/`profile` are iTerm
+    // concepts — the iTerm arm validates + uses them; the WebPty arm REJECTS them (a shell takes
+    // neither) instead of silently ignoring, and must NOT touch the iTerm daemon (no `resume`/script).
+    match opts.backend.unwrap_or_default() {
+        TerminalBackendKind::Iterm => {
+            if let Some(window_id) = opts.window_id.as_deref() {
+                check_identifier(window_id)?;
+            }
+            if let Some(profile) = opts.profile.as_deref() {
+                check_identifier(profile)?;
+            }
+            state.terminal.resume();
+            let script = resolve_script_path(app)?;
+            iterm_backend(app, state, &script)
+                .create_session(opts)
+                .await
+        }
+        TerminalBackendKind::WebPty => {
+            if opts.window_id.is_some() || opts.profile.is_some() {
+                return Err(AppError::new(
+                    "WebPty shell 会话不支持 window/profile 参数".to_string(),
+                ));
+            }
+            webpty_backend(app, state).create_session(opts).await
+        }
     }
-    if let Some(profile) = opts.profile.as_deref() {
-        check_identifier(profile)?;
-    }
-    state.terminal.resume();
-    let script = resolve_script_path(app)?;
-    backend(app, state, &script).create_session(opts).await
 }
 
 #[tauri::command]
@@ -101,9 +256,8 @@ pub(crate) async fn attach_terminal_inner<R: tauri::Runtime>(
     session_id: &str,
 ) -> AppResult<()> {
     check_identifier(session_id)?;
-    state.terminal.resume();
-    let script = resolve_script_path(app)?;
-    backend(app, state, &script).subscribe(session_id).await
+    let route = route_session(app, state, session_id)?;
+    routed_for(app, state, &route).subscribe(session_id).await
 }
 
 #[tauri::command]
@@ -122,9 +276,8 @@ pub(crate) async fn detach_terminal_inner<R: tauri::Runtime>(
     session_id: &str,
 ) -> AppResult<()> {
     check_identifier(session_id)?;
-    state.terminal.resume();
-    let script = resolve_script_path(app)?;
-    backend(app, state, &script).unsubscribe(session_id).await
+    let route = route_session(app, state, session_id)?;
+    routed_for(app, state, &route).unsubscribe(session_id).await
 }
 
 #[tauri::command]
@@ -225,9 +378,8 @@ pub(crate) async fn send_terminal_input_inner<R: tauri::Runtime>(
 ) -> AppResult<()> {
     check_identifier(session_id)?;
     check_input_size(data)?;
-    state.terminal.resume();
-    let script = resolve_script_path(app)?;
-    backend(app, state, &script)
+    let route = route_session(app, state, session_id)?;
+    routed_for(app, state, &route)
         .send_text(session_id, data)
         .await
 }
@@ -252,9 +404,8 @@ pub(crate) async fn resize_terminal_inner<R: tauri::Runtime>(
 ) -> AppResult<()> {
     check_identifier(session_id)?;
     check_grid(cols, rows)?;
-    state.terminal.resume();
-    let script = resolve_script_path(app)?;
-    backend(app, state, &script)
+    let route = route_session(app, state, session_id)?;
+    routed_for(app, state, &route)
         .resize(session_id, cols, rows)
         .await
 }
@@ -268,6 +419,31 @@ pub async fn resize_terminal<R: tauri::Runtime>(
     rows: u16,
 ) -> AppResult<()> {
     resize_terminal_inner(&app, &state, &session_id, cols, rows).await
+}
+
+/// Stop a session's process (#1372). Routes to the owning backend: the WebPty backend SIGKILLs +
+/// reaps the shell child and emits `SessionEnded`; the iTerm backend returns an actionable error
+/// (it has no per-session process to kill — close the tab/window in iTerm instead). UNLIKE
+/// `detach` (which leaves the session running), this terminates it.
+pub(crate) async fn close_terminal_session_inner<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    session_id: &str,
+) -> AppResult<()> {
+    check_identifier(session_id)?;
+    let route = route_session(app, state, session_id)?;
+    routed_for(app, state, &route)
+        .close_session(session_id)
+        .await
+}
+
+#[tauri::command]
+pub async fn close_terminal_session<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    session_id: String,
+) -> AppResult<()> {
+    close_terminal_session_inner(&app, &state, &session_id).await
 }
 
 /// Probe the daemon for the StatusBar (lazy start: first call spawns + handshakes, later
@@ -390,5 +566,62 @@ mod tests {
     fn check_grid_rejects_oversized() {
         assert!(check_grid(MAX_COLS + 1, 24).is_err());
         assert!(check_grid(80, MAX_ROWS + 1).is_err());
+    }
+
+    // #1372: the routing predicate is pure — a PTY-registry hit routes to WebPty, a miss to the
+    // iTerm default. (The exhaustive `match` in `RoutedBackend` is the Hard carrier; this pins the
+    // predicate that selects the arm.)
+    #[test]
+    fn resolve_owner_maps_pty_ownership_to_kind() {
+        assert_eq!(resolve_owner(true), TerminalBackendKind::WebPty);
+        assert_eq!(resolve_owner(false), TerminalBackendKind::Iterm);
+    }
+
+    // A fresh PTY registry owns nothing, so an unknown id routes to the iTerm default.
+    #[test]
+    fn unknown_session_routes_to_iterm_by_default() {
+        let pool = crate::terminal::webpty_manager::WebPtyManager::default();
+        assert_eq!(resolve_owner(pool.owns("nope")), TerminalBackendKind::Iterm);
+    }
+
+    // F5: a WebPty create with iTerm-only `window_id` / `profile` opts is REJECTED (not silently
+    // ignored). The reject fires before any PTY spawn, so this needs no managed AppState / live app.
+    #[tokio::test]
+    async fn webpty_create_rejects_window_and_profile() {
+        let app = tauri::test::mock_app();
+        let state = AppState::default();
+        let err = create_terminal_session_inner(
+            app.handle(),
+            &state,
+            CreateSessionOpts {
+                window_id: Some("w0".to_string()),
+                profile: None,
+                backend: Some(TerminalBackendKind::WebPty),
+            },
+        )
+        .await
+        .expect_err("WebPty must reject window_id");
+        assert!(
+            err.message.contains("不支持"),
+            "actionable: {}",
+            err.message
+        );
+
+        let err2 = create_terminal_session_inner(
+            app.handle(),
+            &state,
+            CreateSessionOpts {
+                window_id: None,
+                profile: Some("Solarized".to_string()),
+                backend: Some(TerminalBackendKind::WebPty),
+            },
+        )
+        .await
+        .expect_err("WebPty must reject profile");
+        assert!(
+            err2.message.contains("不支持"),
+            "actionable: {}",
+            err2.message
+        );
     }
 }

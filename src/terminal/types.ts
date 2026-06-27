@@ -31,13 +31,15 @@ export interface TerminalDaemonStatus {
   message: string;
 }
 
-// The sink the XtermPane registers with the store to receive each rendered screen frame.
-// The store owns the frame data (state); the pane owns the xterm Terminal object (DOM) —
-// this callback is the one-way bridge between them, so the Terminal never enters reactive
-// state. A frame carries the full visible-screen `data` (write after term.reset()) plus an
-// optional cursor position to reposition after the write.
-export type ScreenSink = (frame: {
-  data: string;
-  cursorRow?: number;
-  cursorCol?: number;
-}) => void;
+// The sink the XtermPane registers with the store to bridge backend output to the xterm
+// Terminal. The store owns the output data (state); the pane owns the xterm Terminal object
+// (DOM) — this object is the one-way bridge between them, so the Terminal never enters reactive
+// state. Two methods, one per backend render model (#1372):
+//   • `writeFrame` — an iTerm FULL screen snapshot: the pane resets + writes the whole grid,
+//     then repositions the cursor. `data` is the rendered visible screen.
+//   • `writeRaw` — incremental raw PTY bytes: the pane does a plain `term.write(bytes)` (no
+//     reset). Bytes (not a string) so xterm's own decoder stitches multi-byte UTF-8 across chunks.
+export interface ScreenSink {
+  writeFrame(frame: { data: string; cursorRow?: number; cursorCol?: number }): void;
+  writeRaw(bytes: Uint8Array): void;
+}

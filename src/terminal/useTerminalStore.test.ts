@@ -15,17 +15,19 @@ vi.mock("./api", () => ({
       isActive: true,
       rows: 24,
       cols: 80,
+      backend: "iterm",
     }),
   ),
   attachTerminal: vi.fn(() => Promise.resolve()),
   detachTerminal: vi.fn(() => Promise.resolve()),
+  closeTerminalSession: vi.fn(() => Promise.resolve()),
   sendTerminalInput: vi.fn(() => Promise.resolve()),
   resizeTerminal: vi.fn(() => Promise.resolve()),
   onTerminalEvent: vi.fn(() => Promise.resolve(() => {})),
 }));
 
 import * as api from "./api";
-import { useTerminalStore } from "./useTerminalStore";
+import { RAW_REPLAY_MAX_BYTES, useTerminalStore } from "./useTerminalStore";
 
 function session(over: Partial<TerminalSession> = {}): TerminalSession {
   return {
@@ -36,11 +38,21 @@ function session(over: Partial<TerminalSession> = {}): TerminalSession {
     isActive: false,
     rows: 24,
     cols: 80,
+    backend: "iterm",
     ...over,
   };
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  // Drain the module-singleton's NON-reactive replay state (latestScreen / rawReplay) before
+  // each test: detach() clears BOTH in its finally, and unlike the reactive refs there's no
+  // direct handle to them. Run it with the current mock impls (detach swallows a reject), THEN
+  // clearAllMocks() so this housekeeping detach doesn't pollute per-test call history. Keeps the
+  // output-replay tests order-independent (otherwise a prior test's raw chunks leak forward).
+  const reset = useTerminalStore();
+  reset.activeSessionId.value = "__reset__";
+  await reset.detach();
+
   vi.clearAllMocks();
   vi.mocked(api.listTerminalSessions).mockResolvedValue([]);
   vi.mocked(api.createTerminalSession).mockResolvedValue(
@@ -48,10 +60,11 @@ beforeEach(() => {
   );
   vi.mocked(api.attachTerminal).mockResolvedValue();
   vi.mocked(api.detachTerminal).mockResolvedValue();
+  vi.mocked(api.closeTerminalSession).mockResolvedValue();
   vi.mocked(api.sendTerminalInput).mockResolvedValue();
   vi.mocked(api.resizeTerminal).mockResolvedValue();
   vi.mocked(api.onTerminalEvent).mockResolvedValue(() => {});
-  // Reset the module-level singleton state so each test starts clean.
+  // Reset the module-level singleton reactive state so each test starts clean.
   const s = useTerminalStore();
   s.sessions.value = [];
   s.activeSessionId.value = null;
@@ -59,6 +72,7 @@ beforeEach(() => {
   s.error.value = null;
   s.listenerReady.value = false;
   s.listenerError.value = null;
+  s.stopping.value = false;
   s.unregisterScreenSink();
 });
 
@@ -299,7 +313,7 @@ describe("applyEvent()", () => {
     const store = useTerminalStore();
     store.activeSessionId.value = "s1";
     const frames: { data: string; cursorRow?: number; cursorCol?: number }[] = [];
-    store.registerScreenSink((f) => frames.push(f));
+    store.registerScreenSink({ writeFrame: (f) => frames.push(f), writeRaw: () => {} });
 
     store.applyEvent({
       kind: "screenUpdate",
@@ -317,7 +331,7 @@ describe("applyEvent()", () => {
   it("replays the last screen to a freshly-registered sink (remount)", () => {
     const store = useTerminalStore();
     store.activeSessionId.value = "s1";
-    store.registerScreenSink(() => {});
+    store.registerScreenSink({ writeFrame: () => {}, writeRaw: () => {} });
     store.applyEvent({
       kind: "screenUpdate",
       sessionId: "s1",
@@ -326,9 +340,9 @@ describe("applyEvent()", () => {
       contents: "snap",
     });
 
-    // A new pane mounts: its sink must immediately receive the last frame.
+    // A new pane mounts: its sink must immediately receive the last frame via writeFrame.
     const replayed: { data: string }[] = [];
-    store.registerScreenSink((f) => replayed.push(f));
+    store.registerScreenSink({ writeFrame: (f) => replayed.push(f), writeRaw: () => {} });
 
     expect(replayed).toEqual([{ data: "snap", cursorRow: undefined, cursorCol: undefined }]);
   });
@@ -337,7 +351,7 @@ describe("applyEvent()", () => {
     const store = useTerminalStore();
     store.activeSessionId.value = "s1";
     const frames: unknown[] = [];
-    store.registerScreenSink((f) => frames.push(f));
+    store.registerScreenSink({ writeFrame: (f) => frames.push(f), writeRaw: () => {} });
     frames.length = 0; // ignore any replay of a leaked prior frame
 
     store.applyEvent({
@@ -367,6 +381,24 @@ describe("applyEvent()", () => {
     expect(api.listTerminalSessions).toHaveBeenCalledOnce();
   });
 
+  it("a background sessionEnded (≠ active) refreshes the picker but leaves the focused session untouched (F6)", () => {
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+    store.connection.value = "attached";
+    store.applyEvent({ kind: "output", sessionId: "s1", data: btoa("hi") }); // buffer s1's tail
+
+    // A DIFFERENT (background) session ends — it must still drop from the picker...
+    store.applyEvent({ kind: "sessionEnded", sessionId: "other", reason: "exit" });
+
+    expect(api.listTerminalSessions).toHaveBeenCalledOnce();
+    // ...but the focused session's pane state (connection / active id / replay buffer) is untouched.
+    expect(store.connection.value).toBe("attached");
+    expect(store.activeSessionId.value).toBe("s1");
+    const replayed: Uint8Array[] = [];
+    store.registerScreenSink({ writeFrame: () => {}, writeRaw: (b) => replayed.push(b) });
+    expect(replayed).toEqual([new Uint8Array([104, 105])]); // s1's buffer survived
+  });
+
   it("session-scoped error → connection=error + message", () => {
     const store = useTerminalStore();
     store.activeSessionId.value = "s1";
@@ -385,6 +417,219 @@ describe("applyEvent()", () => {
 
     expect(store.connection.value).toBe("error");
     expect(store.error.value).toBe("daemon crashed");
+  });
+});
+
+describe("applyEvent() output — raw PTY bytes (#1372)", () => {
+  it("decodes the base64 payload and writes raw bytes to the sink", () => {
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+    const raw: Uint8Array[] = [];
+    store.registerScreenSink({ writeFrame: () => {}, writeRaw: (b) => raw.push(b) });
+
+    store.applyEvent({ kind: "output", sessionId: "s1", data: btoa("hi") });
+
+    // Bytes, never a per-chunk decode: "hi" → [104, 105].
+    expect(raw).toEqual([new Uint8Array([104, 105])]);
+  });
+
+  it("drops an output event for a non-active session", () => {
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+    const raw: Uint8Array[] = [];
+    store.registerScreenSink({ writeFrame: () => {}, writeRaw: (b) => raw.push(b) });
+
+    store.applyEvent({ kind: "output", sessionId: "other", data: btoa("nope") });
+
+    expect(raw).toEqual([]);
+  });
+
+  it("replays buffered raw chunks to a freshly-registered sink (PTY remount)", () => {
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+    store.registerScreenSink({ writeFrame: () => {}, writeRaw: () => {} });
+    store.applyEvent({ kind: "output", sessionId: "s1", data: btoa("ab") });
+    store.applyEvent({ kind: "output", sessionId: "s1", data: btoa("cd") });
+
+    const replayed: Uint8Array[] = [];
+    store.registerScreenSink({ writeFrame: () => {}, writeRaw: (b) => replayed.push(b) });
+
+    expect(replayed).toEqual([new Uint8Array([97, 98]), new Uint8Array([99, 100])]);
+  });
+
+  it("a session with a latestScreen replays writeFrame, never raw", () => {
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+    store.registerScreenSink({ writeFrame: () => {}, writeRaw: () => {} });
+    store.applyEvent({
+      kind: "screenUpdate",
+      sessionId: "s1",
+      cols: 80,
+      rows: 24,
+      contents: "snap",
+    });
+
+    const frames: { data: string }[] = [];
+    const raw: Uint8Array[] = [];
+    store.registerScreenSink({ writeFrame: (f) => frames.push(f), writeRaw: (b) => raw.push(b) });
+
+    expect(frames).toEqual([{ data: "snap", cursorRow: undefined, cursorCol: undefined }]);
+    expect(raw).toEqual([]); // iTerm screen frame, not raw bytes
+  });
+
+  it("attach() clears the raw-replay buffer", async () => {
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+    store.registerScreenSink({ writeFrame: () => {}, writeRaw: () => {} });
+    store.applyEvent({ kind: "output", sessionId: "s1", data: btoa("old") });
+
+    await store.attach("s1");
+
+    const replayed: Uint8Array[] = [];
+    store.registerScreenSink({ writeFrame: () => {}, writeRaw: (b) => replayed.push(b) });
+    expect(replayed).toEqual([]);
+  });
+
+  it("drops a malformed-base64 output without crashing the fold", () => {
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+    const raw: Uint8Array[] = [];
+    store.registerScreenSink({ writeFrame: () => {}, writeRaw: (b) => raw.push(b) });
+
+    // '!' is outside the base64 alphabet → atob throws → drop+log, not crash.
+    expect(() =>
+      store.applyEvent({ kind: "output", sessionId: "s1", data: "!!!" }),
+    ).not.toThrow();
+    expect(raw).toEqual([]);
+  });
+
+  it("sessionEnded clears the raw-replay buffer (TEST-3)", () => {
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+    store.applyEvent({ kind: "output", sessionId: "s1", data: btoa("old") });
+
+    // The session dies: teardown must also drop the buffered raw chunks (parallels attach()).
+    store.applyEvent({ kind: "sessionEnded", sessionId: "s1", reason: "exit" });
+
+    const replayed: Uint8Array[] = [];
+    store.registerScreenSink({ writeFrame: () => {}, writeRaw: (b) => replayed.push(b) });
+    expect(replayed).toEqual([]);
+  });
+
+  it("bounds the raw-replay ring, always retaining the last chunk (TEST-4)", () => {
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+
+    // Three chunks each ~half the cap → the total exceeds it, so the OLDEST is evicted.
+    const chunkBytes = Math.ceil(RAW_REPLAY_MAX_BYTES * 0.5);
+    const chunk = (ch: string) => btoa(ch.repeat(chunkBytes)); // 1 byte per char → chunkBytes bytes
+    store.applyEvent({ kind: "output", sessionId: "s1", data: chunk("a") });
+    store.applyEvent({ kind: "output", sessionId: "s1", data: chunk("b") });
+    store.applyEvent({ kind: "output", sessionId: "s1", data: chunk("c") }); // newest
+
+    const replayed: Uint8Array[] = [];
+    store.registerScreenSink({ writeFrame: () => {}, writeRaw: (b) => replayed.push(b) });
+
+    const total = replayed.reduce((n, c) => n + c.byteLength, 0);
+    expect(total).toBeLessThanOrEqual(RAW_REPLAY_MAX_BYTES);
+    // The most-recent chunk is never evicted (the live tail must always survive).
+    const last = replayed[replayed.length - 1];
+    expect(last).toEqual(new Uint8Array(chunkBytes).fill("c".charCodeAt(0)));
+  });
+});
+
+describe("createAndAttach(backend) (#1372)", () => {
+  it("forwards the backend selector to createTerminalSession", async () => {
+    const store = useTerminalStore();
+
+    await store.createAndAttach("webPty");
+
+    expect(api.createTerminalSession).toHaveBeenCalledWith({ backend: "webPty" });
+    expect(api.attachTerminal).toHaveBeenCalledWith("new1");
+  });
+
+  it("passes the iterm backend explicitly when asked", async () => {
+    const store = useTerminalStore();
+
+    await store.createAndAttach("iterm");
+
+    expect(api.createTerminalSession).toHaveBeenCalledWith({ backend: "iterm" });
+  });
+
+  it("defaults to empty opts (daemon picks iterm) when no backend is given", async () => {
+    const store = useTerminalStore();
+
+    await store.createAndAttach();
+
+    expect(api.createTerminalSession).toHaveBeenCalledWith({});
+  });
+});
+
+describe("stopSession() (#1372)", () => {
+  it("closes the active session's process via close_terminal_session", async () => {
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+
+    await store.stopSession();
+
+    expect(api.closeTerminalSession).toHaveBeenCalledWith("s1");
+  });
+
+  it("is a no-op with no active session", async () => {
+    const store = useTerminalStore();
+
+    await store.stopSession();
+
+    expect(api.closeTerminalSession).not.toHaveBeenCalled();
+  });
+
+  it("on a rejected close sets connection=error so the banner surfaces it", async () => {
+    vi.mocked(api.closeTerminalSession).mockRejectedValueOnce({ message: "close boom" });
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+
+    await store.stopSession();
+
+    expect(store.connection.value).toBe("error");
+    expect(store.error.value).toBe("close boom");
+  });
+
+  it("drops a re-entrant stop while one is already in flight (PROD-5a)", async () => {
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+    // Hold the first close open so the second click lands while it's still in flight.
+    let resolveClose: () => void = () => {};
+    vi.mocked(api.closeTerminalSession).mockReturnValueOnce(
+      new Promise<void>((res) => {
+        resolveClose = res;
+      }),
+    );
+
+    const first = store.stopSession();
+    expect(store.stopping.value).toBe(true);
+    await store.stopSession(); // re-entrant → dropped immediately
+
+    expect(api.closeTerminalSession).toHaveBeenCalledTimes(1);
+    resolveClose();
+    await first;
+    expect(store.stopping.value).toBe(false);
+  });
+
+  it("does not clobber a normal close: a stop losing the race stays 'closed' (PROD-5a)", async () => {
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+    store.connection.value = "attached";
+    // The close rejects, but only AFTER a sessionEnded already flipped us to "closed".
+    vi.mocked(api.closeTerminalSession).mockImplementationOnce(() => {
+      store.applyEvent({ kind: "sessionEnded", sessionId: "s1", reason: "exit" });
+      return Promise.reject({ message: "no such session" });
+    });
+
+    await store.stopSession();
+
+    // The confusing error banner must NOT overwrite the normal "closed" state.
+    expect(store.connection.value).toBe("closed");
+    expect(store.error.value).toBeNull();
   });
 });
 

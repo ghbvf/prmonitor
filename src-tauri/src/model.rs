@@ -19,6 +19,30 @@ pub struct Candidate {
     pub kind: String,
 }
 
+/// Which backend owns a [`TerminalSession`] (#1372).
+///
+/// **Hard carrier** (sealed enum): the command layer routes per-session ops through an
+/// exhaustive `match TerminalBackendKind { ... }` (`terminal::commands::RoutedBackend`), so
+/// adding a third backend without handling it everywhere is a compile error — the missing arm
+/// cannot be expressed. The second backend (`WebPty`) realizes the seam the `#1383` slice
+/// reserved.
+///
+/// Wire strings are pinned camelCase (`"iterm"` / `"webPty"`) — a cross-agent contract the
+/// frontend's TS union mirrors exactly; the serde golden below
+/// (`terminal_backend_kind_wire_strings`) locks them against a `rename_all` / variant drift.
+/// `Default` is `Iterm`: the iTerm Python daemon returns rows with NO `backend` key, so a
+/// `#[serde(default)]` parse fills in `Iterm` (the daemon contract stays unchanged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalBackendKind {
+    /// The iTerm2 Python-API daemon backend (#1383).
+    #[default]
+    Iterm,
+    /// A local pseudo-terminal shell backend (#1372): `portable-pty`-spawned, exposed to the
+    /// Remote Web Console; cross-platform (unix openpty + Windows ConPTY).
+    WebPty,
+}
+
 /// One addressable terminal session in the user's iTerm (#1383). The leaf the
 /// frontend xterm panel attaches to: `session_id` is the iTerm session GUID (the
 /// attach key); `window_id` / `tab_id` group it in the picker (the frontend
@@ -29,11 +53,13 @@ pub struct Candidate {
 /// Front/back contract (UNLIKE backend-internal [`Candidate`]): the `terminal`
 /// slice returns `Vec<TerminalSession>` over the `list_terminal_sessions` Tauri
 /// command, so it IS mirrored in `src/types.ts` and the golden below locks the
-/// camelCase wire shape both sides depend on. Single iTerm backend this PR, so
-/// no `backend` discriminator field (the frontend labels it "iTerm" statically;
-/// a 2nd backend adds the field). `Deserialize` too: the Python daemon returns
-/// this exact camelCase shape, Rust parses then re-serializes to the frontend
-/// (same dual-derive rationale as [`Candidate`]).
+/// camelCase wire shape both sides depend on. The [`backend`](Self::backend)
+/// discriminator (#1372) tells the frontend which backend owns the row (label
+/// "iTerm" vs "Web PTY", route close); it is ALWAYS serialized but
+/// `#[serde(default)]` on parse, so the iTerm daemon's rows (which carry NO
+/// `backend` key) deserialize to the Default `Iterm`. `Deserialize` too: the
+/// Python daemon returns this camelCase shape, Rust parses then re-serializes to
+/// the frontend (same dual-derive rationale as [`Candidate`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalSession {
@@ -44,6 +70,11 @@ pub struct TerminalSession {
     pub is_active: bool,
     pub rows: u16,
     pub cols: u16,
+    /// Which backend owns this session (#1372). ALWAYS serialized (no `skip`) so the frontend
+    /// can label + route; `#[serde(default)]` so the iTerm daemon's `backend`-less rows parse to
+    /// `Iterm`.
+    #[serde(default)]
+    pub backend: TerminalBackendKind,
 }
 
 /// Options for `create_terminal_session` (#1383). Both optional: `None` lets the
@@ -58,6 +89,11 @@ pub struct CreateSessionOpts {
     pub window_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// Which backend to create the session on (#1372). `None` routes to the default `Iterm`
+    /// backend (the pre-#1372 behavior the iTerm daemon expects — `skip_serializing_if` OMITS the
+    /// key so its createSession JSON is byte-unchanged); `Some(WebPty)` spawns a local PTY shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<TerminalBackendKind>,
 }
 
 /// Which PR source backs the monitor.
@@ -696,6 +732,7 @@ mod tests {
             is_active: true,
             rows: 24,
             cols: 80,
+            backend: TerminalBackendKind::Iterm,
         };
 
         let v = serde_json::to_value(&session).expect("TerminalSession serializes");
@@ -708,12 +745,43 @@ mod tests {
         assert!(v.get("isActive").is_some());
         assert!(v.get("rows").is_some());
         assert!(v.get("cols").is_some());
+        // #1372: the `backend` discriminator is ALWAYS present (no `skip`) and pins to "iterm"
+        // for an iTerm row; the frontend reads it to label + route close.
+        assert_eq!(v["backend"], "iterm");
 
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("session_id").is_none());
         assert!(v.get("window_id").is_none());
         assert!(v.get("tab_id").is_none());
         assert!(v.get("is_active").is_none());
+
+        // A WebPty row pins to "webPty" (the second backend, #1372).
+        let pty = serde_json::to_value(TerminalSession {
+            session_id: "webpty-1".to_string(),
+            window_id: "webpty".to_string(),
+            tab_id: "webpty".to_string(),
+            title: "sh".to_string(),
+            is_active: true,
+            rows: 24,
+            cols: 80,
+            backend: TerminalBackendKind::WebPty,
+        })
+        .expect("TerminalSession serializes");
+        assert_eq!(pty["backend"], "webPty");
+    }
+
+    // #1372: a daemon row arrives with NO `backend` key; `#[serde(default)]` fills `Iterm`, so an
+    // iTerm session re-serialized to the frontend carries `backend == "iterm"` without the daemon
+    // ever sending it. This locks the deserialize-default half of the contract.
+    #[test]
+    fn terminal_session_defaults_backend_to_iterm_when_absent() {
+        let daemon_row = serde_json::json!({
+            "sessionId": "p0", "windowId": "w0", "tabId": "t0",
+            "title": "zsh", "isActive": true, "rows": 24, "cols": 80
+        });
+        let parsed: TerminalSession =
+            serde_json::from_value(daemon_row).expect("daemon row parses without `backend`");
+        assert_eq!(parsed.backend, TerminalBackendKind::Iterm);
     }
 
     // `CreateSessionOpts`: camelCase + `skip_serializing_if` OMITS absent keys (an absent key,
@@ -723,16 +791,40 @@ mod tests {
         let full = CreateSessionOpts {
             window_id: Some("w0".to_string()),
             profile: Some("Default".to_string()),
+            backend: Some(TerminalBackendKind::WebPty),
         };
         let v = serde_json::to_value(&full).expect("CreateSessionOpts serializes");
         assert_eq!(v["windowId"], "w0");
         assert_eq!(v["profile"], "Default");
         assert!(v.get("window_id").is_none());
+        // #1372: `Some(WebPty)` pins to "webPty" (a create-time backend pick).
+        assert_eq!(v["backend"], "webPty");
 
-        // None → the key is OMITTED entirely (not a JSON null).
+        // None → the key is OMITTED entirely (not a JSON null) — `backend: None` routes to Iterm.
         let empty = serde_json::to_value(CreateSessionOpts::default()).expect("serializes");
         assert!(empty.get("windowId").is_none(), "None omits windowId");
         assert!(empty.get("profile").is_none(), "None omits profile");
+        assert!(empty.get("backend").is_none(), "None omits backend");
+    }
+
+    // Cross-agent wire contract lock for the #1372 backend discriminator: the frontend mirrors
+    // these exact strings to pick a create-time backend + label/route sessions. A variant rename
+    // or `rename_all` change surfaces here (Medium carrier; the exhaustive `match` in
+    // `terminal::commands::RoutedBackend` is the Hard one). Default is `Iterm` ("iterm").
+    #[test]
+    fn terminal_backend_kind_wire_strings() {
+        assert_eq!(
+            serde_json::to_value(TerminalBackendKind::Iterm).expect("serializes"),
+            "iterm"
+        );
+        assert_eq!(
+            serde_json::to_value(TerminalBackendKind::WebPty).expect("serializes"),
+            "webPty"
+        );
+        assert_eq!(
+            serde_json::to_value(TerminalBackendKind::default()).expect("serializes"),
+            "iterm"
+        );
     }
 
     // Cross-agent wire contract lock: the frontend mirrors these exact strings.

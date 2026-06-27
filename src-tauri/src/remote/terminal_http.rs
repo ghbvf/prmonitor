@@ -13,6 +13,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tauri::Manager;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 use url::Url;
 
@@ -83,6 +84,7 @@ enum TerminalCommand {
     CreateSession,
     Attach,
     Detach,
+    CloseSession,
     SendInput,
     Resize,
     Status,
@@ -102,6 +104,13 @@ const TERMINAL_HTTP_COMMANDS: &[(&str, TerminalCommand, Permission)] = &[
     ),
     ("attach_terminal", TerminalCommand::Attach, Permission::Read),
     ("detach_terminal", TerminalCommand::Detach, Permission::Read),
+    // SEC-1: lifecycle destruction is gated at `Create` (≥ creation), not `Write` — a SIGKILL
+    // bypasses the shell's cleanup traps, so the bar to terminate must be at least the bar to spawn.
+    (
+        "close_terminal_session",
+        TerminalCommand::CloseSession,
+        Permission::Create,
+    ),
     (
         "send_terminal_input",
         TerminalCommand::SendInput,
@@ -452,6 +461,16 @@ async fn handle_invoke<R: tauri::Runtime>(
             }
             Err(resp) => return *resp,
         },
+        TerminalCommand::CloseSession => match parse_args::<SessionIdArgs>(body) {
+            Ok(args) => crate::terminal::commands::close_terminal_session_inner(
+                &ctx.app,
+                &state,
+                &args.session_id,
+            )
+            .await
+            .map(|_| empty_response()),
+            Err(resp) => return *resp,
+        },
         TerminalCommand::SendInput => match parse_args::<InputArgs>(body) {
             Ok(args) => crate::terminal::commands::send_terminal_input_inner(
                 &ctx.app,
@@ -495,6 +514,11 @@ async fn handle_invoke<R: tauri::Runtime>(
     )
 }
 
+// SEC-3 (doc only, deferred): this SSE stream is SESSION-AGNOSTIC. A bearer holder with
+// `terminal_read` receives `TerminalEvent`s (including WebPty `Output`) for ALL subscribed
+// sessions on this listener, not just ones it opened — there is no per-session authorization on
+// the event bus. Server-side per-session filtering is a tracked follow-up; no behavior change here
+// (the user deferred the fix). Mitigation today: the listener is loopback-only + bearer-gated.
 async fn handle_events<R: tauri::Runtime>(
     State(ctx): State<Arc<Ctx<R>>>,
     headers: HeaderMap,
@@ -512,26 +536,40 @@ async fn handle_events<R: tauri::Runtime>(
     let stream_ctx = ctx.clone();
     let stream_headers = headers.clone();
     let stream = BroadcastStream::new(rx)
-        .scan((), move |_, item| {
-            let stream_ctx = stream_ctx.clone();
-            let stream_headers = stream_headers.clone();
-            async move {
-                match item {
-                    Ok(StreamEvent::Terminal(ev)) => {
-                        if check_request(&stream_ctx, &stream_headers, Permission::Read).is_err() {
-                            return None;
-                        }
-                        Some(Some(sse_data(&ev)))
-                    }
-                    Ok(_) => Some(None),
-                    Err(e) => {
-                        eprintln!("terminal SSE 滞后：{e}");
-                        Some(None)
+        .flat_map(move |item| {
+            let outs: Vec<TerminalSseItem> = match item {
+                Ok(StreamEvent::Terminal(ev)) => {
+                    // Re-validate read permission before EACH frame — a mid-stream revocation closes
+                    // the stream (the `End` sentinel is consumed by `take_while` below).
+                    if check_request(&stream_ctx, &stream_headers, Permission::Read).is_err() {
+                        vec![TerminalSseItem::End]
+                    } else {
+                        vec![TerminalSseItem::Frame(sse_data(&ev))]
                     }
                 }
-            }
+                Ok(_) => Vec::new(),
+                Err(BroadcastStreamRecvError::Lagged(n)) => {
+                    // F4: a dropped frame is UNRECOVERABLE for a WebPty byte-delta stream (no
+                    // self-healing snapshot). Fail fast — emit ONE error frame, THEN close, so the
+                    // client's transport `onClosed` + error banner drive a re-attach (which
+                    // re-subscribes and replays the backend scrollback ring). A full sequence/replay
+                    // protocol is the deferred follow-up.
+                    eprintln!("terminal SSE 滞后，丢帧 {n}，关闭以触发重连");
+                    vec![
+                        TerminalSseItem::Frame(sse_data(&lag_error_event())),
+                        TerminalSseItem::End,
+                    ]
+                }
+            };
+            futures::stream::iter(outs)
         })
-        .filter_map(|item| async move { item });
+        // Stop AT the first `End` (the lag error frame precedes it, so it is delivered first).
+        .take_while(|item| futures::future::ready(!matches!(item, TerminalSseItem::End)))
+        .map(|item| match item {
+            TerminalSseItem::Frame(frame) => frame,
+            // `End` terminates the stream in `take_while` above and never reaches here.
+            TerminalSseItem::End => unreachable!("End is consumed by take_while"),
+        });
     with_cors(
         Sse::new(stream)
             .keep_alive(KeepAlive::default())
@@ -588,6 +626,23 @@ fn sse_data(event: &TerminalEvent) -> Result<SseEvent, std::convert::Infallible>
         r#"{"kind":"error","message":"terminal stream serialize error"}"#.to_string()
     });
     Ok(SseEvent::default().data(payload))
+}
+
+/// One mapped output for the terminal SSE stream: a frame to send, or a terminal `End` sentinel
+/// that closes the stream (consumed by `take_while` in `handle_events`). The sentinel lets the lag
+/// branch emit ONE error frame THEN close (F4), and the reauth branch close, in one pipeline.
+enum TerminalSseItem {
+    Frame(Result<SseEvent, std::convert::Infallible>),
+    End,
+}
+
+/// The one-shot connection-level error frame sent right before the terminal SSE closes on bus lag
+/// (F4): the client surfaces it as a banner + reconnects (which replays the backend scrollback).
+fn lag_error_event() -> TerminalEvent {
+    TerminalEvent::Error {
+        session_id: None,
+        message: "终端流滞后，已丢帧——请重新连接以重放回放".to_string(),
+    }
 }
 
 fn audit<R: tauri::Runtime>(
@@ -729,6 +784,11 @@ mod tests {
         assert_eq!(
             terminal_command("stop_terminal_daemon"),
             Some((TerminalCommand::StopDaemon, Permission::Admin))
+        );
+        // SEC-1: closing a session (lifecycle destruction) is gated at `Create`, not `Write`.
+        assert_eq!(
+            terminal_command("close_terminal_session"),
+            Some((TerminalCommand::CloseSession, Permission::Create))
         );
         assert_eq!(
             terminal_command("send_terminal_input"),

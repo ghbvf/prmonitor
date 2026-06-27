@@ -24,6 +24,7 @@ describe("terminal api commands", () => {
     expect([...api.TERMINAL_COMMANDS].sort()).toEqual(
       [
         "attach_terminal",
+        "close_terminal_session",
         "create_terminal_session",
         "detach_terminal",
         "get_terminal_status",
@@ -50,6 +51,18 @@ describe("terminal api commands", () => {
     expect(request).toHaveBeenCalledWith("create_terminal_session", {
       opts: { windowId: "w1", profile: "Default" },
     });
+  });
+
+  it("createTerminalSession forwards the backend selector (#1372)", async () => {
+    await api.createTerminalSession({ backend: "webPty" });
+    expect(request).toHaveBeenCalledWith("create_terminal_session", {
+      opts: { backend: "webPty" },
+    });
+  });
+
+  it("closeTerminalSession passes sessionId (camelCase)", async () => {
+    await api.closeTerminalSession("s1");
+    expect(request).toHaveBeenCalledWith("close_terminal_session", { sessionId: "s1" });
   });
 
   it("attachTerminal passes sessionId (camelCase)", async () => {

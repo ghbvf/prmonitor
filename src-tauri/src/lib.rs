@@ -470,6 +470,7 @@ fn build_app() {
             terminal::commands::create_terminal_session,
             terminal::commands::attach_terminal,
             terminal::commands::detach_terminal,
+            terminal::commands::close_terminal_session,
             terminal::commands::send_terminal_input,
             terminal::commands::resize_terminal,
             terminal::commands::get_terminal_status,
@@ -500,6 +501,9 @@ fn build_app() {
                 // Kill the resident iTerm daemon (#1383): same "软件关闭时一起关闭" contract as
                 // codex — the python child never outlives the app.
                 state.terminal.shutdown();
+                // Kill every Web PTY shell child (#1372): same contract — SIGKILL + detached reap,
+                // so no shell (and no reader thread) outlives the app.
+                state.web_pty.shutdown();
             }
         });
 }

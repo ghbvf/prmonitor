@@ -15,6 +15,7 @@ function session(over: Partial<TerminalSession> = {}): TerminalSession {
     isActive: false,
     rows: 24,
     cols: 80,
+    backend: "iterm",
     ...over,
   };
 }

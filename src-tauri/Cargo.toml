@@ -96,6 +96,13 @@ tauri-plugin-notification = "2"
 # hands us `url::Url`, so this is the same crate the plugin uses (already in the tree via reqwest);
 # promoted to a direct dep so the slice-internal parser names it explicitly.
 url = "2"
+# Web PTY backend (#1372): the SECOND `terminal::backend::TerminalBackend` impl — a real local
+# pseudo-terminal exposed to the Remote Web Console. Cross-platform (unix openpty + Windows ConPTY)
+# so the same `WebPtyManager` drives mac + Windows; portable-pty wraps the platform PTY + child.
+portable-pty = "0.9"
+# Base64-encode raw PTY output bytes into the `terminal:event` `output { data }` wire field
+# (byte-lossless — a PTY stream is not guaranteed valid UTF-8, so it is NOT `from_utf8_lossy`d).
+base64 = "0.22"
 
 # Pin: brotli 8.0.3 (pulled transitively by tauri-codegen/tauri-utils) requires
 # alloc-no-stdlib "^2.0", but alloc-stdlib/brotli-decompressor accept ">=2.0.4,<4"

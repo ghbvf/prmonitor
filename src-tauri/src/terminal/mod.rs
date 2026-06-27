@@ -15,9 +15,11 @@
 //! - `process` — spawn + handshake the `python3` child; `TerminalDaemonStatus`.
 //! - `manager` — the resident connection handle held in `AppState`, plus the per-connection
 //!   notification pump.
-//! - `backend` — the `TerminalBackend` trait seam (the future-WebPty extension point).
+//! - `backend` — the `TerminalBackend` trait seam (now with TWO live impls).
 //! - `iterm` — the iTerm `TerminalBackend` impl + the pure `map_notification`.
-//! - `commands` — the Tauri command surface (registered in `lib.rs`).
+//! - `webpty` / `webpty_manager` — the #1372 Web PTY `TerminalBackend` impl + its resident
+//!   `portable-pty` session pool (cross-platform: unix openpty + Windows ConPTY).
+//! - `commands` — the Tauri command surface + the backend ROUTING hub (registered in `lib.rs`).
 //!
 //! **Preconditions for the live daemon** (a missing one surfaces as a structured handshake
 //! error with an actionable Chinese message, never a silent failure): iTerm's
@@ -26,9 +28,11 @@
 //!
 //! Remote Web Terminal exposure lives in the `remote` horizontal: `ListenerKind::Terminal`
 //! binds a loopback-only HTTP router, tunnels expose it publicly, and terminal audit rows record
-//! metadata only. A SECOND backend (e.g. WebPty) is added by a sealed `TerminalBackendKind` enum
-//! plus an exhaustive `match` at the command layer (the Hard carrier) — NOT now (single iTerm
-//! backend).
+//! metadata only. The SECOND backend (`WebPty`, #1372) is now LIVE: the reserved seam is realized
+//! as the sealed [`crate::model::TerminalBackendKind`] enum (the Hard carrier) driving an
+//! exhaustive `match` in `commands::RoutedBackend` — adding a third backend without handling it
+//! everywhere is a compile error. Both backends coexist in one merged session list; create-time
+//! picks the backend; per-session ops route to the owner via `WebPtyManager::owns`.
 
 pub mod backend;
 pub mod codec;
@@ -38,3 +42,5 @@ pub mod manager;
 pub mod process;
 pub mod protocol;
 pub mod rpc;
+pub mod webpty;
+pub mod webpty_manager;

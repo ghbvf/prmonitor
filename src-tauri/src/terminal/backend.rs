@@ -37,4 +37,11 @@ pub trait TerminalBackend {
     async fn unsubscribe(&self, session_id: &str) -> AppResult<()>;
     /// Resize a session's grid to `cols` × `rows`.
     async fn resize(&self, session_id: &str, cols: u16, rows: u16) -> AppResult<()>;
+    /// Stop a session's underlying process (#1372). The WebPty backend SIGKILLs the shell child,
+    /// reaps it, deregisters the session, and emits a `SessionEnded { reason: "killed" }`; the
+    /// iTerm backend has no per-session process it owns (the daemon drives iTerm out-of-band), so
+    /// it returns an actionable error directing the user to close the tab/window in iTerm itself.
+    /// UNLIKE [`unsubscribe`](Self::unsubscribe) (which only stops streaming, leaving the session
+    /// running), this terminates the session.
+    async fn close_session(&self, session_id: &str) -> AppResult<()>;
 }

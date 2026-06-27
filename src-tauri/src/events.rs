@@ -183,8 +183,9 @@ pub enum ReviewEvent {
 ///
 /// `ScreenUpdate` carries a FULL visible-screen snapshot (`contents` is the rendered grid),
 /// not a PTY byte delta: iTerm's Python API `ScreenStreamer` yields the visible screen, so the
-/// component renders each frame with `term.reset()` + `term.write(contents)`. A future true-delta
-/// adapter can add an `output { bytes }` variant without reshaping the others.
+/// component renders each frame with `term.reset()` + `term.write(contents)`. The #1372 WebPty
+/// backend instead streams raw PTY bytes through the [`Output`](Self::Output) variant (the
+/// future true-delta adapter the doc anticipated), which the frontend writes straight into xterm.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 pub enum TerminalEvent {
@@ -210,8 +211,16 @@ pub enum TerminalEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         cursor_col: Option<u16>,
     },
-    /// The iTerm session/tab closed (the daemon's screen streamer ended); the panel marks the
-    /// connection closed. `reason` is a short human label.
+    /// Raw PTY output bytes from the #1372 WebPty backend, base64-encoded. UNLIKE
+    /// [`ScreenUpdate`](Self::ScreenUpdate) (a full rendered-grid snapshot), this is the live byte
+    /// stream the panel writes straight into xterm. `data` is base64 of the raw bytes — a PTY
+    /// stream is not guaranteed valid UTF-8, so it is byte-lossless (NOT `from_utf8_lossy`d). The
+    /// reader pump also replays the scrollback ring as one `Output` on subscribe.
+    #[serde(rename_all = "camelCase")]
+    Output { session_id: String, data: String },
+    /// The iTerm session/tab closed (the daemon's screen streamer ended) OR a WebPty shell exited /
+    /// was killed; the panel marks the connection closed. `reason` is a short human label
+    /// (`"closed"` / `"exited"` / `"killed"`).
     #[serde(rename_all = "camelCase")]
     SessionEnded { session_id: String, reason: String },
     /// A per-session streaming error; the daemon connection survives. `session_id` is OMITTED
@@ -686,6 +695,24 @@ mod tests {
         .expect("serializes");
         assert!(no_cursor.get("cursorRow").is_none(), "None omits cursorRow");
         assert!(no_cursor.get("cursorCol").is_none(), "None omits cursorCol");
+    }
+
+    // Serde wire-shape lock for the #1372 `TerminalEvent::Output` variant (Medium carrier per
+    // ai-robust.md): the `kind` tag is camelCase `"output"`, `sessionId` + `data` are present, and
+    // snake_case is absent. `data` is base64 of raw PTY bytes; the downstream `src/terminal` TS
+    // `TerminalEvent` union must mirror this variant in lockstep (the open end of the funnel).
+    #[test]
+    fn terminal_output_wire_shape_is_camel_case() {
+        let event = TerminalEvent::Output {
+            session_id: "webpty-1".to_string(),
+            data: "aGkK".to_string(), // base64("hi\n")
+        };
+        let v = serde_json::to_value(&event).expect("TerminalEvent serializes");
+        assert_eq!(v["kind"], "output");
+        assert!(v.get("sessionId").is_some());
+        assert!(v.get("data").is_some());
+        assert_eq!(v["data"], "aGkK");
+        assert!(v.get("session_id").is_none());
     }
 
     #[test]

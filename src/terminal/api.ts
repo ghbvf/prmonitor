@@ -16,6 +16,7 @@ export const TERMINAL_COMMANDS = [
   "create_terminal_session",
   "attach_terminal",
   "detach_terminal",
+  "close_terminal_session",
   "send_terminal_input",
   "resize_terminal",
   "get_terminal_status",
@@ -49,6 +50,13 @@ export function detachTerminal(
   return Object.keys(options).length > 0
     ? getTransport().request<void>("detach_terminal", { sessionId }, options)
     : getTransport().request<void>("detach_terminal", { sessionId });
+}
+
+// Stop a session's process (#1372). Unlike `detach` (which leaves the session running), this
+// terminates it — used for a webPty shell (an iTerm session can't be closed this way). The
+// backend emits a subsequent `sessionEnded` event that drives the store's teardown.
+export function closeTerminalSession(sessionId: string): Promise<void> {
+  return getTransport().request<void>("close_terminal_session", { sessionId });
 }
 
 // Forward keystrokes / escape sequences to the attached session.

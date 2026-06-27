@@ -3,7 +3,12 @@
 // mode, mirroring the backend `periodic_polling` gate. A regression to a mode-only check
 // would show disabled projects as monitored / actionable.
 import { describe, it, expect } from "vitest";
-import { periodicPollEligible, manualPullEligible } from "./types";
+import {
+  periodicPollEligible,
+  manualPullEligible,
+  TERMINAL_BACKENDS,
+  terminalBackendLabel,
+} from "./types";
 
 describe("periodicPollEligible", () => {
   it("is true only when enabled AND the mode runs the periodic loop (pull/hybrid)", () => {
@@ -33,5 +38,16 @@ describe("manualPullEligible", () => {
     expect(manualPullEligible(false, "pull-only")).toBe(false);
     expect(manualPullEligible(false, "manual")).toBe(false);
     expect(manualPullEligible(false, "webhook-only")).toBe(false);
+  });
+});
+
+// Mirrors the eventTypeLabel / inboxStatusLabel coverage pattern: every TerminalBackend in the
+// `as const` set must get a non-empty label, so the value-set and the rendered badge can't drift
+// (the `assertNever` default is the Medium exhaustiveness carrier; this is its data-side check).
+describe("terminalBackendLabel", () => {
+  it("returns a non-empty label for every TerminalBackend", () => {
+    for (const b of TERMINAL_BACKENDS) {
+      expect(terminalBackendLabel(b).length).toBeGreaterThan(0);
+    }
   });
 });

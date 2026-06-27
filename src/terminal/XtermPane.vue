@@ -31,16 +31,23 @@ onMounted(() => {
   term.open(host.value);
   fit.fit();
 
-  // The backend streams FULL visible-screen snapshots: redraw the whole grid (reset + write)
-  // per frame, then reposition the cursor when the frame carries one. registerScreenSink
-  // replays the last frame immediately, so a remount restores the screen without waiting.
-  store.registerScreenSink(({ data, cursorRow, cursorCol }) => {
-    term?.reset();
-    term?.write(data);
-    if (cursorRow != null) {
-      // CUP (Cursor Position) is 1-based; the wire cursor is 0-based.
-      term?.write(`\x1b[${cursorRow + 1};${(cursorCol ?? 0) + 1}H`);
-    }
+  // Two render paths by backend (#1372). `writeFrame` (iTerm): a FULL visible-screen snapshot —
+  // redraw the whole grid (reset + write) then reposition the cursor when the frame carries one.
+  // `writeRaw` (webPty): incremental raw PTY bytes — a plain `term.write` (no reset; xterm v6's
+  // `write` accepts a Uint8Array and runs its own UTF-8 decoder). registerScreenSink replays the
+  // last frame / buffered raw chunks immediately, so a remount restores the screen without waiting.
+  store.registerScreenSink({
+    writeFrame({ data, cursorRow, cursorCol }) {
+      term?.reset();
+      term?.write(data);
+      if (cursorRow != null) {
+        // CUP (Cursor Position) is 1-based; the wire cursor is 0-based.
+        term?.write(`\x1b[${cursorRow + 1};${(cursorCol ?? 0) + 1}H`);
+      }
+    },
+    writeRaw(bytes) {
+      term?.write(bytes);
+    },
   });
 
   // Forward every keystroke / paste to the focused session (guarded in the store).

@@ -373,17 +373,44 @@ export type OutboxEvent =
   | { kind: "updated"; projectId: string; entry: OutboxEntry }
   | { kind: "error"; operation: string; message: string };
 
-// ── Remote terminal contracts (#1383) ─────────────────────────────────────────────
+// ── Remote terminal contracts (#1383, #1372) ──────────────────────────────────────
 // Mirror `src-tauri/src/model.rs` (TerminalSession / CreateSessionOpts) + `events.rs`
 // (TerminalEvent), serde camelCase, locked by the model.rs / events.rs golden tests
 // (the open downstream end of those funnels; a Rust-side rename surfaces in those goldens,
 // and this mirror must be synced in lockstep — future Hard path = codegen this from Rust).
 
-// One addressable iTerm session — the leaf the xterm panel attaches to. `sessionId` is the
-// iTerm session GUID (the attach key); `windowId`/`tabId` group it in the picker (the slice
-// flattens this list then re-groups window → tab → session client-side); `rows`/`cols` are
-// iTerm's current grid. Single iTerm backend this PR, so no `backend` field (the UI labels it
-// "iTerm" statically; a 2nd backend adds the field). Mirrors `model.rs::TerminalSession`.
+// Which terminal backend drives a session (#1372): `iterm` = the AppleScript/iTerm daemon
+// (full screen-snapshot frames); `webPty` = a real PTY shell (raw incremental byte stream).
+// Single-sourced as an `as const` array (mirrors SOURCE_KINDS / ENGINE_KINDS): the type is
+// DERIVED from the array, so the literal set is Hard — a backend value outside this list is
+// un-expressible. `terminalBackendLabel` below is the Medium `assertNever`穷尽 carrier on top.
+// Wire values mirror the Rust `TerminalBackend` camelCase serde form (locked by the model.rs
+// golden test). NOTE the lowercase-i `"iterm"` and camelCase `"webPty"`.
+export const TERMINAL_BACKENDS = ["iterm", "webPty"] as const;
+export type TerminalBackend = (typeof TERMINAL_BACKENDS)[number];
+
+// A human-readable label for a TerminalBackend, rendered as the active session's header badge.
+// `default: assertNever(b)` (Medium — `assertNever`穷尽, same carrier class as `eventTypeLabel`):
+// adding a TerminalBackend without a label arm here is a COMPILE error, so the backend set and
+// the rendered badge can't drift past the `as const` array.
+export function terminalBackendLabel(b: TerminalBackend): string {
+  switch (b) {
+    case "iterm":
+      return "iTerm";
+    case "webPty":
+      return "Shell";
+    default:
+      return assertNever(b);
+  }
+}
+
+// One addressable terminal session — the leaf the xterm panel attaches to. `sessionId` is the
+// session GUID (the attach key); `windowId`/`tabId` group it in the picker (the slice flattens
+// this list then re-groups window → tab → session client-side; a PTY shell groups under the
+// backend-supplied synthetic `"webpty"` window/tab); `rows`/`cols` are the current grid.
+// `backend` (#1372) is ALWAYS present on the wire — it tags which backend owns the session so the
+// UI can label it and gate backend-specific controls (PTY-only "stop process"). Mirrors
+// `model.rs::TerminalSession`.
 export interface TerminalSession {
   sessionId: string;
   windowId: string;
@@ -392,20 +419,26 @@ export interface TerminalSession {
   isActive: boolean;
   rows: number;
   cols: number;
+  backend: TerminalBackend;
 }
 
-// Options for `create_terminal_session`. Both optional (omitted = daemon picks a fresh window
-// with the default profile). Mirrors `model.rs::CreateSessionOpts` (serde `skip_serializing_if`
-// → an absent key, not null).
+// Options for `create_terminal_session`. All optional (omitted = daemon picks defaults). `backend`
+// (#1372) selects the backend; OMITTED ⇒ the backend defaults to iterm (serde `skip_serializing_if`
+// → an absent key, not null — the daemon applies its own default). Mirrors `model.rs::CreateSessionOpts`.
 export interface CreateSessionOpts {
   windowId?: string;
   profile?: string;
+  backend?: TerminalBackend;
 }
 
 // One streamed unit on the `terminal:event` Tauri channel. Tagged `kind` (mirrors
-// ReviewEvent / PrEvent), camelCase. `screenUpdate` carries a FULL visible-screen snapshot
-// (`contents` is the rendered grid) — the panel renders each frame with `term.reset()` +
-// `term.write(contents)`, then repositions the cursor when `cursorRow`/`cursorCol` are present.
+// ReviewEvent / PrEvent), camelCase. Two distinct render paths by backend:
+//   • `screenUpdate` (iTerm) carries a FULL visible-screen snapshot — the panel renders each
+//     frame with `term.reset()` + `term.write(contents)`, then repositions the cursor when
+//     `cursorRow`/`cursorCol` are present.
+//   • `output` (#1372, PTY) carries `data` = base64 of raw incremental PTY bytes — the panel
+//     decodes to bytes and does an INCREMENTAL `term.write(bytes)` (no reset). At most one of
+//     the two arms is emitted for a given session (the backend picks the model).
 // Keep this in lockstep with `events.rs::TerminalEvent`; the store's `applyEvent` `assertNever`
 // default is the Medium exhaustiveness carrier.
 export type TerminalEvent =
@@ -419,6 +452,7 @@ export type TerminalEvent =
       cursorRow?: number;
       cursorCol?: number;
     }
+  | { kind: "output"; sessionId: string; data: string }
   | { kind: "sessionEnded"; sessionId: string; reason: string }
   // `sessionId` omitted for a connection-level error not tied to one session.
   | { kind: "error"; sessionId?: string; message: string };

@@ -6,6 +6,7 @@
 import { computed, defineAsyncComponent, onMounted, onUnmounted } from "vue";
 import { useTerminalStore } from "./useTerminalStore";
 import { groupSessions } from "./sessionTree";
+import { terminalBackendLabel } from "../types";
 import MobileToolbar from "./MobileToolbar.vue";
 
 // xterm needs the DOM; lazy-load the pane so the eager bundle (and the browser/SSR build)
@@ -14,6 +15,18 @@ const XtermPane = defineAsyncComponent(() => import("./XtermPane.vue"));
 
 const store = useTerminalStore();
 const tree = computed(() => groupSessions(store.sessions.value));
+
+// The focused session (resolved from the flat list), its backend badge, and whether the
+// PTY-only "stop process" control applies (#1372): an iTerm session can't be closed that way,
+// so the control shows ONLY for an active webPty session.
+const activeSession = computed(
+  () =>
+    store.sessions.value.find((s) => s.sessionId === store.activeSessionId.value) ?? null,
+);
+const activeBackendLabel = computed(() =>
+  activeSession.value ? terminalBackendLabel(activeSession.value.backend) : null,
+);
+const canStop = computed(() => activeSession.value?.backend === "webPty");
 
 // Listener lifecycle like InboxPanel: init() subscribes BEFORE the snapshot read, so no
 // frame racing the mount is dropped. The returned UnlistenFn detaches on unmount.
@@ -60,15 +73,32 @@ async function retryListener() {
   <section class="terminal-view">
     <header class="head">
       <h2>终端 / Terminal</h2>
-      <span class="badge">iTerm</span>
+      <span v-if="activeBackendLabel" class="badge">{{ activeBackendLabel }}</span>
       <span class="spacer" />
       <button
         type="button"
         class="new"
         :disabled="!store.listenerReady.value"
-        @click="store.createAndAttach()"
+        @click="store.createAndAttach('iterm')"
       >
-        新建会话 / New session
+        新建 iTerm / New iTerm
+      </button>
+      <button
+        type="button"
+        class="new"
+        :disabled="!store.listenerReady.value"
+        @click="store.createAndAttach('webPty')"
+      >
+        新建 Shell / New shell
+      </button>
+      <button
+        v-if="canStop"
+        type="button"
+        class="new stop"
+        :disabled="!store.listenerReady.value || store.stopping.value"
+        @click="store.stopSession()"
+      >
+        停止进程 / Stop process
       </button>
     </header>
 
@@ -97,13 +127,23 @@ async function retryListener() {
     </p>
     <p v-else-if="store.connection.value === 'closed'" class="banner muted">
       <span>会话已结束 / Session ended.</span>
+      <!-- Two explicit backends (PROD-2): a hardcoded reopen would silently relaunch an ended
+           iTerm session as a Shell (and vice versa). Mirrors the header's create controls. -->
       <button
         type="button"
         class="banner-action"
         :disabled="!store.listenerReady.value"
-        @click="store.createAndAttach()"
+        @click="store.createAndAttach('webPty')"
       >
-        新建会话 / New session
+        新建 Shell / New shell
+      </button>
+      <button
+        type="button"
+        class="banner-action"
+        :disabled="!store.listenerReady.value"
+        @click="store.createAndAttach('iterm')"
+      >
+        新建 iTerm / New iTerm
       </button>
     </p>
 
@@ -126,7 +166,10 @@ async function retryListener() {
                       :disabled="!store.listenerReady.value"
                       @click="store.attach(s.sessionId)"
                     >
-                      {{ s.title || s.sessionId }}
+                      <!-- Backend badge (PROD-3): an iTerm "zsh" and a PTY "zsh" are otherwise
+                           indistinguishable in the picker. -->
+                      <span class="session-title">{{ s.title || s.sessionId }}</span>
+                      <span class="session-backend">{{ terminalBackendLabel(s.backend) }}</span>
                     </button>
                   </li>
                 </ul>
@@ -180,6 +223,8 @@ async function retryListener() {
   flex: 1;
 }
 .new {
+  /* Touch-first: meets the ~44px minimum touch dimension (reused for both create buttons + stop). */
+  min-height: 44px;
   padding: var(--space-2) var(--space-5);
   font: inherit;
   font-size: var(--font-size-sm);
@@ -188,6 +233,11 @@ async function retryListener() {
   border: 1px solid var(--color-accent);
   border-radius: var(--radius-sm);
   cursor: pointer;
+}
+/* The PTY-only "stop process" control reads as a destructive action. */
+.new.stop {
+  color: var(--color-danger);
+  border-color: var(--color-danger);
 }
 /* Gated controls (disabled until the terminal:event listener is ready) read as inert so an
    action can't fire before the listener could catch the resulting `attached` event. */
@@ -213,10 +263,15 @@ async function retryListener() {
 .banner.muted {
   color: var(--color-text-muted);
 }
-/* Inline recovery CTA — link-style so it sits inside the banner without competing with it. */
+/* Inline recovery CTA — link-style so it sits inside the banner without competing with it.
+   ≥44px min touch target (PROD-2); the first CTA's margin-left:auto pushes the group right,
+   the banner's flex `gap` spaces multiple CTAs (e.g. the closed banner's two reopen buttons). */
 .banner-action {
   flex: none;
-  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
   padding: var(--space-1) var(--space-3);
   font: inherit;
   font-size: var(--font-size-sm);
@@ -225,6 +280,9 @@ async function retryListener() {
   border: 1px solid currentColor;
   border-radius: var(--radius-sm);
   cursor: pointer;
+}
+.banner-action:first-of-type {
+  margin-left: auto;
 }
 .body {
   display: flex;
@@ -257,8 +315,11 @@ async function retryListener() {
   margin-top: var(--space-2);
 }
 .session {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
   width: 100%;
+  min-height: 44px; /* touch-friendly picker row (PROD-3) */
   text-align: left;
   padding: var(--space-2) var(--space-3);
   margin-bottom: var(--space-1);
@@ -272,6 +333,22 @@ async function retryListener() {
 }
 .session:hover {
   background: var(--color-surface-hover);
+}
+/* Title takes the row, truncating; the backend badge stays a compact fixed tag on the right. */
+.session-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-backend {
+  flex: none;
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  background: var(--color-neutral-bg);
 }
 .session.active {
   color: var(--color-accent);

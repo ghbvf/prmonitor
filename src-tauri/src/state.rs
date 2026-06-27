@@ -101,4 +101,9 @@ pub struct AppState {
     /// commands are fast; killed on app shutdown. Owns one per-connection notification pump that
     /// pushes `TerminalEvent`s through the `crate::stream::emit` funnel. Methods take `&self`.
     pub terminal: crate::terminal::manager::ITermDaemonManager,
+    /// The resident Web PTY session pool (#1372): the SECOND terminal backend's owned state — a
+    /// `portable-pty`-spawned shell per session, each with a reader thread streaming output through
+    /// the `crate::stream::emit` funnel. `Default` (empty until the first `create`); killed on app
+    /// shutdown. Methods take `&self`.
+    pub web_pty: crate::terminal::webpty_manager::WebPtyManager,
 }
