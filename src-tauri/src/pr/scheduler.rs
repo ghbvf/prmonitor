@@ -44,13 +44,13 @@ use std::time::Duration;
 
 use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
-use tauri::{AppHandle, Emitter}; // Emitter for app.emit
+use tauri::AppHandle;
 use tokio::sync::Notify;
 use tokio::time::MissedTickBehavior;
 
 use crate::config::service::{self as config_service, Project};
 use crate::error::AppResult;
-use crate::events::{PrEvent, PRS_UPDATED_EVENT};
+use crate::events::{PrEvent, StreamEvent};
 use crate::model::{TrackedPrView, UpdateMode};
 
 use super::{registry, source::DiscoveredEvent};
@@ -743,7 +743,7 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
             )
         }
     };
-    let _ = app.emit(PRS_UPDATED_EVENT, &event); // ignore emit error (window may be gone)
+    crate::stream::emit(app, StreamEvent::Pr(event.clone()));
 
     if let Some(d) = dispatcher {
         if !dispatchable.is_empty() {

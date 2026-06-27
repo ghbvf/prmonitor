@@ -8,9 +8,9 @@
 // Each card owns its OWN `allowedOriginsInput` csv buffer (a local ref keyed off this
 // card's listener) so N cards never share origin state — exactly how ProjectCard handles
 // the `authors` string[] via csv, re-seeded only on id change.
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import type { Listener } from "./types";
-import { LISTENER_GROUPS, type FieldDef, type ListenerFieldKey } from "./fields";
+import { listenerGroupsForKind, type FieldDef, type ListenerFieldKey } from "./fields";
 import { normalizeAllowedOrigins } from "./remoteAccessOps";
 import ConfigField from "./ConfigField.vue";
 
@@ -28,6 +28,7 @@ const emit = defineEmits<{
 // re-seeding from props would fight the user's in-progress typing). Mirrors ProjectCard's
 // authorsInput.
 const allowedOriginsInput = ref(props.listener.allowedOrigins.join(", "));
+const visibleGroups = computed(() => listenerGroupsForKind(props.listener.kind));
 watch(
   () => props.listener.id,
   () => {
@@ -64,7 +65,7 @@ function allowedOriginsArray(): string[] {
 
 <template>
   <article class="listener-card">
-    <div v-for="g in LISTENER_GROUPS" :key="g.id" class="group">
+    <div v-for="g in visibleGroups" :key="g.id" class="group">
       <ConfigField
         v-for="def in g.fields"
         :key="def.key"

@@ -14,6 +14,7 @@ import {
   LISTENER_AUTH_MODES,
   type AppConfig,
   type Listener,
+  type ListenerKind,
   type Project,
   type Tunnel,
 } from "./types";
@@ -72,7 +73,7 @@ export interface FieldDef<K extends FieldKey = FieldKey> {
   visibleWhen?: (p: Project) => boolean;
 }
 
-interface FieldGroup<K extends FieldKey = FieldKey> {
+export interface FieldGroup<K extends FieldKey = FieldKey> {
   id: string;
   title: string;
   fields: FieldDef<K>[];
@@ -462,6 +463,20 @@ export const LISTENER_GROUPS: FieldGroup<ListenerFieldKey>[] = [
     ],
   },
 ];
+
+export function listenerGroupsForKind(
+  kind: ListenerKind,
+  groups: FieldGroup<ListenerFieldKey>[] = LISTENER_GROUPS,
+): FieldGroup<ListenerFieldKey>[] {
+  return groups
+    .map((group) => ({
+      ...group,
+      fields: group.fields.filter(
+        (field) => !(kind === "remote-web" && field.key === "allowedOrigins"),
+      ),
+    }))
+    .filter((group) => group.fields.length > 0);
+}
 
 // Remote-access tunnel field groups (AB#1064): every NON-identity `Tunnel` key appears
 // exactly once (asserted in fields.test.ts). `id`/`name` are identity fields owned by the

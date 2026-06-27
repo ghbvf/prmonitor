@@ -6,6 +6,7 @@
 //! vertical slice dirs; this module is intentionally outside them.
 
 pub mod commands;
+pub mod remote_web_http;
 pub mod status;
 pub mod supervisor;
 pub mod terminal_http;

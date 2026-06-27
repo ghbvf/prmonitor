@@ -27,6 +27,31 @@ pub fn terminal_event_name() -> &'static str {
     TERMINAL_EVENT
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteWebSseTopic {
+    Review,
+    Pr,
+}
+
+/// Parse the two SSE topics the remote web console may consume without letting
+/// remote HTTP code name raw desktop/bus channel literals. This keeps `stream.rs`
+/// free to scan non-funnel files for direct realtime-channel bypasses.
+pub(crate) fn remote_web_sse_topic(topic: Option<&str>) -> Option<RemoteWebSseTopic> {
+    match topic {
+        Some(REVIEW_EVENT) => Some(RemoteWebSseTopic::Review),
+        Some(PRS_UPDATED_EVENT) => Some(RemoteWebSseTopic::Pr),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn remote_web_sse_topic_name(topic: RemoteWebSseTopic) -> &'static str {
+    match topic {
+        RemoteWebSseTopic::Review => REVIEW_EVENT,
+        RemoteWebSseTopic::Pr => PRS_UPDATED_EVENT,
+    }
+}
+
 /// Tauri event name carrying an [`InboxEvent`] (AB#1065): one inbox row was added or
 /// re-processed (a webhook delivery persisted / replayed). Mirrored by
 /// `INBOX_UPDATED_EVENT` in `src/inbox/api.ts`.
@@ -256,6 +281,8 @@ pub enum TerminalEvent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "domain", rename_all = "camelCase")]
 pub enum StreamEvent {
+    /// A PR-list event (retained list update / discovery error). Desktop channel: `prs:updated`.
+    Pr(PrEvent),
     /// A review-session event (deltas / terminal / session error). Desktop channel: `review:event`.
     Review(ReviewEvent),
     /// An action-outbox event (row enqueued / transitioned / cycle error). Desktop channel:
@@ -635,6 +662,22 @@ mod tests {
     }
 
     #[test]
+    fn stream_event_pr_wire_shape_has_domain_and_inner_kind() {
+        let event = StreamEvent::Pr(PrEvent::Updated {
+            project_id: "p1".to_string(),
+            prs: vec![sample_view()],
+        });
+
+        let v = serde_json::to_value(&event).expect("StreamEvent serializes");
+
+        assert_eq!(v["domain"], "pr");
+        assert_eq!(v["kind"], "updated");
+        assert!(v.get("projectId").is_some());
+        assert!(v.get("prs").is_some());
+        assert!(v.get("project_id").is_none());
+    }
+
+    #[test]
     fn stream_event_action_wire_shape_has_domain_and_inner_kind() {
         let event = StreamEvent::Action(OutboxEvent::Error {
             operation: "claim".to_string(),
@@ -784,5 +827,25 @@ mod tests {
         assert_eq!(v["kind"], "screenUpdate");
         assert!(v.get("sessionId").is_some());
         assert!(v.get("session_id").is_none());
+    }
+}
+
+#[cfg(test)]
+mod remote_web_sse_topic_tests {
+    use super::*;
+
+    #[test]
+    fn remote_web_sse_topic_allowlist_is_closed() {
+        assert_eq!(
+            remote_web_sse_topic(Some(remote_web_sse_topic_name(RemoteWebSseTopic::Review))),
+            Some(RemoteWebSseTopic::Review)
+        );
+        assert_eq!(
+            remote_web_sse_topic(Some(remote_web_sse_topic_name(RemoteWebSseTopic::Pr))),
+            Some(RemoteWebSseTopic::Pr)
+        );
+        assert_eq!(remote_web_sse_topic(Some(TERMINAL_EVENT)), None);
+        assert_eq!(remote_web_sse_topic(Some("review:history")), None);
+        assert_eq!(remote_web_sse_topic(None), None);
     }
 }

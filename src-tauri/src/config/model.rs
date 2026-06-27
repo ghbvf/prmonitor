@@ -475,9 +475,14 @@ const WEBHOOK_SECRET_MIN_LEN: usize = 16;
 /// the Host gate), so a non-empty token must clear the same floor as `webhook_secret`. An
 /// EMPTY token is the "disabled" sentinel (fail-closed 401), so it is exempt from this check.
 const LOCAL_API_TOKEN_MIN_LEN: usize = 16;
+const REMOTE_WEB_TOKEN_MIN_LEN: usize = 32;
 
 pub(crate) fn terminal_auth_token_is_strong(token: &str) -> bool {
     token.trim().chars().count() >= LOCAL_API_TOKEN_MIN_LEN
+}
+
+pub(crate) fn remote_web_auth_token_is_strong(token: &str) -> bool {
+    token.trim().chars().count() >= REMOTE_WEB_TOKEN_MIN_LEN
 }
 
 fn is_https_url_without_userinfo(value: &str) -> bool {
@@ -1088,6 +1093,18 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
         }
     }
 
+    let remote_web_has_public_entry = |listener_id: &str| -> bool {
+        config
+            .listeners
+            .iter()
+            .any(|l| l.id == listener_id && !l.public_url.trim().is_empty())
+            || config.tunnels.iter().any(|t| {
+                t.enabled
+                    && t.target_listener_id.trim() == listener_id
+                    && (t.mode == WebhookTunnelMode::Quick || !t.public_url.trim().is_empty())
+            })
+    };
+
     // 2. Port conflict: every ENABLED listening port must be unique. Sources are the webhook
     //    receiver (when enabled) and each enabled listener with a non-zero port (the local REST
     //    API is now one such listener — kind `local-api` — not a standalone field, AB#1225). The
@@ -1156,6 +1173,32 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
                 )));
             }
         }
+        if listener.kind == ListenerKind::RemoteWeb {
+            if listener.auth != ListenerAuthMode::Bearer {
+                return Err(AppError::new(format!(
+                    "auth 远程面板监听器「{}」必须使用 bearer 鉴权",
+                    listener.name
+                )));
+            }
+            if !remote_web_auth_token_is_strong(&listener.auth_token) {
+                return Err(AppError::new(format!(
+                    "authToken 远程面板监听器「{}」必须配置至少 {REMOTE_WEB_TOKEN_MIN_LEN} 个字符的 Bearer token",
+                    listener.name
+                )));
+            }
+            if !listener.allowed_origins.is_empty() {
+                return Err(AppError::new(format!(
+                    "allowedOrigins 远程面板监听器「{}」不支持手填 Origin；Host/Origin 仅从 publicUrl 或目标隧道派生",
+                    listener.name
+                )));
+            }
+            if !remote_web_has_public_entry(&listener.id) {
+                return Err(AppError::new(format!(
+                    "publicUrl 远程面板监听器「{}」必须配置 HTTPS publicUrl，或启用指向它的 HTTPS/Quick 隧道",
+                    listener.name
+                )));
+            }
+        }
         // Label the occupant by its user-facing name, falling back to a short id when the
         // name is empty (so the conflict message points at WHICH listener a human recognizes,
         // not the internal id). webhook/localApi labels stay as their field tokens above.
@@ -1172,10 +1215,10 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
     //    and (c) point at an ENABLED listener — a tunnel that exposes a missing/disabled
     //    listener can never carry traffic, so the config is incoherent. Disabled tunnels are
     //    unconstrained (skipped). The message keeps the `targetListenerId` field-token prefix.
-    let listener_enabled_by_id: std::collections::HashMap<&str, bool> = config
+    let listener_enabled_by_id: std::collections::HashMap<&str, (bool, ListenerKind)> = config
         .listeners
         .iter()
-        .map(|l| (l.id.as_str(), l.enabled))
+        .map(|l| (l.id.as_str(), (l.enabled, l.kind)))
         .collect();
     for tunnel in &config.tunnels {
         if !tunnel.enabled {
@@ -1201,13 +1244,19 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
                     tunnel.name
                 )));
             }
-            Some(false) => {
+            Some((false, _)) => {
                 return Err(AppError::new(format!(
                     "targetListenerId 指向未启用的监听器（隧道「{}」→ 目标未启用）",
                     tunnel.name
                 )));
             }
-            Some(true) => {}
+            Some((true, ListenerKind::LocalApi)) => {
+                return Err(AppError::new(format!(
+                    "targetListenerId 不能指向 local-api（隧道「{}」会暴露本机 CLI API）",
+                    tunnel.name
+                )));
+            }
+            Some((true, _)) => {}
         }
     }
 
@@ -2993,9 +3042,13 @@ mod tests {
             // loopback) and the whole config validates.
             listeners: vec![Listener {
                 id: "l1".to_string(),
+                kind: ListenerKind::Terminal,
                 port: 9000,
                 enabled: true,
                 bind_host: "127.0.0.1".to_string(),
+                auth: ListenerAuthMode::Bearer,
+                auth_token: "terminal-token-0123456789".to_string(),
+                terminal_read: true,
                 ..Listener::default()
             }],
             tunnels: vec![Tunnel {
@@ -3007,6 +3060,29 @@ mod tests {
             ..AppConfig::default()
         };
         assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_enabled_tunnel_targeting_local_api() {
+        let config = AppConfig {
+            listeners: vec![Listener {
+                id: "local-api".to_string(),
+                kind: ListenerKind::LocalApi,
+                port: 8788,
+                enabled: true,
+                bind_host: "127.0.0.1".to_string(),
+                ..Listener::default()
+            }],
+            tunnels: vec![Tunnel {
+                id: "t1".to_string(),
+                enabled: true,
+                target_listener_id: "local-api".to_string(),
+                ..Tunnel::default()
+            }],
+            ..AppConfig::default()
+        };
+        let err = validate(&config).unwrap_err().message;
+        assert!(err.starts_with("targetListenerId"), "{err}");
     }
 
     #[test]
@@ -3061,6 +3137,105 @@ mod tests {
                 auth_token: "terminal-token-0123456789".to_string(),
                 terminal_read: true,
                 ..terminal
+            }],
+            ..AppConfig::default()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_remote_web_listener_requires_bearer_token_and_public_entry() {
+        let web = Listener {
+            id: "web".to_string(),
+            name: "Remote Web".to_string(),
+            kind: ListenerKind::RemoteWeb,
+            bind_host: "127.0.0.1".to_string(),
+            port: 9200,
+            enabled: true,
+            auth: ListenerAuthMode::None,
+            public_url: "https://console.example.com".to_string(),
+            ..Listener::default()
+        };
+
+        let auth_err = validate(&AppConfig {
+            listeners: vec![web.clone()],
+            ..AppConfig::default()
+        })
+        .unwrap_err()
+        .message;
+        assert!(auth_err.starts_with("auth "), "{auth_err}");
+
+        let token_err = validate(&AppConfig {
+            listeners: vec![Listener {
+                auth: ListenerAuthMode::Bearer,
+                auth_token: "short".to_string(),
+                ..web.clone()
+            }],
+            ..AppConfig::default()
+        })
+        .unwrap_err()
+        .message;
+        assert!(token_err.starts_with("authToken"), "{token_err}");
+
+        let public_err = validate(&AppConfig {
+            listeners: vec![Listener {
+                auth: ListenerAuthMode::Bearer,
+                auth_token: "remote-web-token-0123456789abcdef".to_string(),
+                public_url: String::new(),
+                ..web.clone()
+            }],
+            ..AppConfig::default()
+        })
+        .unwrap_err()
+        .message;
+        assert!(public_err.starts_with("publicUrl"), "{public_err}");
+
+        let origins_err = validate(&AppConfig {
+            listeners: vec![Listener {
+                auth: ListenerAuthMode::Bearer,
+                auth_token: "remote-web-token-0123456789abcdef".to_string(),
+                allowed_origins: vec!["https://evil.example.com".to_string()],
+                ..web.clone()
+            }],
+            ..AppConfig::default()
+        })
+        .unwrap_err()
+        .message;
+        assert!(origins_err.starts_with("allowedOrigins"), "{origins_err}");
+
+        assert!(validate(&AppConfig {
+            listeners: vec![Listener {
+                auth: ListenerAuthMode::Bearer,
+                auth_token: "remote-web-token-0123456789abcdef".to_string(),
+                ..web
+            }],
+            ..AppConfig::default()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_remote_web_listener_accepts_quick_tunnel_public_entry() {
+        let web = Listener {
+            id: "web".to_string(),
+            name: "Remote Web".to_string(),
+            kind: ListenerKind::RemoteWeb,
+            bind_host: "127.0.0.1".to_string(),
+            port: 9200,
+            enabled: true,
+            auth: ListenerAuthMode::Bearer,
+            auth_token: "remote-web-token-0123456789abcdef".to_string(),
+            public_url: String::new(),
+            ..Listener::default()
+        };
+        assert!(validate(&AppConfig {
+            listeners: vec![web],
+            tunnels: vec![Tunnel {
+                id: "web-tunnel".to_string(),
+                enabled: true,
+                mode: WebhookTunnelMode::Quick,
+                target_listener_id: "web".to_string(),
+                ..Tunnel::default()
             }],
             ..AppConfig::default()
         })

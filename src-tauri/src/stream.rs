@@ -24,7 +24,9 @@
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tokio::sync::broadcast;
 
-use crate::events::{StreamEvent, OUTBOX_UPDATED_EVENT, REVIEW_EVENT, TERMINAL_EVENT};
+use crate::events::{
+    StreamEvent, OUTBOX_UPDATED_EVENT, PRS_UPDATED_EVENT, REVIEW_EVENT, TERMINAL_EVENT,
+};
 use crate::state::AppState;
 
 /// Bus ring capacity. Generous so a brief consumer stall (an SSE client on a slow link, the
@@ -81,6 +83,9 @@ impl StreamBus {
 ///   `events.rs` is a CI-caught violation. (Was Soft — a reviewer P2 — until that guard landed.)
 pub fn emit<R: Runtime>(app: &AppHandle<R>, event: StreamEvent) {
     match &event {
+        StreamEvent::Pr(e) => {
+            let _ = app.emit(PRS_UPDATED_EVENT, e);
+        }
         StreamEvent::Review(e) => {
             // Best-effort, same as the prior direct emit: a gone window is not worth propagating.
             let _ = app.emit(REVIEW_EVENT, e);
@@ -161,10 +166,12 @@ mod tests {
         // `events.rs` defines + golden-tests the consts (and their wire literals); `stream.rs` is
         // the funnel that emits them. Every other file naming the const OR the literal is a bypass.
         const ALLOWED: [&str; 2] = ["events.rs", "stream.rs"];
-        const FUNNELLED: [&str; 6] = [
+        const FUNNELLED: [&str; 8] = [
+            "PRS_UPDATED_EVENT",
             "REVIEW_EVENT",
             "OUTBOX_UPDATED_EVENT",
             "TERMINAL_EVENT",
+            "\"prs:updated\"",
             "\"review:event\"",
             "\"outbox:updated\"",
             "\"terminal:event\"",

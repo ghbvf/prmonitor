@@ -11,7 +11,7 @@
 //!  - A non-loopback `bindHost` is REFUSED (`BlockedNeeds1073`) for any kind — remote exposure
 //!    must happen through `config.tunnels[]`. Whitelist, never blacklist (mirrors
 //!    `local_api::security::host_allowed`).
-//!  - `remote-web` / `event-ingress` are reported `Unsupported` (no listener runtime yet), never
+//!  - `event-ingress` is reported `Unsupported` (no listener runtime yet), never
 //!    bound.
 //!
 //! Reconcile mirrors `pr::scheduler::SchedulerSet::reconcile` (keyed map under a `StdMutex`,
@@ -41,7 +41,9 @@ use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::oneshot;
 
-use crate::config::model::{terminal_auth_token_is_strong, Listener, ListenerKind, Tunnel};
+use crate::config::model::{
+    remote_web_auth_token_is_strong, terminal_auth_token_is_strong, Listener, ListenerKind, Tunnel,
+};
 use crate::model::WebhookTunnelMode;
 use crate::review::local_api::{build_router, Ctx};
 
@@ -75,13 +77,12 @@ fn classify(l: &Listener) -> Disposition {
         ));
     }
     match l.kind {
-        ListenerKind::LocalApi | ListenerKind::Terminal => Disposition::Bind,
+        ListenerKind::LocalApi | ListenerKind::RemoteWeb | ListenerKind::Terminal => {
+            Disposition::Bind
+        }
         ListenerKind::EventIngress => Disposition::Unsupported(
             "event-ingress 运行时待建（需隧道运行时，AB#1225 后续）".to_string(),
         ),
-        ListenerKind::RemoteWeb => {
-            Disposition::Unsupported("remote-web 运行时待建（需 AB#1073）".to_string())
-        }
     }
 }
 
@@ -101,7 +102,9 @@ fn status_of(
             Some(p)
                 if (l.kind == ListenerKind::LocalApi && !local_api_token_set)
                     || (l.kind == ListenerKind::Terminal
-                        && !terminal_auth_token_is_strong(&l.auth_token)) =>
+                        && !terminal_auth_token_is_strong(&l.auth_token))
+                    || (l.kind == ListenerKind::RemoteWeb
+                        && !remote_web_auth_token_is_strong(&l.auth_token)) =>
             {
                 (
                     ListenerState::BoundNoAuth,
@@ -137,8 +140,9 @@ fn status_of(
 fn bound_no_auth_message(kind: ListenerKind, port: u16) -> String {
     let field = match kind {
         ListenerKind::Terminal => "终端监听器 authToken",
+        ListenerKind::RemoteWeb => "远程面板监听器 authToken",
         ListenerKind::LocalApi => "local API token",
-        ListenerKind::RemoteWeb | ListenerKind::EventIngress => "token",
+        ListenerKind::EventIngress => "token",
     };
     format!(
         "已绑定 127.0.0.1:{port}，但 token 未设置或强度不足——请求将 401（请在设置中配置 {field}）"
@@ -155,7 +159,7 @@ fn bound_no_auth_message(kind: ListenerKind, port: u16) -> String {
 /// `HashMap` collapses can resolve to DIFFERENT listeners (last-writer-wins), letting a later
 /// non-runtime duplicate's kind suppress a bindable `local-api`'s bind. Carrying `kind` IN the
 /// desired entry (built from the SAME bindable-filtered pass) makes that divergence unrepresentable.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct DesiredListener {
     port: u16,
     kind: ListenerKind,
@@ -193,20 +197,20 @@ fn desired_listeners(listeners: &[Listener]) -> HashMap<String, DesiredListener>
 
 /// Pure reconcile diff: ids to tear down (absent from desired, or port changed) and ids to bind
 /// (absent from current, or port changed). Compares the live `id -> port` snapshot against the
-/// desired entries' ports (a kind change on an existing id flips its desired membership, so port is
-/// the only rebind trigger). Unit-tested directly.
+/// desired entries' runtime identity. A kind change on an existing id must rebind even when the port
+/// is unchanged; otherwise the old router remains mounted behind a new listener kind.
 fn diff(
-    current: &HashMap<String, u16>,
+    current: &HashMap<String, DesiredListener>,
     desired: &HashMap<String, DesiredListener>,
 ) -> (Vec<String>, Vec<String>) {
     let remove = current
         .iter()
-        .filter(|(id, port)| desired.get(*id).map(|d| d.port) != Some(**port))
+        .filter(|(id, current)| desired.get(*id) != Some(*current))
         .map(|(id, _)| id.clone())
         .collect();
     let add = desired
         .iter()
-        .filter(|(id, d)| current.get(*id) != Some(&d.port))
+        .filter(|(id, desired)| current.get(*id) != Some(*desired))
         .map(|(id, _)| id.clone())
         .collect();
     (remove, add)
@@ -219,6 +223,7 @@ struct BoundListener {
     /// ends (so a re-bind on the same port is clean).
     shutdown: oneshot::Sender<()>,
     port: u16,
+    kind: ListenerKind,
 }
 
 /// The listener binding supervisor. Lives in [`crate::state::AppState`]; `Default` (no bound
@@ -267,10 +272,18 @@ impl ListenerSupervisor {
                 .filter(|(_, b)| b.server_task.inner().is_finished())
                 .map(|(id, _)| id.clone())
                 .collect();
-            let current: HashMap<String, u16> = runtimes
+            let current: HashMap<String, DesiredListener> = runtimes
                 .iter()
                 .filter(|(id, _)| !dead.contains(id))
-                .map(|(id, b)| (id.clone(), b.port))
+                .map(|(id, b)| {
+                    (
+                        id.clone(),
+                        DesiredListener {
+                            port: b.port,
+                            kind: b.kind,
+                        },
+                    )
+                })
                 .collect();
             let (remove, add) = diff(&current, &desired);
             let removed = remove
@@ -571,7 +584,7 @@ impl ListenerBinder for LocalApiBinder {
         _listener_id: &str,
         port: u16,
     ) -> Option<BoundListener> {
-        bind_loopback(app, port, |app, port| {
+        bind_loopback(app, port, ListenerKind::LocalApi, |app, port| {
             build_router(Arc::new(Ctx { app, port }))
         })
     }
@@ -587,9 +600,31 @@ impl ListenerBinder for TerminalBinder {
         port: u16,
     ) -> Option<BoundListener> {
         let listener_id = listener_id.to_string();
-        bind_loopback(app, port, move |app, port| {
+        bind_loopback(app, port, ListenerKind::Terminal, move |app, port| {
             crate::remote::terminal_http::build_router(Arc::new(
                 crate::remote::terminal_http::Ctx {
+                    app,
+                    port,
+                    listener_id,
+                },
+            ))
+        })
+    }
+}
+
+struct RemoteWebBinder;
+
+impl ListenerBinder for RemoteWebBinder {
+    fn bind<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        listener_id: &str,
+        port: u16,
+    ) -> Option<BoundListener> {
+        let listener_id = listener_id.to_string();
+        bind_loopback(app, port, ListenerKind::RemoteWeb, move |app, port| {
+            crate::remote::remote_web_http::build_router(Arc::new(
+                crate::remote::remote_web_http::Ctx {
                     app,
                     port,
                     listener_id,
@@ -616,8 +651,9 @@ fn bind_for_kind<R: tauri::Runtime>(
 ) -> Option<BoundListener> {
     match kind {
         ListenerKind::LocalApi => LocalApiBinder.bind(app, listener_id, port),
+        ListenerKind::RemoteWeb => RemoteWebBinder.bind(app, listener_id, port),
         ListenerKind::Terminal => TerminalBinder.bind(app, listener_id, port),
-        ListenerKind::EventIngress | ListenerKind::RemoteWeb => None,
+        ListenerKind::EventIngress => None,
     }
 }
 
@@ -635,6 +671,7 @@ fn bind_for_kind<R: tauri::Runtime>(
 fn bind_loopback<R, F>(
     app: &tauri::AppHandle<R>,
     port: u16,
+    kind: ListenerKind,
     make_router: F,
 ) -> Option<BoundListener>
 where
@@ -676,6 +713,7 @@ where
         server_task,
         shutdown: shutdown_tx,
         port,
+        kind,
     })
 }
 
@@ -866,13 +904,31 @@ mod tests {
     }
 
     #[test]
-    fn classify_other_kinds_are_unsupported() {
-        for kind in [ListenerKind::RemoteWeb, ListenerKind::EventIngress] {
-            assert!(matches!(
-                classify(&listener("a", kind, "127.0.0.1", 9000, true)),
-                Disposition::Unsupported(_)
-            ));
-        }
+    fn classify_event_ingress_is_unsupported() {
+        assert!(matches!(
+            classify(&listener(
+                "a",
+                ListenerKind::EventIngress,
+                "127.0.0.1",
+                9000,
+                true
+            )),
+            Disposition::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn classify_remote_web_loopback_is_bind() {
+        assert!(matches!(
+            classify(&listener(
+                "web",
+                ListenerKind::RemoteWeb,
+                "127.0.0.1",
+                9200,
+                true
+            )),
+            Disposition::Bind
+        ));
     }
 
     #[test]
@@ -934,6 +990,16 @@ mod tests {
     }
 
     #[test]
+    fn status_of_bound_no_auth_for_remote_web_short_token() {
+        let mut l = listener("web", ListenerKind::RemoteWeb, "127.0.0.1", 9200, true);
+        l.auth_token = "short".to_string();
+        let s = status_of(&l, Some(9200), true);
+        assert_eq!(s.state, ListenerState::BoundNoAuth);
+        assert!(s.bound);
+        assert_eq!(s.bound_port, Some(9200));
+    }
+
+    #[test]
     fn status_of_error_when_bindable_but_not_bound() {
         let s = status_of(
             &listener("local-api", ListenerKind::LocalApi, "127.0.0.1", 8788, true),
@@ -957,13 +1023,13 @@ mod tests {
     }
 
     #[test]
-    fn status_of_unsupported_for_remote_web() {
+    fn status_of_error_for_unbound_remote_web() {
         let s = status_of(
             &listener("a", ListenerKind::RemoteWeb, "127.0.0.1", 9000, true),
             None,
             true,
         );
-        assert_eq!(s.state, ListenerState::Unsupported);
+        assert_eq!(s.state, ListenerState::Error);
     }
 
     // --- desired_listeners + diff (the reconcile core) --------------------------------------
@@ -978,10 +1044,14 @@ mod tests {
             listener("terminal", ListenerKind::Terminal, "127.0.0.1", 8792, true),
         ];
         let d = desired_listeners(&listeners);
-        assert_eq!(d.len(), 2);
+        assert_eq!(d.len(), 3);
         assert_eq!(
             d.get("ok").map(|x| (x.port, x.kind)),
             Some((8788, ListenerKind::LocalApi))
+        );
+        assert_eq!(
+            d.get("web").map(|x| (x.port, x.kind)),
+            Some((8791, ListenerKind::RemoteWeb))
         );
         assert_eq!(
             d.get("terminal").map(|x| (x.port, x.kind)),
@@ -998,7 +1068,7 @@ mod tests {
         // `reconcile_binds_local_api_despite_duplicate_id_nonruntime_kind`).
         let listeners = vec![
             listener("dup", ListenerKind::LocalApi, "127.0.0.1", 8788, true),
-            listener("dup", ListenerKind::RemoteWeb, "127.0.0.1", 9000, true),
+            listener("dup", ListenerKind::EventIngress, "127.0.0.1", 9000, true),
         ];
         let d = desired_listeners(&listeners);
         assert_eq!(d.len(), 1);
@@ -1041,17 +1111,17 @@ mod tests {
 
     #[test]
     fn diff_adds_new_removes_absent_and_rebinds_changed() {
-        let current: HashMap<String, u16> = [
-            ("keep".to_string(), 1u16),
-            ("gone".to_string(), 2),
-            ("move".to_string(), 3),
-        ]
-        .into_iter()
-        .collect();
         let dl = |port: u16| DesiredListener {
             port,
             kind: ListenerKind::LocalApi,
         };
+        let current: HashMap<String, DesiredListener> = [
+            ("keep".to_string(), dl(1)),
+            ("gone".to_string(), dl(2)),
+            ("move".to_string(), dl(3)),
+        ]
+        .into_iter()
+        .collect();
         let desired: HashMap<String, DesiredListener> = [
             ("keep".to_string(), dl(1)),
             ("new".to_string(), dl(4)),
@@ -1064,6 +1134,31 @@ mod tests {
         add.sort();
         assert_eq!(remove, vec!["gone".to_string(), "move".to_string()]);
         assert_eq!(add, vec!["move".to_string(), "new".to_string()]);
+    }
+
+    #[test]
+    fn diff_rebinds_when_kind_changes_on_same_port() {
+        let current: HashMap<String, DesiredListener> = [(
+            "web".to_string(),
+            DesiredListener {
+                port: 9200,
+                kind: ListenerKind::LocalApi,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let desired: HashMap<String, DesiredListener> = [(
+            "web".to_string(),
+            DesiredListener {
+                port: 9200,
+                kind: ListenerKind::RemoteWeb,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let (remove, add) = diff(&current, &desired);
+        assert_eq!(remove, vec!["web".to_string()]);
+        assert_eq!(add, vec!["web".to_string()]);
     }
 
     // --- bind_std_with_retry (CI-safe: ephemeral port) --------------------------------------
@@ -1219,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn status_snapshot_enabled_remote_web_is_unsupported() {
+    fn status_snapshot_enabled_remote_web_unbound_is_error() {
         let sup = ListenerSupervisor::default();
         let listeners = vec![listener(
             "web",
@@ -1230,23 +1325,21 @@ mod tests {
         )];
         let snap = sup.status_snapshot(&listeners, true);
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].state, ListenerState::Unsupported);
+        assert_eq!(snap[0].state, ListenerState::Error);
     }
 
     // --- ListenerBinder seam (F26 / #1382): dispatch + binder + registry↔classify consistency ---
 
     #[test]
     fn bind_for_kind_non_runtime_kinds_return_none() {
-        // The three kinds without a runtime binder return `None` from the dispatch WITHOUT binding any
+        // The kind without a runtime binder returns `None` from the dispatch WITHOUT binding any
         // socket (the `None` arm short-circuits before any bind). Pins that the seam never silently
         // binds a non-runtime kind — the Hard exhaustive `match` routes them to `None`, fail-closed.
         let app = tauri::test::mock_app();
-        for kind in [ListenerKind::RemoteWeb, ListenerKind::EventIngress] {
-            assert!(
-                bind_for_kind(kind, app.handle(), "x", 0).is_none(),
-                "non-runtime kind {kind:?} must not bind"
-            );
-        }
+        assert!(
+            bind_for_kind(ListenerKind::EventIngress, app.handle(), "x", 0).is_none(),
+            "non-runtime kind EventIngress must not bind"
+        );
     }
 
     #[test]
@@ -1278,23 +1371,21 @@ mod tests {
         // Medium carrier (per `.claude/rules/prmonitor/ai-robust.md` §审查要求): the bindable SET must
         // agree between `classify` (R-free — bindability + Unsupported reason) and `bind_for_kind`
         // (R-specific — WHICH binder). The three non-runtime kinds are BOTH `Unsupported` (classify)
-        // AND `None` (bind_for_kind); `local-api` is `Bind` (classify) AND `Some` (bind_for_kind). Both
+        // AND `None` (bind_for_kind); bindable kinds are `Bind` (classify) AND `Some` (bind_for_kind). Both
         // matches are exhaustive (Hard), so a NEW kind forces an arm in each; this test pins that an
         // EXISTING kind can't be marked bindable in one and not the other — in BOTH directions, so a
         // regression that drops `bind_for_kind`'s `LocalApi` arm to `None` fails HERE (not only in the
         // reconcile integration test).
         let app = tauri::test::mock_app();
-        for kind in [ListenerKind::RemoteWeb, ListenerKind::EventIngress] {
-            let l = listener("x", kind, "127.0.0.1", 9000, true);
-            assert!(
-                matches!(classify(&l), Disposition::Unsupported(_)),
-                "{kind:?} must classify Unsupported"
-            );
-            assert!(
-                bind_for_kind(kind, app.handle(), "x", 9000).is_none(),
-                "{kind:?} must have no binder"
-            );
-        }
+        let l = listener("x", ListenerKind::EventIngress, "127.0.0.1", 9000, true);
+        assert!(
+            matches!(classify(&l), Disposition::Unsupported(_)),
+            "EventIngress must classify Unsupported"
+        );
+        assert!(
+            bind_for_kind(ListenerKind::EventIngress, app.handle(), "x", 9000).is_none(),
+            "EventIngress must have no binder"
+        );
         // local-api: bindable in BOTH the R-free source (classify) AND the R-specific source
         // (bind_for_kind). Bind on port 0 (OS-assigned free port — CI-safe, no TOCTOU), assert a real
         // binder, then tear the spawned serve task down.
@@ -1313,6 +1404,24 @@ mod tests {
         );
         let bound = bind_for_kind(ListenerKind::LocalApi, app.handle(), "local-api", 0)
             .expect("local-api must have a binder in bind_for_kind, not just Bind in classify");
+        let _ = bound.shutdown.send(());
+        bound.server_task.abort();
+
+        assert!(
+            matches!(
+                classify(&listener(
+                    "web",
+                    ListenerKind::RemoteWeb,
+                    "127.0.0.1",
+                    9200,
+                    true
+                )),
+                Disposition::Bind
+            ),
+            "remote-web must classify Bind"
+        );
+        let bound = bind_for_kind(ListenerKind::RemoteWeb, app.handle(), "web", 0)
+            .expect("remote-web must have a binder in bind_for_kind");
         let _ = bound.shutdown.send(());
         bound.server_task.abort();
 
@@ -1422,7 +1531,7 @@ mod tests {
         let sup = ListenerSupervisor::default();
         let listeners = vec![
             listener("dup", ListenerKind::LocalApi, "127.0.0.1", port, true),
-            listener("dup", ListenerKind::RemoteWeb, "127.0.0.1", 9000, true),
+            listener("dup", ListenerKind::EventIngress, "127.0.0.1", 9000, true),
         ];
         sup.reconcile(app.handle(), &listeners, &[], "cloudflared");
         let snap = sup.status_snapshot(&listeners, true);

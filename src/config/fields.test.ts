@@ -23,6 +23,7 @@ import {
   TUNNEL_GROUPS,
   STEPS,
   STEP_FIELDS,
+  listenerGroupsForKind,
   visibleStepFields,
   validateStep,
   errorToStep,
@@ -374,6 +375,17 @@ describe("LISTENER_GROUPS (AB#1064)", () => {
   it("port field has min 0 (so 0 = 未设置 isn't flagged invalid)", () => {
     const port = LISTENER_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "port");
     expect(port?.min).toBe(0);
+  });
+
+  it("remote-web listener editor hides raw allowedOrigins", () => {
+    const remoteKeys = listenerGroupsForKind("remote-web").flatMap((g) =>
+      g.fields.map((f) => f.key),
+    );
+    const terminalKeys = listenerGroupsForKind("terminal").flatMap((g) =>
+      g.fields.map((f) => f.key),
+    );
+    expect(remoteKeys).not.toContain("allowedOrigins");
+    expect(terminalKeys).toContain("allowedOrigins");
   });
 });
 

@@ -1,9 +1,8 @@
 //! PR slice Tauri commands: manual fetch + `gh` auth status.
 
-use tauri::Emitter; // for app.emit
-
 use crate::config::service as config_service;
 use crate::error::AppResult;
+use crate::events::{PrEvent, StreamEvent};
 use crate::model::{Candidate, PullRequestView, SourceKind, UpdateMode};
 
 use super::azure::{az_auth_status, AzStatus, AzureDevOpsCli};
@@ -434,12 +433,12 @@ pub fn set_pr_archived<R: tauri::Runtime>(
         }
     })?;
     if let Some(list) = emitted {
-        let _ = app.emit(
-            crate::events::PRS_UPDATED_EVENT,
-            &crate::events::PrEvent::Updated {
+        crate::stream::emit(
+            &app,
+            StreamEvent::Pr(PrEvent::Updated {
                 project_id,
                 prs: list,
-            },
+            }),
         );
     }
     Ok(())
@@ -735,12 +734,12 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
     });
     match emitted {
         Ok(Some(list)) => {
-            let _ = app.emit(
-                crate::events::PRS_UPDATED_EVENT,
-                &crate::events::PrEvent::Updated {
+            crate::stream::emit(
+                app,
+                StreamEvent::Pr(PrEvent::Updated {
                     project_id: project_id.clone(),
                     prs: list,
-                },
+                }),
             );
         }
         // Persist no-op (untracked status-only PR) — nothing to emit.
@@ -751,12 +750,12 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
         // processing happens in the composition root after this function returns. The list is
         // unchanged, but the banner tells the user the persist failed.
         Err(e) => {
-            let _ = app.emit(
-                crate::events::PRS_UPDATED_EVENT,
-                &crate::events::PrEvent::Error {
+            crate::stream::emit(
+                app,
+                StreamEvent::Pr(PrEvent::Error {
                     project_id: project_id.clone(),
                     message: format!("PR 列表持久化失败：{}", e.message),
-                },
+                }),
             );
         }
     }

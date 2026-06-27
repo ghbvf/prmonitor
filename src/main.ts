@@ -3,6 +3,7 @@ import { createApp } from "vue";
 import { createPinia } from "pinia";
 import App from "./App.vue";
 import { setTransport } from "./transport";
+import { isRemoteWebConsolePath } from "./remoteConsole/route";
 
 // Pick the backend transport at boot, BEFORE mounting, so every store init / event
 // subscription (which runs after mount) sees a ready transport (AB#1375). Tauri v2 injects
@@ -15,8 +16,15 @@ async function boot() {
     ? (await import("./transport/tauri")).createTauriTransport()
     : await browserTransport();
   setTransport(transport);
-  const Root = isTauri ? App : (await import("./RemoteTerminalApp.vue")).default;
+  const Root = isTauri ? App : await browserRoot();
   createApp(Root).use(createPinia()).mount("#app");
+}
+
+async function browserRoot() {
+  if (isRemoteWebConsolePath(window.location.pathname)) {
+    return (await import("./RemoteWebConsoleApp.vue")).default;
+  }
+  return (await import("./RemoteTerminalApp.vue")).default;
 }
 
 async function browserTransport() {
