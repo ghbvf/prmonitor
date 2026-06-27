@@ -27,31 +27,6 @@ pub fn terminal_event_name() -> &'static str {
     TERMINAL_EVENT
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RemoteWebSseTopic {
-    Review,
-    Pr,
-}
-
-/// Parse the two SSE topics the remote web console may consume without letting
-/// remote HTTP code name raw desktop/bus channel literals. This keeps `stream.rs`
-/// free to scan non-funnel files for direct realtime-channel bypasses.
-pub(crate) fn remote_web_sse_topic(topic: Option<&str>) -> Option<RemoteWebSseTopic> {
-    match topic {
-        Some(REVIEW_EVENT) => Some(RemoteWebSseTopic::Review),
-        Some(PRS_UPDATED_EVENT) => Some(RemoteWebSseTopic::Pr),
-        _ => None,
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn remote_web_sse_topic_name(topic: RemoteWebSseTopic) -> &'static str {
-    match topic {
-        RemoteWebSseTopic::Review => REVIEW_EVENT,
-        RemoteWebSseTopic::Pr => PRS_UPDATED_EVENT,
-    }
-}
-
 /// Tauri event name carrying an [`InboxEvent`] (AB#1065): one inbox row was added or
 /// re-processed (a webhook delivery persisted / replayed). Mirrored by
 /// `INBOX_UPDATED_EVENT` in `src/inbox/api.ts`.
@@ -827,25 +802,5 @@ mod tests {
         assert_eq!(v["kind"], "screenUpdate");
         assert!(v.get("sessionId").is_some());
         assert!(v.get("session_id").is_none());
-    }
-}
-
-#[cfg(test)]
-mod remote_web_sse_topic_tests {
-    use super::*;
-
-    #[test]
-    fn remote_web_sse_topic_allowlist_is_closed() {
-        assert_eq!(
-            remote_web_sse_topic(Some(remote_web_sse_topic_name(RemoteWebSseTopic::Review))),
-            Some(RemoteWebSseTopic::Review)
-        );
-        assert_eq!(
-            remote_web_sse_topic(Some(remote_web_sse_topic_name(RemoteWebSseTopic::Pr))),
-            Some(RemoteWebSseTopic::Pr)
-        );
-        assert_eq!(remote_web_sse_topic(Some(TERMINAL_EVENT)), None);
-        assert_eq!(remote_web_sse_topic(Some("review:history")), None);
-        assert_eq!(remote_web_sse_topic(None), None);
     }
 }

@@ -1,6 +1,10 @@
 // Config slice → backend adapter. Wraps the config commands.
 import { getTransport } from "../transport";
-import type { AppConfig, ListenerRuntimeStatus, NotificationChannel } from "./types";
+import type {
+  AppConfig,
+  NotificationChannel,
+  RemoteAccessRuntimeStatus,
+} from "./types";
 
 export function appVersion(): Promise<string> {
   return getTransport().request<string>("app_version");
@@ -26,9 +30,6 @@ export function notificationTestSend(channel: NotificationChannel): Promise<stri
   return getTransport().request<string>("notification_test_send", { channel });
 }
 
-// Fetch the runtime binding status for every configured listener (AB#1225 PR1).
-// Mirrors the Rust `get_listener_runtime_status` command's return shape
-// (`Vec<ListenerRuntimeStatus>` → `ListenerRuntimeStatus[]` camelCase JSON).
-export function getListenerRuntimeStatus(): Promise<ListenerRuntimeStatus[]> {
-  return getTransport().request<ListenerRuntimeStatus[]>("get_listener_runtime_status");
+export function getRemoteAccessRuntimeStatus(): Promise<RemoteAccessRuntimeStatus> {
+  return getTransport().request<RemoteAccessRuntimeStatus>("get_remote_access_runtime_status");
 }

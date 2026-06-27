@@ -3,14 +3,10 @@
 // call when the user changes `sourceKind`, so the two surfaces can't drift on the
 // Bitbucket-required auto-corrections. Pure (mutates a plain Project) → no Pinia/mocks.
 //
-// F10 (AB#1225 PR2): DEFAULT_LOCAL_API_LISTENER was removed from defaults.ts; the backend
-// `AppConfig::default()` is now the single source for the local-api listener seed. The
-// OnboardingWizard.composeConfig() reads `store.config.listeners` (the backend-seeded value)
-// instead of the former TS literal — this module no longer exports the redundant mirror.
-// The compile-time absence of DEFAULT_LOCAL_API_LISTENER is enforced by TypeScript (removing
-// the export makes any import of it a compile error — Hard enforcement via the type system).
+// #1553: Remote Access defaults are backend-owned. The onboarding composer carries the
+// backend-seeded remoteAccess entrypoints through instead of keeping a TS-side literal.
 import { describe, expect, it } from "vitest";
-import type { Listener, Project } from "./types";
+import type { RemoteEntrypoint, Project } from "./types";
 import { DEFAULT_OUTBOX_CONFIG, applySourceKindDefaults } from "./defaults";
 
 // A github-shaped project carrying the github-friendly defaults (labelSource "native",
@@ -109,58 +105,71 @@ describe("DEFAULT_OUTBOX_CONFIG (AB#1182)", () => {
   });
 });
 
-// F10 (AB#1225 PR2): DEFAULT_LOCAL_API_LISTENER was removed — the backend is the single
-// source for the local-api listener seed. This test documents the F10 contract: when
-// OnboardingWizard.composeConfig() spreads `store.config.listeners` (the backend-seeded
-// array), the resulting config retains the local-api entry without a TS-side literal.
+// F10 / #1553: the backend is the single source for the local-api entrypoint seed. This
+// documents the composer contract: spreading loaded remoteAccess into the composed config
+// keeps the local-api entry without a TS-side literal.
 //
 // We cannot directly import `composeConfig` (it's a closure inside the Vue component),
-// so this test simulates the sourcing logic: spread the loaded config's listeners into
-// the composed AppConfig and verify the local-api entry is present and non-empty.
-describe("F10 — onboarding listeners sourced from loaded backend config (not TS literal)", () => {
-  // Simulate the backend-seeded local-api listener that `AppConfig::default()` produces.
+// so this test simulates the sourcing logic: spread the loaded config's remoteAccess into
+// the composed AppConfig and verify the local-api entrypoint is present and non-empty.
+describe("F10 — onboarding remoteAccess sourced from loaded backend config", () => {
+  // Simulate the backend-seeded local-api entrypoint that `AppConfig::default()` produces.
   // This shape is verified by the Rust golden (`app_config_wire_shape_is_camel_case`) —
   // we reference it here only to assert the spread logic, NOT as a TS-side mirror literal.
-  const backendSeededListeners: Listener[] = [
+  const backendSeededEntrypoints: RemoteEntrypoint[] = [
     {
       id: "local-api",
       name: "Local API",
-      kind: "local-api",
       bindHost: "127.0.0.1",
       port: 8788,
       enabled: true,
-      auth: "bearer",
-      authToken: "",
-      terminalRead: false,
-      terminalWrite: false,
-      terminalCreate: false,
-      terminalAdmin: false,
+      sourcePolicy: { mode: "loopback", allow: [] },
       allowedOrigins: [],
-      publicUrl: "",
+      trustedProxies: [],
+      routes: [
+        {
+          id: "local-api",
+          name: "Local API",
+          path: "/api",
+          capability: "local-api",
+          enabled: true,
+          authToken: "",
+          terminalRead: false,
+          terminalWrite: false,
+          terminalCreate: false,
+          terminalAdmin: false,
+        },
+      ],
     },
   ];
 
-  it("spreading the loaded config listeners into a composed config preserves the local-api entry", () => {
+  it("spreading the loaded remoteAccess into a composed config preserves the local-api entrypoint", () => {
     // Mirrors the composeConfig() pattern in OnboardingWizard.vue after F10:
-    //   listeners: store.config?.listeners ? [...store.config.listeners] : []
+    //   remoteAccess: store.config?.remoteAccess ?? { entrypoints: [], tunnels: [] }
     const composed = {
-      listeners: backendSeededListeners.length ? [...backendSeededListeners] : [],
+      remoteAccess: {
+        entrypoints: backendSeededEntrypoints.length ? [...backendSeededEntrypoints] : [],
+        tunnels: [],
+      },
     };
-    expect(composed.listeners).toHaveLength(1);
-    expect(composed.listeners[0].kind).toBe("local-api");
-    expect(composed.listeners[0].id).toBe("local-api");
-    expect(composed.listeners[0].enabled).toBe(true);
+    expect(composed.remoteAccess.entrypoints).toHaveLength(1);
+    expect(composed.remoteAccess.entrypoints[0].id).toBe("local-api");
+    expect(composed.remoteAccess.entrypoints[0].port).toBe(8788);
+    expect(composed.remoteAccess.entrypoints[0].routes[0].capability).toBe("local-api");
   });
 
-  it("guard: if loaded listeners is empty (backend bug), compose yields empty rather than a stale TS literal", () => {
+  it("guard: if loaded remoteAccess is empty, compose yields empty rather than a stale TS literal", () => {
     // This documents the guard path — it should not occur in practice since
-    // AppConfig::default() always seeds the local-api listener on first launch.
-    const emptyListeners: Listener[] = [];
+    // AppConfig::default() always seeds the local-api entrypoint on first launch.
+    const emptyEntrypoints: RemoteEntrypoint[] = [];
     const composed = {
-      listeners: emptyListeners.length ? [...emptyListeners] : [],
+      remoteAccess: {
+        entrypoints: emptyEntrypoints.length ? [...emptyEntrypoints] : [],
+        tunnels: [],
+      },
     };
     // Guard produces [] rather than a stale TS-side default literal — the backend
     // will re-apply its own defaults on next read (no F4 regression from a TS literal).
-    expect(composed.listeners).toHaveLength(0);
+    expect(composed.remoteAccess.entrypoints).toHaveLength(0);
   });
 });

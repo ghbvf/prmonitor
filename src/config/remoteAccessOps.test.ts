@@ -1,23 +1,18 @@
-// Locks the add/delete shape of the remote-access (AB#1064) draft ops. Unlike projectOps
-// there is NO active-id invariant — listeners/tunnels are flat lists — so the contract is
-// just: add appends a default-shaped item with a fresh id; delete removes by stable id and
-// is a no-op for an unknown id. Pure (mutates a plain AppConfig) → no Pinia/mocks.
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
-  makeListener,
-  makeTunnel,
-  addListenerToDraft,
-  deleteListenerFromDraft,
+  addEntrypointToDraft,
+  addRouteToEntrypoint,
   addTunnelToDraft,
+  deleteEntrypointFromDraft,
+  deleteRouteFromEntrypoint,
   deleteTunnelFromDraft,
-  updateListenerField,
-  updateTunnelField,
-  normalizeAllowedOrigins,
+  makeRemoteEntrypoint,
+  makeRemoteRoute,
+  makeRemoteTunnel,
+  normalizeStringList,
 } from "./remoteAccessOps";
 import type { AppConfig } from "./types";
 
-// A minimal draft carrying empty remote-access lists; the other AppConfig fields are
-// irrelevant to these ops but required for the type.
 function draft(): AppConfig {
   return {
     projects: [],
@@ -32,173 +27,136 @@ function draft(): AppConfig {
     localApiToken: "",
     outbox: { notificationTtlSecs: 7200 },
     notifications: { channels: [] },
-    listeners: [],
-    tunnels: [],
+    remoteAccess: { entrypoints: [], tunnels: [] },
     rules: [],
   };
 }
 
-describe("makeListener / makeTunnel", () => {
-  it("mints a default-shaped listener with a fresh id and a name", () => {
-    const l = makeListener();
-    expect(l.id).toBeTruthy();
-    expect(l.name).toBeTruthy();
-    expect(l.kind).toBe("local-api");
-    expect(l.auth).toBe("none");
-    expect(l.authToken).toBe("");
-    expect(l.terminalRead).toBe(false);
-    expect(l.terminalWrite).toBe(false);
-    expect(l.terminalCreate).toBe(false);
-    expect(l.terminalAdmin).toBe(false);
-    expect(l.enabled).toBe(false);
-    expect(l.allowedOrigins).toEqual([]);
+describe("makeRemoteEntrypoint / makeRemoteRoute / makeRemoteTunnel", () => {
+  it("mints a disabled entrypoint with only the local-api route by default", () => {
+    const entrypoint = makeRemoteEntrypoint();
+    expect(entrypoint.id).toBeTruthy();
+    expect(entrypoint.name).toBeTruthy();
+    expect(entrypoint.enabled).toBe(false);
+    expect(entrypoint.bindHost).toBe("127.0.0.1");
+    expect(entrypoint.port).toBe(0);
+    expect(entrypoint.sourcePolicy).toEqual({ mode: "loopback", allow: [] });
+    expect(entrypoint.routes.map((route) => route.capability)).toEqual(["local-api"]);
+    expect(entrypoint.routes[0].path).toBe("/api");
   });
 
-  it("mints a default-shaped tunnel with a fresh id and a name", () => {
-    const t = makeTunnel();
-    expect(t.id).toBeTruthy();
-    expect(t.name).toBeTruthy();
-    expect(t.mode).toBe("quick");
-    expect(t.enabled).toBe(false);
-    expect(t.targetListenerId).toBe("");
-    expect(t.command).toBe("");
+  it("mints a terminal route disabled for write/create/admin by default", () => {
+    const route = makeRemoteRoute("terminal");
+    expect(route.id).toBeTruthy();
+    expect(route.name).toBe("Terminal");
+    expect(route.path).toBe("/terminal");
+    expect(route.capability).toBe("terminal");
+    expect(route.enabled).toBe(true);
+    expect(route.authToken).toBe("");
+    expect(route.terminalRead).toBe(true);
+    expect(route.terminalWrite).toBe(false);
+    expect(route.terminalCreate).toBe(false);
+    expect(route.terminalAdmin).toBe(false);
+  });
+
+  it("mints a LAN tunnel target with a blank entrypoint when none is supplied", () => {
+    const tunnel = makeRemoteTunnel();
+    expect(tunnel.id).toBeTruthy();
+    expect(tunnel.name).toBeTruthy();
+    expect(tunnel.mode).toBe("lan");
+    expect(tunnel.targetEntrypointId).toBe("");
+    expect(tunnel.bindHost).toBe("0.0.0.0");
+    expect(tunnel.port).toBe(0);
+    expect(tunnel.enabled).toBe(false);
   });
 
   it("gives each minted item a distinct id", () => {
-    expect(makeListener().id).not.toBe(makeListener().id);
-    expect(makeTunnel().id).not.toBe(makeTunnel().id);
+    expect(makeRemoteEntrypoint().id).not.toBe(makeRemoteEntrypoint().id);
+    expect(makeRemoteRoute().id).not.toBe(makeRemoteRoute().id);
+    expect(makeRemoteTunnel().id).not.toBe(makeRemoteTunnel().id);
   });
 });
 
-describe("addListenerToDraft / deleteListenerFromDraft", () => {
-  it("appends a fresh listener and returns it", () => {
+describe("entrypoint draft ops", () => {
+  it("appends and removes entrypoints by id", () => {
     const d = draft();
-    const l = addListenerToDraft(d);
-    expect(d.listeners).toHaveLength(1);
-    expect(d.listeners[0]).toBe(l);
+    const a = addEntrypointToDraft(d);
+    const b = addEntrypointToDraft(d);
+    expect(d.remoteAccess.entrypoints).toEqual([a, b]);
+
+    expect(deleteEntrypointFromDraft(d, a.id)).toBe(true);
+    expect(d.remoteAccess.entrypoints.map((entrypoint) => entrypoint.id)).toEqual([b.id]);
   });
 
-  it("removes a listener by id", () => {
+  it("clears tunnel targets that point at a deleted entrypoint", () => {
     const d = draft();
-    const a = addListenerToDraft(d);
-    const b = addListenerToDraft(d);
-    expect(deleteListenerFromDraft(d, a.id)).toBe(true);
-    expect(d.listeners.map((l) => l.id)).toEqual([b.id]);
-  });
-
-  it("is a no-op for an unknown listener id", () => {
-    const d = draft();
-    addListenerToDraft(d);
-    expect(deleteListenerFromDraft(d, "missing")).toBe(false);
-    expect(d.listeners).toHaveLength(1);
-  });
-
-  // codex F3: deleting a listener must not leave a tunnel pointing at a listener id that no
-  // longer exists — the ref is cleared to "", but the tunnel and unrelated refs survive.
-  it("clears targetListenerId on tunnels referencing the deleted listener", () => {
-    const d = draft();
-    const a = addListenerToDraft(d);
-    const b = addListenerToDraft(d);
+    const a = addEntrypointToDraft(d);
+    const b = addEntrypointToDraft(d);
     const pointsAtA = addTunnelToDraft(d);
-    pointsAtA.targetListenerId = a.id;
+    pointsAtA.targetEntrypointId = a.id;
     const pointsAtB = addTunnelToDraft(d);
-    pointsAtB.targetListenerId = b.id;
-    const unset = addTunnelToDraft(d); // never pointed anywhere
+    pointsAtB.targetEntrypointId = b.id;
 
-    expect(deleteListenerFromDraft(d, a.id)).toBe(true);
-    // the tunnel that referenced the deleted listener now has a cleared ref...
-    expect(pointsAtA.targetListenerId).toBe("");
-    // ...but the tunnel itself survives, and unrelated refs are untouched.
-    expect(d.tunnels).toHaveLength(3);
-    expect(pointsAtB.targetListenerId).toBe(b.id);
-    expect(unset.targetListenerId).toBe("");
+    expect(deleteEntrypointFromDraft(d, a.id)).toBe(true);
+    expect(pointsAtA.targetEntrypointId).toBe("");
+    expect(pointsAtB.targetEntrypointId).toBe(b.id);
+  });
+
+  it("is a no-op for an unknown entrypoint id", () => {
+    const d = draft();
+    addEntrypointToDraft(d);
+    expect(deleteEntrypointFromDraft(d, "missing")).toBe(false);
+    expect(d.remoteAccess.entrypoints).toHaveLength(1);
   });
 });
 
-describe("addTunnelToDraft / deleteTunnelFromDraft", () => {
-  it("appends a fresh tunnel and returns it", () => {
-    const d = draft();
-    const t = addTunnelToDraft(d);
-    expect(d.tunnels).toHaveLength(1);
-    expect(d.tunnels[0]).toBe(t);
+describe("route draft ops", () => {
+  it("adds and deletes routes on an entrypoint", () => {
+    const entrypoint = makeRemoteEntrypoint();
+    const route = addRouteToEntrypoint(entrypoint, "terminal");
+    expect(entrypoint.routes.map((item) => item.id)).toContain(route.id);
+
+    expect(deleteRouteFromEntrypoint(entrypoint, route.id)).toBe(true);
+    expect(entrypoint.routes.map((item) => item.id)).not.toContain(route.id);
   });
 
-  it("removes a tunnel by id", () => {
+  it("is a no-op for an unknown route id", () => {
+    const entrypoint = makeRemoteEntrypoint();
+    expect(deleteRouteFromEntrypoint(entrypoint, "missing")).toBe(false);
+    expect(entrypoint.routes).toHaveLength(1);
+  });
+});
+
+describe("tunnel draft ops", () => {
+  it("targets the first entrypoint when adding a tunnel", () => {
+    const d = draft();
+    const entrypoint = addEntrypointToDraft(d);
+    const tunnel = addTunnelToDraft(d);
+    expect(tunnel.targetEntrypointId).toBe(entrypoint.id);
+    expect(d.remoteAccess.tunnels).toEqual([tunnel]);
+  });
+
+  it("removes a tunnel by id and no-ops unknown ids", () => {
     const d = draft();
     const a = addTunnelToDraft(d);
     const b = addTunnelToDraft(d);
     expect(deleteTunnelFromDraft(d, a.id)).toBe(true);
-    expect(d.tunnels.map((t) => t.id)).toEqual([b.id]);
-  });
-
-  it("is a no-op for an unknown tunnel id", () => {
-    const d = draft();
-    addTunnelToDraft(d);
+    expect(d.remoteAccess.tunnels.map((tunnel) => tunnel.id)).toEqual([b.id]);
     expect(deleteTunnelFromDraft(d, "missing")).toBe(false);
-    expect(d.tunnels).toHaveLength(1);
   });
 });
 
-// codex F6: the by-id field-update routing the cards delegate to (RemoteAccessManager →
-// updateListenerField / updateTunnelField) — writes land on the matching item only, and an
-// unknown id is a no-op (so a concurrent reorder/delete can't misroute the write).
-describe("updateListenerField / updateTunnelField", () => {
-  it("updates the listener with the matching id, leaving siblings untouched", () => {
-    const d = draft();
-    const a = addListenerToDraft(d);
-    const b = addListenerToDraft(d);
-    expect(updateListenerField(d, b.id, "bindHost", "0.0.0.0")).toBe(true);
-    expect(b.bindHost).toBe("0.0.0.0");
-    expect(a.bindHost).toBe("127.0.0.1"); // makeListener seed, untouched
-  });
-
-  it("routes string[] (allowedOrigins) and number (port) values by id", () => {
-    const d = draft();
-    const l = addListenerToDraft(d);
-    updateListenerField(d, l.id, "allowedOrigins", ["https://a", "https://b"]);
-    updateListenerField(d, l.id, "port", 8080);
-    expect(l.allowedOrigins).toEqual(["https://a", "https://b"]);
-    expect(l.port).toBe(8080);
-  });
-
-  it("is a no-op (returns false) for an unknown listener id", () => {
-    const d = draft();
-    const l = addListenerToDraft(d);
-    expect(updateListenerField(d, "missing", "bindHost", "x")).toBe(false);
-    expect(l.bindHost).toBe("127.0.0.1");
-  });
-
-  it("updates the tunnel with the matching id, leaving siblings untouched", () => {
-    const d = draft();
-    const a = addTunnelToDraft(d);
-    const b = addTunnelToDraft(d);
-    expect(updateTunnelField(d, b.id, "targetListenerId", "lis-1")).toBe(true);
-    expect(b.targetListenerId).toBe("lis-1");
-    expect(a.targetListenerId).toBe(""); // makeTunnel seed, untouched
-  });
-
-  it("is a no-op (returns false) for an unknown tunnel id", () => {
-    const d = draft();
-    const t = addTunnelToDraft(d);
-    expect(updateTunnelField(d, "missing", "publicUrl", "x")).toBe(false);
-    expect(t.publicUrl).toBe("");
-  });
-});
-
-// codex F6: the allowedOrigins CSV→string[] normalization the ListenerCard csv buffer
-// delegates to — split on comma, trim, drop empties (mirrors ProjectCard's authors split).
-describe("normalizeAllowedOrigins", () => {
+describe("normalizeStringList", () => {
   it("splits on comma, trims, and drops empty entries", () => {
-    expect(normalizeAllowedOrigins("https://a , https://b ,, , https://c")).toEqual([
+    expect(normalizeStringList("10.0.0.1, 192.168.0.0/16 ,, https://a")).toEqual([
+      "10.0.0.1",
+      "192.168.0.0/16",
       "https://a",
-      "https://b",
-      "https://c",
     ]);
   });
 
-  it("returns an empty array for a blank / whitespace-only / commas-only string", () => {
-    expect(normalizeAllowedOrigins("")).toEqual([]);
-    expect(normalizeAllowedOrigins("   ")).toEqual([]);
-    expect(normalizeAllowedOrigins(", ,")).toEqual([]);
+  it("returns an empty array for blank input", () => {
+    expect(normalizeStringList("")).toEqual([]);
+    expect(normalizeStringList(" ,  , ")).toEqual([]);
   });
 });

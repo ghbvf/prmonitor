@@ -492,12 +492,11 @@ fn build_app() {
             // reported `unsupported`. A per-listener bind failure is captured in status, never crashes
             // the app. Reconciled again after each `set_config` save.
             match config::service::load(app.handle()) {
-                Ok(cfg) => state.remote.reconcile(
-                    app.handle(),
-                    &cfg.listeners,
-                    &cfg.tunnels,
-                    &cfg.cloudflared_bin,
-                ),
+                Ok(cfg) => {
+                    state
+                        .remote
+                        .reconcile(app.handle(), &cfg.remote_access, &cfg.cloudflared_bin)
+                }
                 Err(e) => eprintln!("Remote 监听运行时：读取配置失败，跳过初次 reconcile：{e}"),
             }
             // Install the post-save reconcile hook (AB#1225 F4) — the ONLY place that bridges
@@ -512,8 +511,7 @@ fn build_app() {
                 move |cfg: config::model::AppConfig| {
                     app.state::<AppState>().remote.reconcile(
                         &app,
-                        &cfg.listeners,
-                        &cfg.tunnels,
+                        &cfg.remote_access,
                         &cfg.cloudflared_bin,
                     );
                 }
@@ -584,7 +582,7 @@ fn build_app() {
             review::commands::get_session_history,
             review::commands::get_pr_sessions,
             config::commands::set_active_project,
-            remote::commands::get_listener_runtime_status,
+            remote::commands::get_remote_access_runtime_status,
             terminal::commands::list_terminal_sessions,
             terminal::commands::create_terminal_session,
             terminal::commands::attach_terminal,

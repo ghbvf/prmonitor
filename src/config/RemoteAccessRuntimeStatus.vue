@@ -1,31 +1,22 @@
 <script setup lang="ts">
-// Runtime status panel for the configured listeners (AB#1225 PR1). Fetches
-// `get_listener_runtime_status` on mount and whenever `refreshKey` increments (the
-// parent drives re-fetch after a config save). One row per status: name + kind badge +
-// state badge + secondary message text.
-//
-// The `assertNever`穷尽 carrier for ListenerState lives in listenerStateLabel.ts
-// (imported below) so the vitest contract test can drive it without mounting the
-// component — mirrors the eventTypeLabel / inboxStatusLabel pattern (src/types.ts).
-import { computed, watch } from "vue";
-import type { Listener, ListenerRuntimeStatus } from "./types";
-import { getListenerRuntimeStatus } from "./api";
-// listenerStateLabel / listenerKindLabel are extracted to their own module so the vitest
-// contract test can import them directly without mounting this component (same pattern as
-// eventTypeLabel in types.ts).
-import { listenerKindLabel, listenerStateLabel } from "./listenerStateLabel";
-import { ref } from "vue";
+import { ref, watch } from "vue";
+import { getRemoteAccessRuntimeStatus } from "./api";
+import type {
+  RemoteAccessRuntimeStatus,
+  RemoteEntrypoint,
+  RemoteEntrypointState,
+  RemoteTunnel,
+  RemoteTunnelMode,
+  RemoteTunnelState,
+} from "./types";
 
 const props = defineProps<{
-  // Increment this to trigger a re-fetch. The parent should bump it after a
-  // successful config save so the status reflects any newly-added listeners.
   refreshKey?: number;
-  // The current draft listeners from RemoteAccessManager (F14): used to display the
-  // listener's name alongside its runtime id, and to distinguish empty-state cases (F13).
-  listeners?: Listener[];
+  entrypoints?: RemoteEntrypoint[];
+  tunnels?: RemoteTunnel[];
 }>();
 
-const statuses = ref<ListenerRuntimeStatus[]>([]);
+const status = ref<RemoteAccessRuntimeStatus | null>(null);
 const loading = ref(false);
 const fetchError = ref<string | null>(null);
 
@@ -33,7 +24,7 @@ async function refresh() {
   loading.value = true;
   fetchError.value = null;
   try {
-    statuses.value = await getListenerRuntimeStatus();
+    status.value = await getRemoteAccessRuntimeStatus();
   } catch (e) {
     fetchError.value = e instanceof Error ? e.message : String(e);
   } finally {
@@ -41,146 +32,171 @@ async function refresh() {
   }
 }
 
-// Single refresh trigger (F17): `immediate: true` fires on mount AND on every
-// subsequent refreshKey change, replacing the previous dual onMounted+watch pattern.
-// One code path → no risk of double-fetch or a missed initial load.
 watch(() => props.refreshKey, refresh, { immediate: true });
 
-// Resolve a status row's display name: prefer the matching draft listener's name,
-// fall back to the raw id when not found or name is empty (F14).
-function displayName(id: string): string {
-  const match = props.listeners?.find((l) => l.id === id);
+function entrypointName(id: string): string {
+  const match = props.entrypoints?.find((entrypoint) => entrypoint.id === id);
   return match?.name || id;
 }
 
-// Empty-state variant (F13): distinguish between no listeners configured at all vs.
-// listeners present but all disabled (so the status list is empty because the backend
-// only returns ENABLED listeners).
-const emptyStateKind = computed<"none" | "all-disabled">(() => {
-  const ls = props.listeners ?? [];
-  if (ls.length === 0) return "none";
-  if (ls.every((l) => !l.enabled)) return "all-disabled";
-  // Backend returned nothing even though some listeners are enabled — treat as "none"
-  // for the most conservative empty state message.
-  return "none";
-});
+function tunnelName(id: string): string {
+  const match = props.tunnels?.find((tunnel) => tunnel.id === id);
+  return match?.name || id;
+}
+
+function targetEntrypointName(id: string): string {
+  return id ? entrypointName(id) : "未选择";
+}
+
+function entrypointStateLabel(state: RemoteEntrypointState): string {
+  switch (state) {
+    case "bound":
+      return "已绑定";
+    case "bound-no-auth":
+      return "缺少 token";
+    case "error":
+      return "错误";
+  }
+}
+
+function tunnelStateLabel(state: RemoteTunnelState): string {
+  switch (state) {
+    case "running":
+      return "运行中";
+    case "stopped":
+      return "未运行";
+    case "error":
+      return "错误";
+  }
+}
+
+function tunnelModeLabel(mode: RemoteTunnelMode): string {
+  switch (mode) {
+    case "lan":
+      return "LAN";
+    case "quick":
+      return "Quick";
+    case "command":
+      return "Command";
+    case "listener":
+      return "Listener";
+  }
+}
 </script>
 
 <template>
-  <div class="runtime-status" role="region" aria-label="监听器运行时状态">
-    <!-- Visible section heading (F16) -->
-    <h3 class="section-heading">当前运行状态</h3>
-
-    <p v-if="loading" class="muted">加载中…</p>
-    <p v-else-if="fetchError" class="error">{{ fetchError }}</p>
-    <div v-else-if="statuses.length === 0" class="empty">
-      <template v-if="emptyStateKind === 'all-disabled'">
-        所有监听器已停用，启用后在此显示运行状态
-      </template>
-      <template v-else>
-        还没有监听器，请在下方「监听器」添加
-      </template>
-    </div>
-    <ul v-else class="status-list">
-      <li
-        v-for="s in statuses"
-        :key="s.id"
-        class="status-row"
-        :class="`state-${s.state}`"
-        :data-state="s.state"
-      >
-        <!-- F14: display name from draft.listeners, fallback to id -->
-        <span class="row-name">{{ displayName(s.id) }}</span>
-        <!-- F15: localized kind label instead of raw wire value -->
-        <span class="kind-badge">{{ listenerKindLabel(s.kind) }}</span>
-        <span class="state-badge">
-          {{ listenerStateLabel(s.state) }}
-          <template v-if="s.state === 'bound' && s.boundPort != null">
-            :{{ s.boundPort }}
-          </template>
-        </span>
-        <span v-if="s.message" class="message">{{ s.message }}</span>
-      </li>
-    </ul>
+  <div class="runtime-status" role="region" aria-label="Remote Access 运行时状态">
+    <h3>运行状态</h3>
+    <p v-if="loading" class="muted">加载中...</p>
+    <p v-else-if="fetchError" class="fetch-error">{{ fetchError }}</p>
+    <template v-else-if="status">
+      <div v-if="status.entrypoints.length === 0" class="empty">没有启用的 entrypoint。</div>
+      <ul v-else class="status-list">
+        <li v-for="entrypoint in status.entrypoints" :key="entrypoint.id" class="status-row">
+          <strong>{{ entrypointName(entrypoint.id) }}</strong>
+          <span class="id">{{ entrypoint.id }}</span>
+          <span class="badge" :class="entrypoint.state">{{ entrypointStateLabel(entrypoint.state) }}</span>
+          <span v-if="entrypoint.boundPort != null" class="badge">:{{ entrypoint.boundPort }}</span>
+          <span class="message">{{ entrypoint.message }}</span>
+          <span class="routes">
+            {{ entrypoint.routes.map((route) => `${route.path}=${route.capability}`).join(", ") }}
+          </span>
+        </li>
+      </ul>
+      <ul v-if="status.tunnels.length > 0" class="status-list tunnels">
+        <li v-for="tunnel in status.tunnels" :key="tunnel.id" class="status-row">
+          <strong>{{ tunnelName(tunnel.id) }}</strong>
+          <span class="id">{{ tunnel.id }}</span>
+          <span class="badge">{{ tunnelModeLabel(tunnel.mode) }}</span>
+          <span class="badge" :class="tunnel.state">{{ tunnelStateLabel(tunnel.state) }}</span>
+          <span class="badge">目标 {{ targetEntrypointName(tunnel.targetEntrypointId) }}</span>
+          <span class="message">{{ tunnel.publicUrl || tunnel.message }}</span>
+          <details v-if="tunnel.logs.length > 0">
+            <summary>日志</summary>
+            <pre>{{ tunnel.logs.join("\n") }}</pre>
+          </details>
+        </li>
+      </ul>
+    </template>
   </div>
 </template>
 
 <style scoped>
-.section-heading {
-  margin: 0 0 var(--space-3) 0;
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-  color: var(--color-text);
-}
 .runtime-status {
   width: 100%;
 }
-.muted {
-  margin: 0;
-  font-size: var(--font-size-sm);
-  color: var(--color-text-muted);
+h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
 }
-.error {
-  margin: 0;
-  font-size: var(--font-size-sm);
-  color: var(--color-danger);
+.muted,
+.empty,
+.message,
+.routes,
+.id {
+  color: #64748b;
+  font-size: 13px;
 }
-.empty {
-  font-size: var(--font-size-sm);
-  color: var(--color-text-muted);
+.fetch-error {
+  color: #b91c1c;
+  font-size: 13px;
 }
 .status-list {
   list-style: none;
-  margin: 0;
   padding: 0;
+  margin: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  gap: 8px;
+}
+.tunnels {
+  margin-top: 8px;
 }
 .status-row {
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-2) var(--space-3);
-  font-size: var(--font-size-sm);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  border: 1px solid #d8dee8;
+  border-radius: 8px;
+  background: #fff;
 }
-.row-name {
-  font-weight: 500;
-  color: var(--color-text);
-  min-width: 6rem;
+.badge {
+  border: 1px solid #dbe3ef;
+  border-radius: 999px;
+  padding: 2px 7px;
+  font-size: 12px;
+  background: #f8fafc;
 }
-.kind-badge {
-  padding: 0 var(--space-2);
-  font-size: var(--font-size-xs, 0.75rem);
-  color: var(--color-text-muted);
-  background: var(--color-surface-hover);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
+.bound,
+.running {
+  border-color: #bbf7d0;
+  color: #166534;
+  background: #f0fdf4;
 }
-.state-badge {
-  font-weight: 500;
+.bound-no-auth,
+.stopped {
+  border-color: #fde68a;
+  color: #92400e;
+  background: #fffbeb;
 }
-/* State-specific badge colouring. */
-.state-bound .state-badge {
-  color: var(--color-success);
+.error {
+  border-color: #fecaca;
+  color: #991b1b;
+  background: #fef2f2;
 }
-.state-error .state-badge {
-  color: var(--color-danger);
+details {
+  width: 100%;
 }
-.state-blocked-needs-1073 .state-badge,
-.state-unsupported .state-badge {
-  color: var(--color-warn);
-}
-.message {
-  margin-left: auto;
-  color: var(--color-text-muted);
-  font-size: var(--font-size-xs, 0.75rem);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  max-width: 18rem;
+pre {
+  max-height: 140px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding: 8px;
+  background: #0f172a;
+  color: #e2e8f0;
+  border-radius: 6px;
+  font-size: 12px;
 }
 </style>

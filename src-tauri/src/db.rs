@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -200,6 +200,9 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 10 {
         apply_v10(conn)?;
     }
+    if version < 11 {
+        apply_v11(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -301,6 +304,14 @@ fn apply_v9(conn: &Connection) -> AppResult<()> {
 /// non-optional at the DB layer.
 fn apply_v10(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(SCHEMA_V10).map_err(map_err)?;
+    Ok(())
+}
+
+/// v11 (#1553): remote-access gate denial audit. This records only request metadata needed to
+/// investigate blocked remote entrypoint attempts; it intentionally stores no request body, bearer
+/// token, or terminal input.
+fn apply_v11(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(SCHEMA_V11).map_err(map_err)?;
     Ok(())
 }
 
@@ -551,6 +562,24 @@ CREATE TABLE IF NOT EXISTS rule_match_action (
 );
 "#;
 
+const SCHEMA_V11: &str = r#"
+CREATE TABLE IF NOT EXISTS remote_access_audit (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ms         INTEGER NOT NULL,
+    entrypoint_id TEXT    NOT NULL,
+    route         TEXT    NOT NULL,
+    capability    TEXT    NOT NULL,
+    gate          TEXT    NOT NULL,
+    decision      TEXT    NOT NULL,
+    peer_ip       TEXT    NOT NULL,
+    effective_ip  TEXT    NOT NULL,
+    host          TEXT    NOT NULL,
+    origin        TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_remote_access_audit_entrypoint_ts
+    ON remote_access_audit(entrypoint_id, ts_ms);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +613,7 @@ mod tests {
                 "inbox_event",
                 "meta",
                 "outbox_review_claim",
+                "remote_access_audit",
                 "review_history_item",
                 "review_session",
                 "terminal_audit",
@@ -654,7 +684,7 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 10, "current schema is v10");
+            assert_eq!(SCHEMA_VERSION, 11, "current schema is v11");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"
@@ -714,6 +744,14 @@ mod tests {
             assert!(
                 table_has_fk(conn, "rule_match_action"),
                 "fresh v0 → v10 links rule_match_action to match/outbox rows"
+            );
+            assert!(
+                table_exists(conn, "remote_access_audit"),
+                "fresh v0 → v11 has the remote_access_audit table"
+            );
+            assert!(
+                index_exists(conn, "idx_remote_access_audit_entrypoint_ts"),
+                "fresh v0 → v11 has the remote_access_audit entrypoint/time index"
             );
             Ok(())
         })
@@ -1066,6 +1104,44 @@ mod tests {
         assert!(
             index_exists(&conn, "idx_action_outbox_dedupe"),
             "v9 added the pending outbox dedupe index"
+        );
+    }
+
+    #[test]
+    fn migrate_v10_to_v11_adds_remote_access_audit_table() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .expect("enable fk");
+        apply_v1(&conn).expect("seed v1");
+        apply_v2(&conn).expect("seed v2");
+        apply_v3(&conn).expect("seed v3");
+        apply_v4(&conn).expect("seed v4");
+        apply_v5(&conn).expect("seed v5");
+        apply_v6(&conn).expect("seed v6");
+        apply_v7(&conn).expect("seed v7");
+        apply_v8(&conn).expect("seed v8");
+        apply_v9(&conn).expect("seed v9");
+        apply_v10(&conn).expect("seed v10");
+        conn.pragma_update(None, "user_version", 10)
+            .expect("stamp v10");
+        assert!(
+            !table_exists(&conn, "remote_access_audit"),
+            "v10 must not already have remote_access_audit"
+        );
+
+        run_migrations(&conn).expect("v10 -> current migrates");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read version");
+        assert_eq!(version, SCHEMA_VERSION, "stamped to the current schema");
+        assert!(
+            table_exists(&conn, "remote_access_audit"),
+            "v11 added the remote_access_audit table"
+        );
+        assert!(
+            index_exists(&conn, "idx_remote_access_audit_entrypoint_ts"),
+            "v11 added the remote_access_audit entrypoint/time index"
         );
     }
 

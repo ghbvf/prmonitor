@@ -11,15 +11,19 @@ use ts_rs::{Config, TS};
 
 use crate::{
     config::model::{
-        AppConfig, Listener, ListenerAuthMode, ListenerKind, NotificationChannel,
-        NotificationSettings, OutboxConfig, Project, RuleActionKind, RuleConfig, Tunnel,
+        AppConfig, NotificationChannel, NotificationSettings, OutboxConfig, Project,
+        RemoteAccessConfig, RemoteCapability, RemoteEntrypoint, RemoteRoute, RemoteTunnel,
+        RemoteTunnelMode, RuleActionKind, RuleConfig, SourcePolicy, SourcePolicyMode,
     },
     model::{
         EngineKind, EventType, LabelSource, NotificationKind, NotificationLevel,
         SendNotificationRequest, SendNotificationResponse, SourceKind, UpdateMode,
         WebhookTunnelMode,
     },
-    remote::status::{ListenerRuntimeStatus, ListenerState},
+    remote::status::{
+        RemoteAccessRuntimeStatus, RemoteEntrypointRuntimeStatus, RemoteEntrypointState,
+        RemoteRouteRuntimeStatus, RemoteTunnelRuntimeStatus, RemoteTunnelState,
+    },
     rule::store::RuleMatchEntry,
 };
 
@@ -120,14 +124,22 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     config_types.push_str(&declaration::<WebhookTunnelMode>(&cfg));
     config_types.push_str(&option_array::<WebhookTunnelMode>("WEBHOOK_TUNNEL_MODES"));
     config_types.push('\n');
-    config_types.push_str(&declaration::<ListenerKind>(&cfg));
-    config_types.push_str(&option_array::<ListenerKind>("LISTENER_KINDS"));
+    config_types.push_str(&declaration::<RemoteCapability>(&cfg));
+    config_types.push_str(&option_array::<RemoteCapability>("REMOTE_CAPABILITIES"));
     config_types.push('\n');
-    config_types.push_str(&declaration::<ListenerState>(&cfg));
-    config_types.push_str(&option_array::<ListenerState>("LISTENER_STATES"));
+    config_types.push_str(&declaration::<SourcePolicyMode>(&cfg));
+    config_types.push_str(&option_array::<SourcePolicyMode>("SOURCE_POLICY_MODES"));
     config_types.push('\n');
-    config_types.push_str(&declaration::<ListenerAuthMode>(&cfg));
-    config_types.push_str(&option_array::<ListenerAuthMode>("LISTENER_AUTH_MODES"));
+    config_types.push_str(&declaration::<RemoteTunnelMode>(&cfg));
+    config_types.push_str(&option_array::<RemoteTunnelMode>("REMOTE_TUNNEL_MODES"));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<RemoteEntrypointState>(&cfg));
+    config_types.push_str(&option_array::<RemoteEntrypointState>(
+        "REMOTE_ENTRYPOINT_STATES",
+    ));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<RemoteTunnelState>(&cfg));
+    config_types.push_str(&option_array::<RemoteTunnelState>("REMOTE_TUNNEL_STATES"));
     config_types.push('\n');
     config_types.push_str(&declaration::<OutboxConfig>(&cfg));
     config_types.push('\n');
@@ -145,15 +157,27 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
         &NotificationSettings::default(),
     ));
     config_types.push('\n');
-    config_types.push_str(&declaration::<Listener>(&cfg));
+    config_types.push_str(&declaration::<SourcePolicy>(&cfg));
     config_types.push('\n');
-    config_types.push_str(&declaration::<Tunnel>(&cfg));
+    config_types.push_str(&declaration::<RemoteRoute>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<RemoteEntrypoint>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<RemoteTunnel>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<RemoteAccessConfig>(&cfg));
     config_types.push('\n');
     config_types.push_str(&declaration::<Project>(&cfg));
     config_types.push('\n');
     config_types.push_str(&declaration::<AppConfig>(&cfg));
     config_types.push('\n');
-    config_types.push_str(&declaration::<ListenerRuntimeStatus>(&cfg));
+    config_types.push_str(&declaration::<RemoteRouteRuntimeStatus>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<RemoteEntrypointRuntimeStatus>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<RemoteTunnelRuntimeStatus>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<RemoteAccessRuntimeStatus>(&cfg));
 
     vec![
         ("src/types.generated.ts", shared),

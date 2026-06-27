@@ -8,16 +8,7 @@
 // keys are `keyof Project`) and GLOBAL_GROUPS (the global webhook fields, keys are
 // `keyof AppConfig`). `FieldGroup`/`FieldDef` are generic over the key type so each
 // set is precisely typed and its coverage test can assert exactly that key set.
-import {
-  WEBHOOK_TUNNEL_MODES,
-  LISTENER_KINDS,
-  LISTENER_AUTH_MODES,
-  type AppConfig,
-  type Listener,
-  type ListenerKind,
-  type Project,
-  type Tunnel,
-} from "./types";
+import type { AppConfig, Project } from "./types";
 import {
   SOURCE_KINDS,
   ENGINE_KINDS,
@@ -31,16 +22,7 @@ import {
 // (the webhook group). Generic `FieldDef<K>` keeps each group set precisely typed.
 export type ProjectFieldKey = keyof Project;
 export type GlobalFieldKey = keyof AppConfig;
-// Remote-access resource field keys (AB#1064): a listener/tunnel field's key, so each
-// group set (LISTENER_GROUPS / TUNNEL_GROUPS) is precisely typed and its coverage test
-// can assert exactly that key set (mirrors ProjectFieldKey).
-export type ListenerFieldKey = keyof Listener;
-export type TunnelFieldKey = keyof Tunnel;
-export type FieldKey =
-  | ProjectFieldKey
-  | GlobalFieldKey
-  | ListenerFieldKey
-  | TunnelFieldKey;
+export type FieldKey = ProjectFieldKey | GlobalFieldKey;
 type FieldKind = "text" | "number" | "csv" | "select" | "checkbox";
 
 export interface FieldDef<K extends FieldKey = FieldKey> {
@@ -56,7 +38,8 @@ export interface FieldDef<K extends FieldKey = FieldKey> {
   optionLabels?: Record<string, string>;
   // Only meaningful for kind "number": the DOM `min` constraint. Defaults to 1 in the
   // renderer (`def.min ?? 1`) so ports/intervals stay ≥ 1. (AB#1043 codex F3: the old
-  // localApiPort used min: 0 for "0 = 关闭不监听"; port is now in listeners[], gone here.)
+  // localApiPort used min: 0 for "0 = 关闭不监听"; remote access ports now live in
+  // remoteAccess.entrypoints[], gone here.)
   min?: number;
   // Reserved single-option enums (#11) are shown but not editable.
   readonly?: boolean;
@@ -323,7 +306,7 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
         kind: "select",
         // Single-sourced from the union's backing array (#50 G9) — type & options
         // can't drift. command/listener also need 下方「公网 URL」(webhookPublicUrl).
-        options: WEBHOOK_TUNNEL_MODES,
+        options: ["quick", "command", "listener"],
         hint: "quick=零配置随机 URL（App 起 Cloudflare Quick Tunnel）；command=自定义隧道命令、固定 URL；listener=仅监听、隧道全外置。command/listener 需同时填写下方「公网 URL」",
       },
       {
@@ -341,8 +324,8 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
     ],
   },
   {
-    // AB#1043 / AB#1225 PR1: 本地 REST API（给本机 CLI/curl 触发 review 用）。与 webhook 严格分离、
-    // 永不走隧道。端口现在由 listeners[] 中 kind="local-api" 的条目持有（AB#1225 PR1 迁移）；
+    // AB#1043 / AB#1225 PR1: 本地 REST API（给本机 CLI/curl 触发 review 用）。
+    // 端口现在由 remoteAccess.entrypoints[].routes 中 capability="local-api" 的入口持有；
     // 此处只保留 token 字段供全局设置管理鉴权。
     id: "localApi",
     title: "本地 API (CLI)",
@@ -353,177 +336,6 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
         kind: "text",
         secret: true,
         hint: "Bearer 鉴权：请求头 Authorization: Bearer <此 token>。留空=关闭该接口（一切请求 401）；即时生效、无需重启",
-      },
-    ],
-  },
-];
-
-// Remote-access listener field groups (AB#1064): every NON-identity `Listener` key
-// appears exactly once across these groups (asserted in fields.test.ts), so adding a
-// listener field forces a home here. `id`/`name` are listener-identity fields managed by
-// the RemoteAccess list/card header (a per-row name input + add/delete), not these form
-// groups — mirrors how PROJECT_GROUPS omits the project-identity keys. The `kind`/`auth`
-// selects are single-sourced from the LISTENER_KINDS / LISTENER_AUTH_MODES `as const`
-// arrays (same #50 G9 pattern as the tunnel mode) so the options can't drift from the type.
-export const LISTENER_GROUPS: FieldGroup<ListenerFieldKey>[] = [
-  {
-    id: "listener",
-    title: "监听器",
-    fields: [
-      {
-        key: "kind",
-        label: "类型",
-        kind: "select",
-        // Single-sourced from LISTENER_KINDS — type & options can't drift.
-        options: LISTENER_KINDS,
-        optionLabels: {
-          "local-api": "本地 API (CLI)",
-          "remote-web": "远程面板",
-          "event-ingress": "事件入站",
-          terminal: "远程终端",
-        },
-        hint: "local-api=本机 CLI/curl 触发端点；remote-web=经隧道暴露的面板；event-ingress=入站事件/webhook 接收；terminal=远程 shell",
-      },
-      {
-        key: "bindHost",
-        label: "绑定地址",
-        kind: "text",
-        hint: "监听的本地地址，如 127.0.0.1（仅环回）或 0.0.0.0（所有网卡）",
-      },
-      {
-        key: "port",
-        label: "端口",
-        kind: "number",
-        // 0 = 未设置/不绑定 (mirrors the localApiPort field's `min: 0` so the documented
-        // "off" value isn't flagged invalid by the number input; the backend port-conflict
-        // check also skips a 0 port). Without min:0 the renderer's `def.min ?? 1` would mark
-        // a 0 port as a red invalid state.
-        min: 0,
-        hint: "监听端口（0 = 未设置/不绑定）",
-      },
-      {
-        key: "enabled",
-        label: "启用",
-        kind: "checkbox",
-        hint: "勾选=启动该监听器",
-      },
-      {
-        key: "auth",
-        label: "鉴权",
-        kind: "select",
-        // Single-sourced from LISTENER_AUTH_MODES — type & options can't drift.
-        options: LISTENER_AUTH_MODES,
-        // "无鉴权" (not "无（仅环回）"): a listener may bind 0.0.0.0, so "环回" is misleading.
-        optionLabels: { none: "无鉴权", bearer: "Bearer Token" },
-        hint: "none=无凭证；bearer=终端远程访问会校验监听器 token",
-      },
-      {
-        key: "authToken",
-        label: "Bearer Token",
-        kind: "text",
-        secret: true,
-        hint: "终端监听器的远程访问 token；不会放入 URL",
-      },
-      {
-        key: "terminalRead",
-        label: "终端读取",
-        kind: "checkbox",
-        hint: "允许列出/连接会话并接收屏幕事件",
-      },
-      {
-        key: "terminalWrite",
-        label: "终端输入",
-        kind: "checkbox",
-        hint: "允许发送输入和 resize",
-      },
-      {
-        key: "terminalCreate",
-        label: "终端新建",
-        kind: "checkbox",
-        hint: "允许创建新的 iTerm 会话",
-      },
-      {
-        key: "terminalAdmin",
-        label: "终端管理",
-        kind: "checkbox",
-        hint: "允许停止 terminal daemon 等高影响操作",
-      },
-      {
-        key: "allowedOrigins",
-        label: "允许来源",
-        kind: "csv",
-        hint: "逗号分隔的 CORS 允许来源；留空表示仅允许 loopback / publicUrl",
-      },
-      {
-        key: "publicUrl",
-        label: "公网 URL",
-        kind: "text",
-        hint: "经隧道暴露时面板/客户端使用的固定公网根 URL",
-      },
-    ],
-  },
-];
-
-export function listenerGroupsForKind(
-  kind: ListenerKind,
-  groups: FieldGroup<ListenerFieldKey>[] = LISTENER_GROUPS,
-): FieldGroup<ListenerFieldKey>[] {
-  return groups
-    .map((group) => ({
-      ...group,
-      fields: group.fields.filter(
-        (field) => !(kind === "remote-web" && field.key === "allowedOrigins"),
-      ),
-    }))
-    .filter((group) => group.fields.length > 0);
-}
-
-// Remote-access tunnel field groups (AB#1064): every NON-identity `Tunnel` key appears
-// exactly once (asserted in fields.test.ts). `id`/`name` are identity fields owned by the
-// RemoteAccess header (same convention as listeners/projects). `mode` REUSES the existing
-// WEBHOOK_TUNNEL_MODES `as const` array (quick/command/listener) so the tunnel mode select
-// stays single-sourced with the webhook tunnel mode and can't drift from the type.
-export const TUNNEL_GROUPS: FieldGroup<TunnelFieldKey>[] = [
-  {
-    id: "tunnel",
-    title: "隧道",
-    fields: [
-      {
-        key: "mode",
-        label: "模式",
-        kind: "select",
-        // Reuse WEBHOOK_TUNNEL_MODES — type & options can't drift from WebhookTunnelMode.
-        options: WEBHOOK_TUNNEL_MODES,
-        hint: "quick=零配置随机 URL（App 起 Cloudflare Quick Tunnel）；command=自定义隧道命令、固定 URL；listener=仅监听、隧道全外置",
-      },
-      {
-        key: "targetListenerId",
-        label: "目标监听器",
-        // Base kind is "text" (the wire shape is just a listener id string); TunnelCard
-        // overrides it to a "select" at render time, sourcing options from the live
-        // draft.listeners (id→name), so users pick a listener instead of typing its uuid
-        // (codex F4). The override is render-only — fields.ts stays static (no draft access
-        // here), keeping the TUNNEL_GROUPS coverage/kind test (fields.test.ts) intact.
-        kind: "text",
-        hint: "本隧道发布的目标监听器（从上方监听器列表中选择）",
-      },
-      {
-        key: "command",
-        label: "隧道命令",
-        kind: "text",
-        hint: "command 模式：直接执行的隧道命令，可用 {port} 占位",
-      },
-      {
-        key: "publicUrl",
-        label: "公网 URL",
-        kind: "text",
-        hint: "command/listener 模式：固定公网根 URL",
-      },
-      {
-        key: "enabled",
-        label: "启用",
-        kind: "checkbox",
-        hint: "勾选=启动该隧道",
       },
     ],
   },

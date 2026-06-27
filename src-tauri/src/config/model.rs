@@ -311,7 +311,7 @@ pub struct AppConfig {
     /// 非空则作为 `WebhookStatus.public_url`，UI 据此拼出 GitHub Payload URL；为空则 `None`。
     /// `quick` 模式忽略本字段（URL 从 cloudflared 日志抓取）。
     pub webhook_public_url: String,
-    /// 本地 REST API 的 Bearer token（AB#1043）。**空 = fail-closed 禁用**：listener 仍绑定，但
+    /// 本地 REST API 的 Bearer token（AB#1043）。**空 = fail-closed 禁用**：entrypoint 仍绑定，但
     /// handler 每个请求实时读取本字段做常量时间比较，空 token 一律 401。设 / 清即时生效、无需
     /// 重启。loopback-only 仍是触发端点（本机任意进程 + DNS rebinding 可达），故非空时按
     /// `LOCAL_API_TOKEN_MIN_LEN` 强制最小长度（与 `webhook_secret` 同理由）。
@@ -326,11 +326,16 @@ pub struct AppConfig {
     /// Outbound notification channels (AB#1459). Forward-compatible default seeds a local desktop
     /// channel; external channels are user-added/disabled until configured.
     pub notifications: NotificationSettings,
-    /// Declarative Remote Access listeners. The remote supervisor consumes bindable loopback
-    /// listeners at startup and after config saves.
+    /// Declarative Remote Access entrypoints and tunnels. This is the single runtime source:
+    /// each entrypoint owns one bound port and mounts one or more capability routes.
+    pub remote_access: RemoteAccessConfig,
+    /// Legacy pre-#1553 remote-access fields. Kept only so old tests / migration helpers can build;
+    /// they are never serialized, deserialized, generated to TS, or consumed by the runtime.
+    #[serde(skip)]
+    #[cfg_attr(test, ts(skip))]
     pub listeners: Vec<Listener>,
-    /// Declarative Remote Access tunnels. `mode` reuses WebhookTunnelMode and is reconciled
-    /// against currently bound target listeners.
+    #[serde(skip)]
+    #[cfg_attr(test, ts(skip))]
     pub tunnels: Vec<Tunnel>,
 }
 
@@ -350,13 +355,209 @@ impl Default for AppConfig {
             outbox: OutboxConfig::default(),
             rules: Vec::new(),
             notifications: NotificationSettings::default(),
-            // AB#1225: 全新安装默认开启本地触发 API（端口 8788 = webhook 默认 8787 + 1，避免
-            // 两端口同默认时冲突），现以 `listeners[]` 的 local-api 条目表达——supervisor 绑定的
-            // 单一真值源（取代旧的 `local_api_port` 字段）。
-            listeners: vec![default_local_api_listener()],
+            remote_access: RemoteAccessConfig::default(),
+            listeners: Vec::new(),
             tunnels: Vec::new(),
         }
     }
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RemoteAccessConfig {
+    pub entrypoints: Vec<RemoteEntrypoint>,
+    pub tunnels: Vec<RemoteTunnel>,
+}
+
+impl Default for RemoteAccessConfig {
+    fn default() -> Self {
+        Self {
+            entrypoints: vec![RemoteEntrypoint::default_local_api()],
+            tunnels: Vec::new(),
+        }
+    }
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RemoteEntrypoint {
+    pub id: String,
+    pub name: String,
+    pub bind_host: String,
+    pub port: u16,
+    pub enabled: bool,
+    pub source_policy: SourcePolicy,
+    pub allowed_origins: Vec<String>,
+    pub trusted_proxies: Vec<String>,
+    pub routes: Vec<RemoteRoute>,
+}
+
+impl RemoteEntrypoint {
+    pub fn default_local_api() -> Self {
+        Self {
+            id: "local-api".to_string(),
+            name: "Local API".to_string(),
+            bind_host: "127.0.0.1".to_string(),
+            port: 8788,
+            enabled: true,
+            source_policy: SourcePolicy::default(),
+            allowed_origins: Vec::new(),
+            trusted_proxies: Vec::new(),
+            routes: vec![RemoteRoute::local_api()],
+        }
+    }
+}
+
+impl Default for RemoteEntrypoint {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            bind_host: "127.0.0.1".to_string(),
+            port: 0,
+            enabled: false,
+            source_policy: SourcePolicy::default(),
+            allowed_origins: Vec::new(),
+            trusted_proxies: Vec::new(),
+            routes: Vec::new(),
+        }
+    }
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RemoteRoute {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub capability: RemoteCapability,
+    pub enabled: bool,
+    pub auth_token: String,
+    pub terminal_read: bool,
+    pub terminal_write: bool,
+    pub terminal_create: bool,
+    pub terminal_admin: bool,
+}
+
+impl RemoteRoute {
+    pub fn local_api() -> Self {
+        Self {
+            id: "local-api".to_string(),
+            name: "Local API".to_string(),
+            path: "/api".to_string(),
+            capability: RemoteCapability::LocalApi,
+            enabled: true,
+            auth_token: String::new(),
+            terminal_read: false,
+            terminal_write: false,
+            terminal_create: false,
+            terminal_admin: false,
+        }
+    }
+
+    pub fn terminal() -> Self {
+        Self {
+            id: "terminal".to_string(),
+            name: "Terminal".to_string(),
+            path: "/terminal".to_string(),
+            capability: RemoteCapability::Terminal,
+            enabled: true,
+            auth_token: String::new(),
+            terminal_read: true,
+            terminal_write: false,
+            terminal_create: false,
+            terminal_admin: false,
+        }
+    }
+}
+
+impl Default for RemoteRoute {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            path: "/terminal".to_string(),
+            capability: RemoteCapability::Terminal,
+            enabled: false,
+            auth_token: String::new(),
+            terminal_read: false,
+            terminal_write: false,
+            terminal_create: false,
+            terminal_admin: false,
+        }
+    }
+}
+
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteCapability {
+    #[default]
+    Terminal,
+    LocalApi,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SourcePolicy {
+    pub mode: SourcePolicyMode,
+    pub allow: Vec<String>,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SourcePolicyMode {
+    #[default]
+    Loopback,
+    Lan,
+    Custom,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RemoteTunnel {
+    pub id: String,
+    pub name: String,
+    pub mode: RemoteTunnelMode,
+    pub target_entrypoint_id: String,
+    pub bind_host: String,
+    pub port: u16,
+    pub command: String,
+    pub public_url: String,
+    pub enabled: bool,
+}
+
+impl Default for RemoteTunnel {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            mode: RemoteTunnelMode::Quick,
+            target_entrypoint_id: String::new(),
+            bind_host: "0.0.0.0".to_string(),
+            port: 0,
+            command: String::new(),
+            public_url: String::new(),
+            enabled: false,
+        }
+    }
+}
+
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RemoteTunnelMode {
+    #[default]
+    Quick,
+    Command,
+    Listener,
+    Lan,
 }
 
 /// Listener kind (AB#1064). kebab-case wire values mirror the work item's literal naming.
@@ -404,53 +605,7 @@ pub struct Listener {
     pub public_url: String,
 }
 
-/// Stable `id` of the seeded local-api listener (AB#1225). Single source for the literal so the
-/// model's [`default_local_api_listener`] and the service's `seed_local_api_listener` (detect-by-id
-/// / seeded `id`) and its seeded `kind` string agree. NOTE: this wire string equals
-/// [`ListenerKind::LocalApi`]'s serde value (`"local-api"`), golden-locked by
-/// `listener_kind_wire_values_are_kebab` — keep the two in sync if either changes.
-pub(crate) const LOCAL_API_LISTENER_ID: &str = "local-api";
-
-/// Loopback bindHost whitelist (AB#1225). Single source for both save-time validation here and
-/// the runtime supervisor's fail-closed gate. Whitelist, never blacklist.
-///
-/// Narrowed (F2) to ONLY the literal `127.0.0.1` the supervisor actually binds (`bind_std_with_retry`
-/// always binds `("127.0.0.1", port)` and the status text is fixed `127.0.0.1:{p}`): accepting
-/// `localhost` / `::1` / `[::1]` here would let a config value pass save-time validation while the
-/// runtime silently bound a DIFFERENT address than the one configured — a config/runtime mismatch.
-/// `localhost` / `::1` are simply NOT YET supported as a `bindHost` value (no compat shim — they were
-/// never wired to a distinct bind). NOTE: this is a SEPARATE concern from
-/// `review::local_api`'s `security::host_allowed`, which validates the incoming request `Host` HEADER
-/// (and correctly accepts `localhost` / `::1` for loopback clients) — do not conflate the two.
-pub(crate) fn is_loopback_host(host: &str) -> bool {
-    host.trim() == "127.0.0.1"
-}
-
-/// The default local-api listener (AB#1225). Fresh installs get the local trigger API ON at
-/// 8788 (was the old `local_api_port` default), now expressed as a `listeners[]` entry — the
-/// single source of truth the supervisor binds. `auth: Bearer` is descriptive; the token is the
-/// global `local_api_token`, read live by the handler (a per-listener token is an AB#1073 follow-up).
-pub(crate) fn default_local_api_listener() -> Listener {
-    Listener {
-        id: LOCAL_API_LISTENER_ID.to_string(),
-        name: "Local API".to_string(),
-        kind: ListenerKind::LocalApi,
-        bind_host: "127.0.0.1".to_string(),
-        port: 8788,
-        enabled: true,
-        auth: ListenerAuthMode::Bearer,
-        auth_token: String::new(),
-        terminal_read: false,
-        terminal_write: false,
-        terminal_create: false,
-        terminal_admin: false,
-        allowed_origins: Vec::new(),
-        public_url: String::new(),
-    }
-}
-
-/// A declarative tunnel descriptor. Reuses WebhookTunnelMode (quick/command/listener); enabled
-/// tunnels are reconciled against currently bound target listeners.
+/// Legacy pre-#1553 tunnel descriptor, kept as migration input only.
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -475,14 +630,9 @@ const WEBHOOK_SECRET_MIN_LEN: usize = 16;
 /// the Host gate), so a non-empty token must clear the same floor as `webhook_secret`. An
 /// EMPTY token is the "disabled" sentinel (fail-closed 401), so it is exempt from this check.
 const LOCAL_API_TOKEN_MIN_LEN: usize = 16;
-const REMOTE_WEB_TOKEN_MIN_LEN: usize = 32;
 
 pub(crate) fn terminal_auth_token_is_strong(token: &str) -> bool {
     token.trim().chars().count() >= LOCAL_API_TOKEN_MIN_LEN
-}
-
-pub(crate) fn remote_web_auth_token_is_strong(token: &str) -> bool {
-    token.trim().chars().count() >= REMOTE_WEB_TOKEN_MIN_LEN
 }
 
 fn is_https_url_without_userinfo(value: &str) -> bool {
@@ -867,6 +1017,254 @@ fn validate_rule(rule: &RuleConfig) -> AppResult<()> {
     Ok(())
 }
 
+pub(crate) fn normalize_route_path(path: &str) -> AppResult<String> {
+    let trimmed = path.trim().trim_end_matches('/');
+    if trimmed.is_empty() || !trimmed.starts_with('/') {
+        return Err(AppError::new(format!(
+            "routePath 必须以 / 开头且不能为空: {:?}",
+            path
+        )));
+    }
+    if trimmed == "/" || trimmed.split('/').skip(1).any(|seg| seg.is_empty()) {
+        return Err(AppError::new(format!(
+            "routePath 不能为根路径且不能包含空路径段: {trimmed}"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+pub(crate) fn route_paths_conflict(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn parse_ip_or_cidr(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let Some((ip, prefix)) = trimmed.split_once('/') else {
+        return false;
+    };
+    let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    match addr {
+        std::net::IpAddr::V4(_) => prefix <= 32,
+        std::net::IpAddr::V6(_) => prefix <= 128,
+    }
+}
+
+fn validate_source_policy(policy: &SourcePolicy, label: &str) -> AppResult<()> {
+    match policy.mode {
+        SourcePolicyMode::Loopback | SourcePolicyMode::Lan => {
+            if !policy.allow.is_empty() {
+                return Err(AppError::new(format!(
+                    "sourcePolicy allow 仅 custom 模式可填写（{label}）"
+                )));
+            }
+        }
+        SourcePolicyMode::Custom => {
+            if policy.allow.is_empty() {
+                return Err(AppError::new(format!(
+                    "sourcePolicy custom 模式必须填写至少一个 IP/CIDR（{label}）"
+                )));
+            }
+            for item in &policy.allow {
+                if !parse_ip_or_cidr(item) {
+                    return Err(AppError::new(format!(
+                        "sourcePolicy 包含非法 IP/CIDR（{label}）: {item}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_remote_access(config: &AppConfig) -> AppResult<()> {
+    let remote_access = &config.remote_access;
+
+    let mut ports: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
+    let mut claim = |port: u16, label: String| -> AppResult<()> {
+        if let Some(existing) = ports.insert(port, label.clone()) {
+            return Err(AppError::new(format!(
+                "port 冲突：端口 {port} 被 {existing} 与 {label} 同时占用（启用的监听端口必须互不相同）"
+            )));
+        }
+        Ok(())
+    };
+    if config.webhook_enabled {
+        claim(config.webhook_port, "webhookPort".to_string())?;
+    }
+
+    let mut enabled_entrypoints: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut entrypoint_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for entrypoint in &remote_access.entrypoints {
+        let id = entrypoint.id.trim();
+        if id.is_empty() {
+            return Err(AppError::new(format!(
+                "entrypointId 不能为空（入口「{}」需要一个唯一 id）",
+                entrypoint.name
+            )));
+        }
+        if !entrypoint_ids.insert(id) {
+            return Err(AppError::new(format!(
+                "entrypointId 重复: {id}（每个远程入口的 id 必须唯一）"
+            )));
+        }
+        if !entrypoint.enabled {
+            continue;
+        }
+        enabled_entrypoints.insert(id);
+        if entrypoint.port == 0 {
+            return Err(AppError::new(format!(
+                "port 必须大于 0（入口「{}」已启用但端口为 0/未设置）",
+                entrypoint.name
+            )));
+        }
+        if entrypoint.bind_host.trim().is_empty() {
+            return Err(AppError::new(format!(
+                "bindHost 不能为空（入口「{}」已启用）",
+                entrypoint.name
+            )));
+        }
+        validate_source_policy(&entrypoint.source_policy, &entrypoint.name)?;
+        for proxy in &entrypoint.trusted_proxies {
+            if !parse_ip_or_cidr(proxy) {
+                return Err(AppError::new(format!(
+                    "trustedProxies 包含非法 IP/CIDR（入口「{}」）: {proxy}",
+                    entrypoint.name
+                )));
+            }
+        }
+        claim(
+            entrypoint.port,
+            format!("远程入口「{}」", entrypoint.name.trim()),
+        )?;
+
+        let mut route_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut paths: Vec<String> = Vec::new();
+        for route in &entrypoint.routes {
+            let route_id = route.id.trim();
+            if route_id.is_empty() {
+                return Err(AppError::new(format!(
+                    "routeId 不能为空（入口「{}」中的路由需要一个唯一 id）",
+                    entrypoint.name
+                )));
+            }
+            if !route_ids.insert(route_id) {
+                return Err(AppError::new(format!(
+                    "routeId 重复: {route_id}（入口「{}」内路由 id 必须唯一）",
+                    entrypoint.name
+                )));
+            }
+            if !route.enabled {
+                continue;
+            }
+            let path = normalize_route_path(&route.path)?;
+            if paths
+                .iter()
+                .any(|existing| route_paths_conflict(existing, &path))
+            {
+                return Err(AppError::new(format!(
+                    "routePath 冲突（入口「{}」中存在重复或前缀重叠）: {path}",
+                    entrypoint.name
+                )));
+            }
+            paths.push(path);
+            match route.capability {
+                RemoteCapability::Terminal => {
+                    if !terminal_auth_token_is_strong(&route.auth_token) {
+                        return Err(AppError::new(format!(
+                            "authToken 终端路由「{}」必须配置至少 {LOCAL_API_TOKEN_MIN_LEN} 个字符的 Bearer token",
+                            route.name
+                        )));
+                    }
+                    if !route.terminal_read {
+                        return Err(AppError::new(format!(
+                            "terminalRead 终端路由「{}」必须至少开启读取权限",
+                            route.name
+                        )));
+                    }
+                }
+                RemoteCapability::LocalApi => {}
+            }
+        }
+    }
+
+    let mut tunnel_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for tunnel in &remote_access.tunnels {
+        let id = tunnel.id.trim();
+        if id.is_empty() {
+            return Err(AppError::new(format!(
+                "tunnelId 不能为空（隧道「{}」需要一个唯一 id）",
+                tunnel.name
+            )));
+        }
+        if !tunnel_ids.insert(id) {
+            return Err(AppError::new(format!(
+                "tunnelId 重复: {id}（每个隧道的 id 必须唯一）"
+            )));
+        }
+        let public_url = tunnel.public_url.trim();
+        if !public_url.is_empty() && !is_https_url_without_userinfo(public_url) {
+            return Err(AppError::new(format!(
+                "publicUrl 必须是 https:// 开头的 URL（隧道「{}」，不能走明文 HTTP/不能内嵌凭据）: {public_url}",
+                tunnel.name
+            )));
+        }
+        if !tunnel.enabled {
+            continue;
+        }
+        let target = tunnel.target_entrypoint_id.trim();
+        if target.is_empty() {
+            return Err(AppError::new(format!(
+                "targetEntrypointId 不能为空（隧道「{}」已启用，需指定目标入口）",
+                tunnel.name
+            )));
+        }
+        if !enabled_entrypoints.contains(target) {
+            return Err(AppError::new(format!(
+                "targetEntrypointId 不指向已启用入口（隧道「{}」: {target}）",
+                tunnel.name
+            )));
+        }
+        match tunnel.mode {
+            RemoteTunnelMode::Command => {
+                if tunnel.command.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "command 不能为空（隧道「{}」为 command 模式时需填写隧道命令，可用 {{port}} 占位）",
+                        tunnel.name
+                    )));
+                }
+            }
+            RemoteTunnelMode::Listener => {}
+            RemoteTunnelMode::Quick => {}
+            RemoteTunnelMode::Lan => {
+                if tunnel.port == 0 {
+                    return Err(AppError::new(format!(
+                        "port 必须大于 0（LAN 隧道「{}」已启用但端口为 0/未设置）",
+                        tunnel.name
+                    )));
+                }
+                if tunnel.bind_host.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "bindHost 不能为空（LAN 隧道「{}」已启用）",
+                        tunnel.name
+                    )));
+                }
+                claim(tunnel.port, format!("LAN 隧道「{}」", tunnel.name.trim()))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validates the whole [`AppConfig`] before persisting (hard-reject on failure).
 ///
 /// Validates the GLOBAL webhook fields (only when the receiver is enabled), then
@@ -1013,252 +1411,7 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
         )));
     }
 
-    // Remote Access (AB#1073) — config-save fail-fast runtime guard (Medium carrier). Scope is
-    // intentionally the two SIMPLEST checks only (HTTPS-only public URLs + no enabled-port
-    // collisions); per-listener auth/origin semantics are deferred with the runtime (AB#1064).
-    //
-    // 1. HTTPS-only publicUrl: every listener/tunnel `public_url`, when set, must be an
-    //    `https://` URL with NO embedded credentials — a remote ingress over plaintext HTTP
-    //    would expose tokens/traffic, and a `https://user:pass@host` URL would stash a
-    //    plaintext credential in the config (same precedent as the `bitbucketHost` `@`-rejection
-    //    above; and thin-orchestrator: the app must never hold credentials — see
-    //    `[[app-thin-orchestrator-decouple]]`). An empty value is "unset" → skipped (mirrors
-    //    webhook fields being unconstrained when unset). The label names the offending resource
-    //    (监听器/隧道 + name) so the message points at WHICH entry failed; the message still
-    //    starts with the `publicUrl` field-token prefix (golden/routing contract).
-    for (src, url) in config
-        .listeners
-        .iter()
-        .map(|l| (format!("监听器「{}」", l.name), &l.public_url))
-        .chain(
-            config
-                .tunnels
-                .iter()
-                .map(|t| (format!("隧道「{}」", t.name), &t.public_url)),
-        )
-    {
-        let url = url.trim();
-        if url.is_empty() {
-            continue;
-        }
-        // Reject non-https schemes AND embedded credentials. `url` crate v2: `.username()`
-        // returns `&str` (empty when absent), `.password()` returns `Option<&str>`.
-        let is_https_no_creds = Url::parse(url)
-            .map(|u| u.scheme() == "https" && u.username().is_empty() && u.password().is_none())
-            .unwrap_or(false);
-        if !is_https_no_creds {
-            return Err(AppError::new(format!(
-                "publicUrl 必须是 https:// 开头的 URL（{src}，远程入口不能走明文 HTTP/不能内嵌凭据）: {url}"
-            )));
-        }
-    }
-
-    // 1b. Listener / tunnel `id` uniqueness (AB#1225 F3): every listener `id` and every tunnel `id`
-    //     must be non-empty and unique. These ids are HashMap-by-id lookup keys — the supervisor's
-    //     `desired_ports` / runtime map and `listener_enabled_by_id`, plus tunnel `target_listener_id`
-    //     resolution — so a duplicate id would silently fold two entries into one (last writer wins),
-    //     and an empty id can't be addressed by a tunnel target. Checked for EVERY listener/tunnel
-    //     (enabled or not): a disabled entry's id still occupies the id space the moment it is enabled,
-    //     and a tunnel may target a (currently) disabled listener by id. Messages keep the
-    //     `listenerId` / `tunnelId` field-token prefix (cross-end routing contract). The Hard path
-    //     (future) is a typed-id newtype whose constructor rejects empties at the type level.
-    let mut seen_listener_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for listener in &config.listeners {
-        let id = listener.id.trim();
-        if id.is_empty() {
-            return Err(AppError::new(format!(
-                "listenerId 不能为空（监听器「{}」需要一个唯一 id）",
-                listener.name
-            )));
-        }
-        if !seen_listener_ids.insert(id) {
-            return Err(AppError::new(format!(
-                "listenerId 重复: {id}（每个监听器的 id 必须唯一）"
-            )));
-        }
-    }
-    let mut seen_tunnel_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for tunnel in &config.tunnels {
-        let id = tunnel.id.trim();
-        if id.is_empty() {
-            return Err(AppError::new(format!(
-                "tunnelId 不能为空（隧道「{}」需要一个唯一 id）",
-                tunnel.name
-            )));
-        }
-        if !seen_tunnel_ids.insert(id) {
-            return Err(AppError::new(format!(
-                "tunnelId 重复: {id}（每个隧道的 id 必须唯一）"
-            )));
-        }
-    }
-
-    let remote_web_has_public_entry = |listener_id: &str| -> bool {
-        config
-            .listeners
-            .iter()
-            .any(|l| l.id == listener_id && !l.public_url.trim().is_empty())
-            || config.tunnels.iter().any(|t| {
-                t.enabled
-                    && t.target_listener_id.trim() == listener_id
-                    && (t.mode == WebhookTunnelMode::Quick || !t.public_url.trim().is_empty())
-            })
-    };
-
-    // 2. Port conflict: every ENABLED listening port must be unique. Sources are the webhook
-    //    receiver (when enabled) and each enabled listener with a non-zero port (the local REST
-    //    API is now one such listener — kind `local-api` — not a standalone field, AB#1225). The
-    //    label (port → human name) makes the first collision's message name both occupants.
-    // Claim order is fixed (webhook → listeners in declared order), so the first collision — and
-    // thus the conflict error message — is deterministic despite HashMap being an unordered
-    // container (we only ever read `insert`'s returned prior value, never iterate).
-    let mut ports: std::collections::HashMap<u16, String> = std::collections::HashMap::new();
-    let mut claim = |port: u16, label: String| -> AppResult<()> {
-        if let Some(existing) = ports.insert(port, label.clone()) {
-            return Err(AppError::new(format!(
-                "port 冲突：端口 {port} 被 {existing} 与 {label} 同时占用（启用的监听端口必须互不相同）"
-            )));
-        }
-        Ok(())
-    };
-    if config.webhook_enabled {
-        claim(config.webhook_port, "webhookPort".to_string())?;
-    }
-    for listener in &config.listeners {
-        if !listener.enabled {
-            continue;
-        }
-        // An enabled listener with `port == 0` is unbindable (`0` = unset/won't-bind
-        // sentinel), so reject it before the conflict claim (which intentionally skips
-        // `port == 0`). The message keeps the `port` field-token prefix.
-        if listener.port == 0 {
-            return Err(AppError::new(format!(
-                "port 必须大于 0（监听器「{}」已启用但端口为 0/未设置）",
-                listener.name
-            )));
-        }
-        // AB#1225 security gate: an ENABLED listener MUST bind a loopback host. Remote exposure
-        // (`0.0.0.0` / LAN IP / hostname) is deferred to AB#1073 (per-listener auth/origin), so a
-        // non-loopback enabled listener is rejected here — fail-closed, and via the SAME whitelist
-        // ([`is_loopback_host`]) the runtime supervisor enforces at bind time, so save-time and
-        // bind-time agree. Ordered AFTER the port-0 reject (a 0-port listener is unbindable
-        // regardless of host, so that diagnostic wins) and BEFORE the conflict claim (a
-        // remote-exposed listener never reaches port-arbitration). Disabled listeners are exempt
-        // (they never bind), mirroring the disabled port-0 / port-conflict exemptions. The message
-        // keeps the `bindHost` field-token prefix so SettingsView's `errorToStep` routes it to the
-        // listener's bindHost field.
-        if !is_loopback_host(&listener.bind_host) {
-            return Err(AppError::new(format!(
-                "bindHost 仅支持 127.0.0.1（监听器「{}」远程暴露需 AB#1073；localhost/::1 暂不支持）: {}",
-                listener.name, listener.bind_host
-            )));
-        }
-        if listener.kind == ListenerKind::Terminal {
-            if listener.auth != ListenerAuthMode::Bearer {
-                return Err(AppError::new(format!(
-                    "auth 终端监听器「{}」必须使用 bearer 鉴权",
-                    listener.name
-                )));
-            }
-            if !terminal_auth_token_is_strong(&listener.auth_token) {
-                return Err(AppError::new(format!(
-                    "authToken 终端监听器「{}」必须配置至少 {LOCAL_API_TOKEN_MIN_LEN} 个字符的 Bearer token",
-                    listener.name
-                )));
-            }
-            if !listener.terminal_read {
-                return Err(AppError::new(format!(
-                    "terminalRead 终端监听器「{}」必须至少开启读取权限",
-                    listener.name
-                )));
-            }
-        }
-        if listener.kind == ListenerKind::RemoteWeb {
-            if listener.auth != ListenerAuthMode::Bearer {
-                return Err(AppError::new(format!(
-                    "auth 远程面板监听器「{}」必须使用 bearer 鉴权",
-                    listener.name
-                )));
-            }
-            if !remote_web_auth_token_is_strong(&listener.auth_token) {
-                return Err(AppError::new(format!(
-                    "authToken 远程面板监听器「{}」必须配置至少 {REMOTE_WEB_TOKEN_MIN_LEN} 个字符的 Bearer token",
-                    listener.name
-                )));
-            }
-            if !listener.allowed_origins.is_empty() {
-                return Err(AppError::new(format!(
-                    "allowedOrigins 远程面板监听器「{}」不支持手填 Origin；Host/Origin 仅从 publicUrl 或目标隧道派生",
-                    listener.name
-                )));
-            }
-            if !remote_web_has_public_entry(&listener.id) {
-                return Err(AppError::new(format!(
-                    "publicUrl 远程面板监听器「{}」必须配置 HTTPS publicUrl，或启用指向它的 HTTPS/Quick 隧道",
-                    listener.name
-                )));
-            }
-        }
-        // Label the occupant by its user-facing name, falling back to a short id when the
-        // name is empty (so the conflict message points at WHICH listener a human recognizes,
-        // not the internal id). webhook/localApi labels stay as their field tokens above.
-        let label = if listener.name.trim().is_empty() {
-            format!("监听器 {}", listener.id.chars().take(8).collect::<String>())
-        } else {
-            format!("监听器「{}」", listener.name.trim())
-        };
-        claim(listener.port, label)?;
-    }
-
-    // 3. Reference integrity for ENABLED tunnels (AB#1064 declarative wiring): an enabled
-    //    tunnel's `target_listener_id` must (a) be non-empty, (b) match some listener's `id`,
-    //    and (c) point at an ENABLED listener — a tunnel that exposes a missing/disabled
-    //    listener can never carry traffic, so the config is incoherent. Disabled tunnels are
-    //    unconstrained (skipped). The message keeps the `targetListenerId` field-token prefix.
-    let listener_enabled_by_id: std::collections::HashMap<&str, (bool, ListenerKind)> = config
-        .listeners
-        .iter()
-        .map(|l| (l.id.as_str(), (l.enabled, l.kind)))
-        .collect();
-    for tunnel in &config.tunnels {
-        if !tunnel.enabled {
-            continue;
-        }
-        if tunnel.mode == WebhookTunnelMode::Command && tunnel.command.trim().is_empty() {
-            return Err(AppError::new(format!(
-                "command 不能为空（隧道「{}」为 command 模式时需填写隧道命令，可用 {{port}} 占位）",
-                tunnel.name
-            )));
-        }
-        let target = tunnel.target_listener_id.trim();
-        if target.is_empty() {
-            return Err(AppError::new(format!(
-                "targetListenerId 不能为空（隧道「{}」已启用，需指定目标监听器）",
-                tunnel.name
-            )));
-        }
-        match listener_enabled_by_id.get(target) {
-            None => {
-                return Err(AppError::new(format!(
-                    "targetListenerId 不指向任何监听器（隧道「{}」: {target}）",
-                    tunnel.name
-                )));
-            }
-            Some((false, _)) => {
-                return Err(AppError::new(format!(
-                    "targetListenerId 指向未启用的监听器（隧道「{}」→ 目标未启用）",
-                    tunnel.name
-                )));
-            }
-            Some((true, ListenerKind::LocalApi)) => {
-                return Err(AppError::new(format!(
-                    "targetListenerId 不能指向 local-api（隧道「{}」会暴露本机 CLI API）",
-                    tunnel.name
-                )));
-            }
-            Some((true, _)) => {}
-        }
-    }
+    validate_remote_access(config)?;
 
     Ok(())
 }
@@ -1310,6 +1463,28 @@ mod tests {
         }
     }
 
+    fn remote_entrypoint(id: &str, port: u16) -> RemoteEntrypoint {
+        RemoteEntrypoint {
+            id: id.to_string(),
+            name: id.to_string(),
+            bind_host: "127.0.0.1".to_string(),
+            port,
+            enabled: true,
+            routes: vec![RemoteRoute::local_api()],
+            ..RemoteEntrypoint::default()
+        }
+    }
+
+    fn remote_tunnel(id: &str, target_entrypoint_id: &str) -> RemoteTunnel {
+        RemoteTunnel {
+            id: id.to_string(),
+            name: id.to_string(),
+            enabled: true,
+            target_entrypoint_id: target_entrypoint_id.to_string(),
+            ..RemoteTunnel::default()
+        }
+    }
+
     #[test]
     fn app_config_wire_shape_is_camel_case() {
         let config = AppConfig {
@@ -1325,6 +1500,7 @@ mod tests {
             local_api_token: "local-api-token-0123456789".to_string(),
             outbox: OutboxConfig::default(),
             notifications: NotificationSettings::default(),
+            remote_access: RemoteAccessConfig::default(),
             listeners: Vec::new(),
             tunnels: Vec::new(),
             rules: Vec::new(),
@@ -1362,12 +1538,15 @@ mod tests {
         assert_eq!(v["webhookTunnelMode"], "quick");
         assert!(v.get("webhookTunnelCommand").is_some());
         assert!(v.get("webhookPublicUrl").is_some());
-        // AB#1043: local REST API token present (camelCase) at the top level. (The port is no
-        // longer a top-level field — AB#1225 moved it into a `listeners[]` local-api entry.)
+        // AB#1043: local REST API token present (camelCase) at the top level. The port now lives
+        // in `remoteAccess.entrypoints[]`.
         assert!(v.get("localApiToken").is_some());
-        // AB#1064: Remote Access collections present at the top level.
-        assert!(v.get("listeners").is_some());
-        assert!(v.get("tunnels").is_some());
+        // #1553: Remote Access is a nested entrypoints/routes/tunnels model.
+        assert!(v.get("remoteAccess").is_some());
+        assert!(v["remoteAccess"].get("entrypoints").is_some());
+        assert!(v["remoteAccess"].get("tunnels").is_some());
+        assert!(v.get("listeners").is_none());
+        assert!(v.get("tunnels").is_none());
         assert!(v.get("rules").is_some());
 
         // snake_case forms absent — a rename would surface here.
@@ -1380,6 +1559,7 @@ mod tests {
         assert!(v.get("webhook_tunnel_command").is_none());
         assert!(v.get("webhook_public_url").is_none());
         assert!(v.get("local_api_token").is_none());
+        assert!(v.get("remote_access").is_none());
 
         // The per-project fields must NOT have leaked back to the top level (they
         // moved into `Project` — a regression that re-flattened them surfaces here).
@@ -1738,51 +1918,35 @@ mod tests {
         );
     }
 
-    /// Default local-api listener lock (AB#1225, Medium): a fresh install ships exactly ONE
-    /// listener — the local trigger API, enabled at `127.0.0.1:8788` — which is the single source
-    /// of truth the supervisor binds (replacing the old `local_api_port` field). A silent change
-    /// to the seeded default (off / different port / wrong kind) would break "local API on by
-    /// default" for new installs, so it is machine-checked here. No tunnels are seeded — nothing
-    /// public is exposed until the user adds one.
+    /// Default local-api entrypoint lock (#1553, Medium): a fresh install ships exactly ONE
+    /// entrypoint — the local trigger API, enabled at `127.0.0.1:8788` with `/api` route.
+    /// No tunnels are seeded, so nothing public is exposed until the user adds one.
     #[test]
-    fn default_seeds_local_api_listener() {
-        let listeners = AppConfig::default().listeners;
-        assert_eq!(listeners.len(), 1);
-        let l = &listeners[0];
-        assert_eq!(l.kind, ListenerKind::LocalApi);
-        assert!(l.enabled);
-        assert_eq!(l.port, 8788);
-        assert_eq!(l.bind_host, "127.0.0.1");
-        assert!(AppConfig::default().tunnels.is_empty());
+    fn default_seeds_local_api_entrypoint() {
+        let remote = AppConfig::default().remote_access;
+        assert_eq!(remote.entrypoints.len(), 1);
+        let entrypoint = &remote.entrypoints[0];
+        assert_eq!(entrypoint.id, "local-api");
+        assert!(entrypoint.enabled);
+        assert_eq!(entrypoint.port, 8788);
+        assert_eq!(entrypoint.bind_host, "127.0.0.1");
+        assert_eq!(entrypoint.routes.len(), 1);
+        assert_eq!(entrypoint.routes[0].capability, RemoteCapability::LocalApi);
+        assert_eq!(entrypoint.routes[0].path, "/api");
+        assert!(remote.tunnels.is_empty());
     }
 
-    /// AB#1073 HTTPS-only publicUrl (Medium runtime guard): a plaintext `http://` public URL
-    /// is rejected; the message keeps the `publicUrl` field-token prefix.
+    /// #1553: entrypoint allowedOrigins are origins, not public URLs; HTTPS origins validate.
     #[test]
-    fn validate_rejects_http_public_url() {
+    fn validate_accepts_entrypoint_https_allowed_origin() {
         let config = AppConfig {
-            listeners: vec![Listener {
-                public_url: "http://example.com".to_string(),
-                ..sample_listener()
-            }],
-            ..AppConfig::default()
-        };
-        let err = validate(&config).unwrap_err().message;
-        assert!(err.starts_with("publicUrl"), "{err}");
-    }
-
-    /// AB#1073 HTTPS-only publicUrl (Medium runtime guard): an `https://` public URL with
-    /// distinct ports validates.
-    #[test]
-    fn validate_accepts_https_public_url() {
-        let config = AppConfig {
-            // Override `listeners` so only this one listener exists (no seeded default local-api
-            // listener) — only the HTTPS path is exercised here.
-            listeners: vec![Listener {
-                port: 9100,
-                public_url: "https://example.com".to_string(),
-                ..sample_listener()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![RemoteEntrypoint {
+                    allowed_origins: vec!["https://example.com".to_string()],
+                    ..remote_entrypoint("entry", 9100)
+                }],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         };
         assert!(validate(&config).is_ok());
@@ -1793,25 +1957,10 @@ mod tests {
     #[test]
     fn validate_rejects_port_conflict() {
         let config = AppConfig {
-            // Override `listeners` so ONLY these two compete (no seeded default local-api listener).
-            // Both bind loopback so the AB#1225 bindHost gate passes and the PORT conflict is what
-            // surfaces.
-            listeners: vec![
-                Listener {
-                    id: "a".to_string(),
-                    port: 9000,
-                    enabled: true,
-                    bind_host: "127.0.0.1".to_string(),
-                    ..Listener::default()
-                },
-                Listener {
-                    id: "b".to_string(),
-                    port: 9000,
-                    enabled: true,
-                    bind_host: "127.0.0.1".to_string(),
-                    ..Listener::default()
-                },
-            ],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![remote_entrypoint("a", 9000), remote_entrypoint("b", 9000)],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
@@ -2649,19 +2798,19 @@ mod tests {
         );
     }
 
-    /// AB#1073 HTTPS-only publicUrl (Medium runtime guard): a plaintext `http://` public URL on
-    /// a TUNNEL is rejected too (the guard chains listeners AND tunnels); the message keeps the
+    /// #1553 HTTPS-only publicUrl (Medium runtime guard): a plaintext `http://` public URL on
+    /// a TUNNEL is rejected; the message keeps the
     /// `publicUrl` field-token prefix.
     #[test]
     fn validate_rejects_tunnel_http_public_url() {
         let config = AppConfig {
-            // No listeners (drop the seeded default) so ONLY the tunnel HTTPS path can fire.
-            listeners: Vec::new(),
-            tunnels: vec![Tunnel {
-                id: "t1".to_string(),
-                public_url: "http://example.com".to_string(),
-                ..Tunnel::default()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![remote_entrypoint("entry", 9100)],
+                tunnels: vec![RemoteTunnel {
+                    public_url: "http://example.com".to_string(),
+                    ..remote_tunnel("t1", "entry")
+                }],
+            },
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
@@ -2675,275 +2824,192 @@ mod tests {
     #[test]
     fn validate_rejects_userinfo_in_public_url() {
         let config = AppConfig {
-            // Override `listeners` so ONLY this one (with the userinfo URL) is checked.
-            listeners: vec![Listener {
-                port: 9100,
-                public_url: "https://user:pass@example.com".to_string(),
-                ..sample_listener()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![remote_entrypoint("entry", 9100)],
+                tunnels: vec![RemoteTunnel {
+                    public_url: "https://user:pass@example.com".to_string(),
+                    ..remote_tunnel("t1", "entry")
+                }],
+            },
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
         assert!(err.starts_with("publicUrl"), "{err}");
     }
 
-    /// AB#1073 port-conflict (Medium runtime guard): an enabled listener colliding with the
+    /// #1553 port-conflict (Medium runtime guard): an enabled entrypoint colliding with the
     /// (enabled) webhook receiver port is rejected; the message keeps the `port` prefix. The
     /// webhook block must pass first, so the secret is long enough and the mode is the default
     /// `quick` (no tunnel command required) to reach the port-conflict check.
     #[test]
-    fn validate_rejects_webhook_listener_port_conflict() {
+    fn validate_rejects_webhook_entrypoint_port_conflict() {
         let config = AppConfig {
             webhook_enabled: true,
             webhook_port: 9000,
             webhook_secret: "webhook-secret-0123456789".to_string(),
-            // Override `listeners` so the only collision is webhook ↔ this listener (no seeded
-            // default). Loopback bind_host so the AB#1225 bindHost gate passes and the webhook↔
-            // listener PORT conflict is what surfaces.
-            listeners: vec![Listener {
-                id: "l1".to_string(),
-                port: 9000,
-                enabled: true,
-                bind_host: "127.0.0.1".to_string(),
-                ..Listener::default()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![remote_entrypoint("entry", 9000)],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
         assert!(err.starts_with("port"), "{err}");
     }
 
-    /// AB#1225 port-conflict (Medium runtime guard): the local REST API is now itself a
-    /// `kind = local-api` listener (not a standalone field), so an enabled local-api listener
-    /// colliding with another enabled listener on the same port is rejected through the SAME
-    /// enabled-listeners loop; the message keeps the `port` prefix.
+    /// #1553 port-conflict (Medium runtime guard): local-api is an enabled route on an entrypoint,
+    /// so two enabled entrypoints on the same port are rejected through the same port claim.
     #[test]
-    fn validate_rejects_local_api_listener_port_conflict() {
+    fn validate_rejects_local_api_entrypoint_port_conflict() {
         let config = AppConfig {
-            listeners: vec![
-                Listener {
-                    port: 9000,
-                    enabled: true,
-                    ..default_local_api_listener()
-                },
-                Listener {
-                    id: "other".to_string(),
-                    port: 9000,
-                    enabled: true,
-                    // Loopback bind_host so the AB#1225 bindHost gate passes and the PORT conflict
-                    // with the local-api listener is what surfaces.
-                    bind_host: "127.0.0.1".to_string(),
-                    ..Listener::default()
-                },
-            ],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![
+                    remote_entrypoint("local-api", 9000),
+                    remote_entrypoint("other", 9000),
+                ],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
         assert!(err.starts_with("port"), "{err}");
     }
 
-    /// AB#1073 port-conflict (Medium runtime guard): a DISABLED listener is excluded from the
-    /// port-conflict check — only enabled listeners claim a port, so a disabled one sharing the
-    /// enabled local-api listener's port is fine.
+    /// #1553 port-conflict (Medium runtime guard): a disabled entrypoint is excluded from the
+    /// port-conflict check because only enabled entrypoints claim a port.
     #[test]
-    fn validate_disabled_listener_excluded_from_port_conflict() {
+    fn validate_disabled_entrypoint_excluded_from_port_conflict() {
         let config = AppConfig {
-            listeners: vec![
-                Listener {
-                    port: 9000,
-                    enabled: true,
-                    ..default_local_api_listener()
-                },
-                Listener {
-                    id: "l1".to_string(),
-                    port: 9000,
-                    enabled: false,
-                    ..Listener::default()
-                },
-            ],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![
+                    remote_entrypoint("enabled", 9000),
+                    RemoteEntrypoint {
+                        id: "disabled".to_string(),
+                        name: "disabled".to_string(),
+                        port: 9000,
+                        enabled: false,
+                        ..RemoteEntrypoint::default()
+                    },
+                ],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         };
         assert!(validate(&config).is_ok());
     }
 
-    /// AB#1064 port-0 reject (Medium runtime guard): an ENABLED listener with `port == 0`
+    /// #1553 port-0 reject (Medium runtime guard): an enabled entrypoint with `port == 0`
     /// (the unset/won't-bind sentinel) is unbindable, so it is rejected; the message keeps the
     /// `port` prefix.
     #[test]
-    fn validate_rejects_enabled_listener_zero_port() {
+    fn validate_rejects_enabled_entrypoint_zero_port() {
         let config = AppConfig {
-            // Override `listeners` (drop the seeded default) so ONLY the port-0 check can fire.
-            listeners: vec![Listener {
-                id: "l1".to_string(),
-                port: 0,
-                enabled: true,
-                ..Listener::default()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![remote_entrypoint("entry", 0)],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
         assert!(err.starts_with("port"), "{err}");
     }
 
-    /// `is_loopback_host` whitelist (AB#1225, narrowed F2). The save-time bindHost gate and the
-    /// runtime supervisor's fail-closed bind gate share THIS predicate, so its behavior is the
-    /// contract: accept ONLY the literal `127.0.0.1` the supervisor actually binds (incl. surrounding
-    /// whitespace, which is trimmed). `localhost` / `::1` / `[::1]` are REJECTED — the runtime always
-    /// binds `127.0.0.1`, so accepting them would let a config value pass while the runtime bound a
-    /// different address (config/runtime mismatch); they are not yet a supported bindHost value. Also
-    /// reject `0.0.0.0` / a LAN IP / a hostname / empty / a look-alike (`127.0.0.1.evil.com`).
+    /// #1553: an enabled entrypoint may bind a non-loopback host. Remote exposure is controlled by
+    /// sourcePolicy and route/capability gates rather than by a legacy save-time loopback-only rule.
     #[test]
-    fn is_loopback_host_whitelists_only_loopback() {
-        for ok in ["127.0.0.1", "  127.0.0.1  ", "\t127.0.0.1\n"] {
-            assert!(is_loopback_host(ok), "expected {ok:?} to be loopback");
-        }
-        for bad in [
-            // F2: localhost / ::1 / [::1] are no longer accepted — the runtime binds 127.0.0.1 only.
-            "localhost",
-            "::1",
-            "[::1]",
-            "0.0.0.0",
-            "192.168.1.10",
-            "10.0.0.1",
-            "example.com",
-            "",
-            "   ",
-            "127.0.0.1.evil.com",
-            "::",
-        ] {
-            assert!(!is_loopback_host(bad), "expected {bad:?} to be rejected");
-        }
-    }
-
-    /// AB#1225 bindHost gate (Medium/P2 security): an ENABLED listener that binds a non-loopback
-    /// host is rejected at save time — remote exposure is deferred to AB#1073 — with the message
-    /// starting at the `bindHost` field token so SettingsView's `errorToStep` routes it. A DISABLED
-    /// non-loopback listener is exempt (it never binds), and an enabled loopback listener validates.
-    #[test]
-    fn validate_rejects_enabled_non_loopback_bind_host() {
-        // (a) Enabled listener bound to 0.0.0.0 → rejected, message starts with `bindHost`.
+    fn validate_accepts_enabled_non_loopback_bind_host() {
         let config = AppConfig {
-            // Drop the seeded default local-api listener so ONLY this one is checked.
-            listeners: vec![Listener {
-                id: "l1".to_string(),
-                port: 9000,
-                enabled: true,
-                bind_host: "0.0.0.0".to_string(),
-                ..Listener::default()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![RemoteEntrypoint {
+                    bind_host: "0.0.0.0".to_string(),
+                    source_policy: SourcePolicy {
+                        mode: SourcePolicyMode::Lan,
+                        allow: Vec::new(),
+                    },
+                    ..remote_entrypoint("entry", 9000)
+                }],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         };
-        let err = validate(&config).unwrap_err().message;
-        assert!(err.starts_with("bindHost"), "{err}");
+        assert!(validate(&config).is_ok());
     }
 
-    /// AB#1225 bindHost gate — the accept case: an enabled listener bound to loopback validates.
+    /// #1553 bindHost gate — the accept case: an enabled entrypoint bound to loopback validates.
     #[test]
     fn validate_accepts_enabled_loopback_bind_host() {
         let config = AppConfig {
-            listeners: vec![Listener {
-                id: "l1".to_string(),
-                port: 9000,
-                enabled: true,
-                bind_host: "127.0.0.1".to_string(),
-                ..Listener::default()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![remote_entrypoint("entry", 9000)],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         };
         assert!(validate(&config).is_ok());
     }
 
-    /// AB#1225 bindHost gate — the exemption: a DISABLED listener with a non-loopback bind_host is
-    /// NOT rejected (it never binds), mirroring the disabled port-0 / port-conflict exemptions.
+    /// #1553 bindHost gate — the exemption: a disabled entrypoint with a blank bindHost is
+    /// NOT rejected because it never binds.
     #[test]
     fn validate_exempts_disabled_non_loopback_bind_host() {
         let config = AppConfig {
-            listeners: vec![Listener {
-                id: "l1".to_string(),
-                port: 9000,
-                enabled: false,
-                bind_host: "0.0.0.0".to_string(),
-                ..Listener::default()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![RemoteEntrypoint {
+                    id: "disabled".to_string(),
+                    name: "disabled".to_string(),
+                    bind_host: String::new(),
+                    enabled: false,
+                    ..RemoteEntrypoint::default()
+                }],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         };
         assert!(validate(&config).is_ok());
     }
 
-    /// AB#1225 F3 — duplicate listener id is rejected (the id is a HashMap-by-id lookup key the
-    /// supervisor/tunnel resolution fold by, so a duplicate would silently collapse two entries).
-    /// Two distinct loopback ports so the PORT check passes and the id-uniqueness reject is what
-    /// surfaces; the message keeps the `listenerId` prefix.
+    /// #1553 — duplicate entrypoint id is rejected because the supervisor/tunnel resolution folds
+    /// entrypoints by id.
     #[test]
-    fn validate_rejects_duplicate_listener_id() {
+    fn validate_rejects_duplicate_entrypoint_id() {
         let config = AppConfig {
-            listeners: vec![
-                Listener {
-                    id: "dup".to_string(),
-                    port: 9000,
-                    enabled: true,
-                    bind_host: "127.0.0.1".to_string(),
-                    ..Listener::default()
-                },
-                Listener {
-                    id: "dup".to_string(),
-                    port: 9001,
-                    enabled: true,
-                    bind_host: "127.0.0.1".to_string(),
-                    ..Listener::default()
-                },
-            ],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![
+                    remote_entrypoint("dup", 9000),
+                    remote_entrypoint("dup", 9001),
+                ],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
-        assert!(err.starts_with("listenerId"), "{err}");
+        assert!(err.starts_with("entrypointId"), "{err}");
     }
 
-    /// AB#1225 F3 — an empty listener id is rejected (it can't be addressed by a tunnel target, and
-    /// the seeded local-api id is non-empty). The message keeps the `listenerId` prefix.
+    /// #1553 — an empty entrypoint id is rejected because enabled tunnels target entrypoints by id.
     #[test]
-    fn validate_rejects_empty_listener_id() {
+    fn validate_rejects_empty_entrypoint_id() {
         let config = AppConfig {
-            listeners: vec![Listener {
-                id: String::new(),
-                port: 9000,
-                enabled: true,
-                bind_host: "127.0.0.1".to_string(),
-                ..Listener::default()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![remote_entrypoint("", 9000)],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
-        assert!(err.starts_with("listenerId"), "{err}");
+        assert!(err.starts_with("entrypointId"), "{err}");
     }
 
     /// AB#1225 F3 — duplicate tunnel id is rejected (tunnel ids are also a lookup key space). One
-    /// enabled listener target so the tunnels are otherwise coherent and the id-uniqueness reject is
+    /// enabled entrypoint target so the tunnels are otherwise coherent and the id-uniqueness reject is
     /// what surfaces; the message keeps the `tunnelId` prefix.
     #[test]
     fn validate_rejects_duplicate_tunnel_id() {
         let config = AppConfig {
-            listeners: vec![Listener {
-                id: "l1".to_string(),
-                port: 9000,
-                enabled: true,
-                bind_host: "127.0.0.1".to_string(),
-                ..Listener::default()
-            }],
-            tunnels: vec![
-                Tunnel {
-                    id: "dup".to_string(),
-                    enabled: true,
-                    target_listener_id: "l1".to_string(),
-                    ..Tunnel::default()
-                },
-                Tunnel {
-                    id: "dup".to_string(),
-                    enabled: true,
-                    target_listener_id: "l1".to_string(),
-                    ..Tunnel::default()
-                },
-            ],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![remote_entrypoint("entry", 9000)],
+                tunnels: vec![remote_tunnel("dup", "entry"), remote_tunnel("dup", "entry")],
+            },
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
@@ -2954,13 +3020,14 @@ mod tests {
     #[test]
     fn validate_rejects_empty_tunnel_id() {
         let config = AppConfig {
-            // No listeners (drop the seeded default) so the empty-tunnel-id check is what fires.
-            listeners: Vec::new(),
-            tunnels: vec![Tunnel {
-                id: String::new(),
-                enabled: false,
-                ..Tunnel::default()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: Vec::new(),
+                tunnels: vec![RemoteTunnel {
+                    id: String::new(),
+                    enabled: false,
+                    ..RemoteTunnel::default()
+                }],
+            },
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
@@ -2968,150 +3035,99 @@ mod tests {
     }
 
     /// AB#1064 reference integrity (Medium runtime guard): an ENABLED tunnel with an empty
-    /// `target_listener_id` is rejected (an enabled tunnel must name its target); the message
-    /// keeps the `targetListenerId` prefix.
+    /// `targetEntrypointId` is rejected (an enabled tunnel must name its target).
     #[test]
     fn validate_rejects_enabled_tunnel_empty_target() {
         let config = AppConfig {
-            // No listeners (drop the seeded default) so ONLY the tunnel reference check fires.
-            listeners: Vec::new(),
-            tunnels: vec![Tunnel {
-                id: "t1".to_string(),
-                enabled: true,
-                target_listener_id: String::new(),
-                ..Tunnel::default()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: Vec::new(),
+                tunnels: vec![remote_tunnel("t1", "")],
+            },
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
-        assert!(err.starts_with("targetListenerId"), "{err}");
+        assert!(err.starts_with("targetEntrypointId"), "{err}");
     }
 
     /// AB#1064 reference integrity (Medium runtime guard): an ENABLED tunnel pointing at a
-    /// `target_listener_id` that matches no listener is rejected; the message keeps the
-    /// `targetListenerId` prefix.
+    /// `targetEntrypointId` that matches no entrypoint is rejected.
     #[test]
     fn validate_rejects_enabled_tunnel_dangling_target() {
         let config = AppConfig {
-            // No listeners (drop the seeded default) so the target "nope" matches nothing.
-            listeners: Vec::new(),
-            tunnels: vec![Tunnel {
-                id: "t1".to_string(),
-                enabled: true,
-                target_listener_id: "nope".to_string(),
-                ..Tunnel::default()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: Vec::new(),
+                tunnels: vec![remote_tunnel("t1", "nope")],
+            },
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
-        assert!(err.starts_with("targetListenerId"), "{err}");
+        assert!(err.starts_with("targetEntrypointId"), "{err}");
     }
 
     /// AB#1064 reference integrity (Medium runtime guard): an ENABLED tunnel pointing at a
-    /// DISABLED listener is rejected (the tunnel could never carry traffic); the message keeps
-    /// the `targetListenerId` prefix.
+    /// disabled entrypoint is rejected because the tunnel could never carry traffic.
     #[test]
     fn validate_rejects_enabled_tunnel_disabled_target() {
         let config = AppConfig {
-            listeners: vec![Listener {
-                id: "l1".to_string(),
-                port: 9000,
-                enabled: false,
-                ..Listener::default()
-            }],
-            tunnels: vec![Tunnel {
-                id: "t1".to_string(),
-                enabled: true,
-                target_listener_id: "l1".to_string(),
-                ..Tunnel::default()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![RemoteEntrypoint {
+                    id: "entry".to_string(),
+                    name: "entry".to_string(),
+                    enabled: false,
+                    ..RemoteEntrypoint::default()
+                }],
+                tunnels: vec![remote_tunnel("t1", "entry")],
+            },
             ..AppConfig::default()
         };
         let err = validate(&config).unwrap_err().message;
-        assert!(err.starts_with("targetListenerId"), "{err}");
+        assert!(err.starts_with("targetEntrypointId"), "{err}");
     }
 
     /// AB#1064 reference integrity (Medium runtime guard): an ENABLED tunnel pointing at an
-    /// existing ENABLED listener validates. The listener gets a non-zero port (so the port-0
-    /// reject does not fire) distinct from any other claim; overriding `listeners` drops the
-    /// seeded default so this lone listener is the only claim.
+    /// existing enabled entrypoint validates.
     #[test]
     fn validate_accepts_enabled_tunnel_valid_target() {
         let config = AppConfig {
-            // Loopback bind_host so the AB#1225 bindHost gate passes (an enabled listener must bind
-            // loopback) and the whole config validates.
-            listeners: vec![Listener {
-                id: "l1".to_string(),
-                kind: ListenerKind::Terminal,
-                port: 9000,
-                enabled: true,
-                bind_host: "127.0.0.1".to_string(),
-                auth: ListenerAuthMode::Bearer,
-                auth_token: "terminal-token-0123456789".to_string(),
-                terminal_read: true,
-                ..Listener::default()
-            }],
-            tunnels: vec![Tunnel {
-                id: "t1".to_string(),
-                enabled: true,
-                target_listener_id: "l1".to_string(),
-                ..Tunnel::default()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![remote_entrypoint("entry", 9000)],
+                tunnels: vec![remote_tunnel("t1", "entry")],
+            },
             ..AppConfig::default()
         };
         assert!(validate(&config).is_ok());
     }
 
     #[test]
-    fn validate_rejects_enabled_tunnel_targeting_local_api() {
-        let config = AppConfig {
-            listeners: vec![Listener {
-                id: "local-api".to_string(),
-                kind: ListenerKind::LocalApi,
-                port: 8788,
-                enabled: true,
-                bind_host: "127.0.0.1".to_string(),
-                ..Listener::default()
-            }],
-            tunnels: vec![Tunnel {
-                id: "t1".to_string(),
-                enabled: true,
-                target_listener_id: "local-api".to_string(),
-                ..Tunnel::default()
-            }],
-            ..AppConfig::default()
-        };
-        let err = validate(&config).unwrap_err().message;
-        assert!(err.starts_with("targetListenerId"), "{err}");
-    }
-
-    #[test]
-    fn validate_terminal_listener_requires_bearer_token_and_read_permission() {
-        let terminal = Listener {
+    fn validate_terminal_route_requires_bearer_token_and_read_permission() {
+        let terminal_route = RemoteRoute::terminal();
+        let terminal_entrypoint = |route: RemoteRoute| RemoteEntrypoint {
             id: "term".to_string(),
             name: "Terminal".to_string(),
-            kind: ListenerKind::Terminal,
-            bind_host: "127.0.0.1".to_string(),
             port: 9100,
-            enabled: true,
-            auth: ListenerAuthMode::None,
-            ..Listener::default()
+            routes: vec![route],
+            ..remote_entrypoint("term", 9100)
         };
 
         let auth_err = validate(&AppConfig {
-            listeners: vec![terminal.clone()],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![terminal_entrypoint(terminal_route.clone())],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         })
         .unwrap_err()
         .message;
-        assert!(auth_err.starts_with("auth "), "{auth_err}");
+        assert!(auth_err.starts_with("authToken"), "{auth_err}");
 
         let token_err = validate(&AppConfig {
-            listeners: vec![Listener {
-                auth: ListenerAuthMode::Bearer,
-                auth_token: "short".to_string(),
-                ..terminal.clone()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![terminal_entrypoint(RemoteRoute {
+                    auth_token: "short".to_string(),
+                    ..terminal_route.clone()
+                })],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         })
         .unwrap_err()
@@ -3119,12 +3135,14 @@ mod tests {
         assert!(token_err.starts_with("authToken"), "{token_err}");
 
         let read_err = validate(&AppConfig {
-            listeners: vec![Listener {
-                auth: ListenerAuthMode::Bearer,
-                auth_token: "terminal-token-0123456789".to_string(),
-                terminal_read: false,
-                ..terminal.clone()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![terminal_entrypoint(RemoteRoute {
+                    auth_token: "terminal-token-0123456789".to_string(),
+                    terminal_read: false,
+                    ..terminal_route.clone()
+                })],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         })
         .unwrap_err()
@@ -3132,111 +3150,14 @@ mod tests {
         assert!(read_err.starts_with("terminalRead"), "{read_err}");
 
         assert!(validate(&AppConfig {
-            listeners: vec![Listener {
-                auth: ListenerAuthMode::Bearer,
-                auth_token: "terminal-token-0123456789".to_string(),
-                terminal_read: true,
-                ..terminal
-            }],
-            ..AppConfig::default()
-        })
-        .is_ok());
-    }
-
-    #[test]
-    fn validate_remote_web_listener_requires_bearer_token_and_public_entry() {
-        let web = Listener {
-            id: "web".to_string(),
-            name: "Remote Web".to_string(),
-            kind: ListenerKind::RemoteWeb,
-            bind_host: "127.0.0.1".to_string(),
-            port: 9200,
-            enabled: true,
-            auth: ListenerAuthMode::None,
-            public_url: "https://console.example.com".to_string(),
-            ..Listener::default()
-        };
-
-        let auth_err = validate(&AppConfig {
-            listeners: vec![web.clone()],
-            ..AppConfig::default()
-        })
-        .unwrap_err()
-        .message;
-        assert!(auth_err.starts_with("auth "), "{auth_err}");
-
-        let token_err = validate(&AppConfig {
-            listeners: vec![Listener {
-                auth: ListenerAuthMode::Bearer,
-                auth_token: "short".to_string(),
-                ..web.clone()
-            }],
-            ..AppConfig::default()
-        })
-        .unwrap_err()
-        .message;
-        assert!(token_err.starts_with("authToken"), "{token_err}");
-
-        let public_err = validate(&AppConfig {
-            listeners: vec![Listener {
-                auth: ListenerAuthMode::Bearer,
-                auth_token: "remote-web-token-0123456789abcdef".to_string(),
-                public_url: String::new(),
-                ..web.clone()
-            }],
-            ..AppConfig::default()
-        })
-        .unwrap_err()
-        .message;
-        assert!(public_err.starts_with("publicUrl"), "{public_err}");
-
-        let origins_err = validate(&AppConfig {
-            listeners: vec![Listener {
-                auth: ListenerAuthMode::Bearer,
-                auth_token: "remote-web-token-0123456789abcdef".to_string(),
-                allowed_origins: vec!["https://evil.example.com".to_string()],
-                ..web.clone()
-            }],
-            ..AppConfig::default()
-        })
-        .unwrap_err()
-        .message;
-        assert!(origins_err.starts_with("allowedOrigins"), "{origins_err}");
-
-        assert!(validate(&AppConfig {
-            listeners: vec![Listener {
-                auth: ListenerAuthMode::Bearer,
-                auth_token: "remote-web-token-0123456789abcdef".to_string(),
-                ..web
-            }],
-            ..AppConfig::default()
-        })
-        .is_ok());
-    }
-
-    #[test]
-    fn validate_remote_web_listener_accepts_quick_tunnel_public_entry() {
-        let web = Listener {
-            id: "web".to_string(),
-            name: "Remote Web".to_string(),
-            kind: ListenerKind::RemoteWeb,
-            bind_host: "127.0.0.1".to_string(),
-            port: 9200,
-            enabled: true,
-            auth: ListenerAuthMode::Bearer,
-            auth_token: "remote-web-token-0123456789abcdef".to_string(),
-            public_url: String::new(),
-            ..Listener::default()
-        };
-        assert!(validate(&AppConfig {
-            listeners: vec![web],
-            tunnels: vec![Tunnel {
-                id: "web-tunnel".to_string(),
-                enabled: true,
-                mode: WebhookTunnelMode::Quick,
-                target_listener_id: "web".to_string(),
-                ..Tunnel::default()
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![terminal_entrypoint(RemoteRoute {
+                    auth_token: "terminal-token-0123456789".to_string(),
+                    terminal_read: true,
+                    ..terminal_route
+                })],
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         })
         .is_ok());
@@ -3244,30 +3165,21 @@ mod tests {
 
     #[test]
     fn validate_enabled_command_tunnel_requires_per_tunnel_command() {
-        let listener = Listener {
-            id: "term".to_string(),
-            kind: ListenerKind::Terminal,
-            bind_host: "127.0.0.1".to_string(),
-            port: 9100,
-            enabled: true,
-            auth: ListenerAuthMode::Bearer,
-            auth_token: "terminal-token-0123456789".to_string(),
-            terminal_read: true,
-            ..Listener::default()
-        };
-        let tunnel = Tunnel {
+        let tunnel = RemoteTunnel {
             id: "tun".to_string(),
             name: "Terminal Tunnel".to_string(),
             enabled: true,
-            mode: WebhookTunnelMode::Command,
-            target_listener_id: "term".to_string(),
+            mode: RemoteTunnelMode::Command,
+            target_entrypoint_id: "term".to_string(),
             command: String::new(),
-            ..Tunnel::default()
+            ..RemoteTunnel::default()
         };
 
         let err = validate(&AppConfig {
-            listeners: vec![listener.clone()],
-            tunnels: vec![tunnel.clone()],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![remote_entrypoint("term", 9100)],
+                tunnels: vec![tunnel.clone()],
+            },
             ..AppConfig::default()
         })
         .unwrap_err()
@@ -3275,11 +3187,13 @@ mod tests {
         assert!(err.starts_with("command"), "{err}");
 
         assert!(validate(&AppConfig {
-            listeners: vec![listener],
-            tunnels: vec![Tunnel {
-                command: "cloudflared tunnel --url http://127.0.0.1:{port}".to_string(),
-                ..tunnel
-            }],
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![remote_entrypoint("term", 9100)],
+                tunnels: vec![RemoteTunnel {
+                    command: "cloudflared tunnel --url http://127.0.0.1:{port}".to_string(),
+                    ..tunnel
+                }],
+            },
             ..AppConfig::default()
         })
         .is_ok());

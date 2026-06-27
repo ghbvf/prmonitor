@@ -180,16 +180,19 @@ function composeConfig(): AppConfig {
       ...DEFAULT_NOTIFICATION_SETTINGS,
       channels: DEFAULT_NOTIFICATION_SETTINGS.channels.map((c) => ({ ...c })),
     },
-    // Remote-access resources (AB#1064 / F10): source listeners from the LOADED backend
-    // config so the backend `default_local_api_listener()` in config/model.rs is the single
-    // source of truth — no TS-side literal mirror. On first launch `AppConfig::default()`
-    // always seeds a local-api listener, so `store.config.listeners` is guaranteed non-empty
-    // when `finish()` runs (load() completes on mount before the user can reach the done step).
-    // Guard: if config is null (load failed) or listeners is empty (backend bug), spread an
-    // empty array — the backend will re-apply its own defaults on next read (F4 not regressed
-    // because a backend load-failure is already surfaced as store.error before finish() runs).
-    listeners: store.config?.listeners ? [...store.config.listeners] : [],
-    tunnels: [],
+    remoteAccess: {
+      entrypoints: (store.config?.remoteAccess.entrypoints ?? []).map((entrypoint) => ({
+        ...entrypoint,
+        allowedOrigins: [...entrypoint.allowedOrigins],
+        trustedProxies: [...entrypoint.trustedProxies],
+        sourcePolicy: {
+          ...entrypoint.sourcePolicy,
+          allow: [...entrypoint.sourcePolicy.allow],
+        },
+        routes: entrypoint.routes.map((route) => ({ ...route })),
+      })),
+      tunnels: (store.config?.remoteAccess.tunnels ?? []).map((tunnel) => ({ ...tunnel })),
+    },
   };
 }
 

@@ -64,8 +64,7 @@ const draft = reactive<AppConfig>({
   // round-trip (hydrate overwrites it) so saving settings never wipes a configured TTL.
   outbox: { ...DEFAULT_OUTBOX_CONFIG },
   notifications: { channels: DEFAULT_NOTIFICATION_SETTINGS.channels.map((c) => ({ ...c })) },
-  listeners: [],
-  tunnels: [],
+  remoteAccess: { entrypoints: [], tunnels: [] },
   rules: [],
 });
 
@@ -98,14 +97,19 @@ function hydrate(cfg: AppConfig) {
       ...c,
     })),
   };
-  // Deep-copy the remote-access resources (AB#1064) so card edits never mutate the store's
-  // config object before a save — same reason as the projects deep-copy above. A listener's
-  // allowedOrigins is a string[], so clone it too (mirrors the authors clone).
-  draft.listeners = cfg.listeners.map((l) => ({
-    ...l,
-    allowedOrigins: [...l.allowedOrigins],
-  }));
-  draft.tunnels = cfg.tunnels.map((t) => ({ ...t }));
+  draft.remoteAccess = {
+    entrypoints: (cfg.remoteAccess?.entrypoints ?? []).map((entrypoint) => ({
+      ...entrypoint,
+      allowedOrigins: [...entrypoint.allowedOrigins],
+      trustedProxies: [...entrypoint.trustedProxies],
+      sourcePolicy: {
+        ...entrypoint.sourcePolicy,
+        allow: [...entrypoint.sourcePolicy.allow],
+      },
+      routes: entrypoint.routes.map((route) => ({ ...route })),
+    })),
+    tunnels: (cfg.remoteAccess?.tunnels ?? []).map((tunnel) => ({ ...tunnel })),
+  };
 }
 
 // Populate the draft once the async config lands (and on any later replacement).
@@ -158,11 +162,19 @@ async function onSave() {
       ...draft.notifications,
       channels: draft.notifications.channels.map((c) => ({ ...c })),
     },
-    listeners: draft.listeners.map((l) => ({
-      ...l,
-      allowedOrigins: [...l.allowedOrigins],
-    })),
-    tunnels: draft.tunnels.map((t) => ({ ...t })),
+    remoteAccess: {
+      entrypoints: draft.remoteAccess.entrypoints.map((entrypoint) => ({
+        ...entrypoint,
+        allowedOrigins: [...entrypoint.allowedOrigins],
+        trustedProxies: [...entrypoint.trustedProxies],
+        sourcePolicy: {
+          ...entrypoint.sourcePolicy,
+          allow: [...entrypoint.sourcePolicy.allow],
+        },
+        routes: entrypoint.routes.map((route) => ({ ...route })),
+      })),
+      tunnels: draft.remoteAccess.tunnels.map((tunnel) => ({ ...tunnel })),
+    },
     rules: draft.rules.map((r) => ({
       ...r,
       labelsAny: [...r.labelsAny],
@@ -195,7 +207,13 @@ async function onSave() {
       store.error.startsWith("publicUrl") ||
       store.error.startsWith("port") ||
       store.error.startsWith("bindHost") ||
-      store.error.startsWith("targetListenerId") ||
+      store.error.startsWith("entrypointId") ||
+      store.error.startsWith("routeId") ||
+      store.error.startsWith("routePath") ||
+      store.error.startsWith("sourcePolicy") ||
+      store.error.startsWith("trustedProxies") ||
+      store.error.startsWith("targetEntrypointId") ||
+      store.error.startsWith("tunnelId") ||
       store.error.startsWith("auth ") ||
       store.error.startsWith("authToken") ||
       store.error.startsWith("terminalRead") ||

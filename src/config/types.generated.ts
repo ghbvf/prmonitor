@@ -5,14 +5,20 @@ import type { EngineKind, EventType, LabelSource, NotificationKind, SourceKind, 
 export type WebhookTunnelMode = "quick" | "command" | "listener";
 export const WEBHOOK_TUNNEL_MODES = ["quick","command","listener"] as const;
 
-export type ListenerKind = "local-api" | "remote-web" | "event-ingress" | "terminal";
-export const LISTENER_KINDS = ["local-api","remote-web","event-ingress","terminal"] as const;
+export type RemoteCapability = "terminal" | "local-api";
+export const REMOTE_CAPABILITIES = ["terminal","local-api"] as const;
 
-export type ListenerState = "bound" | "bound-no-auth" | "blocked-needs-1073" | "unsupported" | "error";
-export const LISTENER_STATES = ["bound","bound-no-auth","blocked-needs-1073","unsupported","error"] as const;
+export type SourcePolicyMode = "loopback" | "lan" | "custom";
+export const SOURCE_POLICY_MODES = ["loopback","lan","custom"] as const;
 
-export type ListenerAuthMode = "none" | "bearer";
-export const LISTENER_AUTH_MODES = ["none","bearer"] as const;
+export type RemoteTunnelMode = "quick" | "command" | "listener" | "lan";
+export const REMOTE_TUNNEL_MODES = ["quick","command","listener","lan"] as const;
+
+export type RemoteEntrypointState = "bound" | "bound-no-auth" | "error";
+export const REMOTE_ENTRYPOINT_STATES = ["bound","bound-no-auth","error"] as const;
+
+export type RemoteTunnelState = "running" | "stopped" | "error";
+export const REMOTE_TUNNEL_STATES = ["running","stopped","error"] as const;
 
 export type OutboxConfig = {
 /**
@@ -34,9 +40,15 @@ export type NotificationChannel = { id: string, name: string, kind: Notification
 export type NotificationSettings = { channels: Array<NotificationChannel>, };
 export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {"channels":[{"id":"desktop","name":"Desktop","kind":"desktop","enabled":true,"webhookUrl":"","webhookSecret":"","telegramBotToken":"","telegramChatId":"","smtpHost":"","smtpPort":587,"smtpUsername":"","smtpPassword":"","smtpFrom":"","smtpTo":"","timeoutSecs":15}]};
 
-export type Listener = { id: string, name: string, kind: ListenerKind, bindHost: string, port: number, enabled: boolean, auth: ListenerAuthMode, authToken: string, terminalRead: boolean, terminalWrite: boolean, terminalCreate: boolean, terminalAdmin: boolean, allowedOrigins: Array<string>, publicUrl: string, };
+export type SourcePolicy = { mode: SourcePolicyMode, allow: Array<string>, };
 
-export type Tunnel = { id: string, name: string, mode: WebhookTunnelMode, targetListenerId: string, command: string, publicUrl: string, enabled: boolean, };
+export type RemoteRoute = { id: string, name: string, path: string, capability: RemoteCapability, enabled: boolean, authToken: string, terminalRead: boolean, terminalWrite: boolean, terminalCreate: boolean, terminalAdmin: boolean, };
+
+export type RemoteEntrypoint = { id: string, name: string, bindHost: string, port: number, enabled: boolean, sourcePolicy: SourcePolicy, allowedOrigins: Array<string>, trustedProxies: Array<string>, routes: Array<RemoteRoute>, };
+
+export type RemoteTunnel = { id: string, name: string, mode: RemoteTunnelMode, targetEntrypointId: string, bindHost: string, port: number, command: string, publicUrl: string, enabled: boolean, };
+
+export type RemoteAccessConfig = { entrypoints: Array<RemoteEntrypoint>, tunnels: Array<RemoteTunnel>, };
 
 export type Project = {
 /**
@@ -188,7 +200,7 @@ webhookTunnelCommand: string,
  */
 webhookPublicUrl: string,
 /**
- * 本地 REST API 的 Bearer token（AB#1043）。**空 = fail-closed 禁用**：listener 仍绑定，但
+ * 本地 REST API 的 Bearer token（AB#1043）。**空 = fail-closed 禁用**：entrypoint 仍绑定，但
  * handler 每个请求实时读取本字段做常量时间比较，空 token 一律 401。设 / 清即时生效、无需
  * 重启。loopback-only 仍是触发端点（本机任意进程 + DNS rebinding 可达），故非空时按
  * `LOCAL_API_TOKEN_MIN_LEN` 强制最小长度（与 `webhook_secret` 同理由）。
@@ -211,14 +223,15 @@ rules: Array<RuleConfig>,
  */
 notifications: NotificationSettings,
 /**
- * Declarative Remote Access listeners. The remote supervisor consumes bindable loopback
- * listeners at startup and after config saves.
+ * Declarative Remote Access entrypoints and tunnels. This is the single runtime source:
+ * each entrypoint owns one bound port and mounts one or more capability routes.
  */
-listeners: Array<Listener>,
-/**
- * Declarative Remote Access tunnels. `mode` reuses WebhookTunnelMode and is reconciled
- * against currently bound target listeners.
- */
-tunnels: Array<Tunnel>, };
+remoteAccess: RemoteAccessConfig, };
 
-export type ListenerRuntimeStatus = { id: string, kind: ListenerKind, bound: boolean, boundPort?: number, state: ListenerState, message: string, };
+export type RemoteRouteRuntimeStatus = { id: string, path: string, capability: RemoteCapability, enabled: boolean, };
+
+export type RemoteEntrypointRuntimeStatus = { id: string, bound: boolean, boundPort?: number, state: RemoteEntrypointState, message: string, routes: Array<RemoteRouteRuntimeStatus>, };
+
+export type RemoteTunnelRuntimeStatus = { id: string, mode: RemoteTunnelMode, targetEntrypointId: string, state: RemoteTunnelState, publicUrl?: string, message: string, logs: Array<string>, };
+
+export type RemoteAccessRuntimeStatus = { entrypoints: Array<RemoteEntrypointRuntimeStatus>, tunnels: Array<RemoteTunnelRuntimeStatus>, };

@@ -1,298 +1,312 @@
 <script setup lang="ts">
-// Remote-access manager (AB#1064): the declarative editor surface inside Settings for the
-// `listeners` and `tunnels` config resources. Owns the add/delete operations over the
-// SettingsView AppConfig draft's `listeners`/`tunnels` arrays; each item's fields are
-// edited by a ListenerCard / TunnelCard. Mirrors ProjectsManager — edits land on the
-// draft in place (the parent's reactive AppConfig), committed by SettingsView's existing
-// save flow alongside the projects + webhook fields.
-//
-// Each item renders as a collapsible row: an always-visible header (chevron + name + the
-// two-step delete confirm) over the card with the detailed fields (shown only when
-// expanded). The add/delete draft mutations live in remoteAccessOps.ts so they're
-// unit-testable without a component harness. There is NO active-id selection here (unlike
-// projects), so the header carries only name + delete.
-import { nextTick, ref, watch } from "vue";
-import type { AppConfig } from "./types";
-import type { ListenerFieldKey, TunnelFieldKey } from "./fields";
-import {
-  addListenerToDraft,
-  deleteListenerFromDraft,
-  addTunnelToDraft,
-  deleteTunnelFromDraft,
-  updateListenerField,
-  updateTunnelField,
-} from "./remoteAccessOps";
-import ListenerCard from "./ListenerCard.vue";
-import TunnelCard from "./TunnelCard.vue";
+import { ref } from "vue";
+import type { AppConfig, RemoteCapability, RemoteEntrypoint } from "./types";
 import RemoteAccessRuntimeStatus from "./RemoteAccessRuntimeStatus.vue";
+import {
+  addEntrypointToDraft,
+  addRouteToEntrypoint,
+  addTunnelToDraft,
+  deleteEntrypointFromDraft,
+  deleteRouteFromEntrypoint,
+  deleteTunnelFromDraft,
+  normalizeStringList,
+} from "./remoteAccessOps";
 
-// The live AppConfig draft (reactive, owned by SettingsView). We mutate `listeners` and
-// `tunnels` in place; SettingsView persists the whole draft on save.
-// `refreshKey` is forwarded to RemoteAccessRuntimeStatus so the parent (SettingsView) can
-// bump it after a config save to re-fetch live binding state.
 const props = defineProps<{ draft: AppConfig; refreshKey?: number }>();
 const emit = defineEmits<{ edit: [] }>();
+type PendingDelete =
+  | { kind: "entrypoint"; id: string }
+  | { kind: "route"; entrypointId: string; id: string }
+  | { kind: "tunnel"; id: string };
 
-// Which cards are expanded. The two lists share one Set but keys are prefixed
-// ("listener--"/"tunnel--") so a listener and a tunnel that happen to share an id never
-// collide. Vue tracks Set .add/.delete/.has reactively inside a ref. Double-dash avoids
-// a colon in the key, keeping any derived DOM ids valid for querySelector (F20).
-const expanded = ref(new Set<string>());
-function isExpanded(key: string): boolean {
-  return expanded.value.has(key);
-}
-function toggleExpand(key: string) {
-  if (expanded.value.has(key)) expanded.value.delete(key);
-  else expanded.value.add(key);
+const pendingDelete = ref<PendingDelete | null>(null);
+
+function csv(values: string[]): string {
+  return values.join(", ");
 }
 
-// Two-step in-app delete confirmation (window.confirm is unreliable in the Tauri webview —
-// see ProjectsManager). At most one row is pending across BOTH lists; the prefixed key
-// disambiguates which row armed it.
-const pendingDeleteKey = ref<string | null>(null);
-function requestDelete(key: string) {
-  pendingDeleteKey.value = key;
-  // Move focus onto 确认 so keyboard users land on the confirmation (the 删除 button they
-  // activated just unmounted). Keyed by the prefixed row key, unique across both lists.
-  nextTick(() => document.getElementById(`confirm-yes-${key}`)?.focus());
-}
-function cancelDelete() {
-  pendingDeleteKey.value = null;
-}
-// Disarm a pending confirm when the draft re-hydrates: SettingsView REPLACES the
-// listeners/tunnels array references on save/load, while our own delete splices in place
-// (same reference) and won't trip this — so it only clears a strip left armed across a
-// save, never our own edit. Mirrors ProjectsManager's pendingDelete reset watch.
-watch([() => props.draft.listeners, () => props.draft.tunnels], () => {
-  pendingDeleteKey.value = null;
-});
-
-// ----- Listeners -----
-function addListener() {
-  const l = addListenerToDraft(props.draft);
-  expanded.value.add(`listener--${l.id}`);
+function addEntrypoint() {
+  pendingDelete.value = null;
+  addEntrypointToDraft(props.draft);
   emit("edit");
 }
-function confirmDeleteListener(id: string) {
-  if (deleteListenerFromDraft(props.draft, id)) {
-    expanded.value.delete(`listener--${id}`);
-    emit("edit");
-  }
-  pendingDeleteKey.value = null;
-}
-// Apply a single field edit onto the matching draft listener, indexed by stable `id` (not
-// array position) so a concurrent reorder/delete can't misroute the write. The by-id
-// routing lives in updateListenerField (remoteAccessOps.ts) so it's unit-testable.
-function onUpdateListener(
-  id: string,
-  key: ListenerFieldKey,
-  value: string | number | boolean | string[],
-) {
-  if (updateListenerField(props.draft, id, key, value)) emit("edit");
-}
-function onListenerName(id: string, e: Event) {
-  onUpdateListener(id, "name", (e.target as HTMLInputElement).value);
+
+function deleteEntrypoint(id: string) {
+  pendingDelete.value = { kind: "entrypoint", id };
 }
 
-// ----- Tunnels -----
+function confirmDeleteEntrypoint(id: string) {
+  if (deleteEntrypointFromDraft(props.draft, id)) emit("edit");
+  pendingDelete.value = null;
+}
+
+function addRoute(entrypoint: RemoteEntrypoint, capability: RemoteCapability) {
+  pendingDelete.value = null;
+  addRouteToEntrypoint(entrypoint, capability);
+  emit("edit");
+}
+
+function deleteRoute(entrypoint: RemoteEntrypoint, id: string) {
+  pendingDelete.value = { kind: "route", entrypointId: entrypoint.id, id };
+}
+
+function confirmDeleteRoute(entrypoint: RemoteEntrypoint, id: string) {
+  if (deleteRouteFromEntrypoint(entrypoint, id)) emit("edit");
+  pendingDelete.value = null;
+}
+
 function addTunnel() {
-  const t = addTunnelToDraft(props.draft);
-  expanded.value.add(`tunnel--${t.id}`);
+  pendingDelete.value = null;
+  addTunnelToDraft(props.draft);
   emit("edit");
 }
+
+function deleteTunnel(id: string) {
+  pendingDelete.value = { kind: "tunnel", id };
+}
+
 function confirmDeleteTunnel(id: string) {
-  if (deleteTunnelFromDraft(props.draft, id)) {
-    expanded.value.delete(`tunnel--${id}`);
-    emit("edit");
-  }
-  pendingDeleteKey.value = null;
+  if (deleteTunnelFromDraft(props.draft, id)) emit("edit");
+  pendingDelete.value = null;
 }
-function onUpdateTunnel(
-  id: string,
-  key: TunnelFieldKey,
-  value: string | number | boolean | string[],
-) {
-  if (updateTunnelField(props.draft, id, key, value)) emit("edit");
+
+function cancelDelete() {
+  pendingDelete.value = null;
 }
-function onTunnelName(id: string, e: Event) {
-  onUpdateTunnel(id, "name", (e.target as HTMLInputElement).value);
+
+function pendingEntrypoint(id: string): boolean {
+  return pendingDelete.value?.kind === "entrypoint" && pendingDelete.value.id === id;
+}
+
+function pendingRoute(entrypointId: string, id: string): boolean {
+  return (
+    pendingDelete.value?.kind === "route" &&
+    pendingDelete.value.entrypointId === entrypointId &&
+    pendingDelete.value.id === id
+  );
+}
+
+function pendingTunnel(id: string): boolean {
+  return pendingDelete.value?.kind === "tunnel" && pendingDelete.value.id === id;
+}
+
+function setSourcePolicyMode(entrypoint: RemoteEntrypoint, mode: RemoteEntrypoint["sourcePolicy"]["mode"]) {
+  entrypoint.sourcePolicy.mode = mode;
+  if (mode !== "custom") entrypoint.sourcePolicy.allow = [];
+  touch();
+}
+
+function touch() {
+  emit("edit");
 }
 </script>
 
 <template>
   <div class="remote-access">
-    <!-- Runtime binding status (AB#1225 PR1): live per-listener state from the backend
-         supervisor. Shown above both sections so the user can see what's actually bound
-         before editing. `refreshKey` is forwarded from the parent so a save re-fetches.
-         `listeners` is forwarded so the status panel can display names and distinguish
-         empty-state cases (F14, F13). -->
-    <RemoteAccessRuntimeStatus :refresh-key="props.refreshKey" :listeners="draft.listeners" />
+    <RemoteAccessRuntimeStatus
+      :refresh-key="props.refreshKey"
+      :entrypoints="draft.remoteAccess.entrypoints"
+      :tunnels="draft.remoteAccess.tunnels"
+    />
 
-    <!-- Listeners -->
     <section class="resource">
       <div class="resource-head">
-        <p class="lead">监听器：声明 App 暴露的绑定端点（本地 API / 远程面板 / 事件入站 / 终端）。</p>
-        <button type="button" class="add" @click="addListener">+ 添加监听器</button>
+        <h3>Entry Points</h3>
+        <button type="button" class="add" @click="addEntrypoint">+ 添加入口</button>
       </div>
 
-      <div v-if="draft.listeners.length > 0" class="list">
-        <div
-          v-for="l in draft.listeners"
-          :key="l.id"
-          class="list-item"
-          :class="{ disabled: !l.enabled }"
+      <div v-if="draft.remoteAccess.entrypoints.length > 0" class="list">
+        <article
+          v-for="entrypoint in draft.remoteAccess.entrypoints"
+          :key="entrypoint.id"
+          class="item"
+          :class="{ disabled: !entrypoint.enabled }"
         >
-          <header class="row-head">
-            <button
-              type="button"
-              class="chevron"
-              :aria-expanded="isExpanded(`listener--${l.id}`)"
-              :aria-controls="`listener-card-${l.id}`"
-              :aria-label="(isExpanded(`listener--${l.id}`) ? '收起' : '展开') + '监听器 ' + (l.name || '新监听器')"
-              :title="isExpanded(`listener--${l.id}`) ? '收起' : '展开'"
-              @click="toggleExpand(`listener--${l.id}`)"
-            >
-              {{ isExpanded(`listener--${l.id}`) ? "▾" : "▸" }}
-            </button>
-            <input
-              class="name-input"
-              type="text"
-              :value="l.name"
-              placeholder="新监听器"
-              :aria-label="`监听器 ${l.name || '新监听器'} 的名称`"
-              @input="onListenerName(l.id, $event)"
-            />
-            <template v-if="pendingDeleteKey === `listener--${l.id}`">
-              <span class="confirm-text">确认删除？</span>
-              <button
-                :id="`confirm-yes-listener--${l.id}`"
-                type="button"
-                class="confirm-yes"
-                :aria-label="`确认删除监听器 ${l.name || '新监听器'}`"
-                @click="confirmDeleteListener(l.id)"
-                @keydown.escape="cancelDelete"
+          <div class="grid">
+            <label>
+              <span>名称</span>
+              <input v-model="entrypoint.name" type="text" @input="touch" />
+            </label>
+            <label>
+              <span>绑定地址</span>
+              <input v-model="entrypoint.bindHost" type="text" @input="touch" />
+            </label>
+            <label>
+              <span>端口</span>
+              <input v-model.number="entrypoint.port" type="number" min="0" @input="touch" />
+            </label>
+            <label class="check">
+              <input v-model="entrypoint.enabled" type="checkbox" @change="touch" />
+              <span>启用</span>
+            </label>
+            <label>
+              <span>来源策略</span>
+              <select
+                :value="entrypoint.sourcePolicy.mode"
+                @change="setSourcePolicyMode(entrypoint, ($event.target as HTMLSelectElement).value as RemoteEntrypoint['sourcePolicy']['mode'])"
               >
-                确认
-              </button>
-              <button
-                type="button"
-                class="confirm-no"
-                :aria-label="`取消删除监听器 ${l.name || '新监听器'}`"
-                @click="cancelDelete"
-                @keydown.escape="cancelDelete"
-              >
-                取消
-              </button>
-            </template>
-            <button
-              v-else
-              type="button"
-              class="delete"
-              :aria-label="`删除监听器 ${l.name || '新监听器'}`"
-              @click="requestDelete(`listener--${l.id}`)"
-            >
-              删除
-            </button>
-          </header>
-          <ListenerCard
-            v-show="isExpanded(`listener--${l.id}`)"
-            :id="`listener-card-${l.id}`"
-            :listener="l"
-            @update="(key, value) => onUpdateListener(l.id, key, value)"
-            @edit="emit('edit')"
-          />
-        </div>
-      </div>
+                <option value="loopback">loopback</option>
+                <option value="lan">lan</option>
+                <option value="custom">custom</option>
+              </select>
+            </label>
+            <label v-if="entrypoint.sourcePolicy.mode === 'custom'">
+              <span>允许 IP/CIDR</span>
+              <input
+                :value="csv(entrypoint.sourcePolicy.allow)"
+                type="text"
+                placeholder="192.168.1.10, 10.0.0.0/8"
+                @input="entrypoint.sourcePolicy.allow = normalizeStringList(($event.target as HTMLInputElement).value); touch()"
+              />
+            </label>
+            <label>
+              <span>Allowed Origins</span>
+              <input
+                :value="csv(entrypoint.allowedOrigins)"
+                type="text"
+                @input="entrypoint.allowedOrigins = normalizeStringList(($event.target as HTMLInputElement).value); touch()"
+              />
+            </label>
+            <label>
+              <span>Trusted Proxies</span>
+              <input
+                :value="csv(entrypoint.trustedProxies)"
+                type="text"
+                @input="entrypoint.trustedProxies = normalizeStringList(($event.target as HTMLInputElement).value); touch()"
+              />
+            </label>
+          </div>
 
-      <div v-else class="empty-state">
-        <p class="empty-title">还没有监听器</p>
-        <p class="empty-hint">点击下方按钮创建第一个监听器。</p>
-        <button type="button" class="add" @click="addListener">+ 添加监听器</button>
+          <div class="routes-head">
+            <strong>Routes</strong>
+            <div class="actions">
+              <button type="button" @click="addRoute(entrypoint, 'terminal')">+ terminal</button>
+              <button type="button" @click="addRoute(entrypoint, 'local-api')">+ local-api</button>
+            </div>
+          </div>
+
+          <div class="routes">
+            <div v-for="route in entrypoint.routes" :key="route.id" class="route">
+              <label>
+                <span>名称</span>
+                <input v-model="route.name" type="text" @input="touch" />
+              </label>
+              <label>
+                <span>Path</span>
+                <input v-model="route.path" type="text" @input="touch" />
+              </label>
+              <label>
+                <span>能力</span>
+                <select v-model="route.capability" @change="touch">
+                  <option value="terminal">terminal</option>
+                  <option value="local-api">local-api</option>
+                </select>
+              </label>
+              <label class="check">
+                <input v-model="route.enabled" type="checkbox" @change="touch" />
+                <span>启用</span>
+              </label>
+              <label v-if="route.capability === 'terminal'" class="wide">
+                <span>Bearer Token</span>
+                <input v-model="route.authToken" type="password" @input="touch" />
+              </label>
+              <div v-if="route.capability === 'terminal'" class="permissions">
+                <label class="check"><input v-model="route.terminalRead" type="checkbox" @change="touch" />读</label>
+                <label class="check"><input v-model="route.terminalWrite" type="checkbox" @change="touch" />写</label>
+                <label class="check"><input v-model="route.terminalCreate" type="checkbox" @change="touch" />创建</label>
+                <label class="check"><input v-model="route.terminalAdmin" type="checkbox" @change="touch" />管理</label>
+              </div>
+              <div v-if="pendingRoute(entrypoint.id, route.id)" class="delete-confirm">
+                <button type="button" class="delete danger" autofocus @click="confirmDeleteRoute(entrypoint, route.id)">
+                  确认删除
+                </button>
+                <button type="button" @click="cancelDelete">取消</button>
+              </div>
+              <button v-else type="button" class="delete" @click="deleteRoute(entrypoint, route.id)">删除</button>
+            </div>
+          </div>
+
+          <div v-if="pendingEntrypoint(entrypoint.id)" class="delete-confirm entry-delete">
+            <button type="button" class="delete danger" autofocus @click="confirmDeleteEntrypoint(entrypoint.id)">
+              确认删除入口
+            </button>
+            <button type="button" @click="cancelDelete">取消</button>
+          </div>
+          <button v-else type="button" class="delete entry-delete" @click="deleteEntrypoint(entrypoint.id)">
+            删除入口
+          </button>
+        </article>
       </div>
+      <p v-else class="empty">还没有 entrypoint。</p>
     </section>
 
-    <!-- Tunnels -->
     <section class="resource">
       <div class="resource-head">
-        <p class="lead">隧道：把监听器经公网 URL 发布出去（quick / command / listener）。</p>
+        <h3>Tunnels</h3>
         <button type="button" class="add" @click="addTunnel">+ 添加隧道</button>
       </div>
-
-      <div v-if="draft.tunnels.length > 0" class="list">
-        <div
-          v-for="t in draft.tunnels"
-          :key="t.id"
-          class="list-item"
-          :class="{ disabled: !t.enabled }"
-        >
-          <header class="row-head">
-            <button
-              type="button"
-              class="chevron"
-              :aria-expanded="isExpanded(`tunnel--${t.id}`)"
-              :aria-controls="`tunnel-card-${t.id}`"
-              :aria-label="(isExpanded(`tunnel--${t.id}`) ? '收起' : '展开') + '隧道 ' + (t.name || '新隧道')"
-              :title="isExpanded(`tunnel--${t.id}`) ? '收起' : '展开'"
-              @click="toggleExpand(`tunnel--${t.id}`)"
-            >
-              {{ isExpanded(`tunnel--${t.id}`) ? "▾" : "▸" }}
+      <div v-if="draft.remoteAccess.tunnels.length > 0" class="list">
+        <article v-for="tunnel in draft.remoteAccess.tunnels" :key="tunnel.id" class="item">
+          <div class="grid">
+            <label>
+              <span>名称</span>
+              <input v-model="tunnel.name" type="text" @input="touch" />
+            </label>
+            <label>
+              <span>Mode</span>
+              <select v-model="tunnel.mode" @change="touch">
+                <option value="lan">lan</option>
+                <option value="quick">quick</option>
+                <option value="command">command</option>
+                <option value="listener">listener</option>
+              </select>
+            </label>
+            <label>
+              <span>目标入口</span>
+              <select v-model="tunnel.targetEntrypointId" @change="touch">
+                <option value="">未选择</option>
+                <option
+                  v-for="entrypoint in draft.remoteAccess.entrypoints"
+                  :key="entrypoint.id"
+                  :value="entrypoint.id"
+                >
+                  {{ entrypoint.name || entrypoint.id }}
+                </option>
+              </select>
+            </label>
+            <label class="check">
+              <input v-model="tunnel.enabled" type="checkbox" @change="touch" />
+              <span>启用</span>
+            </label>
+            <label>
+              <span>LAN Bind Host</span>
+              <input v-model="tunnel.bindHost" type="text" @input="touch" />
+            </label>
+            <label>
+              <span>LAN Port</span>
+              <input v-model.number="tunnel.port" type="number" min="0" @input="touch" />
+            </label>
+            <label class="wide">
+              <span>Command</span>
+              <input v-model="tunnel.command" type="text" @input="touch" />
+            </label>
+            <label class="wide">
+              <span>Public URL</span>
+              <input v-model="tunnel.publicUrl" type="text" @input="touch" />
+            </label>
+          </div>
+          <div v-if="pendingTunnel(tunnel.id)" class="delete-confirm entry-delete">
+            <button type="button" class="delete danger" autofocus @click="confirmDeleteTunnel(tunnel.id)">
+              确认删除隧道
             </button>
-            <input
-              class="name-input"
-              type="text"
-              :value="t.name"
-              placeholder="新隧道"
-              :aria-label="`隧道 ${t.name || '新隧道'} 的名称`"
-              @input="onTunnelName(t.id, $event)"
-            />
-            <template v-if="pendingDeleteKey === `tunnel--${t.id}`">
-              <span class="confirm-text">确认删除？</span>
-              <button
-                :id="`confirm-yes-tunnel--${t.id}`"
-                type="button"
-                class="confirm-yes"
-                :aria-label="`确认删除隧道 ${t.name || '新隧道'}`"
-                @click="confirmDeleteTunnel(t.id)"
-                @keydown.escape="cancelDelete"
-              >
-                确认
-              </button>
-              <button
-                type="button"
-                class="confirm-no"
-                :aria-label="`取消删除隧道 ${t.name || '新隧道'}`"
-                @click="cancelDelete"
-                @keydown.escape="cancelDelete"
-              >
-                取消
-              </button>
-            </template>
-            <button
-              v-else
-              type="button"
-              class="delete"
-              :aria-label="`删除隧道 ${t.name || '新隧道'}`"
-              @click="requestDelete(`tunnel--${t.id}`)"
-            >
-              删除
-            </button>
-          </header>
-          <TunnelCard
-            v-show="isExpanded(`tunnel--${t.id}`)"
-            :id="`tunnel-card-${t.id}`"
-            :tunnel="t"
-            :listeners="draft.listeners"
-            @update="(key, value) => onUpdateTunnel(t.id, key, value)"
-            @edit="emit('edit')"
-          />
-        </div>
+            <button type="button" @click="cancelDelete">取消</button>
+          </div>
+          <button v-else type="button" class="delete entry-delete" @click="deleteTunnel(tunnel.id)">
+            删除隧道
+          </button>
+        </article>
       </div>
-
-      <div v-else class="empty-state">
-        <p class="empty-title">还没有隧道</p>
-        <p class="empty-hint">点击下方按钮创建第一个隧道。</p>
-        <button type="button" class="add" @click="addTunnel">+ 添加隧道</button>
-      </div>
+      <p v-else class="empty">还没有 tunnel。</p>
     </section>
   </div>
 </template>
@@ -301,152 +315,112 @@ function onTunnelName(id: string, e: Event) {
 .remote-access {
   display: flex;
   flex-direction: column;
-  gap: var(--space-6);
-  width: 100%;
+  gap: 18px;
 }
 .resource {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
+  border-top: 1px solid #e5e7eb;
+  padding-top: 16px;
 }
-.resource-head {
+.resource-head,
+.routes-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-4);
+  gap: 12px;
+  margin-bottom: 12px;
 }
-.lead {
+h3 {
   margin: 0;
-  font-size: var(--font-size-sm);
-  color: var(--color-text-muted);
-}
-.add {
-  flex-shrink: 0;
-  padding: var(--space-3) var(--space-5);
-  font: inherit;
-  font-size: var(--font-size-sm);
-  color: var(--color-surface);
-  background: var(--color-accent);
-  border: none;
-  border-radius: var(--radius-sm);
-  cursor: pointer;
+  font-size: 15px;
 }
 .list {
   display: flex;
   flex-direction: column;
-  gap: var(--space-4);
+  gap: 12px;
 }
-.list-item {
+.item,
+.route {
+  border: 1px solid #d8dee8;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fff;
+}
+.disabled {
+  opacity: 0.72;
+}
+.grid,
+.route {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 10px;
+}
+label {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  gap: 4px;
+  font-size: 12px;
+  color: #4b5563;
 }
-/* Disabled (未启用) items dim their header so "won't run" reads at a glance. */
-.list-item.disabled .row-head {
-  opacity: 0.55;
-}
-.row-head {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-2) var(--space-3);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-sm);
-}
-.chevron {
-  flex-shrink: 0;
-  width: 1.6rem;
-  padding: var(--space-1) 0;
+input,
+select {
+  min-height: 32px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 5px 8px;
   font: inherit;
-  color: var(--color-text-muted);
-  background: none;
-  border: none;
+}
+.check {
+  flex-direction: row;
+  align-items: center;
+  min-height: 32px;
+}
+.check input {
+  min-height: 0;
+}
+.wide {
+  grid-column: 1 / -1;
+}
+.routes {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.permissions,
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+button {
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #f8fafc;
+  padding: 6px 10px;
   cursor: pointer;
 }
-.name-input {
-  flex: 1;
-  min-width: 0;
-  padding: var(--space-2) var(--space-3);
-  font: inherit;
-  font-size: var(--font-size-md);
-  color: var(--color-text);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-sm);
-}
-.name-input:focus {
-  outline: none;
-  border-color: var(--color-accent);
+.add {
+  background: #eef6ff;
+  border-color: #bfdbfe;
 }
 .delete {
-  flex-shrink: 0;
-  padding: var(--space-2) var(--space-4);
-  font: inherit;
-  font-size: var(--font-size-sm);
-  color: var(--color-danger);
-  background: none;
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
+  background: #fff7f7;
+  border-color: #fecaca;
 }
-.delete:hover {
-  background: var(--color-surface-hover);
+.danger {
+  background: #fee2e2;
+  border-color: #fca5a5;
 }
-.confirm-text {
-  flex-shrink: 0;
-  font-size: var(--font-size-sm);
-  color: var(--color-danger);
-}
-.confirm-yes,
-.confirm-no {
-  flex-shrink: 0;
-  padding: var(--space-2) var(--space-4);
-  font: inherit;
-  font-size: var(--font-size-sm);
-  border-radius: var(--radius-sm);
-  cursor: pointer;
-}
-.confirm-yes {
-  color: var(--color-surface);
-  background: var(--color-danger);
-  border: 1px solid var(--color-danger);
-}
-.confirm-yes:hover {
-  opacity: 0.85;
-}
-.confirm-no {
-  color: var(--color-text);
-  background: none;
-  border: 1px solid var(--color-border-strong);
-}
-.confirm-no:hover {
-  background: var(--color-surface-hover);
-}
-.confirm-yes:focus-visible,
-.confirm-no:focus-visible {
-  outline: 2px solid var(--color-accent);
-  outline-offset: 2px;
-}
-.empty-state {
+.delete-confirm {
   display: flex;
-  flex-direction: column;
+  gap: 8px;
   align-items: center;
-  gap: var(--space-3);
-  padding: var(--space-6);
-  text-align: center;
-  color: var(--color-text-muted);
-  background: var(--color-surface);
-  border: 1px dashed var(--color-border-strong);
-  border-radius: var(--radius-md);
 }
-.empty-title {
-  margin: 0;
-  font-size: var(--font-size-md);
-  color: var(--color-text);
+.entry-delete {
+  margin-top: 10px;
 }
-.empty-hint {
-  margin: 0;
-  font-size: var(--font-size-sm);
+.empty {
+  color: #64748b;
+  font-size: 13px;
 }
 </style>

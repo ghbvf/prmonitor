@@ -145,10 +145,10 @@ const WEBHOOK_KEYS: &[&str] = &[
 /// gocell-default project would skip onboarding.)
 ///
 /// Two passes: [`normalize_multiproject`] first (legacy-flat → multi-project shape), then
-/// [`seed_local_api_listener`] (AB#1225) so the local-api `listeners[]` seed applies to BOTH
-/// legacy-flat configs and already-new ones (the latter early-return out of the first pass).
+/// [`migrate_remote_access`] (#1553) so legacy `listeners[]` / `tunnels[]` / `localApiPort`
+/// are lifted into `remoteAccess.entrypoints[]` / `remoteAccess.tunnels[]`.
 fn migrate_value(raw: Value) -> Value {
-    seed_rule_configs(seed_local_api_listener(normalize_multiproject(raw)))
+    seed_rule_configs(migrate_remote_access(normalize_multiproject(raw)))
 }
 
 /// First migration pass: normalize the raw persisted value to the #35 multi-project shape.
@@ -192,93 +192,186 @@ fn normalize_multiproject(raw: Value) -> Value {
     Value::Object(new)
 }
 
-/// Second migration pass (AB#1225): seed the local-api `listeners[]` entry from a legacy
-/// top-level `localApiPort` key, so existing users who had the local trigger API configured
-/// keep it after the field is removed from [`AppConfig`]. The port now lives SOLELY in a
-/// `kind = "local-api"` listener (the single source of truth the supervisor binds).
-///
-/// Runs on BOTH shapes (legacy-flat and already-new) since it is unconditional in
-/// [`migrate_value`] — `normalize_multiproject` early-returns an already-new config unchanged,
-/// which is exactly where a surviving top-level `localApiPort` needs seeding.
-///
-/// Detect-by-kind (idempotent): if `listeners` already has a `local-api` entry, this is a
-/// no-op — a second pass (or a `save`d config reloaded) sees the seeded entry and skips. The
-/// now-unknown `localApiPort` key is left in place (harmless: no `deny_unknown_fields`, and
-/// `from_value` drops it). `port == 0` (the old "disabled" sentinel) seeds a `disabled` entry.
-///
-/// Overflow guard (AB#1225 F6): `localApiPort` is read as a JSON number (u64). A value
-/// `> u16::MAX` would TRUNCATE to a bogus `u16` when the seeded entry's `"port"` later
-/// deserializes into [`crate::config::model::Listener::port`], silently binding the wrong port.
-/// Such an out-of-range value is therefore NOT seeded (the key is left in place, the config is
-/// returned unchanged); the user can re-set a valid port in Settings.
-///
-/// KNOWN EDGE (AB#1225 F9): a TRULY pre-#35 FLAT config (no `projects` key) has its top-level
-/// `localApiPort` DROPPED by [`normalize_multiproject`] (the key is in neither `PROJECT_KEYS` nor
-/// `WEBHOOK_KEYS`) BEFORE this seed pass runs, so such a user's custom port is lost and resets to
-/// the default-seeded 8788 listener on deserialize. This is acceptable because the pre-#35 flat
-/// shape predates AB#1043 — the round that introduced `localApiPort` — so no real pre-#35 config
-/// carries it. Seeding therefore only ever recovers an ALREADY-new config's surviving
-/// `localApiPort` (the realistic case). Locked by `migrate_pre35_flat_drops_legacy_local_api_port`.
-fn seed_local_api_listener(value: Value) -> Value {
-    use crate::config::model::LOCAL_API_LISTENER_ID;
-
+/// #1553 remote-access migration: old `listeners[]` become entrypoints with a single capability
+/// route; old `tunnels[]` retarget those entrypoints. This is idempotent: a config that already
+/// carries `remoteAccess` keeps it, with only a missing legacy `localApiPort` local-api entrypoint
+/// seeded for users upgrading from the transitional top-level field.
+fn migrate_remote_access(value: Value) -> Value {
     let Value::Object(mut obj) = value else {
-        // Non-object (first-launch sentinel etc.): nothing to seed onto.
         return value;
     };
 
-    // Only seed from a numeric legacy `localApiPort`.
-    let Some(port) = obj.get("localApiPort").and_then(Value::as_u64) else {
-        return Value::Object(obj);
-    };
-
-    // Overflow guard (F6): a `localApiPort > u16::MAX` would truncate to a bogus `u16` on the
-    // seeded entry's later deserialize. Do NOT seed such a value — leave the config unchanged and
-    // warn; the user can re-set a valid port. (`port == 0` is fine: it seeds a DISABLED entry.)
-    if port > u16::MAX as u64 {
-        eprintln!(
-            "[config] 忽略越界的 legacy localApiPort={port}（> {}）：未播种 local-api 监听器，请在设置中重设端口",
-            u16::MAX
-        );
-        return Value::Object(obj);
+    let mut remote = obj
+        .get("remoteAccess")
+        .cloned()
+        .unwrap_or_else(|| json!({ "entrypoints": [], "tunnels": [] }));
+    if !remote.is_object() {
+        remote = json!({ "entrypoints": [], "tunnels": [] });
     }
 
-    // Idempotent: skip if a `local-api` listener already exists.
-    let already_seeded = obj
-        .get("listeners")
-        .and_then(Value::as_array)
-        .is_some_and(|arr| {
-            arr.iter()
-                .any(|l| l.get("kind") == Some(&json!(LOCAL_API_LISTENER_ID)))
-        });
-    if already_seeded {
+    let had_remote_access = obj.contains_key("remoteAccess");
+    let has_legacy_remote_access = obj.contains_key("listeners")
+        || obj.contains_key("tunnels")
+        || obj.contains_key("localApiPort");
+    if !had_remote_access && !has_legacy_remote_access {
         return Value::Object(obj);
     }
-
-    let seeded = json!({
-        "id": LOCAL_API_LISTENER_ID,
-        "name": "Local API",
-        // `kind` wire string equals `ListenerKind::LocalApi`'s serde value, golden-locked by
-        // `listener_kind_wire_values_are_kebab`; reusing the id const keeps the two literals one source.
-        "kind": LOCAL_API_LISTENER_ID,
-        "bindHost": "127.0.0.1",
-        "port": port,
-        "enabled": port != 0,
-        "auth": "bearer",
-        "allowedOrigins": [],
-        "publicUrl": "",
-    });
-
-    // Append to `listeners`, creating the array if absent (or replacing a non-array value —
-    // a malformed `listeners` would be dropped by `from_value` anyway).
-    match obj.get_mut("listeners").and_then(Value::as_array_mut) {
-        Some(arr) => arr.push(seeded),
-        None => {
-            obj.insert("listeners".to_string(), json!([seeded]));
+    if !had_remote_access {
+        let entrypoints = obj
+            .get("listeners")
+            .and_then(Value::as_array)
+            .map(|listeners| {
+                listeners
+                    .iter()
+                    .filter_map(legacy_listener_to_entrypoint)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(remote_obj) = remote.as_object_mut() {
+            remote_obj.insert("entrypoints".to_string(), Value::Array(entrypoints));
+            let tunnels = obj
+                .get("tunnels")
+                .and_then(Value::as_array)
+                .map(|tunnels| {
+                    tunnels
+                        .iter()
+                        .filter_map(legacy_tunnel_to_remote_tunnel)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            remote_obj.insert("tunnels".to_string(), Value::Array(tunnels));
         }
     }
 
+    if let Some(port) = obj.get("localApiPort").and_then(Value::as_u64) {
+        if port <= u16::MAX as u64 && !remote_access_has_local_api(&remote) {
+            push_remote_entrypoint(
+                &mut remote,
+                local_api_entrypoint_json(port as u16, port != 0),
+            );
+        } else if port > u16::MAX as u64 {
+            eprintln!(
+                "[config] 忽略越界的 legacy localApiPort={port}（> {}）：未播种 local-api 入口，请在设置中重设端口",
+                u16::MAX
+            );
+        }
+    }
+
+    obj.insert("remoteAccess".to_string(), remote);
+    obj.remove("listeners");
+    obj.remove("tunnels");
     Value::Object(obj)
+}
+
+fn remote_access_has_local_api(remote: &Value) -> bool {
+    remote
+        .get("entrypoints")
+        .and_then(Value::as_array)
+        .is_some_and(|entrypoints| {
+            entrypoints.iter().any(|entrypoint| {
+                entrypoint
+                    .get("routes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|routes| {
+                        routes
+                            .iter()
+                            .any(|route| route.get("capability") == Some(&json!("local-api")))
+                    })
+            })
+        })
+}
+
+fn push_remote_entrypoint(remote: &mut Value, entrypoint: Value) {
+    if let Some(arr) = remote.get_mut("entrypoints").and_then(Value::as_array_mut) {
+        arr.push(entrypoint);
+    } else if let Some(obj) = remote.as_object_mut() {
+        obj.insert("entrypoints".to_string(), json!([entrypoint]));
+    }
+}
+
+fn local_api_entrypoint_json(port: u16, enabled: bool) -> Value {
+    json!({
+        "id": "local-api",
+        "name": "Local API",
+        "bindHost": "127.0.0.1",
+        "port": port,
+        "enabled": enabled,
+        "sourcePolicy": { "mode": "loopback", "allow": [] },
+        "allowedOrigins": [],
+        "trustedProxies": [],
+        "routes": [{
+            "id": "local-api",
+            "name": "Local API",
+            "path": "/api",
+            "capability": "local-api",
+            "enabled": true,
+            "authToken": "",
+            "terminalRead": false,
+            "terminalWrite": false,
+            "terminalCreate": false,
+            "terminalAdmin": false
+        }]
+    })
+}
+
+fn legacy_listener_to_entrypoint(listener: &Value) -> Option<Value> {
+    let kind = listener.get("kind").and_then(Value::as_str)?;
+    match kind {
+        "local-api" => Some(local_api_entrypoint_json(
+            listener
+                .get("port")
+                .and_then(Value::as_u64)
+                .filter(|p| *p <= u16::MAX as u64)
+                .unwrap_or(8788) as u16,
+            listener
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        )),
+        "terminal" => {
+            let id = listener
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("terminal");
+            Some(json!({
+                "id": id,
+                "name": listener.get("name").and_then(Value::as_str).unwrap_or("Terminal"),
+                "bindHost": listener.get("bindHost").and_then(Value::as_str).unwrap_or("127.0.0.1"),
+                "port": listener.get("port").and_then(Value::as_u64).unwrap_or(0),
+                "enabled": listener.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+                "sourcePolicy": { "mode": "loopback", "allow": [] },
+                "allowedOrigins": listener.get("allowedOrigins").cloned().unwrap_or_else(|| json!([])),
+                "trustedProxies": [],
+                "routes": [{
+                    "id": "terminal",
+                    "name": "Terminal",
+                    "path": "/terminal",
+                    "capability": "terminal",
+                    "enabled": true,
+                    "authToken": listener.get("authToken").and_then(Value::as_str).unwrap_or(""),
+                    "terminalRead": listener.get("terminalRead").and_then(Value::as_bool).unwrap_or(true),
+                    "terminalWrite": listener.get("terminalWrite").and_then(Value::as_bool).unwrap_or(false),
+                    "terminalCreate": listener.get("terminalCreate").and_then(Value::as_bool).unwrap_or(false),
+                    "terminalAdmin": listener.get("terminalAdmin").and_then(Value::as_bool).unwrap_or(false)
+                }]
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn legacy_tunnel_to_remote_tunnel(tunnel: &Value) -> Option<Value> {
+    Some(json!({
+        "id": tunnel.get("id").and_then(Value::as_str)?,
+        "name": tunnel.get("name").and_then(Value::as_str).unwrap_or("Tunnel"),
+        "mode": tunnel.get("mode").and_then(Value::as_str).unwrap_or("quick"),
+        "targetEntrypointId": tunnel.get("targetListenerId").and_then(Value::as_str).unwrap_or(""),
+        "bindHost": tunnel.get("bindHost").and_then(Value::as_str).unwrap_or("0.0.0.0"),
+        "port": tunnel.get("port").and_then(Value::as_u64).unwrap_or(0),
+        "command": tunnel.get("command").and_then(Value::as_str).unwrap_or(""),
+        "publicUrl": tunnel.get("publicUrl").and_then(Value::as_str).unwrap_or(""),
+        "enabled": tunnel.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+    }))
 }
 
 /// Seed the v1 rule-engine config (#1371) from legacy per-project trigger fields.
@@ -366,10 +459,17 @@ fn seed_rule_configs(value: Value) -> Value {
 /// (`cli.rs`) which connects to `127.0.0.1:<port>`. (A non-loopback local-api is refused at
 /// runtime by the supervisor; this helper still returns its port — the CLI is loopback-only.)
 pub fn local_api_port(cfg: &AppConfig) -> u16 {
-    cfg.listeners
+    cfg.remote_access
+        .entrypoints
         .iter()
-        .find(|l| l.kind == crate::config::model::ListenerKind::LocalApi && l.enabled)
-        .map(|l| l.port)
+        .find(|entrypoint| {
+            entrypoint.enabled
+                && entrypoint.routes.iter().any(|route| {
+                    route.enabled
+                        && route.capability == crate::config::model::RemoteCapability::LocalApi
+                })
+        })
+        .map(|entrypoint| entrypoint.port)
         .unwrap_or(0)
 }
 
@@ -609,6 +709,19 @@ mod tests {
     use super::*;
     use crate::model::NotificationKind;
 
+    fn local_api_entrypoints(config: &AppConfig) -> Vec<&crate::config::model::RemoteEntrypoint> {
+        config
+            .remote_access
+            .entrypoints
+            .iter()
+            .filter(|entrypoint| {
+                entrypoint.routes.iter().any(|route| {
+                    route.capability == crate::config::model::RemoteCapability::LocalApi
+                })
+            })
+            .collect()
+    }
+
     // SQLite blob round-trip (#70): an empty DB loads the default; a persisted config
     // reads back equal. The blob path is the storage swap — `migrate_value`/`validate`
     // (tested below) are unchanged.
@@ -828,11 +941,7 @@ mod tests {
 
         let config: AppConfig =
             serde_json::from_value(migrated).expect("migrated shape deserializes");
-        let local_api: Vec<_> = config
-            .listeners
-            .iter()
-            .filter(|l| l.kind == crate::config::model::ListenerKind::LocalApi)
-            .collect();
+        let local_api = local_api_entrypoints(&config);
         assert_eq!(local_api.len(), 1, "exactly one local-api listener seeded");
         assert!(local_api[0].enabled);
         assert_eq!(local_api[0].port, 8790);
@@ -924,11 +1033,7 @@ mod tests {
         let config: AppConfig =
             serde_json::from_value(migrate_value(raw)).expect("migrated shape deserializes");
 
-        let local_api: Vec<_> = config
-            .listeners
-            .iter()
-            .filter(|l| l.kind == crate::config::model::ListenerKind::LocalApi)
-            .collect();
+        let local_api = local_api_entrypoints(&config);
         assert_eq!(local_api.len(), 1, "exactly one local-api listener seeded");
         assert!(local_api[0].enabled);
         assert_eq!(local_api[0].port, 8788);
@@ -947,11 +1052,7 @@ mod tests {
         assert_eq!(once, twice, "second pass is a no-op (already-seeded)");
 
         let config: AppConfig = serde_json::from_value(twice).expect("migrated shape deserializes");
-        let count = config
-            .listeners
-            .iter()
-            .filter(|l| l.kind == crate::config::model::ListenerKind::LocalApi)
-            .count();
+        let count = local_api_entrypoints(&config).len();
         assert_eq!(count, 1, "not double-seeded");
     }
 
@@ -968,11 +1069,7 @@ mod tests {
         let config: AppConfig =
             serde_json::from_value(migrate_value(raw)).expect("migrated shape deserializes");
 
-        let local_api: Vec<_> = config
-            .listeners
-            .iter()
-            .filter(|l| l.kind == crate::config::model::ListenerKind::LocalApi)
-            .collect();
+        let local_api = local_api_entrypoints(&config);
         assert_eq!(local_api.len(), 1);
         assert!(!local_api[0].enabled, "port 0 → disabled");
         assert_eq!(local_api[0].port, 0);
@@ -1002,22 +1099,16 @@ mod tests {
         let config: AppConfig =
             serde_json::from_value(migrate_value(raw)).expect("migrated shape deserializes");
 
-        let local_api: Vec<_> = config
-            .listeners
-            .iter()
-            .filter(|l| l.kind == crate::config::model::ListenerKind::LocalApi)
-            .collect();
+        let local_api = local_api_entrypoints(&config);
         assert_eq!(local_api.len(), 1, "existing entry kept, not duplicated");
         // The pre-existing entry (port 8788) wins — the stray `localApiPort: 9999` is ignored.
         assert_eq!(local_api[0].port, 8788);
     }
 
-    /// AB#1225 F6 (overflow guard): a legacy `localApiPort` ABOVE `u16::MAX` must NOT be seeded — a
-    /// truncating cast (e.g. `70000 as u16 == 4464`) would bind a bogus port. Asserted at the raw
-    /// MIGRATED-VALUE level (before `from_value`): the seed pass must NOT append a `listeners` entry.
-    /// (Asserting on the deserialized `AppConfig` would be MASKED by `#[serde(default)]` re-seeding
-    /// the default 8788 listener for the absent `listeners` field — the correct safe fallback, but
-    /// it does not prove the guard fired; the raw shape does.)
+    /// AB#1225 F6 / #1553 (overflow guard): a legacy `localApiPort` ABOVE `u16::MAX` must NOT be
+    /// seeded into `remoteAccess.entrypoints[]` — a truncating cast (e.g. `70000 as u16 == 4464`)
+    /// would bind a bogus port. The deserialized helper must report disabled (`0`) rather than a
+    /// truncated migrated endpoint.
     #[test]
     fn migrate_out_of_range_legacy_port_is_not_seeded() {
         let raw = json!({
@@ -1026,13 +1117,14 @@ mod tests {
             "localApiPort": 70000  // > u16::MAX (65535)
         });
 
-        let migrated = migrate_value(raw);
-        // No `listeners` array created at all (input had none, and the out-of-range port
-        // short-circuited the seed) — so certainly no truncated-port entry was appended.
+        let config: AppConfig =
+            serde_json::from_value(migrate_value(raw)).expect("migrated shape deserializes");
+        let local_api = local_api_entrypoints(&config);
         assert!(
-            migrated.get("listeners").is_none(),
-            "out-of-range port must not seed a listener, got: {migrated}"
+            local_api.iter().all(|entrypoint| entrypoint.port != 4464),
+            "out-of-range port must not seed a truncated remoteAccess entrypoint: {local_api:?}"
         );
+        assert_eq!(local_api_port(&config), 0);
     }
 
     /// AB#1225 F9 (documented pre-#35 edge — regression lock): a TRULY pre-#35 FLAT config (no
@@ -1053,11 +1145,7 @@ mod tests {
             serde_json::from_value(migrate_value(raw)).expect("migrated shape deserializes");
 
         // Exactly one local-api listener, and it is the DEFAULT (8788) — NOT the dropped 9999.
-        let local_api: Vec<_> = config
-            .listeners
-            .iter()
-            .filter(|l| l.kind == crate::config::model::ListenerKind::LocalApi)
-            .collect();
+        let local_api = local_api_entrypoints(&config);
         assert_eq!(
             local_api.len(),
             1,
@@ -1077,20 +1165,16 @@ mod tests {
         assert_eq!(local_api_port(&AppConfig::default()), 8788);
 
         // Disabled local-api listener → 0 (off).
-        let disabled = AppConfig {
-            listeners: vec![crate::config::model::Listener {
-                kind: crate::config::model::ListenerKind::LocalApi,
-                port: 8788,
-                enabled: false,
-                ..Default::default()
-            }],
-            ..AppConfig::default()
-        };
+        let mut disabled = AppConfig::default();
+        disabled.remote_access.entrypoints[0].enabled = false;
         assert_eq!(local_api_port(&disabled), 0);
 
-        // No local-api listener at all → 0 (off).
+        // No local-api entrypoint at all → 0 (off).
         let none = AppConfig {
-            listeners: Vec::new(),
+            remote_access: crate::config::model::RemoteAccessConfig {
+                entrypoints: Vec::new(),
+                tunnels: Vec::new(),
+            },
             ..AppConfig::default()
         };
         assert_eq!(local_api_port(&none), 0);

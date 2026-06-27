@@ -144,8 +144,7 @@ beforeEach(() => {
     localApiToken: "",
     outbox: { notificationTtlSecs: 7200 },
     notifications: { channels: [] },
-    listeners: [],
-    tunnels: [],
+    remoteAccess: { entrypoints: [], tunnels: [] },
     rules: [],
   });
 });
@@ -291,8 +290,7 @@ describe("usePrStore toggle()", () => {
       localApiToken: "",
       outbox: { notificationTtlSecs: 7200 },
       notifications: { channels: [] },
-      listeners: [],
-      tunnels: [],
+      remoteAccess: { entrypoints: [], tunnels: [] },
       rules: [],
     });
     const store = usePrStore();

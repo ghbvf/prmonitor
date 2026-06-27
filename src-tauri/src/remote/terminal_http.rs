@@ -18,7 +18,9 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 use url::Url;
 
-use crate::config::model::{terminal_auth_token_is_strong, Listener};
+use crate::config::model::{
+    terminal_auth_token_is_strong, Listener, ListenerAuthMode, ListenerKind, RemoteCapability,
+};
 use crate::config::service as config_service;
 use crate::db::Database;
 use crate::error::AppError;
@@ -48,7 +50,8 @@ const INDEX_HTML: &str = "index.html";
 pub(crate) struct Ctx<R: tauri::Runtime> {
     pub(crate) app: tauri::AppHandle<R>,
     pub(crate) port: u16,
-    pub(crate) listener_id: String,
+    pub(crate) entrypoint_id: String,
+    pub(crate) route_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,17 +201,8 @@ fn check_static_request<R: tauri::Runtime>(
     ctx: &Ctx<R>,
     headers: &HeaderMap,
 ) -> HttpResult<(Listener, Vec<String>)> {
-    let cfg = config_service::load(&ctx.app).map_err(|_| {
-        Box::new(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "服务不可用",
-        ))
-    })?;
-    let listener = cfg
-        .listeners
-        .into_iter()
-        .find(|l| l.id == ctx.listener_id && l.enabled)
-        .ok_or_else(|| Box::new(error_response(StatusCode::FORBIDDEN, "终端监听器未启用")))?;
+    let listener = terminal_listener_from_config(ctx)
+        .ok_or_else(|| Box::new(error_response(StatusCode::FORBIDDEN, "终端路由未启用")))?;
     let public_urls = runtime_public_urls(ctx);
     if !host_allowed_with_public_urls(
         header_str(headers, "host").unwrap_or(""),
@@ -247,7 +241,7 @@ async fn handle_static<R: tauri::Runtime>(
             // path — the only signal we get, since there is no bearer subject to attribute.
             audit(
                 &ctx.app,
-                &ctx.listener_id,
+                &ctx.entrypoint_id,
                 "static_forbidden",
                 false,
                 &headers,
@@ -332,6 +326,36 @@ fn with_cors(mut response: Response, origin: Option<&str>) -> Response {
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+fn terminal_listener_from_config<R: tauri::Runtime>(ctx: &Ctx<R>) -> Option<Listener> {
+    let cfg = config_service::load(&ctx.app).ok()?;
+    let entrypoint = cfg
+        .remote_access
+        .entrypoints
+        .into_iter()
+        .find(|entrypoint| entrypoint.id == ctx.entrypoint_id && entrypoint.enabled)?;
+    let route = entrypoint.routes.into_iter().find(|route| {
+        route.id == ctx.route_id
+            && route.enabled
+            && matches!(route.capability, RemoteCapability::Terminal)
+    })?;
+    Some(Listener {
+        id: route.id,
+        name: route.name,
+        kind: ListenerKind::Terminal,
+        bind_host: entrypoint.bind_host,
+        port: entrypoint.port,
+        enabled: true,
+        auth: ListenerAuthMode::Bearer,
+        auth_token: route.auth_token,
+        terminal_read: route.terminal_read,
+        terminal_write: route.terminal_write,
+        terminal_create: route.terminal_create,
+        terminal_admin: route.terminal_admin,
+        allowed_origins: entrypoint.allowed_origins,
+        public_url: String::new(),
+    })
 }
 
 fn host_without_port(host: &str) -> &str {
@@ -491,7 +515,7 @@ fn permission_allowed(listener: &Listener, permission: Permission) -> bool {
 fn runtime_public_urls<R: tauri::Runtime>(ctx: &Ctx<R>) -> Vec<String> {
     ctx.app
         .try_state::<AppState>()
-        .map(|state| state.remote.public_urls_for_listener(&ctx.listener_id))
+        .map(|state| state.remote.public_urls_for_entrypoint(&ctx.entrypoint_id))
         .unwrap_or_default()
 }
 
@@ -500,13 +524,8 @@ fn check_request<R: tauri::Runtime>(
     headers: &HeaderMap,
     permission: Permission,
 ) -> HttpResult<Listener> {
-    let cfg = config_service::load(&ctx.app)
-        .map_err(|_| Box::new(error_response(StatusCode::UNAUTHORIZED, "鉴权配置不可用")))?;
-    let listener = cfg
-        .listeners
-        .into_iter()
-        .find(|l| l.id == ctx.listener_id && l.enabled)
-        .ok_or_else(|| Box::new(error_response(StatusCode::FORBIDDEN, "终端监听器未启用")))?;
+    let listener = terminal_listener_from_config(ctx)
+        .ok_or_else(|| Box::new(error_response(StatusCode::FORBIDDEN, "终端路由未启用")))?;
     let public_urls = runtime_public_urls(ctx);
     if !host_allowed_with_public_urls(
         header_str(headers, "host").unwrap_or(""),
@@ -729,16 +748,8 @@ async fn handle_options<R: tauri::Runtime>(
     State(ctx): State<Arc<Ctx<R>>>,
     headers: HeaderMap,
 ) -> Response {
-    let cfg = match config_service::load(&ctx.app) {
-        Ok(cfg) => cfg,
-        Err(_) => return error_response(StatusCode::UNAUTHORIZED, "鉴权配置不可用"),
-    };
-    let Some(listener) = cfg
-        .listeners
-        .into_iter()
-        .find(|l| l.id == ctx.listener_id && l.enabled)
-    else {
-        return error_response(StatusCode::FORBIDDEN, "终端监听器未启用");
+    let Some(listener) = terminal_listener_from_config(&ctx) else {
+        return error_response(StatusCode::FORBIDDEN, "终端路由未启用");
     };
     let public_urls = runtime_public_urls(&ctx);
     if !host_allowed_with_public_urls(
@@ -976,27 +987,40 @@ mod tests {
     }
 
     fn persist_listener<R: tauri::Runtime>(app: &tauri::AppHandle<R>, listener: Listener) {
+        let config = AppConfig {
+            remote_access: crate::config::model::RemoteAccessConfig {
+                entrypoints: vec![crate::config::model::RemoteEntrypoint {
+                    id: listener.id.clone(),
+                    name: listener.name.clone(),
+                    bind_host: listener.bind_host.clone(),
+                    port: listener.port,
+                    enabled: listener.enabled,
+                    allowed_origins: listener.allowed_origins.clone(),
+                    routes: vec![crate::config::model::RemoteRoute {
+                        id: "terminal".to_string(),
+                        name: "Terminal".to_string(),
+                        path: "/terminal".to_string(),
+                        capability: crate::config::model::RemoteCapability::Terminal,
+                        enabled: true,
+                        auth_token: listener.auth_token.clone(),
+                        terminal_read: listener.terminal_read,
+                        terminal_write: listener.terminal_write,
+                        terminal_create: listener.terminal_create,
+                        terminal_admin: listener.terminal_admin,
+                    }],
+                    ..crate::config::model::RemoteEntrypoint::default()
+                }],
+                tunnels: Vec::new(),
+            },
+            ..AppConfig::default()
+        };
         let Some(db) = app.try_state::<Database>() else {
             let db = Database::open_in_memory().expect("open db");
-            crate::config::service::persist_db(
-                &db,
-                &AppConfig {
-                    listeners: vec![listener],
-                    ..AppConfig::default()
-                },
-            )
-            .expect("persist config");
+            crate::config::service::persist_db(&db, &config).expect("persist config");
             app.manage(db);
             return;
         };
-        crate::config::service::persist_db(
-            &db,
-            &AppConfig {
-                listeners: vec![listener],
-                ..AppConfig::default()
-            },
-        )
-        .expect("persist config");
+        crate::config::service::persist_db(&db, &config).expect("persist config");
     }
 
     #[test]
@@ -1014,7 +1038,8 @@ mod tests {
             let ctx = Arc::new(Ctx {
                 app: app.handle().clone(),
                 port,
-                listener_id: "term".to_string(),
+                entrypoint_id: "term".to_string(),
+                route_id: "terminal".to_string(),
             });
             let server = tauri::async_runtime::spawn(async move {
                 let _ = axum::serve(socket, build_router(ctx).into_make_service()).await;
@@ -1105,7 +1130,8 @@ mod tests {
             let ctx = Arc::new(Ctx {
                 app: app.handle().clone(),
                 port,
-                listener_id: "term".to_string(),
+                entrypoint_id: "term".to_string(),
+                route_id: "terminal".to_string(),
             });
             let server = tauri::async_runtime::spawn(async move {
                 let _ = axum::serve(socket, build_router(ctx).into_make_service()).await;
@@ -1143,7 +1169,8 @@ mod tests {
             let ctx = Arc::new(Ctx {
                 app: app.handle().clone(),
                 port,
-                listener_id: "term".to_string(),
+                entrypoint_id: "term".to_string(),
+                route_id: "terminal".to_string(),
             });
             let server = tauri::async_runtime::spawn(async move {
                 let _ = axum::serve(socket, build_router(ctx).into_make_service()).await;
@@ -1178,7 +1205,8 @@ mod tests {
             let ctx = Arc::new(Ctx {
                 app: app.handle().clone(),
                 port,
-                listener_id: "term".to_string(),
+                entrypoint_id: "term".to_string(),
+                route_id: "terminal".to_string(),
             });
             let server = tauri::async_runtime::spawn(async move {
                 let _ = axum::serve(socket, build_router(ctx).into_make_service()).await;
@@ -1268,7 +1296,8 @@ mod tests {
             let ctx = Arc::new(Ctx {
                 app: app.handle().clone(),
                 port,
-                listener_id: "term".to_string(),
+                entrypoint_id: "term".to_string(),
+                route_id: "terminal".to_string(),
             });
             let server = tauri::async_runtime::spawn(async move {
                 let _ = axum::serve(socket, build_router(ctx).into_make_service()).await;

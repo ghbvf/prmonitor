@@ -238,23 +238,25 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 /// (`Option<Response>` rather than `Result<(), Response>` so the gate doesn't carry a large
 /// `Err` variant — a passing request is the empty `None`.)
 fn check_request<R: tauri::Runtime>(ctx: &Ctx<R>, headers: &HeaderMap) -> Option<Response> {
-    // 1. Host allowlist (DNS-rebinding). A missing / non-UTF-8 Host fails closed.
-    if !security::host_allowed(header_str(headers, "host").unwrap_or(""), ctx.port) {
-        return Some(error_response(
-            StatusCode::FORBIDDEN,
-            "Host 不被允许（仅 loopback 可访问）",
-        ));
-    }
-    // 2. Origin / Sec-Fetch-Site (anti-CSRF).
-    if !security::origin_allowed(
-        header_str(headers, "origin"),
-        header_str(headers, "sec-fetch-site"),
-        ctx.port,
-    ) {
-        return Some(error_response(
-            StatusCode::FORBIDDEN,
-            "Origin 不被允许（跨站请求已拒绝）",
-        ));
+    if ctx.remote_entrypoint_id.is_none() {
+        // 1. Host allowlist (DNS-rebinding). A missing / non-UTF-8 Host fails closed.
+        if !security::host_allowed(header_str(headers, "host").unwrap_or(""), ctx.port) {
+            return Some(error_response(
+                StatusCode::FORBIDDEN,
+                "Host 不被允许（仅 loopback 可访问）",
+            ));
+        }
+        // 2. Origin / Sec-Fetch-Site (anti-CSRF).
+        if !security::origin_allowed(
+            header_str(headers, "origin"),
+            header_str(headers, "sec-fetch-site"),
+            ctx.port,
+        ) {
+            return Some(error_response(
+                StatusCode::FORBIDDEN,
+                "Origin 不被允许（跨站请求已拒绝）",
+            ));
+        }
     }
     // 3. Bearer token, read LIVE from config (rotate without restart). A blank token disables
     //    the endpoint (verify_bearer fail-closes); a config load error also fail-closes to 401 —
@@ -302,7 +304,10 @@ async fn handle_create<R: tauri::Runtime>(
     match super::commands::trigger_review(ctx.app.clone(), state, reference, req.pr, req.kind).await
     {
         Ok(id) => {
-            let status_url = format!("http://127.0.0.1:{}/reviews/{}", ctx.port, id);
+            let status_url = format!(
+                "http://127.0.0.1:{}{}/reviews/{}",
+                ctx.port, ctx.base_path, id
+            );
             json_response(StatusCode::ACCEPTED, &TriggerResponse { id, status_url })
         }
         Err(e) => error_response(StatusCode::BAD_REQUEST, e.message),
@@ -559,6 +564,8 @@ async fn handle_stream<R: tauri::Runtime>(
 pub(crate) struct Ctx<R: tauri::Runtime> {
     pub(crate) app: tauri::AppHandle<R>,
     pub(crate) port: u16,
+    pub(crate) base_path: String,
+    pub(crate) remote_entrypoint_id: Option<String>,
 }
 
 /// Build the local-api router for an already-resolved [`Ctx`]. Extracted (AB#1225) from the
@@ -1081,6 +1088,8 @@ mod tests {
             let ctx = Arc::new(Ctx {
                 app: app.handle().clone(),
                 port,
+                base_path: String::new(),
+                remote_entrypoint_id: None,
             });
             let server = tauri::async_runtime::spawn(async move {
                 let _ = axum::serve(listener, build_router(ctx).into_make_service()).await;
