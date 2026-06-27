@@ -43,6 +43,11 @@ describe("makeListener / makeTunnel", () => {
     expect(l.name).toBeTruthy();
     expect(l.kind).toBe("local-api");
     expect(l.auth).toBe("none");
+    expect(l.authToken).toBe("");
+    expect(l.terminalRead).toBe(false);
+    expect(l.terminalWrite).toBe(false);
+    expect(l.terminalCreate).toBe(false);
+    expect(l.terminalAdmin).toBe(false);
     expect(l.enabled).toBe(false);
     expect(l.allowedOrigins).toEqual([]);
   });
@@ -54,6 +59,7 @@ describe("makeListener / makeTunnel", () => {
     expect(t.mode).toBe("quick");
     expect(t.enabled).toBe(false);
     expect(t.targetListenerId).toBe("");
+    expect(t.command).toBe("");
   });
 
   it("gives each minted item a distinct id", () => {

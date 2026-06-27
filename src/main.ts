@@ -13,11 +13,32 @@ async function boot() {
   const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   const transport = isTauri
     ? (await import("./transport/tauri")).createTauriTransport()
-    : (await import("./transport/http")).createHttpTransport(
-        import.meta.env.VITE_API_BASE_URL ?? "",
-      );
+    : await browserTransport();
   setTransport(transport);
-  createApp(App).use(createPinia()).mount("#app");
+  const Root = isTauri ? App : (await import("./RemoteTerminalApp.vue")).default;
+  createApp(Root).use(createPinia()).mount("#app");
+}
+
+async function browserTransport() {
+  const http = await import("./transport/http");
+  const existing = sessionStorage.getItem(http.REMOTE_BEARER_TOKEN_KEY)?.trim();
+  if (!existing) {
+    const entered = promptForToken()?.trim();
+    if (entered) sessionStorage.setItem(http.REMOTE_BEARER_TOKEN_KEY, entered);
+  }
+  return http.createHttpTransport(import.meta.env.VITE_API_BASE_URL ?? "", {
+    onAuthRejected: () => {
+      sessionStorage.removeItem(http.REMOTE_BEARER_TOKEN_KEY);
+      const entered = promptForToken()?.trim();
+      if (!entered) return false;
+      sessionStorage.setItem(http.REMOTE_BEARER_TOKEN_KEY, entered);
+      return true;
+    },
+  });
+}
+
+function promptForToken(): string | null {
+  return window.prompt("Remote access token");
 }
 
 void boot();

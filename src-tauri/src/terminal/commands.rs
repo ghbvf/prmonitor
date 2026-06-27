@@ -26,7 +26,9 @@ const PYTHON_BIN: &str = "python3";
 /// Resolve the bundled daemon script to an absolute path. In a packaged app it lives under
 /// the resource dir (declared in `tauri.conf.json` `bundle.resources`); `BaseDirectory::Resource`
 /// resolves the same relative path tauri copied it to.
-fn resolve_script_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResult<String> {
+pub(crate) fn resolve_script_path<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> AppResult<String> {
     let path = app
         .path()
         .resolve(
@@ -41,7 +43,7 @@ fn resolve_script_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResul
 /// future `TerminalBackendKind` (sealed enum) would drive an exhaustive `match` selecting
 /// `ITermBackend` vs a WebPty backend — the Hard carrier forcing every command to handle the
 /// new variant. Single iTerm backend this PR, so the selection is direct.
-fn backend<'a, R: tauri::Runtime>(
+pub(crate) fn backend<'a, R: tauri::Runtime>(
     app: &'a tauri::AppHandle<R>,
     state: &'a AppState,
     script: &'a str,
@@ -49,20 +51,26 @@ fn backend<'a, R: tauri::Runtime>(
     ITermBackend::new(app, &state.terminal, PYTHON_BIN, script)
 }
 
+pub(crate) async fn list_terminal_sessions_inner<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+) -> AppResult<Vec<TerminalSession>> {
+    state.terminal.resume();
+    let script = resolve_script_path(app)?;
+    backend(app, state, &script).list_sessions().await
+}
+
 #[tauri::command]
 pub async fn list_terminal_sessions<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, AppState>,
 ) -> AppResult<Vec<TerminalSession>> {
-    state.terminal.resume();
-    let script = resolve_script_path(&app)?;
-    backend(&app, &state, &script).list_sessions().await
+    list_terminal_sessions_inner(&app, &state).await
 }
 
-#[tauri::command]
-pub async fn create_terminal_session<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    state: tauri::State<'_, AppState>,
+pub(crate) async fn create_terminal_session_inner<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
     opts: CreateSessionOpts,
 ) -> AppResult<TerminalSession> {
     if let Some(window_id) = opts.window_id.as_deref() {
@@ -72,37 +80,60 @@ pub async fn create_terminal_session<R: tauri::Runtime>(
         check_identifier(profile)?;
     }
     state.terminal.resume();
-    let script = resolve_script_path(&app)?;
-    backend(&app, &state, &script).create_session(opts).await
+    let script = resolve_script_path(app)?;
+    backend(app, state, &script).create_session(opts).await
+}
+
+#[tauri::command]
+pub async fn create_terminal_session<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    opts: CreateSessionOpts,
+) -> AppResult<TerminalSession> {
+    create_terminal_session_inner(&app, &state, opts).await
 }
 
 /// Attach the panel to a session = start streaming its screen (daemon `subscribe`). The
 /// backend emits the one-shot `Attached` then the daemon's `screenUpdate` stream follows.
+pub(crate) async fn attach_terminal_inner<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    session_id: &str,
+) -> AppResult<()> {
+    check_identifier(session_id)?;
+    state.terminal.resume();
+    let script = resolve_script_path(app)?;
+    backend(app, state, &script).subscribe(session_id).await
+}
+
 #[tauri::command]
 pub async fn attach_terminal<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, AppState>,
     session_id: String,
 ) -> AppResult<()> {
-    check_identifier(&session_id)?;
-    state.terminal.resume();
-    let script = resolve_script_path(&app)?;
-    backend(&app, &state, &script).subscribe(&session_id).await
+    attach_terminal_inner(&app, &state, &session_id).await
 }
 
 /// Detach the panel from a session = stop streaming its screen (daemon `unsubscribe`).
+pub(crate) async fn detach_terminal_inner<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    session_id: &str,
+) -> AppResult<()> {
+    check_identifier(session_id)?;
+    state.terminal.resume();
+    let script = resolve_script_path(app)?;
+    backend(app, state, &script).unsubscribe(session_id).await
+}
+
 #[tauri::command]
 pub async fn detach_terminal<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, AppState>,
     session_id: String,
 ) -> AppResult<()> {
-    check_identifier(&session_id)?;
-    state.terminal.resume();
-    let script = resolve_script_path(&app)?;
-    backend(&app, &state, &script)
-        .unsubscribe(&session_id)
-        .await
+    detach_terminal_inner(&app, &state, &session_id).await
 }
 
 /// Upper bound on a single `send_terminal_input` payload (64 KiB, byte length). A keystroke /
@@ -112,7 +143,7 @@ const MAX_INPUT_BYTES: usize = 64 * 1024;
 
 /// Reject an oversized `send_terminal_input` payload with an actionable error. Pure free helper
 /// (no Tauri `State`) so it's unit-testable without a live app — the command calls it first.
-fn check_input_size(data: &str) -> AppResult<()> {
+pub(crate) fn check_input_size(data: &str) -> AppResult<()> {
     if data.len() > MAX_INPUT_BYTES {
         return Err(AppError::new(format!(
             "终端输入过大（{} 字节，超过 {} 字节上限）：请减少单次粘贴/输入的内容",
@@ -150,7 +181,7 @@ fn truncate_id(id: &str) -> String {
 /// Reject an empty or over-long identifier with an actionable error. Pure free helper
 /// (no Tauri `State`) so it's unit-testable; the action commands call it first on their
 /// `session_id` (and `create` on the optional `window_id` / `profile`).
-fn check_identifier(id: &str) -> AppResult<()> {
+pub(crate) fn check_identifier(id: &str) -> AppResult<()> {
     if id.is_empty() {
         return Err(AppError::new(
             "标识符为空：session / window / profile 标识符不能为空".to_string(),
@@ -176,7 +207,7 @@ const MAX_ROWS: u16 = 1000;
 
 /// Reject an out-of-range terminal grid with an actionable error. Pure free helper
 /// (no Tauri `State`) so it's unit-testable; `resize_terminal` calls it first.
-fn check_grid(cols: u16, rows: u16) -> AppResult<()> {
+pub(crate) fn check_grid(cols: u16, rows: u16) -> AppResult<()> {
     if !(MIN_GRID..=MAX_COLS).contains(&cols) || !(MIN_GRID..=MAX_ROWS).contains(&rows) {
         return Err(AppError::new(format!(
             "非法终端网格尺寸（cols={cols} rows={rows}）：列需在 {MIN_GRID}..={MAX_COLS}、行需在 {MIN_GRID}..={MAX_ROWS} 之间"
@@ -186,6 +217,21 @@ fn check_grid(cols: u16, rows: u16) -> AppResult<()> {
 }
 
 /// Forward keystrokes / pasted text into a session (daemon `sendText`).
+pub(crate) async fn send_terminal_input_inner<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    session_id: &str,
+    data: &str,
+) -> AppResult<()> {
+    check_identifier(session_id)?;
+    check_input_size(data)?;
+    state.terminal.resume();
+    let script = resolve_script_path(app)?;
+    backend(app, state, &script)
+        .send_text(session_id, data)
+        .await
+}
+
 #[tauri::command]
 pub async fn send_terminal_input<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -193,16 +239,26 @@ pub async fn send_terminal_input<R: tauri::Runtime>(
     session_id: String,
     data: String,
 ) -> AppResult<()> {
-    check_identifier(&session_id)?;
-    check_input_size(&data)?;
-    state.terminal.resume();
-    let script = resolve_script_path(&app)?;
-    backend(&app, &state, &script)
-        .send_text(&session_id, &data)
-        .await
+    send_terminal_input_inner(&app, &state, &session_id, &data).await
 }
 
 /// Resize a session's grid (daemon `resize`), e.g. after an xterm fit.
+pub(crate) async fn resize_terminal_inner<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    session_id: &str,
+    cols: u16,
+    rows: u16,
+) -> AppResult<()> {
+    check_identifier(session_id)?;
+    check_grid(cols, rows)?;
+    state.terminal.resume();
+    let script = resolve_script_path(app)?;
+    backend(app, state, &script)
+        .resize(session_id, cols, rows)
+        .await
+}
+
 #[tauri::command]
 pub async fn resize_terminal<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -211,13 +267,7 @@ pub async fn resize_terminal<R: tauri::Runtime>(
     cols: u16,
     rows: u16,
 ) -> AppResult<()> {
-    check_identifier(&session_id)?;
-    check_grid(cols, rows)?;
-    state.terminal.resume();
-    let script = resolve_script_path(&app)?;
-    backend(&app, &state, &script)
-        .resize(&session_id, cols, rows)
-        .await
+    resize_terminal_inner(&app, &state, &session_id, cols, rows).await
 }
 
 /// Probe the daemon for the StatusBar (lazy start: first call spawns + handshakes, later
@@ -228,8 +278,21 @@ pub async fn get_terminal_status<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, AppState>,
 ) -> AppResult<TerminalDaemonStatus> {
-    let script = resolve_script_path(&app)?;
-    Ok(state.terminal.status(&app, PYTHON_BIN, &script).await)
+    Ok(get_terminal_status_inner(&app, &state).await)
+}
+
+pub(crate) async fn get_terminal_status_inner<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+) -> TerminalDaemonStatus {
+    match resolve_script_path(app) {
+        Ok(script) => state.terminal.status(app, PYTHON_BIN, &script).await,
+        Err(e) => TerminalDaemonStatus {
+            available: false,
+            desired_running: true,
+            message: e.message,
+        },
+    }
 }
 
 /// Explicitly stop the resident daemon (sync, like `stop_codex`): sets the user-stop flag +
@@ -238,7 +301,11 @@ pub async fn get_terminal_status<R: tauri::Runtime>(
 /// consistency (`stop` can't fail, so it is always `Ok`).
 #[tauri::command]
 pub fn stop_terminal_daemon(state: tauri::State<'_, AppState>) -> AppResult<TerminalDaemonStatus> {
-    Ok(state.terminal.stop())
+    Ok(stop_terminal_daemon_inner(&state))
+}
+
+pub(crate) fn stop_terminal_daemon_inner(state: &AppState) -> TerminalDaemonStatus {
+    state.terminal.stop()
 }
 
 #[cfg(test)]

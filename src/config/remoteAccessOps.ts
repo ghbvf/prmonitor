@@ -23,6 +23,11 @@ export function makeListener(): Listener {
     port: 0,
     enabled: false,
     auth: "none",
+    authToken: "",
+    terminalRead: false,
+    terminalWrite: false,
+    terminalCreate: false,
+    terminalAdmin: false,
     allowedOrigins: [],
     publicUrl: "",
   };
@@ -36,6 +41,7 @@ export function makeTunnel(): Tunnel {
     name: "新隧道",
     mode: "quick",
     targetListenerId: "",
+    command: "",
     publicUrl: "",
     enabled: false,
   };

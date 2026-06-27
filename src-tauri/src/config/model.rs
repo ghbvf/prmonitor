@@ -210,9 +210,11 @@ pub struct AppConfig {
     /// Outbox worker policy (AB#1182): per-kind staleness TTLs for the durable action queue. Global
     /// (one policy serves every project). Forward-compat via the nested `#[serde(default)]`.
     pub outbox: OutboxConfig,
-    /// Declarative Remote Access listeners (AB#1064). Config-only this round; no runtime consumer yet.
+    /// Declarative Remote Access listeners. The remote supervisor consumes bindable loopback
+    /// listeners at startup and after config saves.
     pub listeners: Vec<Listener>,
-    /// Declarative Remote Access tunnels (AB#1064). `mode` reuses WebhookTunnelMode.
+    /// Declarative Remote Access tunnels. `mode` reuses WebhookTunnelMode and is reconciled
+    /// against currently bound target listeners.
     pub tunnels: Vec<Tunnel>,
 }
 
@@ -250,7 +252,8 @@ pub enum ListenerKind {
     Terminal,     // "terminal"
 }
 
-/// Per-listener auth mode (AB#1064). Minimal; not validated this round (1073 = simplest validation only).
+/// Per-listener auth mode. Terminal listeners require bearer auth plus a strong `authToken`;
+/// local-api still uses the legacy global `local_api_token` at runtime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ListenerAuthMode {
@@ -259,8 +262,8 @@ pub enum ListenerAuthMode {
     Bearer, // "bearer"
 }
 
-/// A declarative network listener descriptor (AB#1064). Config-only this round:
-/// no runtime binds these yet (deferred, tracked by the still-open AB#1064).
+/// A declarative network listener descriptor. Supported kinds are bound by the remote supervisor
+/// and must remain loopback-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Listener {
@@ -271,6 +274,11 @@ pub struct Listener {
     pub port: u16,
     pub enabled: bool,
     pub auth: ListenerAuthMode,
+    pub auth_token: String,
+    pub terminal_read: bool,
+    pub terminal_write: bool,
+    pub terminal_create: bool,
+    pub terminal_admin: bool,
     pub allowed_origins: Vec<String>,
     pub public_url: String,
 }
@@ -310,13 +318,18 @@ pub(crate) fn default_local_api_listener() -> Listener {
         port: 8788,
         enabled: true,
         auth: ListenerAuthMode::Bearer,
+        auth_token: String::new(),
+        terminal_read: false,
+        terminal_write: false,
+        terminal_create: false,
+        terminal_admin: false,
         allowed_origins: Vec::new(),
         public_url: String::new(),
     }
 }
 
-/// A declarative tunnel descriptor (AB#1064). Reuses WebhookTunnelMode (quick/command/listener).
-/// Config-only this round (status/logs/restart deferred).
+/// A declarative tunnel descriptor. Reuses WebhookTunnelMode (quick/command/listener); enabled
+/// tunnels are reconciled against currently bound target listeners.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Tunnel {
@@ -324,6 +337,7 @@ pub struct Tunnel {
     pub name: String,
     pub mode: WebhookTunnelMode,
     pub target_listener_id: String,
+    pub command: String,
     pub public_url: String,
     pub enabled: bool,
 }
@@ -339,6 +353,10 @@ const WEBHOOK_SECRET_MIN_LEN: usize = 16;
 /// the Host gate), so a non-empty token must clear the same floor as `webhook_secret`. An
 /// EMPTY token is the "disabled" sentinel (fail-closed 401), so it is exempt from this check.
 const LOCAL_API_TOKEN_MIN_LEN: usize = 16;
+
+pub(crate) fn terminal_auth_token_is_strong(token: &str) -> bool {
+    token.trim().chars().count() >= LOCAL_API_TOKEN_MIN_LEN
+}
 
 /// Validates one [`Project`]'s fields (hard-reject on failure).
 ///
@@ -831,6 +849,26 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
                 listener.name, listener.bind_host
             )));
         }
+        if listener.kind == ListenerKind::Terminal {
+            if listener.auth != ListenerAuthMode::Bearer {
+                return Err(AppError::new(format!(
+                    "auth 终端监听器「{}」必须使用 bearer 鉴权",
+                    listener.name
+                )));
+            }
+            if !terminal_auth_token_is_strong(&listener.auth_token) {
+                return Err(AppError::new(format!(
+                    "authToken 终端监听器「{}」必须配置至少 {LOCAL_API_TOKEN_MIN_LEN} 个字符的 Bearer token",
+                    listener.name
+                )));
+            }
+            if !listener.terminal_read {
+                return Err(AppError::new(format!(
+                    "terminalRead 终端监听器「{}」必须至少开启读取权限",
+                    listener.name
+                )));
+            }
+        }
         // Label the occupant by its user-facing name, falling back to a short id when the
         // name is empty (so the conflict message points at WHICH listener a human recognizes,
         // not the internal id). webhook/localApi labels stay as their field tokens above.
@@ -855,6 +893,12 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
     for tunnel in &config.tunnels {
         if !tunnel.enabled {
             continue;
+        }
+        if tunnel.mode == WebhookTunnelMode::Command && tunnel.command.trim().is_empty() {
+            return Err(AppError::new(format!(
+                "command 不能为空（隧道「{}」为 command 模式时需填写隧道命令，可用 {{port}} 占位）",
+                tunnel.name
+            )));
         }
         let target = tunnel.target_listener_id.trim();
         if target.is_empty() {
@@ -1132,6 +1176,11 @@ mod tests {
             port: 8788,
             enabled: true,
             auth: ListenerAuthMode::Bearer,
+            auth_token: "listener-token-0123456789".to_string(),
+            terminal_read: true,
+            terminal_write: true,
+            terminal_create: true,
+            terminal_admin: false,
             allowed_origins: vec!["https://app.example.com".to_string()],
             public_url: "https://api.example.com".to_string(),
         }
@@ -1151,11 +1200,18 @@ mod tests {
         assert!(v.get("port").is_some());
         assert!(v.get("enabled").is_some());
         assert!(v.get("auth").is_some());
+        assert!(v.get("authToken").is_some());
+        assert!(v.get("terminalRead").is_some());
+        assert!(v.get("terminalWrite").is_some());
+        assert!(v.get("terminalCreate").is_some());
+        assert!(v.get("terminalAdmin").is_some());
         assert!(v.get("allowedOrigins").is_some());
         assert!(v.get("publicUrl").is_some());
 
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("bind_host").is_none());
+        assert!(v.get("auth_token").is_none());
+        assert!(v.get("terminal_read").is_none());
         assert!(v.get("allowed_origins").is_none());
         assert!(v.get("public_url").is_none());
     }
@@ -1169,6 +1225,7 @@ mod tests {
             name: "Quick".to_string(),
             mode: WebhookTunnelMode::default(),
             target_listener_id: "l1".to_string(),
+            command: "cloudflared tunnel --url http://127.0.0.1:{port}".to_string(),
             public_url: "https://t.example.com".to_string(),
             enabled: true,
         };
@@ -1180,6 +1237,7 @@ mod tests {
         assert!(v.get("name").is_some());
         assert!(v.get("mode").is_some());
         assert!(v.get("targetListenerId").is_some());
+        assert!(v.get("command").is_some());
         assert!(v.get("publicUrl").is_some());
         assert!(v.get("enabled").is_some());
 
@@ -2494,6 +2552,107 @@ mod tests {
             ..AppConfig::default()
         };
         assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn validate_terminal_listener_requires_bearer_token_and_read_permission() {
+        let terminal = Listener {
+            id: "term".to_string(),
+            name: "Terminal".to_string(),
+            kind: ListenerKind::Terminal,
+            bind_host: "127.0.0.1".to_string(),
+            port: 9100,
+            enabled: true,
+            auth: ListenerAuthMode::None,
+            ..Listener::default()
+        };
+
+        let auth_err = validate(&AppConfig {
+            listeners: vec![terminal.clone()],
+            ..AppConfig::default()
+        })
+        .unwrap_err()
+        .message;
+        assert!(auth_err.starts_with("auth "), "{auth_err}");
+
+        let token_err = validate(&AppConfig {
+            listeners: vec![Listener {
+                auth: ListenerAuthMode::Bearer,
+                auth_token: "short".to_string(),
+                ..terminal.clone()
+            }],
+            ..AppConfig::default()
+        })
+        .unwrap_err()
+        .message;
+        assert!(token_err.starts_with("authToken"), "{token_err}");
+
+        let read_err = validate(&AppConfig {
+            listeners: vec![Listener {
+                auth: ListenerAuthMode::Bearer,
+                auth_token: "terminal-token-0123456789".to_string(),
+                terminal_read: false,
+                ..terminal.clone()
+            }],
+            ..AppConfig::default()
+        })
+        .unwrap_err()
+        .message;
+        assert!(read_err.starts_with("terminalRead"), "{read_err}");
+
+        assert!(validate(&AppConfig {
+            listeners: vec![Listener {
+                auth: ListenerAuthMode::Bearer,
+                auth_token: "terminal-token-0123456789".to_string(),
+                terminal_read: true,
+                ..terminal
+            }],
+            ..AppConfig::default()
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn validate_enabled_command_tunnel_requires_per_tunnel_command() {
+        let listener = Listener {
+            id: "term".to_string(),
+            kind: ListenerKind::Terminal,
+            bind_host: "127.0.0.1".to_string(),
+            port: 9100,
+            enabled: true,
+            auth: ListenerAuthMode::Bearer,
+            auth_token: "terminal-token-0123456789".to_string(),
+            terminal_read: true,
+            ..Listener::default()
+        };
+        let tunnel = Tunnel {
+            id: "tun".to_string(),
+            name: "Terminal Tunnel".to_string(),
+            enabled: true,
+            mode: WebhookTunnelMode::Command,
+            target_listener_id: "term".to_string(),
+            command: String::new(),
+            ..Tunnel::default()
+        };
+
+        let err = validate(&AppConfig {
+            listeners: vec![listener.clone()],
+            tunnels: vec![tunnel.clone()],
+            ..AppConfig::default()
+        })
+        .unwrap_err()
+        .message;
+        assert!(err.starts_with("command"), "{err}");
+
+        assert!(validate(&AppConfig {
+            listeners: vec![listener],
+            tunnels: vec![Tunnel {
+                command: "cloudflared tunnel --url http://127.0.0.1:{port}".to_string(),
+                ..tunnel
+            }],
+            ..AppConfig::default()
+        })
+        .is_ok());
     }
 
     /// Forward-compat lock for [`Listener`] (AB#1064): a listener object missing fields fills

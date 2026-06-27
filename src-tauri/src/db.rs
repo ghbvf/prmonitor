@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -191,6 +191,9 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 7 {
         apply_v7(conn)?;
     }
+    if version < 8 {
+        apply_v8(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -270,6 +273,14 @@ fn apply_v6(conn: &Connection) -> AppResult<()> {
 /// side); nothing references IT, so the DROP/RENAME is safe even under `foreign_keys=ON`.
 fn apply_v7(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(SCHEMA_V7).map_err(map_err)?;
+    Ok(())
+}
+
+/// v8 (#1445): metadata-only remote terminal audit trail. This intentionally stores no terminal
+/// input and no screen contents; only the listener/action/result/request origin metadata needed to
+/// investigate remote terminal access.
+fn apply_v8(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(SCHEMA_V8).map_err(map_err)?;
     Ok(())
 }
 
@@ -474,6 +485,20 @@ ALTER TABLE outbox_review_claim_new RENAME TO outbox_review_claim;
 PRAGMA foreign_keys=ON;
 "#;
 
+const SCHEMA_V8: &str = r#"
+CREATE TABLE IF NOT EXISTS terminal_audit (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_ms       INTEGER NOT NULL,
+    listener_id TEXT    NOT NULL,
+    action      TEXT    NOT NULL,
+    ok          INTEGER NOT NULL,
+    host        TEXT    NOT NULL,
+    origin      TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_terminal_audit_listener_ts
+    ON terminal_audit(listener_id, ts_ms);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -509,6 +534,7 @@ mod tests {
                 "outbox_review_claim",
                 "review_history_item",
                 "review_session",
+                "terminal_audit",
                 "tracked_pr",
             ] {
                 assert!(names.contains(&expected.to_string()), "missing {expected}");
@@ -576,7 +602,7 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 7, "current schema is v7");
+            assert_eq!(SCHEMA_VERSION, 8, "current schema is v8");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"

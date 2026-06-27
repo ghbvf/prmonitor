@@ -89,6 +89,11 @@ function validListener(): Listener {
     port: 8788,
     enabled: false,
     auth: "none",
+    authToken: "",
+    terminalRead: false,
+    terminalWrite: false,
+    terminalCreate: false,
+    terminalAdmin: false,
     allowedOrigins: [],
     publicUrl: "",
   };
@@ -102,6 +107,7 @@ function validTunnel(): Tunnel {
     name: "Web",
     mode: "quick",
     targetListenerId: "lis-1",
+    command: "",
     publicUrl: "",
     enabled: false,
   };
@@ -342,11 +348,17 @@ describe("LISTENER_GROUPS (AB#1064)", () => {
     expect(f?.options).toEqual(LISTENER_AUTH_MODES);
   });
 
+  it("masks the terminal authToken field", () => {
+    const f = LISTENER_GROUPS.flatMap((g) => g.fields).find((f) => f.key === "authToken");
+    expect(f?.secret).toBe(true);
+  });
+
   it("allowedOrigins is a csv field (string[] round-trip, like authors)", () => {
     const f = LISTENER_GROUPS.flatMap((g) => g.fields).find(
       (f) => f.key === "allowedOrigins",
     );
     expect(f?.kind).toBe("csv");
+    expect(f?.hint).toContain("仅允许");
   });
 
   it("enabled is a checkbox and port is a number", () => {
@@ -381,12 +393,13 @@ describe("TUNNEL_GROUPS (AB#1064)", () => {
     expect(f?.options).toEqual(WEBHOOK_TUNNEL_MODES);
   });
 
-  it("enabled is a checkbox; targetListenerId and publicUrl are text", () => {
+  it("enabled is a checkbox; targetListenerId, command, and publicUrl are text", () => {
     const byKey = new Map(
       TUNNEL_GROUPS.flatMap((g) => g.fields).map((f) => [f.key, f]),
     );
     expect(byKey.get("enabled")?.kind).toBe("checkbox");
     expect(byKey.get("targetListenerId")?.kind).toBe("text");
+    expect(byKey.get("command")?.kind).toBe("text");
     expect(byKey.get("publicUrl")?.kind).toBe("text");
   });
 });

@@ -3,12 +3,24 @@
 // through the shared `../transport` port (never `@tauri-apps/*` directly — slice-boundary
 // funnel), and the wire types come from the `../types` root.
 import { getTransport } from "../transport";
+import type { RequestOptions, SubscribeOptions } from "../transport";
 import type { CreateSessionOpts, TerminalEvent, TerminalSession } from "../types";
 import type { TerminalDaemonStatus } from "./types";
 
 // Mirrors `src-tauri/src/events.rs::TERMINAL_EVENT` (the open downstream end of the
 // event-name funnel — keep in lockstep with the Rust emitter / its golden test).
 const TERMINAL_EVENT = "terminal:event" as const;
+
+export const TERMINAL_COMMANDS = [
+  "list_terminal_sessions",
+  "create_terminal_session",
+  "attach_terminal",
+  "detach_terminal",
+  "send_terminal_input",
+  "resize_terminal",
+  "get_terminal_status",
+  "stop_terminal_daemon",
+] as const;
 
 // List the daemon's current sessions (the picker's snapshot).
 export function listTerminalSessions(): Promise<TerminalSession[]> {
@@ -30,8 +42,13 @@ export function attachTerminal(sessionId: string): Promise<void> {
 }
 
 // Detach — stop streaming the session (it keeps running in iTerm).
-export function detachTerminal(sessionId: string): Promise<void> {
-  return getTransport().request<void>("detach_terminal", { sessionId });
+export function detachTerminal(
+  sessionId: string,
+  options: RequestOptions = {},
+): Promise<void> {
+  return Object.keys(options).length > 0
+    ? getTransport().request<void>("detach_terminal", { sessionId }, options)
+    : getTransport().request<void>("detach_terminal", { sessionId });
 }
 
 // Forward keystrokes / escape sequences to the attached session.
@@ -64,6 +81,8 @@ export function stopTerminalDaemon(): Promise<TerminalDaemonStatus> {
 }
 
 // Subscribe to streamed terminal events. Returns a Promise<UnlistenFn> for cleanup.
-export function onTerminalEvent(cb: (e: TerminalEvent) => void) {
-  return getTransport().subscribe<TerminalEvent>(TERMINAL_EVENT, cb);
+export function onTerminalEvent(cb: (e: TerminalEvent) => void, options: SubscribeOptions = {}) {
+  return Object.keys(options).length > 0
+    ? getTransport().subscribe<TerminalEvent>(TERMINAL_EVENT, cb, options)
+    : getTransport().subscribe<TerminalEvent>(TERMINAL_EVENT, cb);
 }

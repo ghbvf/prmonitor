@@ -422,15 +422,44 @@ export const LISTENER_GROUPS: FieldGroup<ListenerFieldKey>[] = [
         options: LISTENER_AUTH_MODES,
         // "无鉴权" (not "无（仅环回）"): a listener may bind 0.0.0.0, so "环回" is misleading.
         optionLabels: { none: "无鉴权", bearer: "Bearer Token" },
-        // Bearer is config-only this round (no runtime enforces it yet — AB#1064 runtime
-        // deferred), so the hint flags that rather than asserting loopback-only.
-        hint: "none=无凭证（建议仅 127.0.0.1 绑定时用）；bearer=运行时到来后校验（本轮未生效）",
+        hint: "none=无凭证；bearer=终端远程访问会校验监听器 token",
+      },
+      {
+        key: "authToken",
+        label: "Bearer Token",
+        kind: "text",
+        secret: true,
+        hint: "终端监听器的远程访问 token；不会放入 URL",
+      },
+      {
+        key: "terminalRead",
+        label: "终端读取",
+        kind: "checkbox",
+        hint: "允许列出/连接会话并接收屏幕事件",
+      },
+      {
+        key: "terminalWrite",
+        label: "终端输入",
+        kind: "checkbox",
+        hint: "允许发送输入和 resize",
+      },
+      {
+        key: "terminalCreate",
+        label: "终端新建",
+        kind: "checkbox",
+        hint: "允许创建新的 iTerm 会话",
+      },
+      {
+        key: "terminalAdmin",
+        label: "终端管理",
+        kind: "checkbox",
+        hint: "允许停止 terminal daemon 等高影响操作",
       },
       {
         key: "allowedOrigins",
         label: "允许来源",
         kind: "csv",
-        hint: "逗号分隔的 CORS 允许来源；留空表示不限制",
+        hint: "逗号分隔的 CORS 允许来源；留空表示仅允许 loopback / publicUrl",
       },
       {
         key: "publicUrl",
@@ -470,6 +499,12 @@ export const TUNNEL_GROUPS: FieldGroup<TunnelFieldKey>[] = [
         // here), keeping the TUNNEL_GROUPS coverage/kind test (fields.test.ts) intact.
         kind: "text",
         hint: "本隧道发布的目标监听器（从上方监听器列表中选择）",
+      },
+      {
+        key: "command",
+        label: "隧道命令",
+        kind: "text",
+        hint: "command 模式：直接执行的隧道命令，可用 {port} 占位",
       },
       {
         key: "publicUrl",

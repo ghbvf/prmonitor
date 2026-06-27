@@ -146,16 +146,20 @@ async function onSave() {
     remoteAccessRefreshKey.value += 1;
   }
   // On a failed save, route to the page that owns the offending field. The Remote Access
-  // validations emit messages prefixed `publicUrl` / `port` (AB#1073), `bindHost` (new
-  // this PR — bind-address gate), or `targetListenerId` (tunnel ref-integrity check), so
-  // land the user on the 远程访问 page (mirrors the wizard's errorToStep field-token routing).
+  // validations emit messages prefixed `publicUrl`, `port`, `bindHost`, `targetListenerId`,
+  // `auth*`, `terminal*`, or `command`, so land the user on the 远程访问 page (mirrors the
+  // wizard's errorToStep field-token routing).
   else if (
     store.error &&
     (
       store.error.startsWith("publicUrl") ||
       store.error.startsWith("port") ||
       store.error.startsWith("bindHost") ||
-      store.error.startsWith("targetListenerId")
+      store.error.startsWith("targetListenerId") ||
+      store.error.startsWith("auth ") ||
+      store.error.startsWith("authToken") ||
+      store.error.startsWith("terminalRead") ||
+      store.error.startsWith("command")
     )
   ) {
     activeGroupId.value = REMOTE_ACCESS_NAV_ID;

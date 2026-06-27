@@ -15,11 +15,11 @@ use crate::config::model::ListenerKind;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ListenerState {
-    /// Actually listening on its loopback port (the supervisor bound it this PR — only `local-api`).
+    /// Actually listening on its loopback port.
     Bound,
-    /// Bound on its loopback port BUT the local API token is empty, so every request fail-closes
-    /// to 401 (`verify_bearer`) — bound ≠ usable. `AppConfig::default()` ships an empty
-    /// `local_api_token`, so a fresh install's bound local-api listener lands here, not `Bound`.
+    /// Bound on its loopback port BUT the relevant bearer token is empty, so requests fail-close
+    /// to 401 — bound ≠ usable. For `local-api`, this is `local_api_token`; for `terminal`, this
+    /// is the listener's `authToken`.
     BoundNoAuth,
     /// A non-loopback `bindHost` was declared; the runtime refuses to bind it until AB#1073
     /// (auth/secret/audit) lands. Fail-closed — never silently downgraded to loopback.
@@ -27,10 +27,9 @@ pub enum ListenerState {
     // hyphen before a digit), so pin the readable hyphenated wire value the TS mirror uses.
     #[serde(rename = "blocked-needs-1073")]
     BlockedNeeds1073,
-    /// This kind has no runtime yet (`remote-web` / `terminal` need AB#1073; `event-ingress`
-    /// needs the deferred tunnel runtime). Reported, not bound.
+    /// This kind has no listener runtime yet (`remote-web` / `event-ingress`). Reported, not bound.
     Unsupported,
-    /// The kind should have bound (loopback `local-api`) but binding failed (port occupied / OS).
+    /// The kind should have bound but binding failed (port occupied / OS).
     Error,
 }
 

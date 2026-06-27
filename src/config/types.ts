@@ -34,12 +34,11 @@ export type ListenerKind = (typeof LISTENER_KINDS)[number];
 
 // Runtime listener state (AB#1225 PR1) — mirrors the Rust `ListenerState` enum's
 // kebab-case wire values emitted by the `get_listener_runtime_status` command.
-// bound = successfully bound; bound-no-auth = bound but `local_api_token` is empty
-// so requests 401 (bound ≠ usable; user must set a token); blocked-needs-1073 =
-// loopback-only gate prevents binding on a non-loopback host (AB#1073 will lift
-// this); unsupported = the kind can't bind yet (e.g. remote-web, event-ingress,
-// terminal — awaiting AB#1073 / tunnel); error = bind attempt failed (see
-// `message` for details).
+// bound = successfully bound; bound-no-auth = bound but the relevant bearer token
+// is empty, so requests 401 (bound ≠ usable); blocked-needs-1073 = loopback-only
+// gate prevents binding on a non-loopback host; unsupported = the kind can't bind
+// yet (remote-web, event-ingress); error = bind attempt failed (see `message` for
+// details).
 //
 // Single-sourced as an `as const` array (same #50 review G9 pattern): the type is
 // DERIVED from the array so the Medium `assertNever`穷尽 carrier in
@@ -85,6 +84,11 @@ export interface Listener {
   port: number;
   enabled: boolean;
   auth: ListenerAuthMode;
+  authToken: string;
+  terminalRead: boolean;
+  terminalWrite: boolean;
+  terminalCreate: boolean;
+  terminalAdmin: boolean;
   allowedOrigins: string[];
   publicUrl: string;
 }
@@ -98,6 +102,7 @@ export interface Tunnel {
   name: string;
   mode: WebhookTunnelMode;
   targetListenerId: string;
+  command: string;
   publicUrl: string;
   enabled: boolean;
 }

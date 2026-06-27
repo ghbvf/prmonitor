@@ -14,14 +14,26 @@
 // `UnlistenFn` (`() => void`), so a TauriTransport can return one directly.
 export type UnlistenFn = () => void;
 
+export interface RequestOptions {
+  keepalive?: boolean;
+}
+
+export interface SubscribeOptions {
+  onClosed?: (message: string) => void;
+}
+
 export interface Transport {
   // Invoke a backend command by name. `args` keys map to the Rust command's snake_case
   // params (camelCase JS key → serde rename); `undefined` keys are dropped (parity with
   // Tauri's invoke and JSON.stringify), so optional args pass cleanly as `{ projectId }`.
-  request<T>(command: string, args?: Record<string, unknown>): Promise<T>;
+  request<T>(command: string, args?: Record<string, unknown>, options?: RequestOptions): Promise<T>;
   // Subscribe to a backend-pushed event. The handler receives the PAYLOAD directly (the
   // adapter unwraps any transport envelope); the returned UnlistenFn detaches the listener.
-  subscribe<T>(event: string, handler: (payload: T) => void): Promise<UnlistenFn>;
+  subscribe<T>(
+    event: string,
+    handler: (payload: T) => void,
+    options?: SubscribeOptions,
+  ): Promise<UnlistenFn>;
   // Open a URL in the user's external browser (desktop: opener plugin; web: window.open).
   openExternal(url: string): Promise<void>;
 }

@@ -6,13 +6,13 @@
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
-use crate::config::model::Listener;
+use crate::config::model::AppConfig;
 
-/// The composition-root-injected post-save reconcile closure (AB#1225 F4). Given the just-saved
-/// `listeners`, it drives the Remote Access listener-runtime reconcile. OPAQUE on purpose (an `Arc<dyn
-/// Fn>` mirroring `review::notify::NotificationSink`): the `config` slice holds only this type, never
+/// The composition-root-injected post-save reconcile closure. Given the just-saved config, it
+/// drives Remote Access listener and tunnel reconcile. OPAQUE on purpose (an `Arc<dyn Fn>`
+/// mirroring `review::notify::NotificationSink`): the `config` slice holds only this type, never
 /// references `crate::remote`. Aliased so the field type stays simple (clippy `type_complexity`).
-pub type ConfigSavedSink = Arc<dyn Fn(Vec<Listener>) + Send + Sync>;
+pub type ConfigSavedSink = Arc<dyn Fn(AppConfig) + Send + Sync>;
 
 /// The post-`set_config`-save hook seam (AB#1225 F4): a composition-root-injected closure the
 /// `config` slice fires AFTER a successful save, so config never names a sibling horizontal
@@ -32,15 +32,15 @@ impl ConfigSavedHook {
         *self.hook.lock().unwrap_or_else(|p| p.into_inner()) = Some(hook);
     }
 
-    /// Fire the installed hook with the just-saved listeners. Clones the `Arc` out of the lock
+    /// Fire the installed hook with the just-saved config. Clones the `Arc` out of the lock
     /// before calling so the lock isn't held across the (best-effort) reconcile. Poison-safe
     /// (`into_inner`): a panicked prior holder must not panic-cascade every subsequent save. A
     /// no-op if the root hasn't installed the hook yet (never in practice — a save before `setup`
     /// completes), so a missing hook silently skips reconcile rather than failing the save.
-    pub fn fire(&self, listeners: Vec<Listener>) {
+    pub fn fire(&self, config: AppConfig) {
         let hook = self.hook.lock().unwrap_or_else(|p| p.into_inner()).clone();
         if let Some(hook) = hook {
-            hook(listeners);
+            hook(config);
         }
     }
 }

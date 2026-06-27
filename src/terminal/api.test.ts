@@ -20,6 +20,21 @@ beforeEach(() => {
 });
 
 describe("terminal api commands", () => {
+  it("exports the terminal command set used by the remote HTTP surface", () => {
+    expect([...api.TERMINAL_COMMANDS].sort()).toEqual(
+      [
+        "attach_terminal",
+        "create_terminal_session",
+        "detach_terminal",
+        "get_terminal_status",
+        "list_terminal_sessions",
+        "resize_terminal",
+        "send_terminal_input",
+        "stop_terminal_daemon",
+      ].sort(),
+    );
+  });
+
   it("listTerminalSessions invokes list_terminal_sessions (no args)", async () => {
     await api.listTerminalSessions();
     expect(request).toHaveBeenCalledWith("list_terminal_sessions");
@@ -45,6 +60,11 @@ describe("terminal api commands", () => {
   it("detachTerminal passes sessionId (camelCase)", async () => {
     await api.detachTerminal("s1");
     expect(request).toHaveBeenCalledWith("detach_terminal", { sessionId: "s1" });
+  });
+
+  it("detachTerminal forwards keepalive for pagehide cleanup", async () => {
+    await api.detachTerminal("s1", { keepalive: true });
+    expect(request).toHaveBeenCalledWith("detach_terminal", { sessionId: "s1" }, { keepalive: true });
   });
 
   it("sendTerminalInput passes sessionId + data (camelCase)", async () => {
@@ -85,6 +105,13 @@ describe("onTerminalEvent", () => {
     const cb = vi.fn();
     await api.onTerminalEvent(cb);
     expect(subscribe).toHaveBeenCalledWith("terminal:event", cb);
+  });
+
+  it("forwards stream lifecycle options", async () => {
+    const cb = vi.fn();
+    const onClosed = vi.fn();
+    await api.onTerminalEvent(cb, { onClosed });
+    expect(subscribe).toHaveBeenCalledWith("terminal:event", cb, { onClosed });
   });
 
   it("returns the unlisten fn the transport yields", async () => {

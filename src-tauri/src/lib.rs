@@ -355,7 +355,12 @@ fn build_app() {
             // reported `unsupported`. A per-listener bind failure is captured in status, never crashes
             // the app. Reconciled again after each `set_config` save.
             match config::service::load(app.handle()) {
-                Ok(cfg) => state.remote.reconcile(app.handle(), &cfg.listeners),
+                Ok(cfg) => state.remote.reconcile(
+                    app.handle(),
+                    &cfg.listeners,
+                    &cfg.tunnels,
+                    &cfg.cloudflared_bin,
+                ),
                 Err(e) => eprintln!("Remote 监听运行时：读取配置失败，跳过初次 reconcile：{e}"),
             }
             // Install the post-save reconcile hook (AB#1225 F4) — the ONLY place that bridges
@@ -367,8 +372,13 @@ fn build_app() {
             // a direct call: lib.rs is the composition root, so naming remote here is by design.)
             state.config_saved.set_hook(Arc::new({
                 let app = app.handle().clone();
-                move |listeners: Vec<config::model::Listener>| {
-                    app.state::<AppState>().remote.reconcile(&app, &listeners);
+                move |cfg: config::model::AppConfig| {
+                    app.state::<AppState>().remote.reconcile(
+                        &app,
+                        &cfg.listeners,
+                        &cfg.tunnels,
+                        &cfg.cloudflared_bin,
+                    );
                 }
             }));
 

@@ -24,11 +24,11 @@
 //! "Enable Python API" (Preferences → General → Magic), first-run API authorization, and
 //! `pip install iterm2` for the interpreter `python3` resolves to.
 //!
-//! **PR2 forward-compat (NOT this PR):** exposing the terminal over the Remote Web Console is
-//! a `remote::supervisor` `ListenerKind::Terminal` binder + tunnel exposure + an audit trail;
-//! the `StreamEvent::Terminal` bus envelope already feeds an SSE consumer with no producer
-//! change. A SECOND backend (e.g. WebPty) is added by a sealed `TerminalBackendKind` enum + an
-//! exhaustive `match` at the command layer (the Hard carrier) — NOT now (single iTerm backend).
+//! Remote Web Terminal exposure lives in the `remote` horizontal: `ListenerKind::Terminal`
+//! binds a loopback-only HTTP router, tunnels expose it publicly, and terminal audit rows record
+//! metadata only. A SECOND backend (e.g. WebPty) is added by a sealed `TerminalBackendKind` enum
+//! plus an exhaustive `match` at the command layer (the Hard carrier) — NOT now (single iTerm
+//! backend).
 
 pub mod backend;
 pub mod codec;

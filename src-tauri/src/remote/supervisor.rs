@@ -6,13 +6,13 @@
 //! directly, like `dispatch.rs` glues `pr`→`review`); the slice-boundary test does not scan it.
 //!
 //! **Scope this PR (loopback-only, fail-closed):**
-//!  - `local-api` is the SOLE real binder — the resident `LocalApiManager` was removed; the
-//!    local-api router (`review::local_api::build_router`) is now mounted on the port the
-//!    supervisor binds from a `listeners[]` entry of `kind=local-api`. Single source of truth.
+//!  - `local-api` and `terminal` are real binders. Both are mounted on the port the supervisor
+//!    binds from `listeners[]`, keeping the config as the single source of truth.
 //!  - A non-loopback `bindHost` is REFUSED (`BlockedNeeds1073`) for any kind — remote exposure
-//!    waits for AB#1073. Whitelist, never blacklist (mirrors `local_api::security::host_allowed`).
-//!  - `remote-web` / `terminal` / `event-ingress` are reported `Unsupported` (no runtime yet),
-//!    never bound.
+//!    must happen through `config.tunnels[]`. Whitelist, never blacklist (mirrors
+//!    `local_api::security::host_allowed`).
+//!  - `remote-web` / `event-ingress` are reported `Unsupported` (no listener runtime yet), never
+//!    bound.
 //!
 //! Reconcile mirrors `pr::scheduler::SchedulerSet::reconcile` (keyed map under a `StdMutex`,
 //! tear-down-absent / leave-survivors / bind-new) and the kubelet level-triggered pattern
@@ -23,25 +23,26 @@
 //! **Per-kind binder seam (F26 / #1382):** the per-kind runtime is a [`ListenerBinder`] — each kind
 //! that has a real runtime implements it, and `reconcile` dispatches via the exhaustive
 //! [`bind_for_kind`] `match` (mirrors the `ReviewEngine` seam in `review/engine.rs`: a new kind is a
-//! new impl + one dispatch arm, NOT a change to the reconcile/diff/status core). `local-api` is the
-//! SOLE real binder this PR; `remote-web` / `terminal` (AB#1073) and `event-ingress` (tunnel runtime)
-//! have no binder yet and are reported `Unsupported`. The seam is introduced ahead of AB#1073's second
-//! binder by deliberate decision (#1382) — a single-impl seam is acknowledged speculative, so it is
-//! gated on preserving the prior compile-time guarantee: [`bind_for_kind`]'s `match` is exhaustive with
-//! NO wildcard, so a new `ListenerKind` without an arm is a COMPILE ERROR (**Hard** carrier, unchanged
-//! from the pre-seam single `match`). `classify` stays the R-free bindability+reason source; the two
-//! agree on the bindable set, pinned by `binder_registry_consistent_with_classify` (**Medium** carrier).
+//! new impl + one dispatch arm, NOT a change to the reconcile/diff/status core). The match is
+//! exhaustive with NO wildcard, so a new `ListenerKind` without an arm is a COMPILE ERROR (**Hard**
+//! carrier, unchanged from the pre-seam single `match`). `classify` stays the R-free
+//! bindability+reason source; the two agree on the bindable set, pinned by
+//! `binder_registry_consistent_with_classify` (**Medium** carrier).
 //! See `.claude/rules/prmonitor/ai-robust.md` §审查要求 for the rating obligation.
 
 use std::collections::HashMap;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use tauri::async_runtime::{spawn, JoinHandle};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
+use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::oneshot;
 
-use crate::config::model::{Listener, ListenerKind};
+use crate::config::model::{terminal_auth_token_is_strong, Listener, ListenerKind, Tunnel};
+use crate::model::WebhookTunnelMode;
 use crate::review::local_api::{build_router, Ctx};
 
 use super::status::{ListenerRuntimeStatus, ListenerState};
@@ -50,6 +51,7 @@ use super::status::{ListenerRuntimeStatus, ListenerState};
 /// the local-api / webhook receivers used). A final failure is logged + recorded as `Error`.
 const BIND_RETRIES: u32 = 10;
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(20);
+const TUNNEL_URL_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// What the runtime should do with one (enabled) listener — the loopback gate + kind routing.
 enum Disposition {
@@ -73,15 +75,12 @@ fn classify(l: &Listener) -> Disposition {
         ));
     }
     match l.kind {
-        ListenerKind::LocalApi => Disposition::Bind,
+        ListenerKind::LocalApi | ListenerKind::Terminal => Disposition::Bind,
         ListenerKind::EventIngress => Disposition::Unsupported(
             "event-ingress 运行时待建（需隧道运行时，AB#1225 后续）".to_string(),
         ),
         ListenerKind::RemoteWeb => {
             Disposition::Unsupported("remote-web 运行时待建（需 AB#1073）".to_string())
-        }
-        ListenerKind::Terminal => {
-            Disposition::Unsupported("terminal 运行时待建（需 AB#1073 权限/审计）".to_string())
         }
     }
 }
@@ -89,10 +88,7 @@ fn classify(l: &Listener) -> Disposition {
 /// Pure status projection (no app handle) given whether the listener is actually bound and whether
 /// the local API token is set — the classification→status mapping, unit-tested directly.
 ///
-/// `local_api_token_set` gates ONLY `local-api`: a bound local-api listener with an empty token
-/// reports `BoundNoAuth` instead of `Bound`, because `review::local_api::verify_bearer` fail-closes
-/// EVERY request to 401 when the token is empty (so bound ≠ usable). Other kinds never reach the
-/// `Bind` arm this PR, so the flag is irrelevant to them.
+/// `local_api_token_set` gates `local-api`; terminal uses the per-listener `authToken` strength.
 fn status_of(
     l: &Listener,
     bound_port: Option<u16>,
@@ -102,14 +98,18 @@ fn status_of(
         Disposition::Blocked(msg) => (ListenerState::BlockedNeeds1073, false, None, msg),
         Disposition::Unsupported(msg) => (ListenerState::Unsupported, false, None, msg),
         Disposition::Bind => match bound_port {
-            Some(p) if l.kind == ListenerKind::LocalApi && !local_api_token_set => (
-                ListenerState::BoundNoAuth,
-                true,
-                Some(p),
-                format!(
-                    "已绑定 127.0.0.1:{p}，但 token 未设置——请求将 401（请在设置中配置 local API token）"
-                ),
-            ),
+            Some(p)
+                if (l.kind == ListenerKind::LocalApi && !local_api_token_set)
+                    || (l.kind == ListenerKind::Terminal
+                        && !terminal_auth_token_is_strong(&l.auth_token)) =>
+            {
+                (
+                    ListenerState::BoundNoAuth,
+                    true,
+                    Some(p),
+                    bound_no_auth_message(l.kind, p),
+                )
+            }
             Some(p) => (
                 ListenerState::Bound,
                 true,
@@ -132,6 +132,17 @@ fn status_of(
         state,
         message,
     }
+}
+
+fn bound_no_auth_message(kind: ListenerKind, port: u16) -> String {
+    let field = match kind {
+        ListenerKind::Terminal => "终端监听器 authToken",
+        ListenerKind::LocalApi => "local API token",
+        ListenerKind::RemoteWeb | ListenerKind::EventIngress => "token",
+    };
+    format!(
+        "已绑定 127.0.0.1:{port}，但 token 未设置或强度不足——请求将 401（请在设置中配置 {field}）"
+    )
 }
 
 /// One bindable listener's reconcile-relevant fields, kept TOGETHER so the bind step reads a single
@@ -215,6 +226,7 @@ struct BoundListener {
 #[derive(Default)]
 pub struct ListenerSupervisor {
     runtimes: StdMutex<HashMap<String, BoundListener>>,
+    tunnels: StdMutex<HashMap<String, BoundTunnel>>,
     /// Serializes concurrent `reconcile` calls (setup + each `set_config` save). Held for the WHOLE
     /// reconcile so two reconciles can't interleave their bind/teardown, but it is a SEPARATE lock
     /// from `runtimes` — the blocking std bind + retry sleep happen while holding ONLY this guard,
@@ -228,7 +240,13 @@ impl ListenerSupervisor {
     /// no longer desired (removed / disabled / non-loopback / port-changed), leaves survivors,
     /// binds newly-bindable ones. Called from `lib.rs` `setup()` AND after a `set_config` save.
     /// Best-effort: a per-listener bind failure is reflected in status, never propagated.
-    pub fn reconcile<R: tauri::Runtime>(&self, app: &tauri::AppHandle<R>, listeners: &[Listener]) {
+    pub fn reconcile<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        listeners: &[Listener],
+        tunnels: &[Tunnel],
+        cloudflared_bin: &str,
+    ) {
         // Serialize concurrent reconciles for the whole pass. Poison-safe (`into_inner`): a
         // panicked prior reconcile must not panic-cascade every subsequent save.
         let _serialize = self
@@ -244,13 +262,20 @@ impl ListenerSupervisor {
         //    retry sleep below never block `status_snapshot` / `shutdown` / a concurrent save.
         let (add, removed): (Vec<String>, Vec<BoundListener>) = {
             let mut runtimes = self.runtimes.lock().unwrap_or_else(|p| p.into_inner());
+            let dead: Vec<String> = runtimes
+                .iter()
+                .filter(|(_, b)| b.server_task.inner().is_finished())
+                .map(|(id, _)| id.clone())
+                .collect();
             let current: HashMap<String, u16> = runtimes
                 .iter()
+                .filter(|(id, _)| !dead.contains(id))
                 .map(|(id, b)| (id.clone(), b.port))
                 .collect();
             let (remove, add) = diff(&current, &desired);
             let removed = remove
                 .into_iter()
+                .chain(dead)
                 .filter_map(|id| runtimes.remove(&id))
                 .collect();
             (add, removed)
@@ -280,7 +305,7 @@ impl ListenerSupervisor {
         let mut bound: Vec<(String, BoundListener)> = Vec::with_capacity(add.len());
         for id in add {
             let DesiredListener { port, kind } = desired[&id];
-            if let Some(b) = bind_for_kind(kind, app, port) {
+            if let Some(b) = bind_for_kind(kind, app, &id, port) {
                 bound.push((id, b));
             }
             // A bind failure inserts no entry → status_snapshot reports it as `Error`.
@@ -293,6 +318,7 @@ impl ListenerSupervisor {
                 runtimes.insert(id, b);
             }
         }
+        self.reconcile_tunnels(tunnels, cloudflared_bin);
     }
 
     /// Per-(enabled-)listener runtime status, derived FRESH from the passed config + the live
@@ -308,14 +334,15 @@ impl ListenerSupervisor {
     /// to `Error` instead of reporting a phantom `Bound` forever. We probe the inner tokio handle's
     /// `is_finished()` (the tauri `JoinHandle` wrapper only exposes `inner()` + `abort()`, mirroring
     /// `pr::scheduler`'s `task.handle.inner().is_finished()`). The stale entry is left in the map (no
-    /// mutation here, keeping this read-only under the brief lock); the next `reconcile` re-binds it
-    /// because the dead entry still advertises its old port and a fresh bind on a now-free port wins.
+    /// mutation here, keeping this read-only under the brief lock); the next `reconcile` drains the
+    /// dead entry before diffing so the listener is eligible for a fresh bind.
     pub fn status_snapshot(
         &self,
         listeners: &[Listener],
         local_api_token_set: bool,
     ) -> Vec<ListenerRuntimeStatus> {
         let runtimes = self.runtimes.lock().unwrap_or_else(|p| p.into_inner());
+        let tunnel_urls = self.tunnel_public_urls_by_listener();
         listeners
             .iter()
             .filter(|l| l.enabled)
@@ -324,20 +351,196 @@ impl ListenerSupervisor {
                     .get(&l.id)
                     .filter(|b| !b.server_task.inner().is_finished())
                     .map(|b| b.port);
-                status_of(l, bound_port, local_api_token_set)
+                let mut status = status_of(l, bound_port, local_api_token_set);
+                if status.bound {
+                    if let Some(urls) = tunnel_urls.get(&l.id).filter(|urls| !urls.is_empty()) {
+                        status.message =
+                            format!("{}，公网 URL：{}", status.message, urls.join(", "));
+                    }
+                }
+                status
             })
             .collect()
+    }
+
+    pub(crate) fn public_urls_for_listener(&self, listener_id: &str) -> Vec<String> {
+        self.tunnel_public_urls_by_listener()
+            .remove(listener_id)
+            .unwrap_or_default()
+    }
+
+    fn tunnel_public_urls_by_listener(&self) -> HashMap<String, Vec<String>> {
+        let tunnels = self.tunnels.lock().unwrap_or_else(|p| p.into_inner());
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for rt in tunnels.values() {
+            let Some(url) = rt
+                .public_url
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+            else {
+                continue;
+            };
+            out.entry(rt.desired.target_listener_id.clone())
+                .or_default()
+                .push(url);
+        }
+        out
     }
 
     /// App-shutdown cleanup (wired to `RunEvent::Exit`): fire each graceful-shutdown signal + abort
     /// the task so no listener outlives the app (same "软件关闭时一起关闭" contract as the others).
     pub fn shutdown(&self) {
+        self.shutdown_tunnels();
         let mut runtimes = self.runtimes.lock().unwrap_or_else(|p| p.into_inner());
         for (_, b) in runtimes.drain() {
             let _ = b.shutdown.send(());
             b.server_task.abort();
         }
     }
+
+    fn reconcile_tunnels(&self, tunnels: &[Tunnel], cloudflared_bin: &str) {
+        let bound_ports: HashMap<String, u16> = self
+            .runtimes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(_, b)| !b.server_task.inner().is_finished())
+            .map(|(id, b)| (id.clone(), b.port))
+            .collect();
+        let desired: HashMap<String, TunnelDesired> = tunnels
+            .iter()
+            .filter(|t| t.enabled)
+            .filter_map(|t| {
+                let port = *bound_ports.get(&t.target_listener_id)?;
+                Some((
+                    t.id.clone(),
+                    TunnelDesired {
+                        mode: t.mode,
+                        target_listener_id: t.target_listener_id.clone(),
+                        target_port: port,
+                        command: t.command.clone(),
+                        public_url: t.public_url.clone(),
+                    },
+                ))
+            })
+            .collect();
+
+        let add: Vec<(String, TunnelDesired)> = {
+            let mut current = self.tunnels.lock().unwrap_or_else(|p| p.into_inner());
+            let remove: Vec<String> = current
+                .iter_mut()
+                .filter_map(|(id, rt)| {
+                    (desired.get(id) != Some(&rt.desired) || !rt.is_alive()).then(|| id.clone())
+                })
+                .collect();
+            for id in &remove {
+                if let Some(rt) = current.remove(id) {
+                    rt.teardown();
+                }
+            }
+            let add = desired
+                .iter()
+                .filter(|(id, d)| current.get(*id).map(|rt| &rt.desired) != Some(*d))
+                .map(|(id, d)| (id.clone(), d.clone()))
+                .collect();
+            add
+        };
+
+        let mut started = Vec::new();
+        for (id, desired) in add {
+            if let Some(rt) = BoundTunnel::start(cloudflared_bin, desired) {
+                started.push((id, rt));
+            }
+        }
+        if !started.is_empty() {
+            let mut current = self.tunnels.lock().unwrap_or_else(|p| p.into_inner());
+            for (id, rt) in started {
+                current.insert(id, rt);
+            }
+        }
+    }
+
+    fn shutdown_tunnels(&self) {
+        let mut tunnels = self.tunnels.lock().unwrap_or_else(|p| p.into_inner());
+        for (_, rt) in tunnels.drain() {
+            rt.teardown();
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct TunnelDesired {
+    mode: WebhookTunnelMode,
+    target_listener_id: String,
+    target_port: u16,
+    command: String,
+    public_url: String,
+}
+
+struct BoundTunnel {
+    desired: TunnelDesired,
+    child: Option<Child>,
+    drain_task: Option<JoinHandle<()>>,
+    public_url: Arc<StdMutex<Option<String>>>,
+}
+
+impl BoundTunnel {
+    fn start(cloudflared_bin: &str, desired: TunnelDesired) -> Option<Self> {
+        match desired.mode {
+            WebhookTunnelMode::Listener => Some(Self {
+                public_url: Arc::new(StdMutex::new(non_empty_url(&desired.public_url))),
+                desired,
+                child: None,
+                drain_task: None,
+            }),
+            WebhookTunnelMode::Command => {
+                let (child, drain_task) = tauri::async_runtime::block_on(async {
+                    spawn_custom_tunnel(&desired.command, desired.target_port)
+                })
+                .ok()?;
+                Some(Self {
+                    public_url: Arc::new(StdMutex::new(non_empty_url(&desired.public_url))),
+                    desired,
+                    child: Some(child),
+                    drain_task: Some(drain_task),
+                })
+            }
+            WebhookTunnelMode::Quick => {
+                let (child, drain_task, public_url) = tauri::async_runtime::block_on(
+                    spawn_quick_tunnel(cloudflared_bin, desired.target_port),
+                )
+                .ok()?;
+                Some(Self {
+                    public_url,
+                    desired,
+                    child: Some(child),
+                    drain_task: Some(drain_task),
+                })
+            }
+        }
+    }
+
+    fn teardown(mut self) {
+        if let Some(task) = self.drain_task.take() {
+            task.abort();
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
+
+    fn is_alive(&mut self) -> bool {
+        !matches!(self.child.as_mut().map(Child::try_wait), Some(Ok(Some(_))))
+    }
+}
+
+fn non_empty_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// The per-kind listener runtime binder seam (F26 / #1382). Each [`ListenerKind`] that has a real
@@ -352,23 +555,46 @@ trait ListenerBinder {
     fn bind<R: tauri::Runtime>(
         &self,
         app: &tauri::AppHandle<R>,
+        listener_id: &str,
         port: u16,
     ) -> Option<BoundListener>;
 }
 
-/// The sole real binder this PR: mounts the local-api router (`review::local_api::build_router`) on the
-/// bound loopback socket. Other kinds have no binder yet (`remote-web` / `terminal` need AB#1073,
-/// `event-ingress` needs the tunnel runtime) — see [`bind_for_kind`].
+/// Mounts the local-api router (`review::local_api::build_router`) on the bound loopback socket.
+/// Other bindable kinds have their own binder structs — see [`bind_for_kind`].
 struct LocalApiBinder;
 
 impl ListenerBinder for LocalApiBinder {
     fn bind<R: tauri::Runtime>(
         &self,
         app: &tauri::AppHandle<R>,
+        _listener_id: &str,
         port: u16,
     ) -> Option<BoundListener> {
         bind_loopback(app, port, |app, port| {
             build_router(Arc::new(Ctx { app, port }))
+        })
+    }
+}
+
+struct TerminalBinder;
+
+impl ListenerBinder for TerminalBinder {
+    fn bind<R: tauri::Runtime>(
+        &self,
+        app: &tauri::AppHandle<R>,
+        listener_id: &str,
+        port: u16,
+    ) -> Option<BoundListener> {
+        let listener_id = listener_id.to_string();
+        bind_loopback(app, port, move |app, port| {
+            crate::remote::terminal_http::build_router(Arc::new(
+                crate::remote::terminal_http::Ctx {
+                    app,
+                    port,
+                    listener_id,
+                },
+            ))
         })
     }
 }
@@ -385,11 +611,13 @@ impl ListenerBinder for LocalApiBinder {
 fn bind_for_kind<R: tauri::Runtime>(
     kind: ListenerKind,
     app: &tauri::AppHandle<R>,
+    listener_id: &str,
     port: u16,
 ) -> Option<BoundListener> {
     match kind {
-        ListenerKind::LocalApi => LocalApiBinder.bind(app, port),
-        ListenerKind::EventIngress | ListenerKind::RemoteWeb | ListenerKind::Terminal => None,
+        ListenerKind::LocalApi => LocalApiBinder.bind(app, listener_id, port),
+        ListenerKind::Terminal => TerminalBinder.bind(app, listener_id, port),
+        ListenerKind::EventIngress | ListenerKind::RemoteWeb => None,
     }
 }
 
@@ -472,6 +700,112 @@ fn bind_std_with_retry(port: u16) -> Option<std::net::TcpListener> {
     None
 }
 
+fn build_tunnel_command_argv(command: &str, port: u16) -> Option<(String, Vec<String>)> {
+    let port = port.to_string();
+    let mut tokens = command
+        .split_whitespace()
+        .map(|token| token.replace("{port}", &port));
+    let program = tokens.next()?;
+    Some((program, tokens.collect()))
+}
+
+fn spawn_custom_tunnel(
+    command: &str,
+    port: u16,
+) -> crate::error::AppResult<(Child, JoinHandle<()>)> {
+    let (program, args) = build_tunnel_command_argv(command, port)
+        .ok_or_else(|| crate::error::AppError::new("command 不能为空".to_string()))?;
+    let mut cmd = Command::new(&program);
+    cmd.args(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|e| {
+        crate::error::AppError::new(format!("无法启动远程隧道命令（{program}）：{e}"))
+    })?;
+    let stderr = child.stderr.take();
+    let drain_task = spawn(async move {
+        if let Some(stderr) = stderr {
+            let mut lines = BufReader::new(stderr).lines();
+            while matches!(lines.next_line().await, Ok(Some(_))) {}
+        }
+    });
+    Ok((child, drain_task))
+}
+
+async fn spawn_quick_tunnel(
+    bin: &str,
+    port: u16,
+) -> crate::error::AppResult<(Child, JoinHandle<()>, Arc<StdMutex<Option<String>>>)> {
+    let mut cmd = Command::new(bin);
+    cmd.args([
+        "tunnel",
+        "--no-autoupdate",
+        "--url",
+        &format!("http://127.0.0.1:{port}"),
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| crate::error::AppError::new(format!("无法启动 cloudflared：{e}")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| crate::error::AppError::new("cloudflared stderr 不可用".to_string()))?;
+    let mut lines = BufReader::new(stderr).lines();
+    let initial = tokio::time::timeout(TUNNEL_URL_TIMEOUT, scan_for_url(&mut lines))
+        .await
+        .ok()
+        .flatten();
+    if initial.is_none() {
+        if let Ok(Some(exit)) = child.try_wait() {
+            return Err(crate::error::AppError::new(format!(
+                "cloudflared 在解析公网 URL 前已退出（{exit}）"
+            )));
+        }
+    }
+    let public_url = Arc::new(StdMutex::new(initial));
+    let drain_task = spawn(drain_scanning_url(lines, public_url.clone()));
+    Ok((child, drain_task, public_url))
+}
+
+async fn scan_for_url(lines: &mut Lines<BufReader<ChildStderr>>) -> Option<String> {
+    while let Ok(Some(line)) = lines.next_line().await {
+        if let Some(url) = extract_trycloudflare_url(&line) {
+            return Some(url);
+        }
+    }
+    None
+}
+
+async fn drain_scanning_url(
+    mut lines: Lines<BufReader<ChildStderr>>,
+    public_url: Arc<StdMutex<Option<String>>>,
+) {
+    while let Ok(Some(line)) = lines.next_line().await {
+        if public_url
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
+        {
+            if let Some(url) = extract_trycloudflare_url(&line) {
+                *public_url.lock().unwrap_or_else(|p| p.into_inner()) = Some(url);
+            }
+        }
+    }
+}
+
+fn extract_trycloudflare_url(line: &str) -> Option<String> {
+    line.split_whitespace()
+        .find(|part| part.starts_with("https://") && part.contains(".trycloudflare.com"))
+        .map(|part| {
+            part.trim_matches(|c: char| c == '|' || c == ',' || c == ';')
+                .to_string()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +820,11 @@ mod tests {
             port,
             enabled,
             auth: ListenerAuthMode::None,
+            auth_token: String::new(),
+            terminal_read: false,
+            terminal_write: false,
+            terminal_create: false,
+            terminal_admin: false,
             allowed_origins: vec![],
             public_url: String::new(),
         }
@@ -528,16 +867,40 @@ mod tests {
 
     #[test]
     fn classify_other_kinds_are_unsupported() {
-        for kind in [
-            ListenerKind::RemoteWeb,
-            ListenerKind::EventIngress,
-            ListenerKind::Terminal,
-        ] {
+        for kind in [ListenerKind::RemoteWeb, ListenerKind::EventIngress] {
             assert!(matches!(
                 classify(&listener("a", kind, "127.0.0.1", 9000, true)),
                 Disposition::Unsupported(_)
             ));
         }
+    }
+
+    #[test]
+    fn classify_terminal_loopback_is_bind() {
+        assert!(matches!(
+            classify(&listener(
+                "terminal",
+                ListenerKind::Terminal,
+                "127.0.0.1",
+                9100,
+                true
+            )),
+            Disposition::Bind
+        ));
+    }
+
+    #[test]
+    fn classify_terminal_non_loopback_is_blocked() {
+        assert!(matches!(
+            classify(&listener(
+                "terminal",
+                ListenerKind::Terminal,
+                "0.0.0.0",
+                9100,
+                true
+            )),
+            Disposition::Blocked(_)
+        ));
     }
 
     // --- status_of (classification → wire status) -------------------------------------------
@@ -612,12 +975,17 @@ mod tests {
             listener("disabled", ListenerKind::LocalApi, "127.0.0.1", 8789, false),
             listener("remote", ListenerKind::LocalApi, "0.0.0.0", 8790, true),
             listener("web", ListenerKind::RemoteWeb, "127.0.0.1", 8791, true),
+            listener("terminal", ListenerKind::Terminal, "127.0.0.1", 8792, true),
         ];
         let d = desired_listeners(&listeners);
-        assert_eq!(d.len(), 1);
+        assert_eq!(d.len(), 2);
         assert_eq!(
             d.get("ok").map(|x| (x.port, x.kind)),
             Some((8788, ListenerKind::LocalApi))
+        );
+        assert_eq!(
+            d.get("terminal").map(|x| (x.port, x.kind)),
+            Some((8792, ListenerKind::Terminal))
         );
     }
 
@@ -721,6 +1089,77 @@ mod tests {
         );
     }
 
+    #[test]
+    fn command_tunnel_substitutes_target_listener_port() {
+        let (program, args) = build_tunnel_command_argv(
+            "cloudflared tunnel --url http://127.0.0.1:{port} run term",
+            9100,
+        )
+        .expect("command parses");
+        assert_eq!(program, "cloudflared");
+        assert_eq!(
+            args,
+            vec![
+                "tunnel".to_string(),
+                "--url".to_string(),
+                "http://127.0.0.1:9100".to_string(),
+                "run".to_string(),
+                "term".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_trycloudflare_url_finds_quick_tunnel_banner() {
+        assert_eq!(
+            extract_trycloudflare_url("INF | https://abc.trycloudflare.com |"),
+            Some("https://abc.trycloudflare.com".to_string())
+        );
+        assert_eq!(extract_trycloudflare_url("INF starting tunnel"), None);
+    }
+
+    #[test]
+    fn command_tunnel_marks_exited_child_not_alive() {
+        let desired = TunnelDesired {
+            mode: WebhookTunnelMode::Command,
+            target_listener_id: "local-api".to_string(),
+            target_port: 9100,
+            command: "true".to_string(),
+            public_url: String::new(),
+        };
+        let mut rt = BoundTunnel::start("cloudflared", desired).expect("true command starts");
+        for _ in 0..20 {
+            if !rt.is_alive() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !rt.is_alive(),
+            "exited command tunnel must self-heal as dead"
+        );
+    }
+
+    #[test]
+    fn command_tunnel_exposes_configured_public_url_for_listener() {
+        let desired = TunnelDesired {
+            mode: WebhookTunnelMode::Command,
+            target_listener_id: "terminal".to_string(),
+            target_port: 9100,
+            command: "sleep 60".to_string(),
+            public_url: "https://term.example.com".to_string(),
+        };
+        let sup = ListenerSupervisor::default();
+        let rt = BoundTunnel::start("cloudflared", desired).expect("sleep command starts");
+        sup.tunnels.lock().unwrap().insert("tun".to_string(), rt);
+
+        assert_eq!(
+            sup.public_urls_for_listener("terminal"),
+            vec!["https://term.example.com".to_string()]
+        );
+        sup.shutdown();
+    }
+
     // --- status_snapshot (no-bound-entry paths; needs no live runtime) -----------------------
     // These cover every `status_snapshot` projection that does NOT require a bound entry; the
     // `Bound` path (which needs a real `BoundListener` with a `JoinHandle`) is covered by the
@@ -802,13 +1241,9 @@ mod tests {
         // socket (the `None` arm short-circuits before any bind). Pins that the seam never silently
         // binds a non-runtime kind — the Hard exhaustive `match` routes them to `None`, fail-closed.
         let app = tauri::test::mock_app();
-        for kind in [
-            ListenerKind::RemoteWeb,
-            ListenerKind::EventIngress,
-            ListenerKind::Terminal,
-        ] {
+        for kind in [ListenerKind::RemoteWeb, ListenerKind::EventIngress] {
             assert!(
-                bind_for_kind(kind, app.handle(), 0).is_none(),
+                bind_for_kind(kind, app.handle(), "x", 0).is_none(),
                 "non-runtime kind {kind:?} must not bind"
             );
         }
@@ -816,7 +1251,7 @@ mod tests {
 
     #[test]
     fn local_api_binder_binds_loopback() {
-        // The sole real binder this PR: `LocalApiBinder` mounts + binds the local-api router on a
+        // This test covers `LocalApiBinder`: it mounts + binds the local-api router on a
         // loopback port. Reserve a free ephemeral port, release it, bind through the binder directly,
         // assert a live serve task, then clean up (mirrors the reconcile-integration CI-safe pattern;
         // no HTTP request, so the router's managed state / DB is never touched).
@@ -826,7 +1261,7 @@ mod tests {
             l.local_addr().expect("local_addr").port()
         };
         let bound = LocalApiBinder
-            .bind(app.handle(), port)
+            .bind(app.handle(), "local-api", port)
             .expect("local-api binder binds a free loopback port");
         assert_eq!(bound.port, port);
         assert!(
@@ -849,18 +1284,14 @@ mod tests {
         // regression that drops `bind_for_kind`'s `LocalApi` arm to `None` fails HERE (not only in the
         // reconcile integration test).
         let app = tauri::test::mock_app();
-        for kind in [
-            ListenerKind::RemoteWeb,
-            ListenerKind::EventIngress,
-            ListenerKind::Terminal,
-        ] {
+        for kind in [ListenerKind::RemoteWeb, ListenerKind::EventIngress] {
             let l = listener("x", kind, "127.0.0.1", 9000, true);
             assert!(
                 matches!(classify(&l), Disposition::Unsupported(_)),
                 "{kind:?} must classify Unsupported"
             );
             assert!(
-                bind_for_kind(kind, app.handle(), 9000).is_none(),
+                bind_for_kind(kind, app.handle(), "x", 9000).is_none(),
                 "{kind:?} must have no binder"
             );
         }
@@ -880,8 +1311,26 @@ mod tests {
             ),
             "local-api must classify Bind"
         );
-        let bound = bind_for_kind(ListenerKind::LocalApi, app.handle(), 0)
+        let bound = bind_for_kind(ListenerKind::LocalApi, app.handle(), "local-api", 0)
             .expect("local-api must have a binder in bind_for_kind, not just Bind in classify");
+        let _ = bound.shutdown.send(());
+        bound.server_task.abort();
+
+        assert!(
+            matches!(
+                classify(&listener(
+                    "terminal",
+                    ListenerKind::Terminal,
+                    "127.0.0.1",
+                    9100,
+                    true
+                )),
+                Disposition::Bind
+            ),
+            "terminal must classify Bind"
+        );
+        let bound = bind_for_kind(ListenerKind::Terminal, app.handle(), "terminal", 0)
+            .expect("terminal must have a binder in bind_for_kind");
         let _ = bound.shutdown.send(());
         bound.server_task.abort();
     }
@@ -911,7 +1360,7 @@ mod tests {
         )];
 
         // Bind: one entry, state == Bound, bound_port == the reserved port (token set → usable).
-        sup.reconcile(app.handle(), &listeners);
+        sup.reconcile(app.handle(), &listeners, &[], "cloudflared");
         let snap = sup.status_snapshot(&listeners, true);
         assert_eq!(snap.len(), 1, "exactly one enabled listener");
         assert_eq!(snap[0].state, ListenerState::Bound, "should be bound");
@@ -919,13 +1368,40 @@ mod tests {
         assert_eq!(snap[0].bound_port, Some(port));
 
         // Teardown: reconcile to the empty set drops the runtime entry.
-        sup.reconcile(app.handle(), &[]);
+        sup.reconcile(app.handle(), &[], &[], "cloudflared");
         assert!(
             sup.status_snapshot(&[], true).is_empty(),
             "reconcile to empty set tears the bound listener down"
         );
 
         // App-shutdown cleanup is idempotent after teardown.
+        sup.shutdown();
+    }
+
+    #[test]
+    fn reconcile_binds_then_tears_down_terminal() {
+        let app = tauri::test::mock_app();
+        let port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral bind");
+            l.local_addr().expect("local_addr").port()
+        };
+
+        let sup = ListenerSupervisor::default();
+        let listeners = vec![Listener {
+            auth_token: "terminal-token-0123456789".to_string(),
+            terminal_read: true,
+            ..listener("terminal", ListenerKind::Terminal, "127.0.0.1", port, true)
+        }];
+
+        sup.reconcile(app.handle(), &listeners, &[], "cloudflared");
+        let snap = sup.status_snapshot(&listeners, true);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].state, ListenerState::Bound);
+        assert!(snap[0].bound);
+        assert_eq!(snap[0].bound_port, Some(port));
+
+        sup.reconcile(app.handle(), &[], &[], "cloudflared");
+        assert!(sup.status_snapshot(&[], true).is_empty());
         sup.shutdown();
     }
 
@@ -948,7 +1424,7 @@ mod tests {
             listener("dup", ListenerKind::LocalApi, "127.0.0.1", port, true),
             listener("dup", ListenerKind::RemoteWeb, "127.0.0.1", 9000, true),
         ];
-        sup.reconcile(app.handle(), &listeners);
+        sup.reconcile(app.handle(), &listeners, &[], "cloudflared");
         let snap = sup.status_snapshot(&listeners, true);
         let local_api_bound = snap.iter().any(|s| {
             s.kind == ListenerKind::LocalApi
@@ -982,7 +1458,7 @@ mod tests {
             true,
         )];
 
-        sup.reconcile(app.handle(), &listeners);
+        sup.reconcile(app.handle(), &listeners, &[], "cloudflared");
         assert_eq!(
             sup.status_snapshot(&listeners, true)[0].state,
             ListenerState::Bound,
@@ -1019,6 +1495,73 @@ mod tests {
         assert!(!snap[0].bound);
         assert_eq!(snap[0].bound_port, None);
 
+        sup.reconcile(app.handle(), &listeners, &[], "cloudflared");
+        assert_eq!(
+            sup.status_snapshot(&listeners, true)[0].state,
+            ListenerState::Bound,
+            "same-config reconcile must drain dead runtime and re-bind"
+        );
+
+        sup.shutdown();
+    }
+
+    #[test]
+    fn reconcile_restarts_dead_command_tunnel() {
+        let app = tauri::test::mock_app();
+        let port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral bind");
+            l.local_addr().expect("local_addr").port()
+        };
+        let sup = ListenerSupervisor::default();
+        let listeners = vec![listener(
+            "local-api",
+            ListenerKind::LocalApi,
+            "127.0.0.1",
+            port,
+            true,
+        )];
+        let tunnels = vec![Tunnel {
+            id: "tun".to_string(),
+            name: "Tunnel".to_string(),
+            mode: WebhookTunnelMode::Command,
+            target_listener_id: "local-api".to_string(),
+            command: "sleep 60".to_string(),
+            public_url: String::new(),
+            enabled: true,
+        }];
+
+        sup.reconcile(app.handle(), &listeners, &tunnels, "cloudflared");
+        {
+            let mut tunnels = sup.tunnels.lock().unwrap();
+            let rt = tunnels.get_mut("tun").expect("tunnel starts");
+            assert!(rt.is_alive(), "precondition: sleep tunnel is alive");
+            rt.child
+                .as_mut()
+                .expect("child")
+                .start_kill()
+                .expect("kill child");
+        }
+        tauri::async_runtime::block_on(async {
+            for _ in 0..200 {
+                {
+                    let mut tunnels = sup.tunnels.lock().unwrap();
+                    if !tunnels.get_mut("tun").expect("tunnel").is_alive() {
+                        return;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            panic!("tunnel child did not exit after kill");
+        });
+
+        sup.reconcile(app.handle(), &listeners, &tunnels, "cloudflared");
+        {
+            let mut tunnels = sup.tunnels.lock().unwrap();
+            assert!(
+                tunnels.get_mut("tun").expect("tunnel restarted").is_alive(),
+                "same-config reconcile must restart dead tunnel child"
+            );
+        }
         sup.shutdown();
     }
 }

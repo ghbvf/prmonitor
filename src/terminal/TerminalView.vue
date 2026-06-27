@@ -23,13 +23,20 @@ const tree = computed(() => groupSessions(store.sessions.value));
 // live listener that would leak. Detecting `!active` after the await tears it down immediately.
 let unlisten: Awaited<ReturnType<typeof store.init>> | null = null;
 let active = true;
+function detachForPageHide() {
+  void store.detach({ keepalive: true });
+}
+
 onMounted(async () => {
+  window.addEventListener("pagehide", detachForPageHide);
   unlisten = await store.init();
   if (!active) unlisten();
 });
 onUnmounted(() => {
   active = false;
+  window.removeEventListener("pagehide", detachForPageHide);
   unlisten?.();
+  void store.detach();
 });
 
 // Error-banner recovery: re-attach the focused session if one is set (its attach failed),
@@ -38,6 +45,14 @@ function retry() {
   const id = store.activeSessionId.value;
   if (id) void store.attach(id);
   else void store.refreshSessions();
+}
+
+async function retryListener() {
+  unlisten?.();
+  unlisten = null;
+  store.resetListener();
+  unlisten = await store.init();
+  if (!active) unlisten();
 }
 </script>
 
@@ -58,7 +73,10 @@ function retry() {
     </header>
 
     <p v-if="store.listenerError.value" class="banner error">
-      事件监听注册失败：{{ store.listenerError.value }}
+      <span>事件监听失败：{{ store.listenerError.value }}</span>
+      <button type="button" class="banner-action" @click="retryListener()">
+        重新连接 / Reconnect
+      </button>
     </p>
     <p v-else-if="store.connection.value === 'attaching'" class="banner muted">
       连接中… / attaching
@@ -283,5 +301,31 @@ function retry() {
 }
 .empty {
   padding: var(--space-3);
+}
+
+@media (max-width: 640px) {
+  .head {
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    padding: var(--space-3);
+  }
+  .head h2 {
+    font-size: var(--font-size-md);
+  }
+  .new {
+    width: 100%;
+  }
+  .body {
+    flex-direction: column;
+  }
+  .picker {
+    width: auto;
+    max-height: 34vh;
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border-strong);
+  }
+  .screen {
+    padding: var(--space-1);
+  }
 }
 </style>

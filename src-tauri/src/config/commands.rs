@@ -28,9 +28,9 @@ pub fn get_config<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> AppResult<AppC
 /// `config` slice from orchestrating the remote horizontal (mirrors `notify_outbox` / webhook).
 #[tauri::command]
 pub fn set_config<R: tauri::Runtime>(app: tauri::AppHandle<R>, config: AppConfig) -> AppResult<()> {
-    let listeners = config.listeners.clone();
+    let saved = config.clone();
     service::save(&app, config)?;
-    app.state::<AppState>().config_saved.fire(listeners);
+    app.state::<AppState>().config_saved.fire(saved);
     Ok(())
 }
 

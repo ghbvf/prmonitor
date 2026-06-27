@@ -122,11 +122,15 @@ async function createAndAttach() {
 
 // Detach the focused session (it keeps running in iTerm). Resets to idle regardless of the
 // outcome — the user asked to leave — and clears the last frame so a future attach starts blank.
-async function detach() {
+async function detach(options: { keepalive?: boolean } = {}) {
   const id = activeSessionId.value;
   if (!id) return;
   try {
-    await detachTerminal(id);
+    if (options.keepalive) {
+      await detachTerminal(id, { keepalive: true });
+    } else {
+      await detachTerminal(id);
+    }
   } catch (err) {
     error.value = toMessage(err);
     console.error("detach terminal 失败", err);
@@ -135,6 +139,11 @@ async function detach() {
     connection.value = "idle";
     latestScreen = null;
   }
+}
+
+function resetListener() {
+  listenerReady.value = false;
+  listenerError.value = null;
 }
 
 // Forward keystrokes to the focused session. GUARD: only when a session is active AND the
@@ -226,7 +235,13 @@ function applyEvent(ev: TerminalEvent) {
 async function init() {
   let unlisten: Awaited<ReturnType<typeof onTerminalEvent>>;
   try {
-    unlisten = await onTerminalEvent(applyEvent);
+    resetListener();
+    unlisten = await onTerminalEvent(applyEvent, {
+      onClosed: (message) => {
+        listenerReady.value = false;
+        listenerError.value = message;
+      },
+    });
     listenerReady.value = true;
   } catch (err) {
     listenerError.value = toMessage(err);
@@ -251,6 +266,7 @@ export function useTerminalStore() {
     attach,
     createAndAttach,
     detach,
+    resetListener,
     sendInput,
     resize,
     applyEvent,

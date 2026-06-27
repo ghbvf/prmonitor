@@ -253,6 +253,16 @@ describe("detach()", () => {
     expect(store.connection.value).toBe("idle");
   });
 
+  it("passes keepalive when detaching during pagehide cleanup", async () => {
+    const store = useTerminalStore();
+    store.activeSessionId.value = "s1";
+    store.connection.value = "attached";
+
+    await store.detach({ keepalive: true });
+
+    expect(api.detachTerminal).toHaveBeenCalledWith("s1", { keepalive: true });
+  });
+
   it("is a no-op with no active session", async () => {
     const store = useTerminalStore();
 
@@ -396,6 +406,32 @@ describe("init()", () => {
     expect(order).toEqual(["subscribe", "snapshot"]);
     expect(store.listenerReady.value).toBe(true);
     expect(typeof unlisten).toBe("function");
+  });
+
+  it("marks the listener unavailable when the SSE stream closes after init", async () => {
+    let onClosed: ((message: string) => void) | undefined;
+    vi.mocked(api.onTerminalEvent).mockImplementationOnce((_cb, options) => {
+      onClosed = options?.onClosed;
+      return Promise.resolve(() => {});
+    });
+    const store = useTerminalStore();
+
+    await store.init();
+    onClosed?.("stream closed");
+
+    expect(store.listenerReady.value).toBe(false);
+    expect(store.listenerError.value).toBe("stream closed");
+  });
+
+  it("resetListener clears listener error state before retrying init", () => {
+    const store = useTerminalStore();
+    store.listenerReady.value = true;
+    store.listenerError.value = "stream closed";
+
+    store.resetListener();
+
+    expect(store.listenerReady.value).toBe(false);
+    expect(store.listenerError.value).toBeNull();
   });
 
   it("surfaces a listener registration failure and returns a noop unlisten", async () => {

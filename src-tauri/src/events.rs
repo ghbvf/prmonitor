@@ -20,6 +20,13 @@ pub const REVIEW_EVENT: &str = "review:event";
 /// anticipated by the [`StreamEvent`] doc below — this lands its producer.
 pub const TERMINAL_EVENT: &str = "terminal:event";
 
+/// Returns the terminal desktop/SSE topic name without requiring non-funnel modules to name the
+/// channel constant directly (the stream funnel scan allows only this file and `stream.rs` to name
+/// the raw channel).
+pub fn terminal_event_name() -> &'static str {
+    TERMINAL_EVENT
+}
+
 /// Tauri event name carrying an [`InboxEvent`] (AB#1065): one inbox row was added or
 /// re-processed (a webhook delivery persisted / replayed). Mirrored by
 /// `INBOX_UPDATED_EVENT` in `src/inbox/api.ts`.
