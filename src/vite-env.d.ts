@@ -5,3 +5,7 @@ declare module "*.vue" {
   const component: DefineComponent<{}, {}, any>;
   export default component;
 }
+
+interface Window {
+  __PRMONITOR_REMOTE_BASE_PATH__?: string;
+}

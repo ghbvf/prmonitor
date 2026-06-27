@@ -34,7 +34,7 @@ async function browserTransport() {
     const entered = promptForToken()?.trim();
     if (entered) sessionStorage.setItem(http.REMOTE_BEARER_TOKEN_KEY, entered);
   }
-  return http.createHttpTransport(import.meta.env.VITE_API_BASE_URL ?? "", {
+  return http.createHttpTransport(browserApiBaseUrl(), {
     onAuthRejected: () => {
       sessionStorage.removeItem(http.REMOTE_BEARER_TOKEN_KEY);
       const entered = promptForToken()?.trim();
@@ -43,6 +43,16 @@ async function browserTransport() {
       return true;
     },
   });
+}
+
+function browserApiBaseUrl(): string {
+  const configured = import.meta.env.VITE_API_BASE_URL?.trim();
+  if (configured) return trimTrailingSlashes(configured);
+  return trimTrailingSlashes(window.__PRMONITOR_REMOTE_BASE_PATH__?.trim() ?? "");
+}
+
+function trimTrailingSlashes(value: string): string {
+  return value.replace(/\/+$/, "");
 }
 
 function promptForToken(): string | null {

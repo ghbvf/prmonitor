@@ -1030,7 +1030,20 @@ pub(crate) fn normalize_route_path(path: &str) -> AppResult<String> {
             "routePath 不能为根路径且不能包含空路径段: {trimmed}"
         )));
     }
+    if !trimmed
+        .split('/')
+        .skip(1)
+        .all(|seg| seg.bytes().all(is_route_path_segment_byte))
+    {
+        return Err(AppError::new(format!(
+            "routePath 只能包含 URL path-safe 字符（A-Z a-z 0-9 . _ ~ -）: {trimmed}"
+        )));
+    }
     Ok(trimmed.to_string())
+}
+
+fn is_route_path_segment_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'-')
 }
 
 pub(crate) fn route_paths_conflict(a: &str, b: &str) -> bool {
@@ -2998,6 +3011,48 @@ mod tests {
         };
         let err = validate(&config).unwrap_err().message;
         assert!(err.starts_with("entrypointId"), "{err}");
+    }
+
+    /// #1553 follow-up — routePath is later reused as HTML/script data by the terminal shell, so
+    /// config validation is the single ingress that rejects bytes unsafe outside URL path segments.
+    #[test]
+    fn validate_rejects_route_path_html_and_script_delimiters() {
+        for path in [
+            "/term\"inal",
+            "/term<inal",
+            "/term>inal",
+            "/terminal</script><script>alert(1)</script>",
+            "/terminal?x=1",
+            "/terminal#hash",
+            "/terminal%2fadmin",
+            "/term inal",
+        ] {
+            let mut entrypoint = remote_entrypoint("entry", 9000);
+            entrypoint.routes[0].path = path.to_string();
+            let config = AppConfig {
+                remote_access: RemoteAccessConfig {
+                    entrypoints: vec![entrypoint],
+                    tunnels: Vec::new(),
+                },
+                ..AppConfig::default()
+            };
+            let err = validate(&config).unwrap_err().message;
+            assert!(err.starts_with("routePath"), "{path}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_accepts_route_path_url_safe_segments() {
+        let mut entrypoint = remote_entrypoint("entry", 9000);
+        entrypoint.routes[0].path = "/terminal-v1/api_2/~health.check".to_string();
+        let config = AppConfig {
+            remote_access: RemoteAccessConfig {
+                entrypoints: vec![entrypoint],
+                tunnels: Vec::new(),
+            },
+            ..AppConfig::default()
+        };
+        assert!(validate(&config).is_ok());
     }
 
     /// AB#1225 F3 — duplicate tunnel id is rejected (tunnel ids are also a lookup key space). One

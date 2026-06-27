@@ -499,6 +499,7 @@ fn build_entrypoint_router<R: tauri::Runtime>(
                         port,
                         entrypoint_id: entrypoint.id.clone(),
                         route_id: route.id.clone(),
+                        base_path: route.path.clone(),
                     },
                 )),
             ),

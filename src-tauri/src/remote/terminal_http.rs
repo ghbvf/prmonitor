@@ -52,6 +52,7 @@ pub(crate) struct Ctx<R: tauri::Runtime> {
     pub(crate) port: u16,
     pub(crate) entrypoint_id: String,
     pub(crate) route_id: String,
+    pub(crate) base_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +269,11 @@ async fn handle_static<R: tauri::Runtime>(
         }
     };
     let mime = mime_guess::from_path(key).first_or_octet_stream();
+    let body = if key == INDEX_HTML {
+        scope_index_html(body.into_owned(), &ctx.base_path)
+    } else {
+        body.into_owned()
+    };
     let response = (
         [
             (header::CONTENT_TYPE, mime.as_ref()),
@@ -275,7 +281,7 @@ async fn handle_static<R: tauri::Runtime>(
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::X_FRAME_OPTIONS, "SAMEORIGIN"),
         ],
-        body.into_owned(),
+        body,
     )
         .into_response();
     // Mirror the API path: tag the allowed Origin so a configured cross-origin SPA host can fetch the
@@ -284,6 +290,59 @@ async fn handle_static<R: tauri::Runtime>(
         response,
         cors_origin(&headers, ctx.port, &listener, &public_urls),
     )
+}
+
+fn scope_index_html(body: Vec<u8>, base_path: &str) -> Vec<u8> {
+    let base_path = normalise_base_path(base_path);
+    let html = match String::from_utf8(body) {
+        Ok(html) => html,
+        Err(err) => return err.into_bytes(),
+    };
+    let html = if base_path.is_empty() {
+        html
+    } else {
+        let attr_base_path = html_attr_escape(&base_path);
+        html.replace("src=\"/", &format!("src=\"{attr_base_path}/"))
+            .replace("href=\"/", &format!("href=\"{attr_base_path}/"))
+    };
+    inject_remote_base_path(html, &base_path).into_bytes()
+}
+
+fn normalise_base_path(path: &str) -> String {
+    let trimmed = path.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn inject_remote_base_path(html: String, base_path: &str) -> String {
+    let value = script_json_string(base_path);
+    let script = format!("<script>window.__PRMONITOR_REMOTE_BASE_PATH__={value};</script>");
+    if let Some(idx) = html.find("</head>") {
+        let mut out = String::with_capacity(html.len() + script.len());
+        out.push_str(&html[..idx]);
+        out.push_str(&script);
+        out.push_str(&html[idx..]);
+        out
+    } else {
+        format!("{script}{html}")
+    }
+}
+
+fn html_attr_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn script_json_string(value: &str) -> String {
+    serde_json::to_string(value)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('/', "\\/")
 }
 
 fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response {
@@ -1040,6 +1099,7 @@ mod tests {
                 port,
                 entrypoint_id: "term".to_string(),
                 route_id: "terminal".to_string(),
+                base_path: String::new(),
             });
             let server = tauri::async_runtime::spawn(async move {
                 let _ = axum::serve(socket, build_router(ctx).into_make_service()).await;
@@ -1132,6 +1192,7 @@ mod tests {
                 port,
                 entrypoint_id: "term".to_string(),
                 route_id: "terminal".to_string(),
+                base_path: String::new(),
             });
             let server = tauri::async_runtime::spawn(async move {
                 let _ = axum::serve(socket, build_router(ctx).into_make_service()).await;
@@ -1171,6 +1232,7 @@ mod tests {
                 port,
                 entrypoint_id: "term".to_string(),
                 route_id: "terminal".to_string(),
+                base_path: String::new(),
             });
             let server = tauri::async_runtime::spawn(async move {
                 let _ = axum::serve(socket, build_router(ctx).into_make_service()).await;
@@ -1207,6 +1269,7 @@ mod tests {
                 port,
                 entrypoint_id: "term".to_string(),
                 route_id: "terminal".to_string(),
+                base_path: String::new(),
             });
             let server = tauri::async_runtime::spawn(async move {
                 let _ = axum::serve(socket, build_router(ctx).into_make_service()).await;
@@ -1283,6 +1346,87 @@ mod tests {
     }
 
     #[test]
+    fn scoped_index_html_rewrites_assets_and_injects_remote_base_path() {
+        let html = br#"<!doctype html><html><head><script type="module" src="/assets/app.js"></script><link rel="stylesheet" href="/assets/app.css"></head><body></body></html>"#;
+        let scoped = String::from_utf8(scope_index_html(html.to_vec(), "terminal/")).unwrap();
+        assert!(scoped.contains("window.__PRMONITOR_REMOTE_BASE_PATH__=\"\\/terminal\""));
+        assert!(scoped.contains("src=\"/terminal/assets/app.js\""));
+        assert!(scoped.contains("href=\"/terminal/assets/app.css\""));
+    }
+
+    #[test]
+    fn scoped_index_html_escapes_malicious_base_path_contexts() {
+        let html = br#"<!doctype html><html><head><script type="module" src="/assets/app.js"></script><link rel="stylesheet" href="/assets/app.css"></head><body></body></html>"#;
+        let scoped = String::from_utf8(scope_index_html(
+            html.to_vec(),
+            r#"/terminal"></script><script>alert(1)</script>"#,
+        ))
+        .unwrap();
+        assert!(!scoped.contains(r#"</script><script>alert(1)</script>"#));
+        assert!(scoped.contains("&quot;&gt;&lt;/script&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(scoped.contains(r#"window.__PRMONITOR_REMOTE_BASE_PATH__="\/terminal\""#));
+        assert!(scoped.contains(r#"<\/script><script>alert(1)<\/script>"#));
+    }
+
+    #[test]
+    fn terminal_nested_route_serves_scoped_shell_without_bearer() {
+        let app = tauri::test::mock_app();
+        tauri::async_runtime::block_on(async move {
+            let socket = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind loopback");
+            let port = socket.local_addr().expect("addr").port();
+            let mut l = listener();
+            l.port = port;
+            persist_listener(app.handle(), l);
+            let ctx = Arc::new(Ctx {
+                app: app.handle().clone(),
+                port,
+                entrypoint_id: "term".to_string(),
+                route_id: "terminal".to_string(),
+                base_path: "/terminal".to_string(),
+            });
+            let router = Router::new().nest("/terminal", build_router(ctx));
+            let server = tauri::async_runtime::spawn(async move {
+                let _ = axum::serve(socket, router.into_make_service()).await;
+            });
+            let base = format!("http://127.0.0.1:{port}");
+
+            let shell = reqwest::get(format!("{base}/terminal"))
+                .await
+                .expect("send");
+            assert_eq!(shell.status(), reqwest::StatusCode::OK);
+            let body = shell.text().await.expect("body");
+            assert!(
+                body.contains("window.__PRMONITOR_REMOTE_BASE_PATH__=\"\\/terminal\""),
+                "{body}"
+            );
+            assert!(
+                !body.contains("src=\"/assets/") && !body.contains("href=\"/assets/"),
+                "{body}"
+            );
+
+            let unknown_api_at_root = reqwest::Client::new()
+                .post(format!("{base}/invoke/not_terminal"))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(unknown_api_at_root.status(), reqwest::StatusCode::NOT_FOUND);
+
+            let unknown_api_under_route = reqwest::Client::new()
+                .post(format!("{base}/terminal/invoke/not_terminal"))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(
+                unknown_api_under_route.status(),
+                reqwest::StatusCode::NOT_FOUND
+            );
+            server.abort();
+        });
+    }
+
+    #[test]
     fn terminal_serves_static_spa_shell_host_gated_not_bearer_gated() {
         let app = tauri::test::mock_app();
         tauri::async_runtime::block_on(async move {
@@ -1298,6 +1442,7 @@ mod tests {
                 port,
                 entrypoint_id: "term".to_string(),
                 route_id: "terminal".to_string(),
+                base_path: String::new(),
             });
             let server = tauri::async_runtime::spawn(async move {
                 let _ = axum::serve(socket, build_router(ctx).into_make_service()).await;
