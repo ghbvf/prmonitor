@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use crate::db::Database;
 use crate::error::AppResult;
-use crate::model::ActionKind;
+use crate::model::{ActionExecutionResult, ActionKind};
 
 pub mod commands;
 pub mod manager;
@@ -48,7 +48,10 @@ pub mod store;
 /// row's `attempt_count` and reschedules it — or, at the attempt cap, dead-letters it — rather than
 /// falsely marking it `done`.
 pub type ActionExecutor = Arc<
-    dyn Fn(tauri::AppHandle, OutboxAction) -> Pin<Box<dyn Future<Output = AppResult<()>> + Send>>
+    dyn Fn(
+            tauri::AppHandle,
+            OutboxAction,
+        ) -> Pin<Box<dyn Future<Output = AppResult<ActionExecutionResult>> + Send>>
         + Send
         + Sync,
 >;

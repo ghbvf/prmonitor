@@ -82,17 +82,78 @@ fn scan_dir(dir: &Path, owner: &str, violations: &mut Vec<String>, files_scanned
             continue;
         };
         *files_scanned += 1;
+        let mut grouped_use: Option<(usize, String)> = None;
         for (i, line) in text.lines().enumerate() {
             // Strip any trailing `//` comment (and skip whole comment lines) before scanning, so a
             // cross-slice mention in a doc/inline comment is NOT a false positive — only real code
             // references count. A `//` inside a string can truncate early, but that only drops a
             // would-be match in a comment, never hides a real code-position `crate::<slice>::`.
             let code = line.split("//").next().unwrap_or(line);
+
+            if let Some((start_line, statement)) = grouped_use.as_mut() {
+                statement.push('\n');
+                statement.push_str(code);
+                if code.contains(';') {
+                    scan_grouped_use(&path, *start_line, owner, statement, violations);
+                    grouped_use = None;
+                }
+                continue;
+            }
+
+            if code.contains("use crate::{") && !code.contains(';') {
+                grouped_use = Some((i + 1, code.to_owned()));
+                continue;
+            }
+
             for target in SLICES {
                 if target == owner {
                     continue;
                 }
                 let needle = format!("crate::{target}::");
+                let direct_use = format!("use crate::{target}");
+                if code.trim_start().starts_with(&direct_use) {
+                    if target == CONSUMABLE_SLICE
+                        && code.trim_start().starts_with("use crate::config::service")
+                    {
+                        continue;
+                    }
+                    let rest = &code.trim_start()[direct_use.len()..];
+                    if rest.starts_with(';')
+                        || rest.starts_with(',')
+                        || rest.starts_with(' ')
+                        || rest.starts_with("::{")
+                    {
+                        violations.push(format!(
+                            "{}:{} imports sibling slice crate::{} — wire it through the \
+                             composition root instead",
+                            path.display(),
+                            i + 1,
+                            target
+                        ));
+                        continue;
+                    }
+                }
+                if let Some(group) = crate_group(code) {
+                    if group.split(',').map(str::trim).any(|part| {
+                        if target == CONSUMABLE_SLICE
+                            && part.starts_with(&format!(
+                                "{CONSUMABLE_SLICE}::{CONSUMABLE_ALLOWED_SUBMODULE}"
+                            ))
+                        {
+                            return false;
+                        }
+                        part == target || part.starts_with(&format!("{target}::"))
+                    }) {
+                        violations.push(format!(
+                            "{}:{} imports sibling slice crate::{} via grouped use — wire it \
+                             through the composition root instead",
+                            path.display(),
+                            i + 1,
+                            target
+                        ));
+                        continue;
+                    }
+                }
                 // `config` is the one cross-slice consumable, but ONLY through its public
                 // `service` seam (AB#1182 F1): a reach into another config submodule
                 // (`crate::config::model`, …) is the same Medium boundary violation as referencing
@@ -126,5 +187,58 @@ fn scan_dir(dir: &Path, owner: &str, violations: &mut Vec<String>, files_scanned
                 }
             }
         }
+        if let Some((start_line, statement)) = grouped_use {
+            scan_grouped_use(&path, start_line, owner, &statement, violations);
+        }
     }
+}
+
+fn scan_grouped_use(
+    path: &Path,
+    start_line: usize,
+    owner: &str,
+    code: &str,
+    violations: &mut Vec<String>,
+) {
+    let Some(group) = crate_group(code) else {
+        return;
+    };
+    for target in SLICES {
+        if target == owner {
+            continue;
+        }
+        if group.split(',').map(str::trim).any(|part| {
+            if target == CONSUMABLE_SLICE
+                && part.starts_with(&format!(
+                    "{CONSUMABLE_SLICE}::{CONSUMABLE_ALLOWED_SUBMODULE}"
+                ))
+            {
+                return false;
+            }
+            part == target || part.starts_with(&format!("{target}::"))
+        }) {
+            violations.push(format!(
+                "{}:{} imports sibling slice crate::{} via grouped use — wire it through the \
+                 composition root instead",
+                path.display(),
+                start_line,
+                target
+            ));
+        }
+    }
+}
+
+fn crate_group(code: &str) -> Option<&str> {
+    let group_start = code.find("use crate::{")? + "use crate::{".len();
+    let group_end = code[group_start..].find('}')? + group_start;
+    Some(&code[group_start..group_end])
+}
+
+#[test]
+fn crate_group_handles_multiline_grouped_use() {
+    let group =
+        crate_group("use crate::{\n    config::service,\n    review::notify,\n    outbox,\n};")
+            .expect("multiline grouped use should be parsed");
+    assert!(group.contains("review::notify"));
+    assert!(group.contains("outbox"));
 }

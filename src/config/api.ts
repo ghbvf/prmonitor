@@ -1,6 +1,6 @@
 // Config slice → backend adapter. Wraps the config commands.
 import { getTransport } from "../transport";
-import type { AppConfig, ListenerRuntimeStatus } from "./types";
+import type { AppConfig, ListenerRuntimeStatus, NotificationChannel } from "./types";
 
 export function appVersion(): Promise<string> {
   return getTransport().request<string>("app_version");
@@ -20,6 +20,10 @@ export function setConfig(config: AppConfig): Promise<void> {
 // rather than re-spelling the command name).
 export function setActiveProject(projectId: string): Promise<void> {
   return getTransport().request<void>("set_active_project", { projectId });
+}
+
+export function notificationTestSend(channel: NotificationChannel): Promise<string> {
+  return getTransport().request<string>("notification_test_send", { channel });
 }
 
 // Fetch the runtime binding status for every configured listener (AB#1225 PR1).

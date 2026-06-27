@@ -2,11 +2,14 @@
 
 use std::path::Path;
 
+use lettre::message::Mailbox;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::error::{AppError, AppResult};
-use crate::model::{EngineKind, LabelSource, SourceKind, UpdateMode, WebhookTunnelMode};
+use crate::model::{
+    EngineKind, LabelSource, NotificationKind, SourceKind, UpdateMode, WebhookTunnelMode,
+};
 
 /// One monitored project (#35). What was previously the flat per-repo subset of
 /// [`AppConfig`] is now a list element: each project carries its own repo, paths,
@@ -165,6 +168,84 @@ impl Default for OutboxConfig {
     }
 }
 
+/// Global notification delivery configuration (AB#1459). The outbox stores only a channel id and
+/// kind in its panel-visible payload; adapters live-load this config at execution time.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NotificationSettings {
+    pub channels: Vec<NotificationChannel>,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            channels: vec![NotificationChannel::desktop_default()],
+        }
+    }
+}
+
+/// One configured outbound notification channel.
+///
+/// The shape is intentionally flat instead of a serde-tagged enum because the existing Settings
+/// screen edits whole `AppConfig` snapshots. A flat shape lets the frontend keep hidden fields
+/// round-tripped while the backend's exhaustive `match kind` in [`validate_notification_channel`]
+/// decides which fields are meaningful for each channel.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NotificationChannel {
+    pub id: String,
+    pub name: String,
+    pub kind: NotificationKind,
+    pub enabled: bool,
+    pub webhook_url: String,
+    pub webhook_secret: String,
+    pub telegram_bot_token: String,
+    pub telegram_chat_id: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_username: String,
+    pub smtp_password: String,
+    pub smtp_from: String,
+    pub smtp_to: String,
+    pub timeout_secs: u64,
+}
+
+impl NotificationChannel {
+    pub fn desktop_default() -> Self {
+        Self {
+            id: "desktop".to_string(),
+            name: "Desktop".to_string(),
+            kind: NotificationKind::Desktop,
+            enabled: true,
+            webhook_url: String::new(),
+            webhook_secret: String::new(),
+            telegram_bot_token: String::new(),
+            telegram_chat_id: String::new(),
+            smtp_host: String::new(),
+            smtp_port: 587,
+            smtp_username: String::new(),
+            smtp_password: String::new(),
+            smtp_from: String::new(),
+            smtp_to: String::new(),
+            timeout_secs: DEFAULT_NOTIFICATION_TIMEOUT_SECS,
+        }
+    }
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for NotificationChannel {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ..Self::desktop_default()
+        }
+    }
+}
+
+pub const DEFAULT_NOTIFICATION_TIMEOUT_SECS: u64 = 15;
+
 /// Persisted application configuration (#35: multi-project). Holds the list of
 /// monitored [`Project`]s plus the GLOBAL webhook/shell settings (one webhook
 /// receiver serves every project).
@@ -213,6 +294,9 @@ pub struct AppConfig {
     /// Outbox worker policy (AB#1182): per-kind staleness TTLs for the durable action queue. Global
     /// (one policy serves every project). Forward-compat via the nested `#[serde(default)]`.
     pub outbox: OutboxConfig,
+    /// Outbound notification channels (AB#1459). Forward-compatible default seeds a local desktop
+    /// channel; external channels are user-added/disabled until configured.
+    pub notifications: NotificationSettings,
     /// Declarative Remote Access listeners. The remote supervisor consumes bindable loopback
     /// listeners at startup and after config saves.
     pub listeners: Vec<Listener>,
@@ -235,6 +319,7 @@ impl Default for AppConfig {
             webhook_public_url: String::new(),
             local_api_token: String::new(),
             outbox: OutboxConfig::default(),
+            notifications: NotificationSettings::default(),
             // AB#1225: 全新安装默认开启本地触发 API（端口 8788 = webhook 默认 8787 + 1，避免
             // 两端口同默认时冲突），现以 `listeners[]` 的 local-api 条目表达——supervisor 绑定的
             // 单一真值源（取代旧的 `local_api_port` 字段）。
@@ -363,6 +448,133 @@ const LOCAL_API_TOKEN_MIN_LEN: usize = 16;
 
 pub(crate) fn terminal_auth_token_is_strong(token: &str) -> bool {
     token.trim().chars().count() >= LOCAL_API_TOKEN_MIN_LEN
+}
+
+fn is_https_url_without_userinfo(value: &str) -> bool {
+    Url::parse(value.trim())
+        .map(|u| u.scheme() == "https" && u.username().is_empty() && u.password().is_none())
+        .unwrap_or(false)
+}
+
+fn is_valid_mailbox(value: &str) -> bool {
+    value.trim().parse::<Mailbox>().is_ok()
+}
+
+pub(crate) fn validate_notification_channel(channel: &NotificationChannel) -> AppResult<()> {
+    if channel.id.trim().is_empty()
+        || channel.id.contains(':')
+        || channel.id.chars().any(char::is_whitespace)
+    {
+        return Err(AppError::new(format!(
+            "notificationChannelId 非法（不能为空、含 `:` 或空白字符）: {:?}",
+            channel.id
+        )));
+    }
+    if channel.timeout_secs == 0 {
+        return Err(AppError::new(format!(
+            "notificationTimeoutSecs 必须大于 0（通知渠道「{}」）",
+            channel.name
+        )));
+    }
+    if !channel.enabled {
+        return Ok(());
+    }
+
+    match channel.kind {
+        NotificationKind::Desktop => Ok(()),
+        NotificationKind::Email => {
+            if channel.smtp_host.trim().is_empty() {
+                return Err(AppError::new(format!(
+                    "smtpHost 不能为空（通知渠道「{}」）",
+                    channel.name
+                )));
+            }
+            if channel.smtp_port == 0 {
+                return Err(AppError::new(format!(
+                    "smtpPort 必须大于 0（通知渠道「{}」）",
+                    channel.name
+                )));
+            }
+            if channel.smtp_from.trim().is_empty() {
+                return Err(AppError::new(format!(
+                    "smtpFrom 不能为空（通知渠道「{}」）",
+                    channel.name
+                )));
+            }
+            if !is_valid_mailbox(&channel.smtp_from) {
+                return Err(AppError::new(format!(
+                    "smtpFrom 必须是有效邮件地址（通知渠道「{}」）",
+                    channel.name
+                )));
+            }
+            if channel.smtp_to.trim().is_empty() {
+                return Err(AppError::new(format!(
+                    "smtpTo 不能为空（通知渠道「{}」）",
+                    channel.name
+                )));
+            }
+            if channel
+                .smtp_to
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .any(|addr| !is_valid_mailbox(addr))
+            {
+                return Err(AppError::new(format!(
+                    "smtpTo 必须是逗号分隔的有效邮件地址（通知渠道「{}」）",
+                    channel.name
+                )));
+            }
+            Ok(())
+        }
+        NotificationKind::Slack
+        | NotificationKind::WeChatWork
+        | NotificationKind::Feishu
+        | NotificationKind::DingTalk => {
+            if channel.webhook_url.trim().is_empty() {
+                return Err(AppError::new(format!(
+                    "notificationWebhookUrl 不能为空（通知渠道「{}」）",
+                    channel.name
+                )));
+            }
+            if !is_https_url_without_userinfo(&channel.webhook_url) {
+                return Err(AppError::new(format!(
+                    "notificationWebhookUrl 必须是 https:// URL 且不能内嵌 userinfo（通知渠道「{}」）",
+                    channel.name
+                )));
+            }
+            Ok(())
+        }
+        NotificationKind::Telegram => {
+            if channel.telegram_bot_token.trim().is_empty() {
+                return Err(AppError::new(format!(
+                    "telegramBotToken 不能为空（通知渠道「{}」）",
+                    channel.name
+                )));
+            }
+            if channel.telegram_chat_id.trim().is_empty() {
+                return Err(AppError::new(format!(
+                    "telegramChatId 不能为空（通知渠道「{}」）",
+                    channel.name
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_notifications(settings: &NotificationSettings) -> AppResult<()> {
+    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for channel in &settings.channels {
+        let id = channel.id.trim();
+        if !seen_ids.insert(id) {
+            return Err(AppError::new(format!(
+                "notificationChannelId 重复: {id}（每个通知渠道 id 必须唯一）"
+            )));
+        }
+        validate_notification_channel(channel)?;
+    }
+    Ok(())
 }
 
 /// Validates one [`Project`]'s fields (hard-reject on failure).
@@ -654,6 +866,8 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
             "localApiToken 太短（至少 {LOCAL_API_TOKEN_MIN_LEN} 个字符；请使用更长的随机串）"
         )));
     }
+
+    validate_notifications(&config.notifications)?;
 
     // Per-project fields: validate each ENABLED project; disabled ones are skipped
     // (their fields may be intentionally incomplete). The id/repo of every project
@@ -995,6 +1209,7 @@ mod tests {
             webhook_public_url: String::new(),
             local_api_token: "local-api-token-0123456789".to_string(),
             outbox: OutboxConfig::default(),
+            notifications: NotificationSettings::default(),
             listeners: Vec::new(),
             tunnels: Vec::new(),
         };
@@ -1013,6 +1228,15 @@ mod tests {
             v["outbox"]["notificationTtlSecs"],
             DEFAULT_NOTIFICATION_TTL_SECS
         );
+        assert!(v.get("notifications").is_some());
+        assert_eq!(v["notifications"]["channels"][0]["kind"], "desktop");
+        assert_eq!(v["notifications"]["channels"][0]["id"], "desktop");
+        assert!(v["notifications"]["channels"][0]
+            .get("webhookUrl")
+            .is_some());
+        assert!(v["notifications"]["channels"][0]
+            .get("webhook_url")
+            .is_none());
         // Global webhook keys stay at the top level.
         assert!(v.get("webhookEnabled").is_some());
         assert!(v.get("webhookPort").is_some());
@@ -1074,6 +1298,83 @@ mod tests {
         let explicit: AppConfig = serde_json::from_str(r#"{"outbox":{"notificationTtlSecs":0}}"#)
             .expect("explicit loads");
         assert_eq!(explicit.outbox.notification_ttl_secs, 0);
+    }
+
+    #[test]
+    fn validate_notification_channels_enforces_ids_timeout_and_kind_fields() {
+        let mut cfg = valid_base();
+        let mut slack = valid_notification_channel(NotificationKind::Slack);
+        slack.webhook_url = String::new();
+        cfg.notifications.channels = vec![slack.clone()];
+        assert_error_prefix(validate(&cfg), "notificationWebhookUrl 不能为空");
+
+        slack.enabled = false;
+        cfg.notifications.channels = vec![slack.clone()];
+        validate(&cfg).expect("disabled channels skip kind-specific required fields");
+
+        slack.enabled = true;
+        slack.webhook_url = "http://example.com/hook".to_string();
+        cfg.notifications.channels = vec![slack.clone()];
+        assert_error_prefix(validate(&cfg), "notificationWebhookUrl 必须是 https:// URL");
+
+        slack.webhook_url = "https://user@example.com/hook".to_string();
+        cfg.notifications.channels = vec![slack.clone()];
+        assert_error_prefix(validate(&cfg), "notificationWebhookUrl 必须是 https:// URL");
+
+        slack.webhook_url = "https://example.com/hook".to_string();
+        slack.timeout_secs = 0;
+        cfg.notifications.channels = vec![slack.clone()];
+        assert_error_prefix(validate(&cfg), "notificationTimeoutSecs 必须大于 0");
+
+        slack.timeout_secs = DEFAULT_NOTIFICATION_TIMEOUT_SECS;
+        cfg.notifications.channels = vec![slack.clone(), slack.clone()];
+        assert_error_prefix(validate(&cfg), "notificationChannelId 重复");
+
+        let mut telegram = valid_notification_channel(NotificationKind::Telegram);
+        telegram.telegram_bot_token = String::new();
+        cfg.notifications.channels = vec![telegram];
+        assert_error_prefix(validate(&cfg), "telegramBotToken 不能为空");
+
+        let mut email = valid_notification_channel(NotificationKind::Email);
+        email.smtp_to = String::new();
+        cfg.notifications.channels = vec![email];
+        assert_error_prefix(validate(&cfg), "smtpTo 不能为空");
+
+        let mut email = valid_notification_channel(NotificationKind::Email);
+        email.smtp_from = "not-an-email".to_string();
+        cfg.notifications.channels = vec![email];
+        assert_error_prefix(validate(&cfg), "smtpFrom 必须是有效邮件地址");
+
+        let mut email = valid_notification_channel(NotificationKind::Email);
+        email.smtp_to = "ok@example.com,not-an-email".to_string();
+        cfg.notifications.channels = vec![email];
+        assert_error_prefix(validate(&cfg), "smtpTo 必须是逗号分隔的有效邮件地址");
+    }
+
+    fn valid_notification_channel(kind: NotificationKind) -> NotificationChannel {
+        NotificationChannel {
+            id: format!("{kind:?}").to_lowercase(),
+            name: format!("{kind:?}"),
+            kind,
+            enabled: true,
+            webhook_url: "https://example.com/hook".to_string(),
+            telegram_bot_token: "telegram-token".to_string(),
+            telegram_chat_id: "chat".to_string(),
+            smtp_host: "smtp.example.com".to_string(),
+            smtp_port: 587,
+            smtp_from: "from@example.com".to_string(),
+            smtp_to: "to@example.com".to_string(),
+            ..NotificationChannel::default()
+        }
+    }
+
+    fn assert_error_prefix(result: AppResult<()>, prefix: &str) {
+        let err = result.expect_err("validation should fail");
+        assert!(
+            err.message.starts_with(prefix),
+            "expected error prefix {prefix:?}, got {:?}",
+            err.message
+        );
     }
 
     #[test]

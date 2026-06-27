@@ -9,9 +9,10 @@
 import { onMounted, reactive, ref, watch } from "vue";
 import { useConfigStore } from "./useConfigStore";
 import type { AppConfig } from "./types";
-import { DEFAULT_OUTBOX_CONFIG } from "./defaults";
+import { DEFAULT_NOTIFICATION_SETTINGS, DEFAULT_OUTBOX_CONFIG } from "./defaults";
 import { GLOBAL_GROUPS, type FieldDef, type GlobalFieldKey } from "./fields";
 import ConfigField from "./ConfigField.vue";
+import NotificationChannelsManager from "./NotificationChannelsManager.vue";
 import ProjectsManager from "./ProjectsManager.vue";
 import RemoteAccessManager from "./RemoteAccessManager.vue";
 // The webhook control panel lives in the `pr` slice; mounting it here would be a
@@ -36,6 +37,8 @@ const PROJECTS_NAV_ID = "projects";
 // (RemoteAccessManager) instead of the scalar GLOBAL_GROUPS ConfigField path.
 const REMOTE_ACCESS_NAV_ID = "remoteAccess";
 
+const NOTIFICATIONS_NAV_ID = "notifications";
+
 // Bumped on each successful save so RemoteAccessRuntimeStatus re-fetches live state
 // (AB#1225 PR1). Forwarded through RemoteAccessManager → RemoteAccessRuntimeStatus via
 // the `refreshKey` prop chain.
@@ -58,6 +61,7 @@ const draft = reactive<AppConfig>({
   // No settings-panel control yet (AB#1182): the draft carries the loaded value through a save
   // round-trip (hydrate overwrites it) so saving settings never wipes a configured TTL.
   outbox: { ...DEFAULT_OUTBOX_CONFIG },
+  notifications: { channels: DEFAULT_NOTIFICATION_SETTINGS.channels.map((c) => ({ ...c })) },
   listeners: [],
   tunnels: [],
 });
@@ -79,6 +83,12 @@ function hydrate(cfg: AppConfig) {
   // whole draft, so a missed copy here would silently reset the TTL on every settings save. Fall
   // back to the default if an older cached config lacks the field.
   draft.outbox = { ...(cfg.outbox ?? DEFAULT_OUTBOX_CONFIG) };
+  draft.notifications = {
+    ...(cfg.notifications ?? DEFAULT_NOTIFICATION_SETTINGS),
+    channels: (cfg.notifications?.channels ?? DEFAULT_NOTIFICATION_SETTINGS.channels).map((c) => ({
+      ...c,
+    })),
+  };
   // Deep-copy the remote-access resources (AB#1064) so card edits never mutate the store's
   // config object before a save — same reason as the projects deep-copy above. A listener's
   // allowedOrigins is a string[], so clone it too (mirrors the authors clone).
@@ -135,6 +145,10 @@ async function onSave() {
     projects: draft.projects.map((p) => ({ ...p, authors: [...p.authors] })),
     // Detach the remote-access resources too (AB#1064): clone each object and the
     // listener's allowedOrigins array so the store snapshot isn't the live reactive draft.
+    notifications: {
+      ...draft.notifications,
+      channels: draft.notifications.channels.map((c) => ({ ...c })),
+    },
     listeners: draft.listeners.map((l) => ({
       ...l,
       allowedOrigins: [...l.allowedOrigins],
@@ -145,13 +159,21 @@ async function onSave() {
     emit("saved");
     remoteAccessRefreshKey.value += 1;
   }
-  // On a failed save, route to the page that owns the offending field. The Remote Access
-  // validations emit messages prefixed `publicUrl`, `port`, `bindHost`, `targetListenerId`,
-  // `auth*`, `terminal*`, or `command`, so land the user on the 远程访问 page (mirrors the
-  // wizard's errorToStep field-token routing).
-  else if (
-    store.error &&
-    (
+  // On a failed save, route to the page that owns the offending field.
+  else if (store.error) {
+    if (
+      store.error.startsWith("notificationChannelId") ||
+      store.error.startsWith("notificationTimeoutSecs") ||
+      store.error.startsWith("notificationWebhookUrl") ||
+      store.error.startsWith("telegramBotToken") ||
+      store.error.startsWith("telegramChatId") ||
+      store.error.startsWith("smtpHost") ||
+      store.error.startsWith("smtpPort") ||
+      store.error.startsWith("smtpFrom") ||
+      store.error.startsWith("smtpTo")
+    ) {
+      activeGroupId.value = NOTIFICATIONS_NAV_ID;
+    } else if (
       store.error.startsWith("publicUrl") ||
       store.error.startsWith("port") ||
       store.error.startsWith("bindHost") ||
@@ -160,9 +182,9 @@ async function onSave() {
       store.error.startsWith("authToken") ||
       store.error.startsWith("terminalRead") ||
       store.error.startsWith("command")
-    )
-  ) {
-    activeGroupId.value = REMOTE_ACCESS_NAV_ID;
+    ) {
+      activeGroupId.value = REMOTE_ACCESS_NAV_ID;
+    }
   }
 }
 </script>
@@ -195,6 +217,14 @@ async function onSave() {
           远程访问
         </button>
         <button
+          type="button"
+          class="nav-item"
+          :class="{ active: activeGroupId === NOTIFICATIONS_NAV_ID }"
+          @click="activeGroupId = NOTIFICATIONS_NAV_ID"
+        >
+          通知
+        </button>
+        <button
           v-for="g in GLOBAL_GROUPS"
           :key="g.id"
           type="button"
@@ -216,6 +246,13 @@ async function onSave() {
           class="group projects-group"
         >
           <RemoteAccessManager :draft="draft" :refresh-key="remoteAccessRefreshKey" @edit="onEdit" />
+        </div>
+
+        <div
+          v-if="activeGroupId === NOTIFICATIONS_NAV_ID"
+          class="group projects-group"
+        >
+          <NotificationChannelsManager :draft="draft" @edit="onEdit" />
         </div>
 
         <template v-for="g in GLOBAL_GROUPS" :key="g.id">

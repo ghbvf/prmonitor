@@ -13,6 +13,7 @@ use tauri::Manager;
 use super::model::AppConfig;
 use crate::db::{map_err, Database};
 use crate::error::{AppError, AppResult};
+use crate::model::NotificationDeliveryChannel;
 
 /// Re-export the project domain type THROUGH the config public service surface (#35,
 /// F9). The `pr` slice (scheduler / commands) depends on `Project` via
@@ -21,6 +22,7 @@ use crate::error::{AppError, AppResult};
 /// detail the service mediates. The functions below (`project` / `project_validated`)
 /// use `Project` through this same re-export.
 pub use super::model::Project;
+pub use super::model::{NotificationChannel, NotificationSettings};
 
 /// The DEFAULT outbox worker policy, exposed THROUGH the config public service surface (AB#1182
 /// F1) — the seam the `outbox` worker uses as its config-read-failure FALLBACK. The worker reads
@@ -31,6 +33,35 @@ pub use super::model::Project;
 /// `DEFAULT_NOTIFICATION_TTL_SECS`, so a future outbox-policy field is picked up here for free.
 pub fn default_outbox_config() -> super::model::OutboxConfig {
     super::model::OutboxConfig::default()
+}
+
+pub fn default_notification_settings() -> NotificationSettings {
+    NotificationSettings::default()
+}
+
+pub fn notification_delivery_channel(channel: &NotificationChannel) -> NotificationDeliveryChannel {
+    NotificationDeliveryChannel {
+        id: channel.id.clone(),
+        name: channel.name.clone(),
+        kind: channel.kind,
+        webhook_url: channel.webhook_url.clone(),
+        webhook_secret: channel.webhook_secret.clone(),
+        telegram_bot_token: channel.telegram_bot_token.clone(),
+        telegram_chat_id: channel.telegram_chat_id.clone(),
+        smtp_host: channel.smtp_host.clone(),
+        smtp_port: channel.smtp_port,
+        smtp_username: channel.smtp_username.clone(),
+        smtp_password: channel.smtp_password.clone(),
+        smtp_from: channel.smtp_from.clone(),
+        smtp_to: channel.smtp_to.clone(),
+        timeout_secs: channel.timeout_secs,
+    }
+}
+
+pub fn validate_notification_channel_for_test(channel: &NotificationChannel) -> AppResult<()> {
+    let mut test_channel = channel.clone();
+    test_channel.enabled = true;
+    super::model::validate_notification_channel(&test_channel)
 }
 
 /// `id`/`name` assigned to the single project lifted out of a legacy flat config by
@@ -235,6 +266,29 @@ pub fn local_api_port(cfg: &AppConfig) -> u16 {
         .find(|l| l.kind == crate::config::model::ListenerKind::LocalApi && l.enabled)
         .map(|l| l.port)
         .unwrap_or(0)
+}
+
+pub fn notification_channel<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    channel_id: &str,
+) -> AppResult<NotificationChannel> {
+    let cfg = load(app)?;
+    cfg.notifications
+        .channels
+        .into_iter()
+        .find(|c| c.id == channel_id)
+        .ok_or_else(|| AppError::new(format!("notificationChannelId 不存在: {channel_id}")))
+}
+
+pub fn enabled_notification_channels<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> AppResult<Vec<NotificationChannel>> {
+    Ok(load(app)?
+        .notifications
+        .channels
+        .into_iter()
+        .filter(|c| c.enabled)
+        .collect())
 }
 
 /// Loads the persisted configuration, falling back to [`AppConfig::default`]
@@ -448,6 +502,7 @@ pub fn set_active_project<R: tauri::Runtime>(app: &tauri::AppHandle<R>, id: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::NotificationKind;
 
     // SQLite blob round-trip (#70): an empty DB loads the default; a persisted config
     // reads back equal. The blob path is the storage swap — `migrate_value`/`validate`
@@ -490,6 +545,26 @@ mod tests {
         assert_eq!(config.projects[0].repo, "octocat/hello");
         assert_eq!(config.active_project_id, MIGRATED_PROJECT_ID);
         assert!(config.projects[0].auto_review);
+    }
+
+    #[test]
+    fn notification_test_validation_checks_disabled_draft_fields() {
+        let mut channel = NotificationChannel {
+            id: "slack-1".to_string(),
+            name: "Slack".to_string(),
+            kind: NotificationKind::Slack,
+            enabled: false,
+            webhook_url: "https://hooks.slack.test/services/T000/B000/XXX".to_string(),
+            ..NotificationChannel::default()
+        };
+        validate_notification_channel_for_test(&channel).expect("disabled draft can be tested");
+
+        channel.webhook_url.clear();
+        let err = validate_notification_channel_for_test(&channel).expect_err("missing URL fails");
+        assert!(
+            err.to_string().contains("notificationWebhookUrl 不能为空"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

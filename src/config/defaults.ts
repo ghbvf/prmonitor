@@ -5,7 +5,8 @@
 // config/model.rs) so an added/onboarded project is immediately valid except for
 // the user-supplied repo/repoRoot.
 import type { SourceKind } from "../types";
-import type { OutboxConfig, Project } from "./types";
+import type { NotificationChannel, OutboxConfig, Project } from "./types";
+import { DEFAULT_NOTIFICATION_SETTINGS as GENERATED_DEFAULT_NOTIFICATION_SETTINGS } from "./types.generated";
 
 // The fixed id the wizard gives the first project; mirrors the backend migration's
 // fixed id for symmetry. ProjectsManager mints a fresh uuid per added project, so
@@ -18,6 +19,12 @@ export const DEFAULT_PROJECT_ID = "default";
 // onboarding config seeds this. Single-sourced here so the two AppConfig literals can't drift.
 export const DEFAULT_OUTBOX_CONFIG: OutboxConfig = {
   notificationTtlSecs: 2 * 60 * 60,
+};
+
+export const DEFAULT_NOTIFICATION_SETTINGS = GENERATED_DEFAULT_NOTIFICATION_SETTINGS;
+
+export const DEFAULT_NOTIFICATION_CHANNEL: NotificationChannel = {
+  ...DEFAULT_NOTIFICATION_SETTINGS.channels[0],
 };
 
 // Per-project field defaults sans identity (`id`/`name`): callers supply those.

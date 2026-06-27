@@ -23,7 +23,8 @@ vi.mock("../transport", () => ({
   }),
 }));
 
-import { getListenerRuntimeStatus } from "./api";
+import { getListenerRuntimeStatus, notificationTestSend } from "./api";
+import { DEFAULT_NOTIFICATION_CHANNEL } from "./defaults";
 
 // ── listenerStateLabel exhaustiveness ───────────────────────────────────────────
 
@@ -133,6 +134,28 @@ describe("getListenerRuntimeStatus (api wrapper)", () => {
     requestMock.mockResolvedValue([]);
     const result = await getListenerRuntimeStatus();
     expect(result).toHaveLength(0);
+  });
+});
+
+describe("notificationTestSend (api wrapper)", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it("calls request with the draft channel payload", async () => {
+    requestMock.mockResolvedValue("ok");
+    const channel = {
+      ...DEFAULT_NOTIFICATION_CHANNEL,
+      id: "slack-main",
+      name: "Slack",
+      kind: "slack" as const,
+      enabled: true,
+      webhookUrl: "https://example.com/hook",
+    };
+
+    await expect(notificationTestSend(channel)).resolves.toBe("ok");
+
+    expect(requestMock).toHaveBeenCalledWith("notification_test_send", { channel });
   });
 });
 

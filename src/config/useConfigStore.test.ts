@@ -54,6 +54,7 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
   webhookPublicUrl: "",
   localApiToken: "",
   outbox: { notificationTtlSecs: 7200 },
+  notifications: { channels: [] },
   listeners: [],
   tunnels: [],
   ...over,

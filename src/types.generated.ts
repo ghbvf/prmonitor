@@ -11,3 +11,6 @@ export const LABEL_SOURCES = ["native","title"] as const;
 
 export type UpdateMode = "webhook-only" | "pull-only" | "hybrid" | "manual";
 export const UPDATE_MODES = ["webhook-only","pull-only","hybrid","manual"] as const;
+
+export type NotificationKind = "desktop" | "email" | "slack" | "telegram" | "weChatWork" | "feishu" | "dingTalk";
+export const NOTIFICATION_KINDS = ["desktop","email","slack","telegram","weChatWork","feishu","dingTalk"] as const;

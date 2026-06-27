@@ -146,6 +146,7 @@ beforeEach(() => {
     webhookPublicUrl: "",
     localApiToken: "",
     outbox: { notificationTtlSecs: 7200 },
+    notifications: { channels: [] },
     listeners: [],
     tunnels: [],
   });
@@ -291,6 +292,7 @@ describe("usePrStore toggle()", () => {
       webhookPublicUrl: "",
       localApiToken: "",
       outbox: { notificationTtlSecs: 7200 },
+      notifications: { channels: [] },
       listeners: [],
       tunnels: [],
     });

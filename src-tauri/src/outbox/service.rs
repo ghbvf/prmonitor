@@ -18,7 +18,7 @@ use tauri::{Manager, Runtime};
 use crate::db::Database;
 use crate::error::AppResult;
 use crate::events::{OutboxEvent, StreamEvent};
-use crate::model::ActionKind;
+use crate::model::{ActionExecutionResult, ActionKind};
 use crate::outbox::{store, ActionExecutor, ClaimReleaser};
 use crate::state::AppState;
 
@@ -194,17 +194,38 @@ fn record_action_result(
     id: i64,
     prev_attempt_count: u32,
     now: u64,
-    result: &AppResult<()>,
+    result: &AppResult<ActionExecutionResult>,
 ) -> AppResult<Outcome> {
     let new_attempt_count = prev_attempt_count.saturating_add(1);
-    let error = result
-        .as_ref()
-        .err()
-        .map(|e| e.message.clone())
-        .unwrap_or_default();
-    // The row `id` seeds the backoff jitter (AB#1182): rows that fail in the same cycle get
-    // distinct retry delays, so they don't re-fire in lockstep (thundering-herd avoidance).
-    let outcome = decide_outcome(new_attempt_count, now, result.is_err(), id as u64);
+    let (outcome, error) = match result {
+        Ok(ActionExecutionResult::Done) => (Outcome::Done, String::new()),
+        Ok(ActionExecutionResult::Dead { message }) => (Outcome::Dead, message.clone()),
+        Ok(ActionExecutionResult::Retry {
+            message,
+            retry_after_secs,
+        }) => {
+            if new_attempt_count >= MAX_ATTEMPTS {
+                (Outcome::Dead, message.clone())
+            } else {
+                let next_attempt_at = retry_after_secs
+                    .map(|s| now.saturating_add(s.clamp(1, BACKOFF_CAP_SECS)))
+                    .unwrap_or_else(|| {
+                        // The row `id` seeds the backoff jitter (AB#1182): rows that fail in the
+                        // same cycle get distinct retry delays, so they don't re-fire in lockstep.
+                        now.saturating_add(next_backoff(new_attempt_count, id as u64))
+                    });
+                (Outcome::Retry { next_attempt_at }, message.clone())
+            }
+        }
+        Err(e) => {
+            // Legacy executor errors stay retryable so non-notification actions keep their existing
+            // behavior. Channel adapters should return a classified `ActionExecutionResult`.
+            (
+                decide_outcome(new_attempt_count, now, true, id as u64),
+                e.message.clone(),
+            )
+        }
+    };
     match &outcome {
         Outcome::Done => store::mark_done(db, id, new_attempt_count, now)?,
         Outcome::Retry { next_attempt_at } => {
@@ -635,7 +656,7 @@ mod tests {
 
         let mut now = 0u64;
         let mut retries_seen = 0u32;
-        let err: AppResult<()> = Err(AppError::new("always boom"));
+        let err: AppResult<ActionExecutionResult> = Err(AppError::new("always boom"));
         // Simulate the worker draining the row until it dead-letters. Bound the loop well above
         // MAX_ATTEMPTS so a regression (never dead-lettering) fails loudly instead of looping.
         for _ in 0..(MAX_ATTEMPTS + 3) {
@@ -697,7 +718,7 @@ mod tests {
             store::enqueue(&db, "p1", ActionKind::Notification, "s", "{}", 0).expect("enqueue");
         let (mut due, _q) = store::claim_due(&db, 0).expect("claim");
         let action = due.remove(0);
-        let ok: AppResult<()> = Ok(());
+        let ok: AppResult<ActionExecutionResult> = Ok(ActionExecutionResult::Done);
         assert_eq!(
             record_action_result(&db, id, action.attempt_count, 0, &ok).expect("record"),
             Outcome::Done
@@ -720,8 +741,8 @@ mod tests {
         let db = Database::open_in_memory().expect("open db");
         let id =
             store::enqueue(&db, "p1", ActionKind::Notification, "s", "{}", 0).expect("enqueue");
-        let err: AppResult<()> = Err(AppError::new("transient"));
-        let ok: AppResult<()> = Ok(());
+        let err: AppResult<ActionExecutionResult> = Err(AppError::new("transient"));
+        let ok: AppResult<ActionExecutionResult> = Ok(ActionExecutionResult::Done);
 
         // Two failures (attempt_count → 1 then 2), then a success on attempt 3.
         record_action_result(&db, id, 0, 0, &err).expect("fail 1");
@@ -735,5 +756,66 @@ mod tests {
             "done reflects all attempts, not just the last"
         );
         assert_eq!(entry.last_error, None, "success clears the prior error");
+    }
+
+    #[test]
+    fn classified_dead_result_dead_letters_immediately() {
+        let db = Database::open_in_memory().expect("open db");
+        let id =
+            store::enqueue(&db, "p1", ActionKind::Notification, "s", "{}", 0).expect("enqueue");
+        let result: AppResult<ActionExecutionResult> = Ok(ActionExecutionResult::Dead {
+            message: "permanent config error".to_string(),
+        });
+
+        assert_eq!(
+            record_action_result(&db, id, 0, 10, &result).expect("record"),
+            Outcome::Dead
+        );
+
+        let entry = store::get_entry(&db, id).expect("get").expect("exists");
+        assert_eq!(entry.status, crate::model::ActionStatus::Dead);
+        assert_eq!(entry.attempt_count, 1);
+        assert_eq!(entry.last_error.as_deref(), Some("permanent config error"));
+    }
+
+    #[test]
+    fn classified_retry_result_honors_retry_after() {
+        let db = Database::open_in_memory().expect("open db");
+        let id =
+            store::enqueue(&db, "p1", ActionKind::Notification, "s", "{}", 0).expect("enqueue");
+        let result: AppResult<ActionExecutionResult> = Ok(ActionExecutionResult::Retry {
+            message: "rate limited".to_string(),
+            retry_after_secs: Some(90),
+        });
+
+        assert_eq!(
+            record_action_result(&db, id, 0, 10, &result).expect("record"),
+            Outcome::Retry {
+                next_attempt_at: 100
+            }
+        );
+
+        let entry = store::get_entry(&db, id).expect("get").expect("exists");
+        assert_eq!(entry.status, crate::model::ActionStatus::Pending);
+        assert_eq!(entry.next_attempt_at, 100);
+        assert_eq!(entry.last_error.as_deref(), Some("rate limited"));
+    }
+
+    #[test]
+    fn classified_retry_result_caps_retry_after() {
+        let db = Database::open_in_memory().expect("open db");
+        let id =
+            store::enqueue(&db, "p1", ActionKind::Notification, "s", "{}", 0).expect("enqueue");
+        let result: AppResult<ActionExecutionResult> = Ok(ActionExecutionResult::Retry {
+            message: "rate limited".to_string(),
+            retry_after_secs: Some(BACKOFF_CAP_SECS * 10),
+        });
+
+        assert_eq!(
+            record_action_result(&db, id, 0, 10, &result).expect("record"),
+            Outcome::Retry {
+                next_attempt_at: 10 + BACKOFF_CAP_SECS
+            }
+        );
     }
 }

@@ -46,6 +46,46 @@ use model::Candidate;
 use state::AppState;
 use tauri::Manager;
 
+enum NotificationActionPayload {
+    Delivery(model::NotificationDeliveryPayload),
+    Legacy(model::Notification),
+}
+
+fn parse_notification_action_payload(payload: &str) -> error::AppResult<NotificationActionPayload> {
+    match serde_json::from_str::<model::NotificationDeliveryPayload>(payload) {
+        Ok(payload) => Ok(NotificationActionPayload::Delivery(payload)),
+        Err(new_err) => match serde_json::from_str::<model::Notification>(payload) {
+            Ok(note) => Ok(NotificationActionPayload::Legacy(note)),
+            Err(old_err) => Err(error::AppError::new(format!(
+                "outbox 通知 payload 既不是 NotificationDeliveryPayload，也不是 legacy Notification：new={new_err}; legacy={old_err}"
+            ))),
+        },
+    }
+}
+
+#[tauri::command]
+async fn notification_test_send<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    channel: config::service::NotificationChannel,
+) -> error::AppResult<String> {
+    config::service::validate_notification_channel_for_test(&channel)?;
+    let delivery_channel = config::service::notification_delivery_channel(&channel);
+    let note = model::Notification::new(
+        model::NotificationLevel::Info,
+        "prmonitor 通知测试".to_string(),
+        String::new(),
+        model::RedactedNotificationBody::fixed("这是一条 prmonitor 测试通知"),
+        String::new(),
+    );
+    match review::notify::deliver_channel_with_app(&app, &delivery_channel, &note).await? {
+        model::ActionExecutionResult::Done => {
+            Ok(format!("通知渠道「{}」测试发送成功", channel.name))
+        }
+        model::ActionExecutionResult::Retry { message, .. }
+        | model::ActionExecutionResult::Dead { message } => Err(error::AppError::new(message)),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // AB#1044: branch on `argv` BEFORE building Tauri. `prmonitor review …` runs entirely as a thin
@@ -262,26 +302,71 @@ fn build_app() {
                     Box::pin(async move {
                         match action.kind {
                             model::ActionKind::Notification => {
-                                let note: model::Notification =
-                                    serde_json::from_str(&action.payload).map_err(|e| {
-                                        error::AppError::new(format!(
-                                            "outbox 通知反序列化失败：{e}"
-                                        ))
-                                    })?;
-                                review::notify::deliver(
+                                let payload =
+                                    match parse_notification_action_payload(&action.payload) {
+                                        Ok(payload) => payload,
+                                        Err(e) => {
+                                            return Ok(model::ActionExecutionResult::Dead {
+                                                message: e.message,
+                                            });
+                                        }
+                                    };
+                                let payload = match payload {
+                                    NotificationActionPayload::Delivery(payload) => payload,
+                                    NotificationActionPayload::Legacy(note) => {
+                                        return review::notify::deliver(
+                                            &app,
+                                            model::NotificationKind::Desktop,
+                                            &note,
+                                        )
+                                        .await;
+                                    }
+                                };
+                                let channel = match config::service::notification_channel(
                                     &app,
-                                    model::NotificationKind::Desktop,
-                                    &note,
+                                    &payload.channel_id,
+                                ) {
+                                    Ok(channel) => channel,
+                                    Err(e) => {
+                                        return Ok(model::ActionExecutionResult::Dead {
+                                            message: e.message,
+                                        });
+                                    }
+                                };
+                                if !channel.enabled {
+                                    return Ok(model::ActionExecutionResult::Dead {
+                                        message: format!(
+                                            "通知渠道「{}」已禁用，停止投递",
+                                            channel.name
+                                        ),
+                                    });
+                                }
+                                if channel.kind != payload.kind {
+                                    return Ok(model::ActionExecutionResult::Dead {
+                                        message: format!(
+                                            "通知渠道「{}」kind 已从 {:?} 改为 {:?}，停止投递",
+                                            channel.name, payload.kind, channel.kind
+                                        ),
+                                    });
+                                }
+                                let delivery_channel =
+                                    config::service::notification_delivery_channel(&channel);
+                                review::notify::deliver_channel_with_app(
+                                    &app,
+                                    &delivery_channel,
+                                    &payload.notification,
                                 )
                                 .await
                             }
-                            model::ActionKind::Review => {
-                                run_review_action(&app, &action, "review").await
-                            }
-                            model::ActionKind::Check => {
-                                run_review_action(&app, &action, "check").await
-                            }
-                            model::ActionKind::StopReview => run_stop_action(&app, &action).await,
+                            model::ActionKind::Review => run_review_action(&app, &action, "review")
+                                .await
+                                .map(|_| model::ActionExecutionResult::Done),
+                            model::ActionKind::Check => run_review_action(&app, &action, "check")
+                                .await
+                                .map(|_| model::ActionExecutionResult::Done),
+                            model::ActionKind::StopReview => run_stop_action(&app, &action)
+                                .await
+                                .map(|_| model::ActionExecutionResult::Done),
                         }
                     })
                 });
@@ -344,17 +429,26 @@ fn build_app() {
             state.notify_outbox.set_sink(Arc::new({
                 let app = app.handle().clone();
                 move |note: model::Notification| {
-                    let summary = note.title.clone();
-                    let payload = serde_json::to_string(&note)
-                        .map_err(|e| error::AppError::new(format!("outbox 通知序列化失败：{e}")))?;
-                    outbox::service::enqueue(
-                        &app,
-                        &note.project_id,
-                        model::ActionKind::Notification,
-                        &summary,
-                        &payload,
-                    )
-                    .map(|_id| ())
+                    let channels = config::service::enabled_notification_channels(&app)?;
+                    for channel in channels {
+                        let delivery = model::NotificationDeliveryPayload {
+                            notification: note.clone(),
+                            channel_id: channel.id.clone(),
+                            kind: channel.kind,
+                        };
+                        let summary = format!("{} via {}", note.title, channel.name);
+                        let payload = serde_json::to_string(&delivery).map_err(|e| {
+                            error::AppError::new(format!("outbox 通知序列化失败：{e}"))
+                        })?;
+                        outbox::service::enqueue(
+                            &app,
+                            &note.project_id,
+                            model::ActionKind::Notification,
+                            &summary,
+                            &payload,
+                        )?;
+                    }
+                    Ok(())
                 }
             }));
 
@@ -434,6 +528,7 @@ fn build_app() {
             config::commands::app_version,
             config::commands::get_config,
             config::commands::set_config,
+            notification_test_send,
             pr::commands::start_polling,
             pr::commands::stop_polling,
             pr::commands::poll_now,
@@ -828,6 +923,23 @@ mod tests {
             !should_skip_auto_dispatch_for_stopped_codex(model::EngineKind::Claude, true),
             "Claude has no resident codex stop flag"
         );
+    }
+
+    #[test]
+    fn notification_action_payload_accepts_legacy_naked_notification() {
+        let note = model::Notification::new(
+            model::NotificationLevel::Info,
+            "done".to_string(),
+            "https://example.com/pr/1".to_string(),
+            model::RedactedNotificationBody::fixed("review done"),
+            "p1".to_string(),
+        );
+        let raw = serde_json::to_string(&note).expect("legacy note serializes");
+
+        match parse_notification_action_payload(&raw).expect("legacy note parses") {
+            NotificationActionPayload::Legacy(parsed) => assert_eq!(parsed, note),
+            NotificationActionPayload::Delivery(_) => panic!("legacy note parsed as new payload"),
+        }
     }
 
     // Cross-slice legacy-import ASSEMBLY + guard (review F11). The per-slice

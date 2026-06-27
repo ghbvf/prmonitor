@@ -28,6 +28,7 @@ function draft(projects: Project[], activeProjectId: string): AppConfig {
     webhookPublicUrl: "",
     localApiToken: "",
     outbox: { notificationTtlSecs: 7200 },
+    notifications: { channels: [] },
     listeners: [],
     tunnels: [],
   };

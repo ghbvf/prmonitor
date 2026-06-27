@@ -459,7 +459,7 @@ impl RedactedNotificationBody {
 /// open TS end). The serde golden (`notification_wire_shape_is_camel_case`) is the
 /// **Medium** carrier locking the camelCase wire shape, so a future channel that
 /// (de)serializes it (an email/webhook outbox queue) sees a stable shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Notification {
     /// Severity, for channels that render it (email subject prefix, log level, icon).
@@ -514,15 +514,76 @@ pub enum NotificationLevel {
 /// expressed. Today ONE variant (`Desktop`), already load-bearing at the review-completion
 /// call site (the only outbound today), mirroring how [`SourceKind`] / [`EngineKind`] dispatch.
 ///
-/// AB#1070 design reservation: future channels slot in as `Email` → `"email"`, `Feishu` →
-/// `"feishu"`, `Telegram` → `"telegram"`, `WeChatWork` → `"weChatWork"` (NOT implemented).
-/// Wire string pinned camelCase; the serde golden locks it (Medium carrier).
+/// AB#1459 adds external channels as concrete variants: `Email` → `"email"`, `Feishu` →
+/// `"feishu"`, `Telegram` → `"telegram"`, `WeChatWork` → `"weChatWork"`. Wire string pinned
+/// camelCase; the serde golden locks it (Medium carrier).
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum NotificationKind {
     #[default]
     Desktop,
-    // future AB#1070: Email, Feishu, Telegram, WeChatWork
+    Email,
+    Slack,
+    Telegram,
+    WeChatWork,
+    Feishu,
+    DingTalk,
+}
+
+/// Persisted payload for one notification delivery row (AB#1459).
+///
+/// **Hard carrier for secret exclusion:** this is the ONLY shape an outbox
+/// `ActionKind::Notification` row executes. It carries the normalized notification plus a channel
+/// reference (`channel_id` + `kind`), but it has no field capable of holding a webhook URL, bot
+/// token, SMTP password, authorization header, or provider response. Adapters live-load channel
+/// config by id at execution time, so the panel-visible raw payload cannot contain channel secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationDeliveryPayload {
+    pub notification: Notification,
+    pub channel_id: String,
+    pub kind: NotificationKind,
+}
+
+/// Runtime delivery config for one notification channel (AB#1459).
+///
+/// Horizontal DTO: config owns persisted settings, review owns delivery adapters, and `lib.rs`
+/// composes them. Adapters consume this model-level shape so the `review` slice never imports the
+/// `config` slice's persisted model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationDeliveryChannel {
+    pub id: String,
+    pub name: String,
+    pub kind: NotificationKind,
+    pub webhook_url: String,
+    pub webhook_secret: String,
+    pub telegram_bot_token: String,
+    pub telegram_chat_id: String,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub smtp_username: String,
+    pub smtp_password: String,
+    pub smtp_from: String,
+    pub smtp_to: String,
+    pub timeout_secs: u64,
+}
+
+/// Classified result of one outbox action execution (AB#1459).
+///
+/// Horizontal because the composition root, outbox worker, and notification adapters all need the
+/// same sealed result without any slice importing a sibling. Adapters map provider-specific
+/// HTTP/SMTP failures into this type before the generic outbox worker records state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionExecutionResult {
+    Done,
+    Retry {
+        message: String,
+        retry_after_secs: Option<u64>,
+    },
+    Dead {
+        message: String,
+    },
 }
 
 /// The kind of side effect a persisted outbox row executes (AB#1066/AB#1069, epic AB#1078).
@@ -1270,15 +1331,61 @@ mod tests {
                 .expect("NotificationLevel serializes"),
             "info"
         );
-        // Today ONE channel; future channels (email / feishu / telegram / weChatWork) pin here.
         assert_eq!(
             serde_json::to_value(NotificationKind::Desktop).expect("NotificationKind serializes"),
             "desktop"
         );
         assert_eq!(
+            serde_json::to_value(NotificationKind::Email).expect("NotificationKind serializes"),
+            "email"
+        );
+        assert_eq!(
+            serde_json::to_value(NotificationKind::Slack).expect("NotificationKind serializes"),
+            "slack"
+        );
+        assert_eq!(
+            serde_json::to_value(NotificationKind::Telegram).expect("NotificationKind serializes"),
+            "telegram"
+        );
+        assert_eq!(
+            serde_json::to_value(NotificationKind::WeChatWork)
+                .expect("NotificationKind serializes"),
+            "weChatWork"
+        );
+        assert_eq!(
+            serde_json::to_value(NotificationKind::Feishu).expect("NotificationKind serializes"),
+            "feishu"
+        );
+        assert_eq!(
+            serde_json::to_value(NotificationKind::DingTalk).expect("NotificationKind serializes"),
+            "dingTalk"
+        );
+        assert_eq!(
             serde_json::to_value(NotificationKind::default()).expect("NotificationKind serializes"),
             "desktop"
         );
+    }
+
+    #[test]
+    fn notification_delivery_payload_excludes_channel_secrets() {
+        let payload = NotificationDeliveryPayload {
+            notification: Notification::new(
+                NotificationLevel::Info,
+                "PR #7 review 完成".to_string(),
+                "https://example.com/pr/7".to_string(),
+                RedactedNotificationBody::action_url("https://example.com/pr/7".to_string()),
+                "p1".to_string(),
+            ),
+            channel_id: "slack-main".to_string(),
+            kind: NotificationKind::Slack,
+        };
+
+        let json = serde_json::to_string(&payload).expect("payload serializes");
+        assert!(json.contains("slack-main"));
+        assert!(!json.contains("webhook"));
+        assert!(!json.contains("token"));
+        assert!(!json.contains("password"));
+        assert!(!json.contains("secret"));
     }
 
     // Cross-agent wire contract lock for the AB#1066 outbox status / kind (Medium carrier per

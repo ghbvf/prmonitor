@@ -11,6 +11,7 @@ import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useConfigStore } from "./useConfigStore";
 import type { AppConfig, Project } from "./types";
 import {
+  DEFAULT_NOTIFICATION_SETTINGS,
   DEFAULT_OUTBOX_CONFIG,
   DEFAULT_PROJECT_ID,
   NEW_PROJECT_DEFAULTS,
@@ -170,6 +171,10 @@ function composeConfig(): AppConfig {
     webhookPublicUrl: "",
     localApiToken: "",
     outbox: { ...DEFAULT_OUTBOX_CONFIG },
+    notifications: {
+      ...DEFAULT_NOTIFICATION_SETTINGS,
+      channels: DEFAULT_NOTIFICATION_SETTINGS.channels.map((c) => ({ ...c })),
+    },
     // Remote-access resources (AB#1064 / F10): source listeners from the LOADED backend
     // config so the backend `default_local_api_listener()` in config/model.rs is the single
     // source of truth — no TS-side literal mirror. On first launch `AppConfig::default()`

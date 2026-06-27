@@ -11,9 +11,10 @@ use ts_rs::{Config, TS};
 
 use crate::{
     config::model::{
-        AppConfig, Listener, ListenerAuthMode, ListenerKind, OutboxConfig, Project, Tunnel,
+        AppConfig, Listener, ListenerAuthMode, ListenerKind, NotificationChannel,
+        NotificationSettings, OutboxConfig, Project, Tunnel,
     },
-    model::{EngineKind, LabelSource, SourceKind, UpdateMode, WebhookTunnelMode},
+    model::{EngineKind, LabelSource, NotificationKind, SourceKind, UpdateMode, WebhookTunnelMode},
     remote::status::{ListenerRuntimeStatus, ListenerState},
 };
 
@@ -25,7 +26,12 @@ fn config() -> Config {
 }
 
 fn declaration<T: TS>(cfg: &Config) -> String {
-    format!("export {}\n", T::decl(cfg))
+    let decl = T::decl(cfg)
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("export {decl}\n")
 }
 
 fn enum_values<T>() -> String
@@ -49,6 +55,13 @@ where
     T: IntoEnumIterator + Serialize,
 {
     format!("export const {name} = {} as const;\n", enum_values::<T>())
+}
+
+fn default_const<T: Serialize>(name: &str, type_name: &str, value: &T) -> String {
+    format!(
+        "export const {name}: {type_name} = {};\n",
+        serde_json::to_string(value).expect("default value serializes")
+    )
 }
 
 fn write_if_changed(path: &Path, contents: &str) {
@@ -79,10 +92,13 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push('\n');
     shared.push_str(&declaration::<UpdateMode>(&cfg));
     shared.push_str(&option_array::<UpdateMode>("UPDATE_MODES"));
+    shared.push('\n');
+    shared.push_str(&declaration::<NotificationKind>(&cfg));
+    shared.push_str(&option_array::<NotificationKind>("NOTIFICATION_KINDS"));
 
     let mut config_types = String::from(HEADER);
     config_types.push_str(
-        "import type { EngineKind, LabelSource, SourceKind, UpdateMode } from \"../types.generated\";\n\n",
+        "import type { EngineKind, LabelSource, NotificationKind, SourceKind, UpdateMode } from \"../types.generated\";\n\n",
     );
     config_types.push_str(&declaration::<WebhookTunnelMode>(&cfg));
     config_types.push_str(&option_array::<WebhookTunnelMode>("WEBHOOK_TUNNEL_MODES"));
@@ -97,6 +113,15 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     config_types.push_str(&option_array::<ListenerAuthMode>("LISTENER_AUTH_MODES"));
     config_types.push('\n');
     config_types.push_str(&declaration::<OutboxConfig>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<NotificationChannel>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<NotificationSettings>(&cfg));
+    config_types.push_str(&default_const(
+        "DEFAULT_NOTIFICATION_SETTINGS",
+        "NotificationSettings",
+        &NotificationSettings::default(),
+    ));
     config_types.push('\n');
     config_types.push_str(&declaration::<Listener>(&cfg));
     config_types.push('\n');

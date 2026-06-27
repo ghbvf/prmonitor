@@ -69,6 +69,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # `default-features = false` drops the default native-tls stack. Reuses the existing
 # tokio runtime (async reqwest), mirroring how gh/az run on tokio::process.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Parse RFC-compliant HTTP-date `Retry-After` values for notification webhook backoff.
+httpdate = "1"
+# SMTP email notification adapter (AB#1459). Use tokio + rustls instead of native-tls/OpenSSL.
+lettre = { version = "0.11.22", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1", "tokio1-rustls-tls", "rustls-platform-verifier"] }
 # CLI subcommand (`prmonitor review …`, AB#1044): `clap` parses the review args, then the same
 # binary acts as a thin HTTP client over the AB#1043 local API (reusing the resident `reqwest`).
 clap = { version = "4", features = ["derive"] }
