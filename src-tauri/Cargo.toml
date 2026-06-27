@@ -107,6 +107,14 @@ portable-pty = "0.9"
 # Base64-encode raw PTY output bytes into the `terminal:event` `output { data }` wire field
 # (byte-lossless — a PTY stream is not guaranteed valid UTF-8, so it is NOT `from_utf8_lossy`d).
 base64 = "0.22"
+# Serve the built web SPA (`dist-web`) over the terminal listener so the Remote Web Terminal is
+# reachable in a browser via the tunnel (#1504). CORE derive only — NOT rust-embed's `axum` feature,
+# which targets axum 0.8 and would conflict with our pinned axum 0.7; the handler builds the axum 0.7
+# `Response` manually like the sibling `/invoke`+`/events` handlers. Release embeds the bundle into
+# the binary (self-contained); debug reads `dist-web/` from disk (live-reload). `mime_guess` maps the
+# asset extension to `Content-Type`.
+rust-embed = "8"
+mime_guess = "2"
 
 # Pin: brotli 8.0.3 (pulled transitively by tauri-codegen/tauri-utils) requires
 # alloc-no-stdlib "^2.0", but alloc-stdlib/brotli-decompressor accept ">=2.0.4,<4"

@@ -22,7 +22,7 @@ pnpm -v
 node -v
 ```
 
-`src-tauri/tauri.conf.json` 中 `beforeBuildCommand` 已配置为 `pnpm build`，所以 `pnpm tauri build` 会自动先跑前端类型检查和 Vite 构建。
+`src-tauri/tauri.conf.json` 中 `beforeBuildCommand` 已配置为 `pnpm build && pnpm build:web`，所以 `pnpm tauri build` 会自动先跑前端类型检查 + 桌面 Vite 构建（`dist`）+ 远程 Web 终端 SPA 构建（`dist-web`，#1504 经 rust-embed 嵌入 terminal listener）。无需手动先跑 `build:web`。
 
 ## 启动本地 App
 

@@ -25,6 +25,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      # #1504: validate the web-terminal SPA bundle here (fast frontend job) too — not only in the
+      # slower Rust job — so Vite-bundle errors surface early. Mirrors beforeBuildCommand's coverage.
+      - run: pnpm run build:web
       - run: pnpm test
 
   rust:
@@ -58,6 +61,9 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
+      # #1504: the web SPA bundle (`dist-web`) is embedded by `remote::terminal_http` via rust-embed.
+      # Must run BEFORE cargo so release embeds the real bundle (build.rs only writes a placeholder).
+      - run: pnpm run build:web
       - run: pnpm run check:config-types
       - name: cargo fmt
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check

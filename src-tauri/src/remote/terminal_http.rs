@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use futures::StreamExt;
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tauri::Manager;
@@ -29,6 +30,19 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 type HttpResult<T> = Result<T, Box<Response>>;
 const CORS_ALLOW_HEADERS: &str = "authorization, content-type";
 const CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
+
+/// The built web SPA (`pnpm build:web` → repo-root `dist-web`), served over the terminal listener so
+/// the Remote Web Terminal loads in a browser via the tunnel (#1504). Release embeds these bytes into
+/// the binary (self-contained); debug reads `dist-web/` from disk at request time (no Rust recompile
+/// needed — but re-run `pnpm build:web` after SPA source changes). `build.rs` writes a placeholder
+/// `index.html` so the compile-time `#[folder]` resolves on fresh checkouts.
+// `#[folder]` is resolved relative to `CARGO_MANIFEST_DIR` (src-tauri) by rust-embed, so `../dist-web`
+// is the repo-root bundle. (No `$CARGO_MANIFEST_DIR` interpolation — that needs an extra feature.)
+#[derive(RustEmbed)]
+#[folder = "../dist-web"]
+struct WebAssets;
+
+const INDEX_HTML: &str = "index.html";
 
 #[derive(Clone)]
 pub(crate) struct Ctx<R: tauri::Runtime> {
@@ -150,8 +164,132 @@ pub(crate) fn build_router<R: tauri::Runtime>(ctx: Arc<Ctx<R>>) -> Router {
             "/events",
             get(handle_events::<R>).options(handle_options::<R>),
         )
+        // Static SPA shell + assets (#1504). `.fallback` only catches paths NOT matched by the
+        // explicit `/invoke/:command` + `/events` routes above, so the API surface is never shadowed.
+        .fallback(handle_static::<R>)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(ctx)
+}
+
+/// Map a request path to the embedded asset key. `/` (or empty) → `index.html`; otherwise strip the
+/// leading slash. Returns `None` for any path containing a `..` segment — a defense-in-depth traversal
+/// guard: release is already safe (the embed is a compile-time key map, so `../` simply never matches),
+/// but debug reads from disk via rust-embed, whose traversal guard exempts symlinks; this app-layer
+/// filter removes that implicit dependency on a dependency's internals. The SPA fallback for an unknown
+/// *client route* lives in `handle_static` (this stays a pure, table-testable normaliser).
+fn resolve_asset(path: &str) -> Option<&str> {
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    Some(if trimmed.is_empty() {
+        INDEX_HTML
+    } else {
+        trimmed
+    })
+}
+
+/// Host/Origin gate for the static SPA shell. Deliberately NO bearer/permission check: the shell
+/// (`index.html` + `/assets/*`) carries no secrets and must load BEFORE the SPA can prompt for the
+/// bearer token — that token then gates every `/invoke` + `/events` call (see `check_request`). This
+/// is the closed upstream of the funnel (Host = DNS-rebind defense; Origin = same-origin gate); the
+/// stateful API surface stays bearer-gated downstream.
+fn check_static_request<R: tauri::Runtime>(
+    ctx: &Ctx<R>,
+    headers: &HeaderMap,
+) -> HttpResult<(Listener, Vec<String>)> {
+    let cfg = config_service::load(&ctx.app).map_err(|_| {
+        Box::new(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "服务不可用",
+        ))
+    })?;
+    let listener = cfg
+        .listeners
+        .into_iter()
+        .find(|l| l.id == ctx.listener_id && l.enabled)
+        .ok_or_else(|| Box::new(error_response(StatusCode::FORBIDDEN, "终端监听器未启用")))?;
+    let public_urls = runtime_public_urls(ctx);
+    if !host_allowed_with_public_urls(
+        header_str(headers, "host").unwrap_or(""),
+        ctx.port,
+        &listener,
+        &public_urls,
+    ) {
+        return Err(Box::new(error_response(
+            StatusCode::FORBIDDEN,
+            "Host 不被允许",
+        )));
+    }
+    if !static_origin_allowed_with_public_urls(
+        header_str(headers, "origin"),
+        ctx.port,
+        &listener,
+        &public_urls,
+    ) {
+        return Err(Box::new(error_response(
+            StatusCode::FORBIDDEN,
+            "Origin 不被允许",
+        )));
+    }
+    Ok((listener, public_urls))
+}
+
+async fn handle_static<R: tauri::Runtime>(
+    State(ctx): State<Arc<Ctx<R>>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let (listener, public_urls) = match check_static_request(&ctx, &headers) {
+        Ok(v) => v,
+        Err(resp) => {
+            // Observe Host/Origin rejections (e.g. DNS-rebind probes) on the unauthenticated static
+            // path — the only signal we get, since there is no bearer subject to attribute.
+            audit(
+                &ctx.app,
+                &ctx.listener_id,
+                "static_forbidden",
+                false,
+                &headers,
+            );
+            return *resp;
+        }
+    };
+    let Some(requested) = resolve_asset(uri.path()) else {
+        return error_response(StatusCode::NOT_FOUND, "资源不存在");
+    };
+    let (key, body) = match WebAssets::get(requested) {
+        Some(content) => (requested, content.data),
+        None => {
+            // A missing asset-like path (has a file extension) is a real 404 — never serve index.html
+            // as JS/CSS (a `text/html` body would break the SPA with a MIME/parse error). Only an
+            // extensionless *client route* falls back to index.html for client-side routing.
+            if std::path::Path::new(requested).extension().is_some() {
+                return error_response(StatusCode::NOT_FOUND, "资源不存在");
+            }
+            match WebAssets::get(INDEX_HTML) {
+                Some(content) => (INDEX_HTML, content.data),
+                None => return error_response(StatusCode::NOT_FOUND, "资源不存在"),
+            }
+        }
+    };
+    let mime = mime_guess::from_path(key).first_or_octet_stream();
+    let response = (
+        [
+            (header::CONTENT_TYPE, mime.as_ref()),
+            // Defense-in-depth for a publicly-tunneled endpoint: no MIME sniffing, no framing.
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::X_FRAME_OPTIONS, "SAMEORIGIN"),
+        ],
+        body.into_owned(),
+    )
+        .into_response();
+    // Mirror the API path: tag the allowed Origin so a configured cross-origin SPA host can fetch the
+    // shell (same-origin navigation carries no Origin → with_cors is a no-op).
+    with_cors(
+        response,
+        cors_origin(&headers, ctx.port, &listener, &public_urls),
+    )
 }
 
 fn json_response<T: Serialize>(status: StatusCode, body: &T) -> Response {
@@ -272,6 +410,15 @@ fn origin_allowed_with_public_urls(
         None => true,
         Some(o) => origin_matches_with_public_urls(o, port, listener, public_urls),
     }
+}
+
+fn static_origin_allowed_with_public_urls(
+    origin: Option<&str>,
+    port: u16,
+    listener: &Listener,
+    public_urls: &[String],
+) -> bool {
+    origin.is_none_or(|o| origin_matches_with_public_urls(o, port, listener, public_urls))
 }
 
 fn origin_matches_with_public_urls(
@@ -1085,6 +1232,131 @@ mod tests {
                 .expect("stream close timeout")
                 .expect("stream close result");
             assert!(closed.is_none(), "revoked read permission should close SSE");
+            server.abort();
+        });
+    }
+
+    #[test]
+    fn resolve_asset_normalises_paths() {
+        // root → index.html
+        assert_eq!(resolve_asset(""), Some(INDEX_HTML));
+        assert_eq!(resolve_asset("/"), Some(INDEX_HTML));
+        // real asset → leading slash stripped, passthrough
+        assert_eq!(
+            resolve_asset("/assets/app-abc123.js"),
+            Some("assets/app-abc123.js")
+        );
+        assert_eq!(resolve_asset("/index.html"), Some("index.html"));
+        // client-side deep link → passthrough here; handle_static falls back to index.html on miss
+        assert_eq!(resolve_asset("/settings/tokens"), Some("settings/tokens"));
+        // traversal guard: any `..` segment → None (handle_static maps to 404), never escapes dist-web
+        assert_eq!(resolve_asset("/../../etc/passwd"), None);
+        assert_eq!(resolve_asset("/assets/../../secret"), None);
+    }
+
+    #[test]
+    fn terminal_serves_static_spa_shell_host_gated_not_bearer_gated() {
+        let app = tauri::test::mock_app();
+        tauri::async_runtime::block_on(async move {
+            let socket = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind loopback");
+            let port = socket.local_addr().expect("addr").port();
+            let mut l = listener();
+            l.port = port;
+            persist_listener(app.handle(), l);
+            let ctx = Arc::new(Ctx {
+                app: app.handle().clone(),
+                port,
+                listener_id: "term".to_string(),
+            });
+            let server = tauri::async_runtime::spawn(async move {
+                let _ = axum::serve(socket, build_router(ctx).into_make_service()).await;
+            });
+            let client = reqwest::Client::new();
+            let base = format!("http://127.0.0.1:{port}");
+
+            // Shell loads WITHOUT a bearer token (the SPA must render before it can prompt for one).
+            let root = client.get(format!("{base}/")).send().await.expect("send");
+            assert_eq!(root.status(), reqwest::StatusCode::OK);
+            assert!(
+                root.headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .contains("text/html"),
+                "root should serve index.html as text/html"
+            );
+
+            // Unknown deep link → SPA fallback to index.html (200 text/html), still no bearer.
+            let deep = client
+                .get(format!("{base}/settings/tokens"))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(deep.status(), reqwest::StatusCode::OK);
+            assert!(deep
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .contains("text/html"));
+
+            // Static is still Host-gated (DNS-rebind defense).
+            let bad_host = client
+                .get(format!("{base}/"))
+                .header("host", "evil.example.com")
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(bad_host.status(), reqwest::StatusCode::FORBIDDEN);
+
+            // ...and Origin-gated: a cross-site request from a non-allowlisted Origin is rejected.
+            let bad_origin = client
+                .get(format!("{base}/"))
+                .header("origin", "https://evil.example.com")
+                .header("sec-fetch-site", "cross-site")
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(bad_origin.status(), reqwest::StatusCode::FORBIDDEN);
+
+            // Top-level document navigation can be cross-site without an Origin header; Host gating is
+            // still enough for the unauthenticated static shell so the SPA can render its token prompt.
+            let cross_site_navigation = client
+                .get(format!("{base}/"))
+                .header("sec-fetch-site", "cross-site")
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(cross_site_navigation.status(), reqwest::StatusCode::OK);
+
+            // A missing asset-like path (has an extension) → real 404, NOT index.html — so the browser
+            // never receives `text/html` where it expects JS/CSS (which would break the SPA).
+            let missing_asset = client
+                .get(format!("{base}/assets/does-not-exist-xyz.js"))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(missing_asset.status(), reqwest::StatusCode::NOT_FOUND);
+
+            // Regression: the static fallback did NOT loosen the API gate — /invoke without a bearer
+            // is still rejected, and an unknown command is still 404 (matched before any auth).
+            let api_unauth = client
+                .post(format!("{base}/invoke/list_terminal_sessions"))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(api_unauth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+            let unknown = client
+                .post(format!("{base}/invoke/not_terminal"))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+
             server.abort();
         });
     }
