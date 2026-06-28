@@ -11,6 +11,7 @@ import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useConfigStore } from "./useConfigStore";
 import type { AppConfig, Project } from "./types";
 import {
+  DEFAULT_MESSAGING_SETTINGS,
   DEFAULT_NOTIFICATION_SETTINGS,
   DEFAULT_OUTBOX_CONFIG,
   DEFAULT_PROJECT_ID,
@@ -179,6 +180,14 @@ function composeConfig(): AppConfig {
     notifications: {
       ...DEFAULT_NOTIFICATION_SETTINGS,
       channels: DEFAULT_NOTIFICATION_SETTINGS.channels.map((c) => ({ ...c })),
+    },
+    messaging: {
+      integrations: (store.config?.messaging.integrations ?? DEFAULT_MESSAGING_SETTINGS.integrations).map(
+        (integration) => ({
+          ...integration,
+          allowedConversationIds: [...integration.allowedConversationIds],
+        }),
+      ),
     },
     remoteAccess: {
       entrypoints: (store.config?.remoteAccess.entrypoints ?? []).map((entrypoint) => ({

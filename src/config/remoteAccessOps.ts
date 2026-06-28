@@ -1,10 +1,19 @@
 import type {
   AppConfig,
+  MessagingIntegration,
+  RemoteAccessRuntimeStatus,
   RemoteCapability,
   RemoteEntrypoint,
   RemoteRoute,
   RemoteTunnel,
 } from "./types";
+
+export interface MessagingCallbackEndpoint {
+  entrypointId: string;
+  routeId: string;
+  integrationId: string;
+  url: string;
+}
 
 export function normalizeStringList(csv: string): string[] {
   return csv
@@ -14,10 +23,15 @@ export function normalizeStringList(csv: string): string[] {
 }
 
 export function makeRemoteRoute(capability: RemoteCapability = "local-api"): RemoteRoute {
+  const defaults: Record<RemoteCapability, { name: string; path: string }> = {
+    terminal: { name: "Terminal", path: "/terminal" },
+    "local-api": { name: "Local API", path: "/api" },
+    messaging: { name: "Messaging", path: "/messaging" },
+  };
   return {
     id: crypto.randomUUID(),
-    name: capability === "terminal" ? "Terminal" : "Local API",
-    path: capability === "terminal" ? "/terminal" : "/api",
+    name: defaults[capability].name,
+    path: defaults[capability].path,
     capability,
     enabled: true,
     authToken: "",
@@ -99,4 +113,61 @@ export function deleteTunnelFromDraft(draft: AppConfig, id: string): boolean {
   if (idx === -1) return false;
   draft.remoteAccess.tunnels.splice(idx, 1);
   return true;
+}
+
+export function messagingCallbackEndpoints(
+  status: RemoteAccessRuntimeStatus,
+  configuredEntrypoints: RemoteEntrypoint[],
+  configuredTunnels: RemoteTunnel[],
+  integrations: MessagingIntegration[],
+): MessagingCallbackEndpoint[] {
+  const enabledIntegrations = integrations.filter((integration) => integration.enabled);
+  if (enabledIntegrations.length === 0) return [];
+
+  const configuredById = new Map(configuredEntrypoints.map((entrypoint) => [entrypoint.id, entrypoint]));
+  const tunnelBaseByEntrypoint = new Map<string, string>();
+  for (const tunnel of status.tunnels) {
+    if (tunnel.state !== "running" || !tunnel.publicUrl) continue;
+    const configured = configuredTunnels.find((item) => item.id === tunnel.id);
+    if (configured && !configured.enabled) continue;
+    tunnelBaseByEntrypoint.set(tunnel.targetEntrypointId, trimTrailingSlash(tunnel.publicUrl));
+  }
+
+  const endpoints: MessagingCallbackEndpoint[] = [];
+  for (const entrypoint of status.entrypoints) {
+    const configured = configuredById.get(entrypoint.id);
+    const base =
+      tunnelBaseByEntrypoint.get(entrypoint.id) ??
+      localEntrypointBase(configured, entrypoint.boundPort ?? null);
+    if (!base) continue;
+    for (const route of entrypoint.routes) {
+      if (!route.enabled || route.capability !== "messaging") continue;
+      const routePath = normalizeRoutePath(route.path);
+      for (const integration of enabledIntegrations) {
+        endpoints.push({
+          entrypointId: entrypoint.id,
+          routeId: route.id,
+          integrationId: integration.id,
+          url: `${base}${routePath}/${integration.kind}/${encodeURIComponent(integration.id)}`,
+        });
+      }
+    }
+  }
+  return endpoints;
+}
+
+function localEntrypointBase(entrypoint: RemoteEntrypoint | undefined, boundPort: number | null): string | null {
+  if (!entrypoint || boundPort == null) return null;
+  const host = entrypoint.bindHost === "0.0.0.0" ? "127.0.0.1" : entrypoint.bindHost;
+  return `http://${host}:${boundPort}`;
+}
+
+function normalizeRoutePath(path: string): string {
+  const trimmed = path.trim();
+  const withSlash = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  return trimTrailingSlash(withSlash);
+}
+
+function trimTrailingSlash(value: string): string {
+  return value.replace(/\/+$/, "");
 }

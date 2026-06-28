@@ -17,6 +17,7 @@ import ReviewPanel from "./review/ReviewPanel.vue";
 import ReviewSessions from "./review/ReviewSessions.vue";
 import InboxPanel from "./inbox/InboxPanel.vue";
 import OutboxPanel from "./outbox/OutboxPanel.vue";
+import MessagingPanel from "./messaging/MessagingPanel.vue";
 import TerminalView from "./terminal/TerminalView.vue";
 import { useReviewStore } from "./review/useReviewStore";
 import { reschedule, startPolling } from "./pr/api";
@@ -38,6 +39,7 @@ const {
   goOnboarding,
   goInbox,
   goOutbox,
+  goMessaging,
   goTerminal,
 } = useAppView();
 // Active project (#35): the switcher rail flips it; the PR + review views below
@@ -272,6 +274,14 @@ watch(selectedNumber, (n) => {
         v-if="!booting && currentView === 'monitor'"
         type="button"
         class="nav-btn"
+        @click="goMessaging"
+      >
+        Messaging
+      </button>
+      <button
+        v-if="!booting && currentView === 'monitor'"
+        type="button"
+        class="nav-btn"
         @click="goTerminal"
       >
         Terminal
@@ -289,6 +299,7 @@ watch(selectedNumber, (n) => {
           currentView === 'settings' ||
           currentView === 'inbox' ||
           currentView === 'outbox' ||
+          currentView === 'messaging' ||
           currentView === 'terminal'
         "
         type="button"
@@ -337,6 +348,9 @@ watch(selectedNumber, (n) => {
       class="view"
       :active-project-id="activeProjectId"
     />
+
+    <!-- Messaging audit view (#1559): independent from the PR-oriented inbox schema. -->
+    <MessagingPanel v-else-if="currentView === 'messaging'" class="view" />
 
     <!-- Terminal view (#1383): a full-width iTerm session view. TerminalView self-manages
          its `terminal:event` listener (onMounted/onUnmounted), so the composition root only

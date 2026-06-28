@@ -206,6 +206,7 @@ impl ListenerSupervisor {
                                     !terminal_auth_token_is_strong(&route.auth_token)
                                 }
                                 RemoteCapability::LocalApi => !local_api_token_set,
+                                RemoteCapability::Messaging => false,
                             }
                     });
                     let (state, message) = match bound_port {
@@ -511,6 +512,12 @@ fn build_entrypoint_router<R: tauri::Runtime>(
                     base_path: route.path.clone(),
                     remote_entrypoint_id: Some(entrypoint.id.clone()),
                 })),
+            ),
+            RemoteCapability::Messaging => router.nest(
+                route.path.as_str(),
+                crate::messaging::commands::build_router(Arc::new(
+                    crate::messaging::commands::Ctx { app: app.clone() },
+                )),
             ),
         };
     }
@@ -931,6 +938,7 @@ fn capability_audit_label(capability: RemoteCapability) -> &'static str {
     match capability {
         RemoteCapability::Terminal => "terminal",
         RemoteCapability::LocalApi => "local-api",
+        RemoteCapability::Messaging => "messaging",
     }
 }
 

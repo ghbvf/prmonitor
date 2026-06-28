@@ -1,6 +1,7 @@
 //! Rust slice-boundary enforcement test (Medium, per `.claude/rules/prmonitor/ai-robust.md`).
 //!
-//! The backend vertical slices (`config` / `pr` / `review` / `inbox` / `outbox` / `rule`) must be
+//! The backend vertical slices (`config` / `pr` / `review` / `inbox` / `outbox` / `rule` /
+//! `messaging`) must be
 //! self-contained: a file in one slice must NOT make a runtime VALUE reference (`crate::<sibling>::`)
 //! into a SIBLING slice. Cross-slice wiring is the composition root's job (`lib.rs` + the horizontal
 //! modules `model` / `error` / `events` / `db` / `state` / `dispatch`, none of which are slices).
@@ -29,8 +30,15 @@ use std::fs;
 use std::path::Path;
 
 /// The backend vertical slices scanned for boundary violations.
-const SLICES: [&str; 7] = [
-    "config", "pr", "review", "inbox", "outbox", "rule", "terminal",
+const SLICES: [&str; 8] = [
+    "config",
+    "pr",
+    "review",
+    "inbox",
+    "outbox",
+    "rule",
+    "terminal",
+    "messaging",
 ];
 
 /// The ONE cross-slice consumable. `config` is the shared configuration provider consumed by

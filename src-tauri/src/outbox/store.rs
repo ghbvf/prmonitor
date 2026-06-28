@@ -826,6 +826,7 @@ mod tests {
             (ActionKind::Review, "review"),
             (ActionKind::Check, "check"),
             (ActionKind::StopReview, "stopReview"),
+            (ActionKind::MessagingReply, "messagingReply"),
         ] {
             assert_eq!(kind_as_wire(kind), wire, "{kind:?} → {wire}");
             assert_eq!(

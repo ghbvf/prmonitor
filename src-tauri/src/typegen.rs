@@ -11,14 +11,16 @@ use ts_rs::{Config, TS};
 
 use crate::{
     config::model::{
-        AppConfig, NotificationChannel, NotificationSettings, OutboxConfig, Project,
-        RemoteAccessConfig, RemoteCapability, RemoteEntrypoint, RemoteRoute, RemoteTunnel,
-        RemoteTunnelMode, RuleActionKind, RuleConfig, SourcePolicy, SourcePolicyMode,
+        AppConfig, MessagingIntegration, MessagingSettings, NotificationChannel,
+        NotificationSettings, OutboxConfig, Project, RemoteAccessConfig, RemoteCapability,
+        RemoteEntrypoint, RemoteRoute, RemoteTunnel, RemoteTunnelMode, RuleActionKind, RuleConfig,
+        SourcePolicy, SourcePolicyMode,
     },
     model::{
-        EngineKind, EventType, LabelSource, NotificationKind, NotificationLevel,
-        SendNotificationRequest, SendNotificationResponse, SourceKind, UpdateMode,
-        WebhookTunnelMode,
+        ActionStatus, EngineKind, EventType, LabelSource, MessagingEvent, MessagingEventEntry,
+        MessagingEventStatus, MessagingProviderCapability, MessagingProviderKind,
+        MessagingReplyAudit, NotificationKind, NotificationLevel, SendNotificationRequest,
+        SendNotificationResponse, SourceKind, UpdateMode, WebhookTunnelMode,
     },
     remote::status::{
         RemoteAccessRuntimeStatus, RemoteEntrypointRuntimeStatus, RemoteEntrypointState,
@@ -108,6 +110,27 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push_str(&declaration::<NotificationKind>(&cfg));
     shared.push_str(&option_array::<NotificationKind>("NOTIFICATION_KINDS"));
     shared.push('\n');
+    shared.push_str(&declaration::<MessagingProviderKind>(&cfg));
+    shared.push_str(&option_array::<MessagingProviderKind>(
+        "MESSAGING_PROVIDER_KINDS",
+    ));
+    shared.push('\n');
+    shared.push_str(&declaration::<MessagingEventStatus>(&cfg));
+    shared.push_str(&option_array::<MessagingEventStatus>(
+        "MESSAGING_EVENT_STATUSES",
+    ));
+    shared.push('\n');
+    shared.push_str(&declaration::<ActionStatus>(&cfg));
+    shared.push_str(&option_array::<ActionStatus>("ACTION_STATUSES"));
+    shared.push('\n');
+    shared.push_str(&declaration::<MessagingProviderCapability>(&cfg));
+    shared.push('\n');
+    shared.push_str(&declaration::<MessagingEvent>(&cfg));
+    shared.push('\n');
+    shared.push_str(&declaration::<MessagingReplyAudit>(&cfg));
+    shared.push('\n');
+    shared.push_str(&declaration::<MessagingEventEntry>(&cfg));
+    shared.push('\n');
     shared.push_str(&declaration::<NotificationLevel>(&cfg));
     shared.push_str(&option_array::<NotificationLevel>("NOTIFICATION_LEVELS"));
     shared.push('\n');
@@ -119,7 +142,7 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
 
     let mut config_types = String::from(HEADER);
     config_types.push_str(
-        "import type { EngineKind, EventType, LabelSource, NotificationKind, SourceKind, UpdateMode } from \"../types.generated\";\n\n",
+        "import type { EngineKind, EventType, LabelSource, MessagingProviderKind, NotificationKind, SourceKind, UpdateMode } from \"../types.generated\";\n\n",
     );
     config_types.push_str(&declaration::<WebhookTunnelMode>(&cfg));
     config_types.push_str(&option_array::<WebhookTunnelMode>("WEBHOOK_TUNNEL_MODES"));
@@ -155,6 +178,20 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
         "DEFAULT_NOTIFICATION_SETTINGS",
         "NotificationSettings",
         &NotificationSettings::default(),
+    ));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<MessagingIntegration>(&cfg));
+    config_types.push_str(&default_const(
+        "DEFAULT_MESSAGING_INTEGRATION",
+        "MessagingIntegration",
+        &MessagingIntegration::default(),
+    ));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<MessagingSettings>(&cfg));
+    config_types.push_str(&default_const(
+        "DEFAULT_MESSAGING_SETTINGS",
+        "MessagingSettings",
+        &MessagingSettings::default(),
     ));
     config_types.push('\n');
     config_types.push_str(&declaration::<SourcePolicy>(&cfg));

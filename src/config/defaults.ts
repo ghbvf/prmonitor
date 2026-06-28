@@ -6,7 +6,11 @@
 // the user-supplied repo/repoRoot.
 import type { SourceKind } from "../types";
 import type { NotificationChannel, OutboxConfig, Project } from "./types";
-import { DEFAULT_NOTIFICATION_SETTINGS as GENERATED_DEFAULT_NOTIFICATION_SETTINGS } from "./types.generated";
+import {
+  DEFAULT_MESSAGING_INTEGRATION as GENERATED_DEFAULT_MESSAGING_INTEGRATION,
+  DEFAULT_MESSAGING_SETTINGS as GENERATED_DEFAULT_MESSAGING_SETTINGS,
+  DEFAULT_NOTIFICATION_SETTINGS as GENERATED_DEFAULT_NOTIFICATION_SETTINGS,
+} from "./types.generated";
 
 // The fixed id the wizard gives the first project; mirrors the backend migration's
 // fixed id for symmetry. ProjectsManager mints a fresh uuid per added project, so
@@ -22,6 +26,8 @@ export const DEFAULT_OUTBOX_CONFIG: OutboxConfig = {
 };
 
 export const DEFAULT_NOTIFICATION_SETTINGS = GENERATED_DEFAULT_NOTIFICATION_SETTINGS;
+export const DEFAULT_MESSAGING_SETTINGS = GENERATED_DEFAULT_MESSAGING_SETTINGS;
+export const DEFAULT_MESSAGING_INTEGRATION = GENERATED_DEFAULT_MESSAGING_INTEGRATION;
 
 export const DEFAULT_NOTIFICATION_CHANNEL: NotificationChannel = {
   ...DEFAULT_NOTIFICATION_SETTINGS.channels[0],

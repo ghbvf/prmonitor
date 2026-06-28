@@ -11,6 +11,7 @@ export type AppView =
   | "onboarding"
   | "inbox"
   | "outbox"
+  | "messaging"
   | "terminal";
 
 const currentView = ref<AppView>("monitor");
@@ -23,6 +24,7 @@ export function useAppView() {
     goOnboarding: () => (currentView.value = "onboarding"),
     goInbox: () => (currentView.value = "inbox"),
     goOutbox: () => (currentView.value = "outbox"),
+    goMessaging: () => (currentView.value = "messaging"),
     goTerminal: () => (currentView.value = "terminal"),
   };
 }

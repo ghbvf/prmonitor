@@ -29,6 +29,7 @@ function draft(projects: Project[], activeProjectId: string): AppConfig {
     localApiToken: "",
     outbox: { notificationTtlSecs: 7200 },
     notifications: { channels: [] },
+    messaging: { integrations: [] },
     remoteAccess: { entrypoints: [], tunnels: [] },
     rules: [],
   };

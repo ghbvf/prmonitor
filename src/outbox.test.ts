@@ -57,16 +57,18 @@ describe("outboxKindLabel", () => {
     expect(outboxKindLabel("review")).toBe("评审 / Review");
     expect(outboxKindLabel("check")).toBe("复查 / Check");
     expect(outboxKindLabel("stopReview")).toBe("停止评审 / Stop Review");
+    expect(outboxKindLabel("messagingReply")).toBe("消息回复 / Messaging Reply");
   });
 
-  it("includes the AB#1069 action-executor kinds (mirrors Rust ActionKind)", () => {
+  it("includes the action-executor kinds (mirrors Rust ActionKind)", () => {
     // Pins the `as const` set membership — review/check/stopReview are the AB#1069 additions;
-    // email/IM are deliberately ABSENT (they are notification channels, not action kinds).
+    // messagingReply is the #1559 bot reply executor.
     expect([...ACTION_KINDS]).toEqual([
       "notification",
       "review",
       "check",
       "stopReview",
+      "messagingReply",
     ]);
   });
 });

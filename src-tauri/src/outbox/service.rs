@@ -119,7 +119,9 @@ fn decide_outcome(new_attempt_count: u32, now: u64, is_err: bool, seed: u64) -> 
 /// add its own TTL arm here.
 fn ttl_secs(kind: ActionKind, notification_ttl_secs: u64) -> Option<u64> {
     match kind {
-        ActionKind::Notification => (notification_ttl_secs > 0).then_some(notification_ttl_secs),
+        ActionKind::Notification | ActionKind::MessagingReply => {
+            (notification_ttl_secs > 0).then_some(notification_ttl_secs)
+        }
         ActionKind::Review | ActionKind::Check | ActionKind::StopReview => None,
     }
 }

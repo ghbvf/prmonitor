@@ -107,6 +107,7 @@ function touch() {
       :refresh-key="props.refreshKey"
       :entrypoints="draft.remoteAccess.entrypoints"
       :tunnels="draft.remoteAccess.tunnels"
+      :messaging-integrations="draft.messaging.integrations"
     />
 
     <section class="resource">
@@ -182,6 +183,7 @@ function touch() {
             <div class="actions">
               <button type="button" @click="addRoute(entrypoint, 'terminal')">+ terminal</button>
               <button type="button" @click="addRoute(entrypoint, 'local-api')">+ local-api</button>
+              <button type="button" @click="addRoute(entrypoint, 'messaging')">+ messaging</button>
             </div>
           </div>
 
@@ -200,6 +202,7 @@ function touch() {
                 <select v-model="route.capability" @change="touch">
                   <option value="terminal">terminal</option>
                   <option value="local-api">local-api</option>
+                  <option value="messaging">messaging</option>
                 </select>
               </label>
               <label class="check">

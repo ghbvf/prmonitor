@@ -22,7 +22,8 @@ use crate::model::NotificationDeliveryChannel;
 /// detail the service mediates. The functions below (`project` / `project_validated`)
 /// use `Project` through this same re-export.
 pub use super::model::{
-    NotificationChannel, NotificationSettings, Project, RuleActionKind, RuleConfig,
+    MessagingIntegration, MessagingSettings, NotificationChannel, NotificationSettings, Project,
+    RuleActionKind, RuleConfig,
 };
 
 /// The DEFAULT outbox worker policy, exposed THROUGH the config public service surface (AB#1182
@@ -62,6 +63,10 @@ pub fn default_notification_settings() -> NotificationSettings {
     NotificationSettings::default()
 }
 
+pub fn default_messaging_settings() -> MessagingSettings {
+    MessagingSettings::default()
+}
+
 pub fn notification_delivery_channel(channel: &NotificationChannel) -> NotificationDeliveryChannel {
     NotificationDeliveryChannel {
         id: channel.id.clone(),
@@ -85,6 +90,29 @@ pub fn validate_notification_channel_for_test(channel: &NotificationChannel) -> 
     let mut test_channel = channel.clone();
     test_channel.enabled = true;
     super::model::validate_notification_channel(&test_channel)
+}
+
+pub fn messaging_integration<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    id: &str,
+) -> AppResult<MessagingIntegration> {
+    load(app)?
+        .messaging
+        .integrations
+        .into_iter()
+        .find(|integration| integration.id == id)
+        .ok_or_else(|| crate::error::AppError::new(format!("messagingIntegrationId 不存在: {id}")))
+}
+
+pub fn enabled_messaging_integrations<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> AppResult<Vec<MessagingIntegration>> {
+    Ok(load(app)?
+        .messaging
+        .integrations
+        .into_iter()
+        .filter(|integration| integration.enabled)
+        .collect())
 }
 
 /// `id`/`name` assigned to the single project lifted out of a legacy flat config by

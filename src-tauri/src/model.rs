@@ -551,6 +551,144 @@ pub enum NotificationKind {
     DingTalk,
 }
 
+/// Which bidirectional messaging provider owns a bot integration (#1559).
+///
+/// Separate from [`NotificationKind`]: notification channels are one-way egress adapters, while
+/// messaging integrations own ingress verification, event parsing, conversation authorization, and
+/// replies. The exhaustive provider/router matches in `messaging` and `remote` are the Hard carrier
+/// that prevents accidentally treating a bot provider as a notification channel.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum MessagingProviderKind {
+    #[default]
+    Feishu,
+}
+
+impl MessagingProviderKind {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            MessagingProviderKind::Feishu => "feishu",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "feishu" => Some(MessagingProviderKind::Feishu),
+            _ => None,
+        }
+    }
+}
+
+/// Provider capability descriptor surfaced through generated config/types (#1559).
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagingProviderCapability {
+    pub provider: MessagingProviderKind,
+    pub supports_reply: bool,
+    pub supports_send: bool,
+    pub requires_allowed_conversations: bool,
+}
+
+/// Normalized inbound messaging event (#1559).
+///
+/// Provider payloads (Feishu v1) are normalized to this shape before command parsing. It is stored
+/// in `messaging_event.event_json` and mirrored to the audit UI, so the camelCase wire shape is
+/// locked by tests and generated TS.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagingEvent {
+    pub provider: MessagingProviderKind,
+    pub integration_id: String,
+    pub event_id: String,
+    pub conversation_id: String,
+    pub thread_id: String,
+    pub sender_id: String,
+    pub text: String,
+    pub mentioned_bot: bool,
+    pub raw_payload: String,
+    pub received_at_epoch: u64,
+}
+
+/// The current processing state of one persisted messaging delivery (#1559).
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum MessagingEventStatus {
+    #[default]
+    Received,
+    Processed,
+    Failed,
+}
+
+impl MessagingEventStatus {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            MessagingEventStatus::Received => "received",
+            MessagingEventStatus::Processed => "processed",
+            MessagingEventStatus::Failed => "failed",
+        }
+    }
+
+    pub fn from_wire_lenient(value: &str) -> Self {
+        match value {
+            "received" => MessagingEventStatus::Received,
+            "processed" => MessagingEventStatus::Processed,
+            _ => MessagingEventStatus::Failed,
+        }
+    }
+}
+
+/// Reply side effect linked from one messaging audit row (#1559).
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagingReplyAudit {
+    pub outbox_id: i64,
+    pub kind: String,
+    pub summary: String,
+    pub status: Option<ActionStatus>,
+    pub error: Option<String>,
+}
+
+/// Frontend-visible audit row for one messaging delivery (#1559).
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagingEventEntry {
+    pub id: i64,
+    pub event: MessagingEvent,
+    pub status: MessagingEventStatus,
+    pub processed_at_epoch: Option<u64>,
+    pub error: Option<String>,
+    pub reply: Option<MessagingReplyAudit>,
+}
+
+/// Where a provider reply should be sent (#1559).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagingReplyTarget {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub thread_id: String,
+}
+
+/// Secret-free outbox payload for a messaging reply (#1559).
+///
+/// It carries only an integration id and normalized target. Provider credentials are live-loaded
+/// from config at execution time, mirroring `NotificationDeliveryPayload`'s secret-exclusion
+/// boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagingReplyPayload {
+    pub integration_id: String,
+    pub provider: MessagingProviderKind,
+    pub target: MessagingReplyTarget,
+    pub text: String,
+}
+
 /// Persisted payload for one notification delivery row (AB#1459).
 ///
 /// **Hard carrier for secret exclusion:** this is the ONLY shape an outbox
@@ -649,11 +787,14 @@ pub enum ActionExecutionResult {
 /// ([`crate::outbox::store::kind_as_wire`] / `kind_from_wire`) round-trips through serde, so a new
 /// variant is carried automatically (no exhaustive store edit). Variants: `Notification` (the
 /// review-completion desktop notification, AB#1066) + `Review` / `Check` / `StopReview` (the
-/// AB#1069 action executor, each reusing the existing review funnel).
+/// AB#1069 action executor, each reusing the existing review funnel) + `MessagingReply` (#1559
+/// bot reply executor).
 ///
-/// **Email / IM are NOT ActionKinds — they are [`NotificationKind`] channels** under the single
-/// `Notification` action: "send via email/Feishu/…" is one notification delivered over a different
-/// channel, sharing the unified status/retry/dead-letter lifecycle, not a distinct action class.
+/// **Email / IM notifications are NOT ActionKinds — they are [`NotificationKind`] channels** under
+/// the single `Notification` action: "send via email/Feishu/…" is one notification delivered over a
+/// different channel, sharing the unified status/retry/dead-letter lifecycle, not a distinct action
+/// class. `MessagingReply` is separate because it acknowledges an inbound bot event with its own
+/// dedupe key and provider reply target.
 /// AB#1069/1070 design reservation for genuinely-distinct future kinds: `WebhookForward`,
 /// `WorkItemComment` — each forcing a new executor arm. Wire string pinned camelCase; the serde
 /// golden locks it (Medium carrier).
@@ -670,8 +811,10 @@ pub enum ActionKind {
     /// Interrupt an in-flight review/check session for a `(project, pr, kind)` (AB#1069) →
     /// `"stopReview"`. Idempotent: no live session is a benign no-op success, not a failure.
     StopReview,
+    /// Reply to an inbound messaging event (#1559) → `"messagingReply"`.
+    MessagingReply,
     // future genuinely-distinct kinds (AB#1069/1070): WebhookForward, WorkItemComment.
-    // Email/IM are NotificationKind channels, NOT kinds here — see the doc comment.
+    // Email/IM notification channels are NOT kinds here — see the doc comment.
 }
 
 /// The outbox payload for a [`ActionKind::Review`] / [`ActionKind::Check`] action (AB#1069): the PR
@@ -732,6 +875,7 @@ pub struct StopReviewActionPayload {
 /// (`"pending" | "done" | "dead"`) — the frontend's `OUTBOX_STATUSES` (`src/types.ts`) mirrors
 /// them; the serde golden below is the **Medium** carrier locking them against a `rename_all` /
 /// variant drift.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum ActionStatus {
@@ -1543,8 +1687,44 @@ mod tests {
             "stopReview"
         );
         assert_eq!(
+            serde_json::to_value(ActionKind::MessagingReply).expect("ActionKind serializes"),
+            "messagingReply"
+        );
+        assert_eq!(
             serde_json::to_value(ActionKind::default()).expect("ActionKind serializes"),
             "notification"
+        );
+    }
+
+    #[test]
+    fn messaging_provider_and_status_wire_helpers_match_serde_values() {
+        assert_eq!(
+            serde_json::to_value(MessagingProviderKind::Feishu)
+                .expect("MessagingProviderKind serializes"),
+            "feishu"
+        );
+        assert_eq!(MessagingProviderKind::Feishu.as_wire(), "feishu");
+        assert_eq!(
+            MessagingProviderKind::from_wire("feishu"),
+            Some(MessagingProviderKind::Feishu)
+        );
+        assert_eq!(MessagingProviderKind::from_wire("slack"), None);
+
+        for (status, wire) in [
+            (MessagingEventStatus::Received, "received"),
+            (MessagingEventStatus::Processed, "processed"),
+            (MessagingEventStatus::Failed, "failed"),
+        ] {
+            assert_eq!(status.as_wire(), wire);
+            assert_eq!(
+                serde_json::to_value(status).expect("MessagingEventStatus serializes"),
+                wire
+            );
+            assert_eq!(MessagingEventStatus::from_wire_lenient(wire), status);
+        }
+        assert_eq!(
+            MessagingEventStatus::from_wire_lenient("corrupt"),
+            MessagingEventStatus::Failed
         );
     }
 

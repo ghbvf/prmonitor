@@ -9,9 +9,10 @@
 import { onMounted, reactive, ref, watch } from "vue";
 import { useConfigStore } from "./useConfigStore";
 import type { AppConfig } from "./types";
-import { DEFAULT_NOTIFICATION_SETTINGS, DEFAULT_OUTBOX_CONFIG } from "./defaults";
+import { DEFAULT_MESSAGING_SETTINGS, DEFAULT_NOTIFICATION_SETTINGS, DEFAULT_OUTBOX_CONFIG } from "./defaults";
 import { GLOBAL_GROUPS, type FieldDef, type GlobalFieldKey } from "./fields";
 import ConfigField from "./ConfigField.vue";
+import MessagingIntegrationsManager from "./MessagingIntegrationsManager.vue";
 import NotificationChannelsManager from "./NotificationChannelsManager.vue";
 import ProjectsManager from "./ProjectsManager.vue";
 import RemoteAccessManager from "./RemoteAccessManager.vue";
@@ -40,6 +41,7 @@ const REMOTE_ACCESS_NAV_ID = "remoteAccess";
 const RULES_NAV_ID = "rules";
 
 const NOTIFICATIONS_NAV_ID = "notifications";
+const MESSAGING_NAV_ID = "messaging";
 
 // Bumped on each successful save so RemoteAccessRuntimeStatus re-fetches live state
 // (AB#1225 PR1). Forwarded through RemoteAccessManager → RemoteAccessRuntimeStatus via
@@ -64,6 +66,7 @@ const draft = reactive<AppConfig>({
   // round-trip (hydrate overwrites it) so saving settings never wipes a configured TTL.
   outbox: { ...DEFAULT_OUTBOX_CONFIG },
   notifications: { channels: DEFAULT_NOTIFICATION_SETTINGS.channels.map((c) => ({ ...c })) },
+  messaging: { integrations: DEFAULT_MESSAGING_SETTINGS.integrations.map((i) => ({ ...i, allowedConversationIds: [...i.allowedConversationIds] })) },
   remoteAccess: { entrypoints: [], tunnels: [] },
   rules: [],
 });
@@ -95,6 +98,13 @@ function hydrate(cfg: AppConfig) {
     ...(cfg.notifications ?? DEFAULT_NOTIFICATION_SETTINGS),
     channels: (cfg.notifications?.channels ?? DEFAULT_NOTIFICATION_SETTINGS.channels).map((c) => ({
       ...c,
+    })),
+  };
+  draft.messaging = {
+    ...(cfg.messaging ?? DEFAULT_MESSAGING_SETTINGS),
+    integrations: (cfg.messaging?.integrations ?? DEFAULT_MESSAGING_SETTINGS.integrations).map((i) => ({
+      ...i,
+      allowedConversationIds: [...i.allowedConversationIds],
     })),
   };
   draft.remoteAccess = {
@@ -162,6 +172,13 @@ async function onSave() {
       ...draft.notifications,
       channels: draft.notifications.channels.map((c) => ({ ...c })),
     },
+    messaging: {
+      ...draft.messaging,
+      integrations: draft.messaging.integrations.map((i) => ({
+        ...i,
+        allowedConversationIds: [...i.allowedConversationIds],
+      })),
+    },
     remoteAccess: {
       entrypoints: draft.remoteAccess.entrypoints.map((entrypoint) => ({
         ...entrypoint,
@@ -203,6 +220,17 @@ async function onSave() {
       store.error.startsWith("smtpTo")
     ) {
       activeGroupId.value = NOTIFICATIONS_NAV_ID;
+    } else if (
+      store.error.startsWith("messagingIntegrationId") ||
+      store.error.startsWith("messagingTimeoutSecs") ||
+      store.error.startsWith("messagingAllowedConversationIds") ||
+      store.error.startsWith("feishuVerificationToken") ||
+      store.error.startsWith("feishuEncryptKey") ||
+      store.error.startsWith("feishuAppId") ||
+      store.error.startsWith("feishuAppSecret") ||
+      store.error.startsWith("feishuBotOpenId")
+    ) {
+      activeGroupId.value = MESSAGING_NAV_ID;
     } else if (
       store.error.startsWith("publicUrl") ||
       store.error.startsWith("port") ||
@@ -269,6 +297,14 @@ async function onSave() {
           通知
         </button>
         <button
+          type="button"
+          class="nav-item"
+          :class="{ active: activeGroupId === MESSAGING_NAV_ID }"
+          @click="activeGroupId = MESSAGING_NAV_ID"
+        >
+          消息集成
+        </button>
+        <button
           v-for="g in GLOBAL_GROUPS"
           :key="g.id"
           type="button"
@@ -301,6 +337,13 @@ async function onSave() {
           class="group projects-group"
         >
           <NotificationChannelsManager :draft="draft" @edit="onEdit" />
+        </div>
+
+        <div
+          v-if="activeGroupId === MESSAGING_NAV_ID"
+          class="group projects-group"
+        >
+          <MessagingIntegrationsManager :draft="draft" @edit="onEdit" />
         </div>
 
         <template v-for="g in GLOBAL_GROUPS" :key="g.id">

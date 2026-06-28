@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 13;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -203,6 +203,12 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 11 {
         apply_v11(conn)?;
     }
+    if version < 12 {
+        apply_v12(conn)?;
+    }
+    if version < 13 {
+        apply_v13(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -312,6 +318,19 @@ fn apply_v10(conn: &Connection) -> AppResult<()> {
 /// token, or terminal input.
 fn apply_v11(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(SCHEMA_V11).map_err(map_err)?;
+    Ok(())
+}
+
+/// v12 (#1559): bidirectional messaging ingress audit. Separate from `inbox_event`, whose
+/// normalized event shape is PR/source-oriented.
+fn apply_v12(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(SCHEMA_V12).map_err(map_err)?;
+    Ok(())
+}
+
+/// v13 (#1559): link inbound messaging audit rows to the reply outbox action they enqueue.
+fn apply_v13(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(SCHEMA_V13).map_err(map_err)?;
     Ok(())
 }
 
@@ -580,6 +599,33 @@ CREATE INDEX IF NOT EXISTS idx_remote_access_audit_entrypoint_ts
     ON remote_access_audit(entrypoint_id, ts_ms);
 "#;
 
+const SCHEMA_V12: &str = r#"
+CREATE TABLE IF NOT EXISTS messaging_event (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider           TEXT    NOT NULL,
+    integration_id     TEXT    NOT NULL,
+    event_id           TEXT    NOT NULL,
+    conversation_id    TEXT    NOT NULL,
+    event_json         TEXT    NOT NULL,
+    raw_summary        TEXT    NOT NULL,
+    status             TEXT    NOT NULL,
+    received_at_epoch  INTEGER NOT NULL,
+    processed_at_epoch INTEGER,
+    error              TEXT,
+    UNIQUE(provider, integration_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_messaging_event_integration
+    ON messaging_event(integration_id, id DESC);
+"#;
+
+const SCHEMA_V13: &str = r#"
+ALTER TABLE messaging_event ADD COLUMN reply_outbox_id INTEGER;
+ALTER TABLE messaging_event ADD COLUMN reply_kind TEXT;
+ALTER TABLE messaging_event ADD COLUMN reply_summary TEXT;
+CREATE INDEX IF NOT EXISTS idx_messaging_event_reply_outbox
+    ON messaging_event(reply_outbox_id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,6 +658,7 @@ mod tests {
                 "dispatch_key",
                 "inbox_event",
                 "meta",
+                "messaging_event",
                 "outbox_review_claim",
                 "remote_access_audit",
                 "review_history_item",
@@ -684,7 +731,7 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 11, "current schema is v11");
+            assert_eq!(SCHEMA_VERSION, 13, "current schema is v13");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"
@@ -752,6 +799,30 @@ mod tests {
             assert!(
                 index_exists(conn, "idx_remote_access_audit_entrypoint_ts"),
                 "fresh v0 → v11 has the remote_access_audit entrypoint/time index"
+            );
+            assert!(
+                table_exists(conn, "messaging_event"),
+                "fresh v0 → v12 has the messaging_event table"
+            );
+            assert!(
+                index_exists(conn, "idx_messaging_event_integration"),
+                "fresh v0 → v12 has the messaging_event integration index"
+            );
+            assert!(
+                table_has_column(conn, "messaging_event", "reply_outbox_id"),
+                "fresh v0 → v13 has messaging_event.reply_outbox_id"
+            );
+            assert!(
+                table_has_column(conn, "messaging_event", "reply_kind"),
+                "fresh v0 → v13 has messaging_event.reply_kind"
+            );
+            assert!(
+                table_has_column(conn, "messaging_event", "reply_summary"),
+                "fresh v0 → v13 has messaging_event.reply_summary"
+            );
+            assert!(
+                index_exists(conn, "idx_messaging_event_reply_outbox"),
+                "fresh v0 → v13 has the messaging_event reply outbox index"
             );
             Ok(())
         })
@@ -1142,6 +1213,87 @@ mod tests {
         assert!(
             index_exists(&conn, "idx_remote_access_audit_entrypoint_ts"),
             "v11 added the remote_access_audit entrypoint/time index"
+        );
+    }
+
+    #[test]
+    fn migrate_v11_to_v12_adds_messaging_event_table() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .expect("enable fk");
+        apply_v1(&conn).expect("seed v1");
+        apply_v2(&conn).expect("seed v2");
+        apply_v3(&conn).expect("seed v3");
+        apply_v4(&conn).expect("seed v4");
+        apply_v5(&conn).expect("seed v5");
+        apply_v6(&conn).expect("seed v6");
+        apply_v7(&conn).expect("seed v7");
+        apply_v8(&conn).expect("seed v8");
+        apply_v9(&conn).expect("seed v9");
+        apply_v10(&conn).expect("seed v10");
+        apply_v11(&conn).expect("seed v11");
+        conn.pragma_update(None, "user_version", 11)
+            .expect("stamp v11");
+        assert!(
+            !table_exists(&conn, "messaging_event"),
+            "v11 must not already have messaging_event"
+        );
+
+        run_migrations(&conn).expect("v11 -> current migrates");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read version");
+        assert_eq!(version, SCHEMA_VERSION, "stamped to the current schema");
+        assert!(
+            table_exists(&conn, "messaging_event"),
+            "v12 added the messaging_event table"
+        );
+        assert!(
+            index_exists(&conn, "idx_messaging_event_integration"),
+            "v12 added the messaging_event integration index"
+        );
+    }
+
+    #[test]
+    fn migrate_v12_to_v13_adds_messaging_reply_audit_columns() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .expect("enable fk");
+        apply_v1(&conn).expect("seed v1");
+        apply_v2(&conn).expect("seed v2");
+        apply_v3(&conn).expect("seed v3");
+        apply_v4(&conn).expect("seed v4");
+        apply_v5(&conn).expect("seed v5");
+        apply_v6(&conn).expect("seed v6");
+        apply_v7(&conn).expect("seed v7");
+        apply_v8(&conn).expect("seed v8");
+        apply_v9(&conn).expect("seed v9");
+        apply_v10(&conn).expect("seed v10");
+        apply_v11(&conn).expect("seed v11");
+        apply_v12(&conn).expect("seed v12");
+        conn.pragma_update(None, "user_version", 12)
+            .expect("stamp v12");
+        assert!(
+            !table_has_column(&conn, "messaging_event", "reply_outbox_id"),
+            "v12 must not already have reply_outbox_id"
+        );
+
+        run_migrations(&conn).expect("v12 -> current migrates");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read version");
+        assert_eq!(version, SCHEMA_VERSION, "stamped to the current schema");
+        for col in ["reply_outbox_id", "reply_kind", "reply_summary"] {
+            assert!(
+                table_has_column(&conn, "messaging_event", col),
+                "v13 messaging_event has {col}"
+            );
+        }
+        assert!(
+            index_exists(&conn, "idx_messaging_event_reply_outbox"),
+            "v13 added the messaging_event reply outbox index"
         );
     }
 

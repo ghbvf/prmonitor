@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { getRemoteAccessRuntimeStatus } from "./api";
+import { messagingCallbackEndpoints } from "./remoteAccessOps";
 import type {
+  MessagingIntegration,
   RemoteAccessRuntimeStatus,
   RemoteEntrypoint,
   RemoteEntrypointState,
@@ -14,6 +16,7 @@ const props = defineProps<{
   refreshKey?: number;
   entrypoints?: RemoteEntrypoint[];
   tunnels?: RemoteTunnel[];
+  messagingIntegrations?: MessagingIntegration[];
 }>();
 
 const status = ref<RemoteAccessRuntimeStatus | null>(null);
@@ -33,6 +36,16 @@ async function refresh() {
 }
 
 watch(() => props.refreshKey, refresh, { immediate: true });
+
+const messagingEndpoints = computed(() => {
+  if (!status.value) return [];
+  return messagingCallbackEndpoints(
+    status.value,
+    props.entrypoints ?? [],
+    props.tunnels ?? [],
+    props.messagingIntegrations ?? [],
+  );
+});
 
 function entrypointName(id: string): string {
   const match = props.entrypoints?.find((entrypoint) => entrypoint.id === id);
@@ -117,6 +130,15 @@ function tunnelModeLabel(mode: RemoteTunnelMode): string {
           </details>
         </li>
       </ul>
+      <div v-if="messagingEndpoints.length > 0" class="messaging-endpoints">
+        <h4>Messaging callbacks</h4>
+        <ul>
+          <li v-for="endpoint in messagingEndpoints" :key="`${endpoint.routeId}:${endpoint.integrationId}`">
+            <span class="badge">{{ endpoint.integrationId }}</span>
+            <code>{{ endpoint.url }}</code>
+          </li>
+        </ul>
+      </div>
     </template>
   </div>
 </template>
@@ -151,6 +173,32 @@ h3 {
 }
 .tunnels {
   margin-top: 8px;
+}
+.messaging-endpoints {
+  margin-top: 8px;
+}
+.messaging-endpoints h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+.messaging-endpoints ul {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+.messaging-endpoints li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
 }
 .status-row {
   display: flex;

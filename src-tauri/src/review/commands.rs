@@ -583,14 +583,24 @@ pub async fn trigger_review<R: tauri::Runtime>(
     pr_number: u64,
     kind: String,
 ) -> AppResult<SessionId> {
+    trigger_review_with_state(&app, &state, reference, pr_number, kind).await
+}
+
+pub(crate) async fn trigger_review_with_state<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppState,
+    reference: String,
+    pr_number: u64,
+    kind: String,
+) -> AppResult<SessionId> {
     // Reject a bogus `kind` BEFORE resolving the project / any side effect (parity with
     // `start_review`): an unvalidated kind would run a full review under a bad registry key.
     validate_kind(&kind)?;
     validate_pr_number(pr_number)?;
     // Resolve by id-or-repo + validate the project's filesystem paths (the trigger funnel's
     // analogue of `project_validated`), keeping the review slice on `config::service` only.
-    let project = config_service::project_by_ref_validated(&app, &reference)?;
-    dispatch_engine(&app, &state, &project, pr_number, &kind).await
+    let project = config_service::project_by_ref_validated(app, &reference)?;
+    dispatch_engine(app, state, &project, pr_number, &kind).await
 }
 
 /// Interrupt a running review session by its `threadId` (#718): the shared stop body behind the

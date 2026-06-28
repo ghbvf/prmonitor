@@ -52,6 +52,7 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
   localApiToken: "",
   outbox: { notificationTtlSecs: 7200 },
   notifications: { channels: [] },
+  messaging: { integrations: [] },
   remoteAccess: { entrypoints: [], tunnels: [] },
   rules: [],
   ...over,

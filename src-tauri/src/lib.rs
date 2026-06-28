@@ -25,6 +25,7 @@ pub mod dispatch;
 pub mod error;
 pub mod events;
 pub mod inbox;
+pub mod messaging;
 pub mod model;
 pub mod notification;
 pub mod outbox;
@@ -42,6 +43,8 @@ mod slice_boundary_test;
 #[cfg(test)]
 mod typegen;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use model::{Candidate, Event};
@@ -63,6 +66,43 @@ fn parse_notification_action_payload(payload: &str) -> error::AppResult<Notifica
                 "outbox 通知 payload 既不是 NotificationDeliveryPayload，也不是 legacy Notification：new={new_err}; legacy={old_err}"
             ))),
         },
+    }
+}
+
+struct MessagingActionsImpl;
+
+impl<R: tauri::Runtime> messaging::service::MessagingActions<R> for MessagingActionsImpl {
+    fn enqueue_reply(
+        &self,
+        app: &tauri::AppHandle<R>,
+        integration_id: &str,
+        kind: model::ActionKind,
+        summary: &str,
+        payload_json: &str,
+        dedupe_key: &str,
+    ) -> error::AppResult<i64> {
+        outbox::service::enqueue_deduped(
+            app,
+            integration_id,
+            kind,
+            summary,
+            payload_json,
+            dedupe_key,
+        )
+    }
+
+    fn trigger_review<'a>(
+        &'a self,
+        app: &'a tauri::AppHandle<R>,
+        reference: String,
+        pr_number: u64,
+        kind: String,
+    ) -> Pin<Box<dyn Future<Output = error::AppResult<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let state = app.state::<AppState>();
+            review::commands::trigger_review_with_state(app, &state, reference, pr_number, kind)
+                .await
+        })
     }
 }
 
@@ -127,6 +167,9 @@ fn build_app() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_store::Builder::new().build())
         .manage(AppState::default())
+        .manage(messaging::service::MessagingRuntime::<tauri::Wry> {
+            actions: Arc::new(MessagingActionsImpl),
+        })
         .setup(|app| {
             // Open + migrate the unified SQLite store and manage it as a `tauri::State`
             // BEFORE anything that reads persistence (config load / poll start). It is a
@@ -389,6 +432,22 @@ fn build_app() {
                             model::ActionKind::StopReview => run_stop_action(&app, &action)
                                 .await
                                 .map(|_| model::ActionExecutionResult::Done),
+                            model::ActionKind::MessagingReply => {
+                                let payload =
+                                    match serde_json::from_str::<model::MessagingReplyPayload>(
+                                        &action.payload,
+                                    ) {
+                                        Ok(payload) => payload,
+                                        Err(e) => {
+                                            return Ok(model::ActionExecutionResult::Dead {
+                                                message: format!(
+                                                    "messaging reply payload 反序列化失败: {e}"
+                                                ),
+                                            });
+                                        }
+                                    };
+                                messaging::service::execute_reply(&app, payload).await
+                            }
                         }
                     })
                 });
@@ -566,6 +625,9 @@ fn build_app() {
             inbox::commands::inbox_list,
             inbox::commands::inbox_get_raw,
             inbox::commands::inbox_replay,
+            messaging::commands::messaging_events_list,
+            messaging::commands::messaging_event_raw,
+            messaging::commands::messaging_event_replay,
             outbox::commands::outbox_list,
             outbox::commands::outbox_get_raw,
             outbox::commands::outbox_retry,

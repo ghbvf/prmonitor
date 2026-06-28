@@ -29,6 +29,7 @@ function draft(projects: Project[], activeProjectId: string): AppConfig {
       ...DEFAULT_NOTIFICATION_SETTINGS,
       channels: DEFAULT_NOTIFICATION_SETTINGS.channels.map((c) => ({ ...c })),
     },
+    messaging: { integrations: [] },
     remoteAccess: { entrypoints: [], tunnels: [] },
     rules: [],
   };

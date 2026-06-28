@@ -8,7 +8,8 @@ use url::Url;
 
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    EngineKind, EventType, LabelSource, NotificationKind, SourceKind, UpdateMode, WebhookTunnelMode,
+    EngineKind, EventType, LabelSource, MessagingProviderKind, NotificationKind, SourceKind,
+    UpdateMode, WebhookTunnelMode,
 };
 
 /// One monitored project (#35). What was previously the flat per-repo subset of
@@ -210,6 +211,64 @@ impl Default for NotificationSettings {
     }
 }
 
+/// Global bidirectional messaging/bot integration configuration (#1559).
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MessagingSettings {
+    pub integrations: Vec<MessagingIntegration>,
+}
+
+/// One configured bidirectional messaging integration (#1559).
+///
+/// The shape is intentionally flat like [`NotificationChannel`]: Settings edits whole
+/// `AppConfig` snapshots and should preserve provider-specific hidden fields while validation uses
+/// exhaustive `kind` matches to decide which fields are meaningful.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct MessagingIntegration {
+    pub id: String,
+    pub name: String,
+    pub kind: MessagingProviderKind,
+    pub enabled: bool,
+    pub verification_token: String,
+    pub encrypt_key: String,
+    pub app_id: String,
+    pub app_secret: String,
+    pub bot_open_id: String,
+    /// Stable provider conversation ids allowed to execute commands. Empty fail-closes when enabled.
+    pub allowed_conversation_ids: Vec<String>,
+    /// Whether group chat events must mention the bot before command parsing.
+    pub require_mention: bool,
+    pub timeout_secs: u64,
+}
+
+impl MessagingIntegration {
+    pub fn feishu_default() -> Self {
+        Self {
+            id: String::new(),
+            name: "飞书".to_string(),
+            kind: MessagingProviderKind::Feishu,
+            enabled: false,
+            verification_token: String::new(),
+            encrypt_key: String::new(),
+            app_id: String::new(),
+            app_secret: String::new(),
+            bot_open_id: String::new(),
+            allowed_conversation_ids: Vec::new(),
+            require_mention: true,
+            timeout_secs: DEFAULT_NOTIFICATION_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl Default for MessagingIntegration {
+    fn default() -> Self {
+        Self::feishu_default()
+    }
+}
+
 /// One configured outbound notification channel.
 ///
 /// The shape is intentionally flat instead of a serde-tagged enum because the existing Settings
@@ -326,6 +385,8 @@ pub struct AppConfig {
     /// Outbound notification channels (AB#1459). Forward-compatible default seeds a local desktop
     /// channel; external channels are user-added/disabled until configured.
     pub notifications: NotificationSettings,
+    /// Bidirectional messaging/bot integrations (#1559). Separate from outbound notifications.
+    pub messaging: MessagingSettings,
     /// Declarative Remote Access entrypoints and tunnels. This is the single runtime source:
     /// each entrypoint owns one bound port and mounts one or more capability routes.
     pub remote_access: RemoteAccessConfig,
@@ -355,6 +416,7 @@ impl Default for AppConfig {
             outbox: OutboxConfig::default(),
             rules: Vec::new(),
             notifications: NotificationSettings::default(),
+            messaging: MessagingSettings::default(),
             remote_access: RemoteAccessConfig::default(),
             listeners: Vec::new(),
             tunnels: Vec::new(),
@@ -472,6 +534,21 @@ impl RemoteRoute {
             terminal_admin: false,
         }
     }
+
+    pub fn messaging() -> Self {
+        Self {
+            id: "messaging".to_string(),
+            name: "Messaging".to_string(),
+            path: "/messaging".to_string(),
+            capability: RemoteCapability::Messaging,
+            enabled: true,
+            auth_token: String::new(),
+            terminal_read: false,
+            terminal_write: false,
+            terminal_create: false,
+            terminal_admin: false,
+        }
+    }
 }
 
 impl Default for RemoteRoute {
@@ -498,6 +575,7 @@ pub enum RemoteCapability {
     #[default]
     Terminal,
     LocalApi,
+    Messaging,
 }
 
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -758,6 +836,91 @@ fn validate_notifications(settings: &NotificationSettings) -> AppResult<()> {
             )));
         }
         validate_notification_channel(channel)?;
+    }
+    Ok(())
+}
+
+fn validate_messaging(settings: &MessagingSettings) -> AppResult<()> {
+    let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for integration in &settings.integrations {
+        let id = integration.id.trim();
+        if id.is_empty() || id.contains(':') || id.chars().any(char::is_whitespace) {
+            return Err(AppError::new(format!(
+                "messagingIntegrationId 非法（不能为空、含 `:` 或空白字符）: {:?}",
+                integration.id
+            )));
+        }
+        if !seen_ids.insert(id) {
+            return Err(AppError::new(format!(
+                "messagingIntegrationId 重复: {id}（每个消息集成 id 必须唯一）"
+            )));
+        }
+        if integration.timeout_secs == 0 {
+            return Err(AppError::new(format!(
+                "messagingTimeoutSecs 必须大于 0（消息集成「{}」）",
+                integration.name
+            )));
+        }
+        if !integration.enabled {
+            continue;
+        }
+        if integration.allowed_conversation_ids.is_empty()
+            || integration
+                .allowed_conversation_ids
+                .iter()
+                .any(|value| value.trim().is_empty())
+        {
+            return Err(AppError::new(format!(
+                "messagingAllowedConversationIds 不能为空（启用消息集成「{}」时必须显式允许会话）",
+                integration.name
+            )));
+        }
+        match integration.kind {
+            MessagingProviderKind::Feishu => {
+                if integration.verification_token.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "feishuVerificationToken 不能为空（消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.verification_token.trim().chars().count() < WEBHOOK_SECRET_MIN_LEN {
+                    return Err(AppError::new(format!(
+                        "feishuVerificationToken 太短（至少 {WEBHOOK_SECRET_MIN_LEN} 个字符；消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.encrypt_key.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "feishuEncryptKey 不能为空（消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.encrypt_key.trim().chars().count() < WEBHOOK_SECRET_MIN_LEN {
+                    return Err(AppError::new(format!(
+                        "feishuEncryptKey 太短（至少 {WEBHOOK_SECRET_MIN_LEN} 个字符；消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.app_id.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "feishuAppId 不能为空（消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.app_secret.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "feishuAppSecret 不能为空（消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.require_mention && integration.bot_open_id.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "feishuBotOpenId 不能为空（消息集成「{}」启用 @Bot 触发时必须配置）",
+                        integration.name
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1205,7 +1368,7 @@ fn validate_remote_access(config: &AppConfig) -> AppResult<()> {
                         )));
                     }
                 }
-                RemoteCapability::LocalApi => {}
+                RemoteCapability::LocalApi | RemoteCapability::Messaging => {}
             }
         }
     }
@@ -1333,6 +1496,7 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
     }
 
     validate_notifications(&config.notifications)?;
+    validate_messaging(&config.messaging)?;
 
     // Per-project fields: validate each ENABLED project; disabled ones are skipped
     // (their fields may be intentionally incomplete). The id/repo of every project
@@ -1513,6 +1677,7 @@ mod tests {
             local_api_token: "local-api-token-0123456789".to_string(),
             outbox: OutboxConfig::default(),
             notifications: NotificationSettings::default(),
+            messaging: MessagingSettings::default(),
             remote_access: RemoteAccessConfig::default(),
             listeners: Vec::new(),
             tunnels: Vec::new(),
@@ -1708,6 +1873,67 @@ mod tests {
         assert_error_prefix(validate(&cfg), "smtpTo 必须是逗号分隔的有效邮件地址");
     }
 
+    #[test]
+    fn validate_messaging_enforces_ids_timeout_allowlist_and_feishu_fields() {
+        let mut cfg = valid_base();
+        let mut integration = valid_messaging_integration();
+
+        integration.enabled = false;
+        integration.verification_token = String::new();
+        integration.encrypt_key = String::new();
+        integration.app_id = String::new();
+        integration.app_secret = String::new();
+        integration.bot_open_id = String::new();
+        integration.allowed_conversation_ids = Vec::new();
+        cfg.messaging.integrations = vec![integration.clone()];
+        validate(&cfg).expect("disabled messaging integrations skip provider fields and allowlist");
+
+        integration.enabled = true;
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "messagingAllowedConversationIds 不能为空");
+
+        integration.allowed_conversation_ids = vec!["oc_123".to_string()];
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "feishuVerificationToken 不能为空");
+
+        integration.verification_token = "short".to_string();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "feishuVerificationToken 太短");
+
+        integration.verification_token = "verify-token-1234".to_string();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "feishuEncryptKey 不能为空");
+
+        integration.encrypt_key = "short".to_string();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "feishuEncryptKey 太短");
+
+        integration.encrypt_key = "encrypt-key-1234".to_string();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "feishuAppId 不能为空");
+
+        integration.app_id = "cli_xxx".to_string();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "feishuAppSecret 不能为空");
+
+        integration.app_secret = "app-secret".to_string();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "feishuBotOpenId 不能为空");
+
+        integration.bot_open_id = "ou_bot".to_string();
+        integration.timeout_secs = 0;
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "messagingTimeoutSecs 必须大于 0");
+
+        integration.timeout_secs = DEFAULT_NOTIFICATION_TIMEOUT_SECS;
+        cfg.messaging.integrations = vec![integration.clone(), integration.clone()];
+        assert_error_prefix(validate(&cfg), "messagingIntegrationId 重复");
+
+        integration.id = "bad id".to_string();
+        cfg.messaging.integrations = vec![integration];
+        assert_error_prefix(validate(&cfg), "messagingIntegrationId 非法");
+    }
+
     fn valid_notification_channel(kind: NotificationKind) -> NotificationChannel {
         NotificationChannel {
             id: format!("{kind:?}").to_lowercase(),
@@ -1722,6 +1948,21 @@ mod tests {
             smtp_from: "from@example.com".to_string(),
             smtp_to: "to@example.com".to_string(),
             ..NotificationChannel::default()
+        }
+    }
+
+    fn valid_messaging_integration() -> MessagingIntegration {
+        MessagingIntegration {
+            id: "feishu-main".to_string(),
+            name: "Feishu".to_string(),
+            enabled: true,
+            verification_token: "verify-token-1234".to_string(),
+            encrypt_key: "encrypt-key-1234".to_string(),
+            app_id: "cli_xxx".to_string(),
+            app_secret: "app-secret".to_string(),
+            bot_open_id: "ou_bot".to_string(),
+            allowed_conversation_ids: vec!["oc_123".to_string()],
+            ..MessagingIntegration::feishu_default()
         }
     }
 

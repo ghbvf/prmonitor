@@ -18,6 +18,23 @@ export const EVENT_TYPES = ["pullRequest","issue","comment","label","generic"] a
 export type NotificationKind = "desktop" | "email" | "slack" | "telegram" | "weChatWork" | "feishu" | "dingTalk";
 export const NOTIFICATION_KINDS = ["desktop","email","slack","telegram","weChatWork","feishu","dingTalk"] as const;
 
+export type MessagingProviderKind = "feishu";
+export const MESSAGING_PROVIDER_KINDS = ["feishu"] as const;
+
+export type MessagingEventStatus = "received" | "processed" | "failed";
+export const MESSAGING_EVENT_STATUSES = ["received","processed","failed"] as const;
+
+export type ActionStatus = "pending" | "done" | "dead";
+export const ACTION_STATUSES = ["pending","done","dead"] as const;
+
+export type MessagingProviderCapability = { provider: MessagingProviderKind, supportsReply: boolean, supportsSend: boolean, requiresAllowedConversations: boolean, };
+
+export type MessagingEvent = { provider: MessagingProviderKind, integrationId: string, eventId: string, conversationId: string, threadId: string, senderId: string, text: string, mentionedBot: boolean, rawPayload: string, receivedAtEpoch: number, };
+
+export type MessagingReplyAudit = { outboxId: number, kind: string, summary: string, status: ActionStatus | null, error: string | null, };
+
+export type MessagingEventEntry = { id: number, event: MessagingEvent, status: MessagingEventStatus, processedAtEpoch: number | null, error: string | null, reply: MessagingReplyAudit | null, };
+
 export type NotificationLevel = "info" | "warning" | "error";
 export const NOTIFICATION_LEVELS = ["info","warning","error"] as const;
 

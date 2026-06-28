@@ -9,9 +9,10 @@ import {
   makeRemoteEntrypoint,
   makeRemoteRoute,
   makeRemoteTunnel,
+  messagingCallbackEndpoints,
   normalizeStringList,
 } from "./remoteAccessOps";
-import type { AppConfig } from "./types";
+import type { AppConfig, RemoteAccessRuntimeStatus } from "./types";
 
 function draft(): AppConfig {
   return {
@@ -27,6 +28,7 @@ function draft(): AppConfig {
     localApiToken: "",
     outbox: { notificationTtlSecs: 7200 },
     notifications: { channels: [] },
+    messaging: { integrations: [] },
     remoteAccess: { entrypoints: [], tunnels: [] },
     rules: [],
   };
@@ -57,6 +59,16 @@ describe("makeRemoteEntrypoint / makeRemoteRoute / makeRemoteTunnel", () => {
     expect(route.terminalWrite).toBe(false);
     expect(route.terminalCreate).toBe(false);
     expect(route.terminalAdmin).toBe(false);
+  });
+
+  it("mints a messaging route under the remote access entrypoint", () => {
+    const route = makeRemoteRoute("messaging");
+    expect(route.id).toBeTruthy();
+    expect(route.name).toBe("Messaging");
+    expect(route.path).toBe("/messaging");
+    expect(route.capability).toBe("messaging");
+    expect(route.enabled).toBe(true);
+    expect(route.authToken).toBe("");
   });
 
   it("mints a LAN tunnel target with a blank entrypoint when none is supplied", () => {
@@ -158,5 +170,113 @@ describe("normalizeStringList", () => {
   it("returns an empty array for blank input", () => {
     expect(normalizeStringList("")).toEqual([]);
     expect(normalizeStringList(" ,  , ")).toEqual([]);
+  });
+});
+
+describe("messagingCallbackEndpoints", () => {
+  it("projects enabled messaging routes and integrations onto the tunnel public URL", () => {
+    const entrypoint = makeRemoteEntrypoint();
+    entrypoint.id = "entry-main";
+    entrypoint.enabled = true;
+    entrypoint.routes = [makeRemoteRoute("messaging")];
+    entrypoint.routes[0].id = "route-msg";
+    const tunnel = makeRemoteTunnel(entrypoint.id);
+    tunnel.id = "tun";
+    tunnel.enabled = true;
+    tunnel.publicUrl = "https://bot.example.com/";
+    const status: RemoteAccessRuntimeStatus = {
+      entrypoints: [
+        {
+          id: entrypoint.id,
+          bound: true,
+          boundPort: 8788,
+          state: "bound",
+          message: "bound",
+          routes: [
+            {
+              id: "route-msg",
+              path: "/messaging/",
+              capability: "messaging",
+              enabled: true,
+            },
+          ],
+        },
+      ],
+      tunnels: [
+        {
+          id: "tun",
+          mode: "lan",
+          targetEntrypointId: entrypoint.id,
+          state: "running",
+          publicUrl: "https://bot.example.com/",
+          message: "running",
+          logs: [],
+        },
+      ],
+    };
+
+    const endpoints = messagingCallbackEndpoints(status, [entrypoint], [tunnel], [
+      {
+        id: "feishu-main",
+        name: "Feishu",
+        kind: "feishu",
+        enabled: true,
+        appId: "",
+        appSecret: "",
+        verificationToken: "",
+        encryptKey: "",
+        botOpenId: "",
+        allowedConversationIds: [],
+        requireMention: true,
+        timeoutSecs: 10,
+      },
+    ]);
+
+    expect(endpoints).toEqual([
+      {
+        entrypointId: "entry-main",
+        routeId: "route-msg",
+        integrationId: "feishu-main",
+        url: "https://bot.example.com/messaging/feishu/feishu-main",
+      },
+    ]);
+  });
+
+  it("falls back to the bound local entrypoint URL when no public tunnel is running", () => {
+    const entrypoint = makeRemoteEntrypoint();
+    entrypoint.id = "entry-local";
+    entrypoint.bindHost = "0.0.0.0";
+    const status: RemoteAccessRuntimeStatus = {
+      entrypoints: [
+        {
+          id: "entry-local",
+          bound: true,
+          boundPort: 9010,
+          state: "bound",
+          message: "bound",
+          routes: [{ id: "msg", path: "messaging", capability: "messaging", enabled: true }],
+        },
+      ],
+      tunnels: [],
+    };
+
+    const endpoints = messagingCallbackEndpoints(status, [entrypoint], [], [
+      {
+        id: "fs",
+        name: "Feishu",
+        kind: "feishu",
+        enabled: true,
+        appId: "",
+        appSecret: "",
+        verificationToken: "",
+        encryptKey: "",
+        botOpenId: "",
+        allowedConversationIds: [],
+        requireMention: true,
+        timeoutSecs: 10,
+      },
+    ]);
+
+    expect(endpoints[0].url).toBe("http://127.0.0.1:9010/messaging/feishu/fs");
   });
 });
