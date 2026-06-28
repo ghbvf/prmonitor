@@ -323,6 +323,21 @@ impl ListenerSupervisor {
             .collect()
     }
 
+    fn forwarded_public_urls_for_entrypoint(&self, entrypoint_id: &str) -> Vec<String> {
+        let tunnels = self.tunnels.lock().unwrap_or_else(|p| p.into_inner());
+        tunnels
+            .values()
+            .filter(|rt| rt.desired.target_entrypoint_id == entrypoint_id)
+            .filter(|rt| rt.desired.mode != RemoteTunnelMode::Lan)
+            .filter_map(|rt| {
+                rt.public_url
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+            })
+            .collect()
+    }
+
     pub fn shutdown(&self) {
         {
             let mut tunnels = self.tunnels.lock().unwrap_or_else(|p| p.into_inner());
@@ -537,6 +552,7 @@ async fn remote_access_gate<R: tauri::Runtime>(
     let direct_ip = peer.ip();
     let identity = effective_peer_identity(req.headers(), direct_ip, entrypoint);
     let public_urls = public_urls_for_gate(&state.app, entrypoint.id.as_str());
+    let forwarded_public_urls = forwarded_public_urls_for_gate(&state.app, entrypoint.id.as_str());
     if !host_allowed(
         req.headers().get(header::HOST),
         entrypoint,
@@ -571,7 +587,7 @@ async fn remote_access_gate<R: tauri::Runtime>(
         );
         return Err(StatusCode::FORBIDDEN);
     }
-    if !source_request_allowed(req.headers(), direct_ip, entrypoint, &public_urls) {
+    if !source_request_allowed(req.headers(), direct_ip, entrypoint, &forwarded_public_urls) {
         audit_remote_denial(
             &state.app,
             entrypoint,
@@ -866,6 +882,19 @@ fn public_urls_for_gate<R: tauri::Runtime>(
 ) -> Vec<String> {
     app.try_state::<AppState>()
         .map(|state| state.remote.public_urls_for_entrypoint(entrypoint_id))
+        .unwrap_or_default()
+}
+
+fn forwarded_public_urls_for_gate<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    entrypoint_id: &str,
+) -> Vec<String> {
+    app.try_state::<AppState>()
+        .map(|state| {
+            state
+                .remote
+                .forwarded_public_urls_for_entrypoint(entrypoint_id)
+        })
         .unwrap_or_default()
 }
 
@@ -1474,6 +1503,82 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_public_urls_excludes_lan_tunnel_status_url() {
+        let supervisor = ListenerSupervisor::default();
+        let entrypoint = entrypoint();
+        let lan_desired = TunnelDesired {
+            mode: RemoteTunnelMode::Lan,
+            target_entrypoint_id: entrypoint.id.clone(),
+            target_bind_host: entrypoint.bind_host.clone(),
+            target_port: entrypoint.port,
+            lan_bind_host: "192.168.5.10".to_string(),
+            lan_port: 8789,
+            command: String::new(),
+            public_url: String::new(),
+            signature: "lan".to_string(),
+            entrypoint: entrypoint.clone(),
+        };
+        let command_desired = TunnelDesired {
+            mode: RemoteTunnelMode::Command,
+            target_entrypoint_id: entrypoint.id.clone(),
+            target_bind_host: entrypoint.bind_host.clone(),
+            target_port: entrypoint.port,
+            lan_bind_host: String::new(),
+            lan_port: 0,
+            command: "cloudflared tunnel run".to_string(),
+            public_url: "https://prmonitor.example.com".to_string(),
+            signature: "command".to_string(),
+            entrypoint: entrypoint.clone(),
+        };
+        let state = running_tunnel_state(RemoteTunnelMode::Lan);
+        let logs = Arc::new(StdMutex::new(VecDeque::new()));
+        supervisor.tunnels.lock().unwrap().insert(
+            "lan".to_string(),
+            BoundTunnel {
+                desired: lan_desired,
+                process_task: None,
+                process_shutdown: None,
+                server_task: None,
+                shutdown: None,
+                drain_task: None,
+                public_url: Arc::new(StdMutex::new(Some("http://192.168.5.10:8789".to_string()))),
+                state: state.clone(),
+                logs: logs.clone(),
+            },
+        );
+        supervisor.tunnels.lock().unwrap().insert(
+            "command".to_string(),
+            BoundTunnel {
+                desired: command_desired,
+                process_task: None,
+                process_shutdown: None,
+                server_task: None,
+                shutdown: None,
+                drain_task: None,
+                public_url: Arc::new(StdMutex::new(Some(
+                    "https://prmonitor.example.com".to_string(),
+                ))),
+                state,
+                logs,
+            },
+        );
+
+        let mut public_urls = supervisor.public_urls_for_entrypoint("ep");
+        public_urls.sort();
+        assert_eq!(
+            public_urls,
+            vec![
+                "http://192.168.5.10:8789".to_string(),
+                "https://prmonitor.example.com".to_string()
+            ]
+        );
+        assert_eq!(
+            supervisor.forwarded_public_urls_for_entrypoint("ep"),
+            vec!["https://prmonitor.example.com".to_string()]
+        );
+    }
+
+    #[test]
     fn effective_peer_ip_ignores_forwarded_headers_without_trusted_proxy() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
@@ -1577,6 +1682,24 @@ mod tests {
     }
 
     #[test]
+    fn lan_tunnel_source_gate_allows_direct_ip_host_without_forwarded_identity() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("192.168.5.10:8789"));
+        let mut entrypoint = entrypoint();
+        entrypoint.source_policy = SourcePolicy {
+            mode: SourcePolicyMode::Custom,
+            allow: vec!["0.0.0.0/0".to_string()],
+        };
+
+        assert!(source_request_allowed(
+            &headers,
+            "192.168.5.10".parse::<IpAddr>().unwrap(),
+            &entrypoint,
+            &[]
+        ));
+    }
+
+    #[test]
     fn runtime_checked_entrypoint_rejects_invalid_route_path_before_axum_nest() {
         let mut entrypoint = entrypoint();
         entrypoint.routes[0].path = "api".to_string();
@@ -1649,6 +1772,20 @@ mod tests {
 
         assert!(source_allowed(
             "169.254.99.7".parse::<IpAddr>().unwrap(),
+            &entrypoint
+        ));
+    }
+
+    #[test]
+    fn custom_source_policy_allows_wildcard_ipv4_cidr() {
+        let mut entrypoint = entrypoint();
+        entrypoint.source_policy = SourcePolicy {
+            mode: SourcePolicyMode::Custom,
+            allow: vec!["0.0.0.0/0".to_string()],
+        };
+
+        assert!(source_allowed(
+            "192.168.5.10".parse::<IpAddr>().unwrap(),
             &entrypoint
         ));
     }

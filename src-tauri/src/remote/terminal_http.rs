@@ -448,6 +448,11 @@ fn loopback_host_allowed(host: &str, port: u16) -> bool {
     allowed.iter().any(|h| h.eq_ignore_ascii_case(host))
 }
 
+fn host_matches_bind_host(host: &str, bind_host: &str) -> bool {
+    host.eq_ignore_ascii_case(bind_host)
+        || (matches!(bind_host, "0.0.0.0" | "::") && host.parse::<std::net::IpAddr>().is_ok())
+}
+
 #[cfg(test)]
 fn host_allowed(host: &str, port: u16, listener: &Listener) -> bool {
     host_allowed_with_public_urls(host, port, listener, &[])
@@ -463,6 +468,9 @@ fn host_allowed_with_public_urls(
         return true;
     }
     let host = host_without_port(host);
+    if host_matches_bind_host(host, &listener.bind_host) {
+        return true;
+    }
     listener_public_host(listener)
         .is_some_and(|public_host| host.eq_ignore_ascii_case(&public_host))
         || public_urls.iter().any(|url| {
@@ -521,6 +529,10 @@ fn origin_matches_with_public_urls(
         "http://[::1]".to_string(),
     ];
     loopback.iter().any(|o| o.eq_ignore_ascii_case(origin))
+        || Url::parse(origin)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .is_some_and(|host| host_matches_bind_host(&host, &listener.bind_host))
         || listener
             .allowed_origins
             .iter()
@@ -964,6 +976,21 @@ mod tests {
         assert!(host_allowed("term.example.com", 9100, &l));
         assert!(host_allowed("term.example.com:443", 9100, &l));
         assert!(!host_allowed("evil.example.com", 9100, &l));
+    }
+
+    #[test]
+    fn terminal_host_allows_wildcard_bind_ip_host_headers() {
+        let mut l = listener();
+        l.bind_host = "0.0.0.0".to_string();
+        l.public_url = String::new();
+
+        assert!(host_allowed("192.168.5.10:8789", 8789, &l));
+        assert!(origin_allowed(
+            Some("http://192.168.5.10:8789"),
+            None,
+            8789,
+            &l
+        ));
     }
 
     #[test]
