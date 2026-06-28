@@ -22,6 +22,13 @@ export function normalizeStringList(csv: string): string[] {
     .filter((item) => item.length > 0);
 }
 
+export function generateRemoteBearerToken(): string {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => alphabet[byte & 0x3f]).join("");
+}
+
 export function makeRemoteRoute(capability: RemoteCapability = "local-api"): RemoteRoute {
   const defaults: Record<RemoteCapability, { name: string; path: string }> = {
     terminal: { name: "Terminal", path: "/terminal" },

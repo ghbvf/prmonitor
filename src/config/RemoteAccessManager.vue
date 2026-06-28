@@ -9,6 +9,7 @@ import {
   deleteEntrypointFromDraft,
   deleteRouteFromEntrypoint,
   deleteTunnelFromDraft,
+  generateRemoteBearerToken,
   normalizeStringList,
 } from "./remoteAccessOps";
 
@@ -93,6 +94,11 @@ function pendingTunnel(id: string): boolean {
 function setSourcePolicyMode(entrypoint: RemoteEntrypoint, mode: RemoteEntrypoint["sourcePolicy"]["mode"]) {
   entrypoint.sourcePolicy.mode = mode;
   if (mode !== "custom") entrypoint.sourcePolicy.allow = [];
+  touch();
+}
+
+function generateBearerToken(route: { authToken: string }) {
+  route.authToken = generateRemoteBearerToken();
   touch();
 }
 
@@ -211,7 +217,10 @@ function touch() {
               </label>
               <label v-if="route.capability === 'terminal'" class="wide">
                 <span>Bearer Token</span>
-                <input v-model="route.authToken" type="password" @input="touch" />
+                <span class="token-row">
+                  <input v-model="route.authToken" type="password" @input="touch" />
+                  <button type="button" @click="generateBearerToken(route)">生成</button>
+                </span>
               </label>
               <div v-if="route.capability === 'terminal'" class="permissions">
                 <label class="check"><input v-model="route.terminalRead" type="checkbox" @change="touch" />读</label>
@@ -371,6 +380,11 @@ select {
   border-radius: 6px;
   padding: 5px 8px;
   font: inherit;
+}
+.token-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
 }
 .check {
   flex-direction: row;

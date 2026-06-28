@@ -304,6 +304,8 @@ fn scope_index_html(body: Vec<u8>, base_path: &str) -> Vec<u8> {
         let attr_base_path = html_attr_escape(&base_path);
         html.replace("src=\"/", &format!("src=\"{attr_base_path}/"))
             .replace("href=\"/", &format!("href=\"{attr_base_path}/"))
+            .replace("src=\"./", &format!("src=\"{attr_base_path}/"))
+            .replace("href=\"./", &format!("href=\"{attr_base_path}/"))
     };
     inject_remote_base_path(html, &base_path).into_bytes()
 }
@@ -611,7 +613,10 @@ fn check_request<R: tauri::Runtime>(
     }
     if !terminal_auth_token_is_strong(&listener.auth_token) {
         return Err(Box::new(with_cors(
-            error_response(StatusCode::UNAUTHORIZED, "终端监听器 token 强度不足"),
+            error_response(
+                StatusCode::UNAUTHORIZED,
+                "终端监听器 token 强度不足（至少 32 个字符；请使用随机生成的 Bearer token）",
+            ),
             cors_origin(headers, ctx.port, &listener, &public_urls),
         )));
     }
@@ -891,6 +896,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::Duration;
 
+    const STRONG_TERMINAL_TOKEN: &str = "terminal-token-0123456789abcdefg";
+
     fn listener() -> Listener {
         Listener {
             id: "term".to_string(),
@@ -902,7 +909,7 @@ mod tests {
             auth: ListenerAuthMode::Bearer,
             public_url: "https://term.example.com".to_string(),
             allowed_origins: vec!["https://mobile.example.com".to_string()],
-            auth_token: "terminal-token-0123456789".to_string(),
+            auth_token: STRONG_TERMINAL_TOKEN.to_string(),
             terminal_read: true,
             terminal_write: true,
             terminal_create: false,
@@ -1158,7 +1165,7 @@ mod tests {
 
             let forbidden = client
                 .post(format!("{base}/invoke/send_terminal_input"))
-                .header("authorization", "Bearer terminal-token-0123456789")
+                .header("authorization", format!("Bearer {STRONG_TERMINAL_TOKEN}"))
                 .json(&serde_json::json!({"sessionId":"s1","data":"x"}))
                 .send()
                 .await
@@ -1202,7 +1209,7 @@ mod tests {
                 .post(format!(
                     "http://127.0.0.1:{port}/invoke/get_terminal_status"
                 ))
-                .header("authorization", "Bearer terminal-token-0123456789")
+                .header("authorization", format!("Bearer {STRONG_TERMINAL_TOKEN}"))
                 .json(&serde_json::json!({}))
                 .send()
                 .await
@@ -1225,7 +1232,7 @@ mod tests {
             let port = socket.local_addr().expect("addr").port();
             let mut l = listener();
             l.port = port;
-            l.auth_token = "short".to_string();
+            l.auth_token = "x".repeat(31);
             persist_listener(app.handle(), l);
             let ctx = Arc::new(Ctx {
                 app: app.handle().clone(),
@@ -1241,13 +1248,13 @@ mod tests {
                 .get(format!(
                     "http://127.0.0.1:{port}/events?topic=terminal:event"
                 ))
-                .header("authorization", "Bearer short")
+                .header("authorization", format!("Bearer {}", "x".repeat(31)))
                 .send()
                 .await
                 .expect("send");
             assert_eq!(resp.status(), reqwest::StatusCode::UNAUTHORIZED);
             let body = resp.text().await.expect("body");
-            assert!(body.contains("强度不足"), "{body}");
+            assert!(body.contains("至少 32 个字符"), "{body}");
             server.abort();
         });
     }
@@ -1279,7 +1286,7 @@ mod tests {
                 .get(format!(
                     "http://127.0.0.1:{port}/events?topic=terminal:event"
                 ))
-                .header("authorization", "Bearer terminal-token-0123456789")
+                .header("authorization", format!("Bearer {STRONG_TERMINAL_TOKEN}"))
                 .send()
                 .await
                 .expect("send");
@@ -1347,11 +1354,14 @@ mod tests {
 
     #[test]
     fn scoped_index_html_rewrites_assets_and_injects_remote_base_path() {
-        let html = br#"<!doctype html><html><head><script type="module" src="/assets/app.js"></script><link rel="stylesheet" href="/assets/app.css"></head><body></body></html>"#;
+        let html = br#"<!doctype html><html><head><link rel="icon" href="./vite.svg"><script type="module" src="/assets/app.js"></script><script type="module" src="./assets/chunk.js"></script><link rel="stylesheet" href="/assets/app.css"><link rel="stylesheet" href="./assets/chunk.css"></head><body></body></html>"#;
         let scoped = String::from_utf8(scope_index_html(html.to_vec(), "terminal/")).unwrap();
         assert!(scoped.contains("window.__PRMONITOR_REMOTE_BASE_PATH__=\"\\/terminal\""));
+        assert!(scoped.contains("href=\"/terminal/vite.svg\""));
         assert!(scoped.contains("src=\"/terminal/assets/app.js\""));
+        assert!(scoped.contains("src=\"/terminal/assets/chunk.js\""));
         assert!(scoped.contains("href=\"/terminal/assets/app.css\""));
+        assert!(scoped.contains("href=\"/terminal/assets/chunk.css\""));
     }
 
     #[test]

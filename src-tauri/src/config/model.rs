@@ -709,8 +709,12 @@ const WEBHOOK_SECRET_MIN_LEN: usize = 16;
 /// EMPTY token is the "disabled" sentinel (fail-closed 401), so it is exempt from this check.
 const LOCAL_API_TOKEN_MIN_LEN: usize = 16;
 
+/// Terminal routes can be exposed through public tunnels, so their bearer token floor is higher than
+/// the loopback-only local API token. Medium enforcement: validate + runtime guard + tests.
+const REMOTE_TERMINAL_TOKEN_MIN_LEN: usize = 32;
+
 pub(crate) fn terminal_auth_token_is_strong(token: &str) -> bool {
-    token.trim().chars().count() >= LOCAL_API_TOKEN_MIN_LEN
+    token.trim().chars().count() >= REMOTE_TERMINAL_TOKEN_MIN_LEN
 }
 
 fn is_https_url_without_userinfo(value: &str) -> bool {
@@ -1357,7 +1361,7 @@ fn validate_remote_access(config: &AppConfig) -> AppResult<()> {
                 RemoteCapability::Terminal => {
                     if !terminal_auth_token_is_strong(&route.auth_token) {
                         return Err(AppError::new(format!(
-                            "authToken 终端路由「{}」必须配置至少 {LOCAL_API_TOKEN_MIN_LEN} 个字符的 Bearer token",
+                            "authToken 终端路由「{}」必须配置至少 {REMOTE_TERMINAL_TOKEN_MIN_LEN} 个字符的随机 Bearer token",
                             route.name
                         )));
                     }
@@ -3419,7 +3423,7 @@ mod tests {
         let token_err = validate(&AppConfig {
             remote_access: RemoteAccessConfig {
                 entrypoints: vec![terminal_entrypoint(RemoteRoute {
-                    auth_token: "short".to_string(),
+                    auth_token: "x".repeat(31),
                     ..terminal_route.clone()
                 })],
                 tunnels: Vec::new(),
@@ -3429,11 +3433,12 @@ mod tests {
         .unwrap_err()
         .message;
         assert!(token_err.starts_with("authToken"), "{token_err}");
+        assert!(token_err.contains("至少 32 个字符"), "{token_err}");
 
         let read_err = validate(&AppConfig {
             remote_access: RemoteAccessConfig {
                 entrypoints: vec![terminal_entrypoint(RemoteRoute {
-                    auth_token: "terminal-token-0123456789".to_string(),
+                    auth_token: "x".repeat(32),
                     terminal_read: false,
                     ..terminal_route.clone()
                 })],
@@ -3448,7 +3453,7 @@ mod tests {
         assert!(validate(&AppConfig {
             remote_access: RemoteAccessConfig {
                 entrypoints: vec![terminal_entrypoint(RemoteRoute {
-                    auth_token: "terminal-token-0123456789".to_string(),
+                    auth_token: "x".repeat(32),
                     terminal_read: true,
                     ..terminal_route
                 })],

@@ -6,6 +6,7 @@ import {
   deleteEntrypointFromDraft,
   deleteRouteFromEntrypoint,
   deleteTunnelFromDraft,
+  generateRemoteBearerToken,
   makeRemoteEntrypoint,
   makeRemoteRoute,
   makeRemoteTunnel,
@@ -86,6 +87,18 @@ describe("makeRemoteEntrypoint / makeRemoteRoute / makeRemoteTunnel", () => {
     expect(makeRemoteEntrypoint().id).not.toBe(makeRemoteEntrypoint().id);
     expect(makeRemoteRoute().id).not.toBe(makeRemoteRoute().id);
     expect(makeRemoteTunnel().id).not.toBe(makeRemoteTunnel().id);
+  });
+});
+
+describe("generateRemoteBearerToken", () => {
+  it("generates a 32+ char URL-safe bearer token", () => {
+    const token = generateRemoteBearerToken();
+    expect(token.length).toBeGreaterThanOrEqual(32);
+    expect(token).toMatch(/^[A-Za-z0-9_-]+$/);
+  });
+
+  it("generates fresh values", () => {
+    expect(generateRemoteBearerToken()).not.toBe(generateRemoteBearerToken());
   });
 });
 
