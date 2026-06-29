@@ -5,7 +5,7 @@ use tauri::Manager;
 use crate::config::service as config_service;
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
-use crate::model::EngineKind;
+use crate::model::{EngineKind, ReviewLifecycleDispatch};
 use crate::review::claim_store;
 use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
 use crate::review::engines::claude::process::{claude_availability, ClaudeStatus, CLAUDE_BIN};
@@ -146,7 +146,7 @@ async fn start_via_engine<R: tauri::Runtime>(
     // against — never a config edited mid-review. Both engines carry this owned context into
     // their `Starting` session; built once here since the fields are identical for either.
     let url_ctx = comment_url_ctx_from(project);
-    match project.engine_kind {
+    let outcome = match project.engine_kind {
         EngineKind::Codex => {
             let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
             // Codex stop-flag contract (PR #47 F1): an EXPLICIT trigger (UI / CLI / deeplink)
@@ -196,7 +196,23 @@ async fn start_via_engine<R: tauri::Runtime>(
             };
             engine.start(pr_number, kind).await
         }
+    }?;
+    if let StartReviewOutcome::Started(thread_id) = &outcome {
+        if let Err(e) = state.review_lifecycle.fire(ReviewLifecycleDispatch {
+            project_id: project.id.clone(),
+            pr_number,
+            kind: kind.to_string(),
+            thread_id: thread_id.clone(),
+            event: crate::model::ReviewLifecycleEvent::Started,
+            comment_url: None,
+        }) {
+            eprintln!(
+                "review lifecycle started 通知入队失败（{thread_id}）：{}",
+                e.message
+            );
+        }
     }
+    Ok(outcome)
 }
 
 /// The MANUAL / explicit start path (AB#1042): the shared dispatch body behind BOTH

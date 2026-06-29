@@ -26,7 +26,7 @@ use super::engines::codex::CodexManager;
 use super::history_store::HistoryItemKind;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, StreamEvent};
-use crate::model::EngineKind;
+use crate::model::{EngineKind, ReviewLifecycleDispatch, ReviewLifecycleEvent};
 use crate::review::engine::StartReviewOutcome;
 
 /// A review session is identified by its codex `threadId`.
@@ -718,6 +718,7 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
         Err(e) => {
             registry.set_status(&thread_id, SessionStatus::Failed);
             persist_status(app, &thread_id, SessionStatus::Failed);
+            fire_failed_lifecycle(app, project_id, pr_number, kind, &thread_id);
             return Err(e);
         }
     };
@@ -1334,6 +1335,25 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
             comment_url: comment_url.clone(),
         }),
     );
+    if let Some(event) = lifecycle_event_from_wire_status(wire_status) {
+        let state = app.state::<crate::state::AppState>();
+        if let Err(e) = state.review_lifecycle.fire(ReviewLifecycleDispatch {
+            project_id: project_id.to_string(),
+            pr_number,
+            kind: registry
+                .get(thread_id)
+                .map(|info| info.kind)
+                .unwrap_or_else(|| "review".to_string()),
+            thread_id: thread_id.to_string(),
+            event,
+            comment_url: comment_url.clone(),
+        }) {
+            eprintln!(
+                "review lifecycle terminal 通知入队失败（{thread_id}）：{}",
+                e.message
+            );
+        }
+    }
 
     // 5. Signal LAST — subscribers wake to an already-settled registry/DB.
     registry.signal_completion(
@@ -1346,6 +1366,40 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
             comment_url,
         },
     );
+}
+
+fn fire_failed_lifecycle<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_id: &str,
+    pr_number: u64,
+    kind: &str,
+    thread_id: &str,
+) {
+    let state = app.state::<crate::state::AppState>();
+    if let Err(e) = state.review_lifecycle.fire(ReviewLifecycleDispatch {
+        project_id: project_id.to_string(),
+        pr_number,
+        kind: kind.to_string(),
+        thread_id: thread_id.to_string(),
+        event: ReviewLifecycleEvent::Failed,
+        comment_url: None,
+    }) {
+        eprintln!(
+            "review lifecycle turn/start 失败通知入队失败（{thread_id}）：{}",
+            e.message
+        );
+    }
+}
+
+fn lifecycle_event_from_wire_status(
+    wire_status: &str,
+) -> Option<crate::model::ReviewLifecycleEvent> {
+    match wire_status {
+        "completed" => Some(crate::model::ReviewLifecycleEvent::Completed),
+        "failed" => Some(crate::model::ReviewLifecycleEvent::Failed),
+        "interrupted" => Some(crate::model::ReviewLifecycleEvent::Interrupted),
+        _ => None,
+    }
 }
 
 /// Map one codex notification to a [`ReviewEvent`] for this session, or `None`

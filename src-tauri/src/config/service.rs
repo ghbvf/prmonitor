@@ -23,8 +23,10 @@ use crate::model::NotificationDeliveryChannel;
 /// use `Project` through this same re-export.
 pub use super::model::{
     MessagingIntegration, MessagingSettings, NotificationChannel, NotificationSettings, Project,
-    RuleActionKind, RuleConfig,
+    ReviewLifecycleNotificationConfig, ReviewLifecycleTarget, RuleActionConfig,
+    RuleActionDedupePolicy, RuleActionKind, RuleActionTarget, RuleConfig,
 };
+pub use crate::model::ReviewLifecycleEvent;
 
 /// The DEFAULT outbox worker policy, exposed THROUGH the config public service surface (AB#1182
 /// F1) — the seam the `outbox` worker uses as its config-read-failure FALLBACK. The worker reads
@@ -414,6 +416,7 @@ fn seed_rule_configs(value: Value) -> Value {
         return value;
     };
     if obj.contains_key("rules") {
+        migrate_rule_actions(&mut obj);
         return Value::Object(obj);
     }
 
@@ -445,7 +448,7 @@ fn seed_rule_configs(value: Value) -> Value {
                         "labelsAll": [],
                         "titleContains": "",
                         "bodyContains": "",
-                        "actions": ["review"]
+                        "actions": [rule_action_json("review")]
                     }));
                 }
             }
@@ -463,7 +466,7 @@ fn seed_rule_configs(value: Value) -> Value {
                         "labelsAll": [],
                         "titleContains": "",
                         "bodyContains": "",
-                        "actions": ["check"]
+                        "actions": [rule_action_json("check")]
                     }));
                 }
             }
@@ -480,6 +483,38 @@ fn seed_rule_configs(value: Value) -> Value {
     }
     obj.insert("rules".to_string(), Value::Array(rules));
     Value::Object(obj)
+}
+
+fn rule_action_json(kind: &str) -> Value {
+    json!({
+        "id": kind,
+        "kind": kind,
+        "enabled": true,
+        "target": { "kind": "none" },
+        "dedupePolicy": "event",
+        "delaySecs": 0,
+        "dependsOn": [],
+        "level": "action"
+    })
+}
+
+fn migrate_rule_actions(obj: &mut Map<String, Value>) {
+    let Some(rules) = obj.get_mut("rules").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for rule in rules {
+        let Some(rule_obj) = rule.as_object_mut() else {
+            continue;
+        };
+        let Some(actions) = rule_obj.get_mut("actions").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for action in actions {
+            if let Some(kind) = action.as_str() {
+                *action = rule_action_json(kind);
+            }
+        }
+    }
 }
 
 /// The port the local-api listener is bound on (AB#1225 single source of truth): the first
@@ -889,10 +924,12 @@ mod tests {
         assert_eq!(rules[0]["projectId"], MIGRATED_PROJECT_ID);
         assert_eq!(rules[0]["repo"], "octocat/hello");
         assert_eq!(rules[0]["labelsAny"], json!(["needs-review"]));
-        assert_eq!(rules[0]["actions"], json!(["review"]));
+        assert_eq!(rules[0]["actions"][0]["kind"], "review");
+        assert_eq!(rules[0]["actions"][0]["id"], "review");
         assert_eq!(rules[1]["id"], "default-check");
         assert_eq!(rules[1]["labelsAny"], json!(["needs-check"]));
-        assert_eq!(rules[1]["actions"], json!(["check"]));
+        assert_eq!(rules[1]["actions"][0]["kind"], "check");
+        assert_eq!(rules[1]["actions"][0]["id"], "check");
 
         // The migrated shape must deserialize into a real `AppConfig` (lenient path
         // `load` uses) with the lifted values intact.
@@ -903,6 +940,47 @@ mod tests {
         assert_eq!(config.projects[0].repo, "octocat/hello");
         assert_eq!(config.rules.len(), 2);
         assert!(config.rules.iter().all(|rule| rule.enabled));
+    }
+
+    #[test]
+    fn migrate_new_shape_rule_string_actions_to_structured_actions() {
+        let raw = json!({
+            "activeProjectId": "p1",
+            "projects": [{
+                "id": "p1",
+                "name": "Project",
+                "repo": "octocat/hello"
+            }],
+            "rules": [{
+                "id": "r1",
+                "name": "Legacy actions",
+                "enabled": true,
+                "source": null,
+                "eventType": "pullRequest",
+                "projectId": "p1",
+                "repo": "",
+                "labelsAny": [],
+                "labelsAll": [],
+                "titleContains": "",
+                "bodyContains": "",
+                "actions": ["review", "notify"],
+                "allowActionKinds": [],
+                "denyActionKinds": []
+            }]
+        });
+
+        let migrated = migrate_value(raw);
+
+        assert_eq!(migrated["rules"][0]["actions"][0]["id"], "review");
+        assert_eq!(migrated["rules"][0]["actions"][0]["kind"], "review");
+        assert_eq!(
+            migrated["rules"][0]["actions"][0]["target"],
+            json!({ "kind": "none" })
+        );
+        assert_eq!(migrated["rules"][0]["actions"][0]["dedupePolicy"], "event");
+        assert_eq!(migrated["rules"][0]["actions"][0]["dependsOn"], json!([]));
+        assert_eq!(migrated["rules"][0]["actions"][1]["id"], "notify");
+        serde_json::from_value::<AppConfig>(migrated).expect("migrated config deserializes");
     }
 
     #[test]

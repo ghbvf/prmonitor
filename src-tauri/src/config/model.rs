@@ -9,8 +9,8 @@ use url::Url;
 
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    EngineKind, EventType, LabelSource, MessagingProviderKind, NotificationKind, SourceKind,
-    UpdateMode, WebhookTunnelMode,
+    EngineKind, EventType, LabelSource, MessagingProviderKind, NotificationKind,
+    ReviewLifecycleEvent, SourceKind, UpdateMode, WebhookTunnelMode,
 };
 
 /// One monitored project (#35). What was previously the flat per-repo subset of
@@ -130,6 +130,7 @@ impl Default for Project {
 /// sourced here so [`OutboxConfig::default`] and the worker's load-failure fallback (which reads
 /// `AppConfig::default().outbox`) agree on one value.
 pub const DEFAULT_NOTIFICATION_TTL_SECS: u64 = 2 * 60 * 60;
+const MAX_CONFIGURED_DELAY_SECS: u64 = 365 * 24 * 60 * 60;
 
 /// Outbox worker policy (AB#1182): the per-kind staleness TTLs for the durable action queue.
 /// GLOBAL (one policy serves every project) on purpose — staleness is an infrastructure concern,
@@ -172,6 +173,68 @@ pub enum RuleActionKind {
     Notify,
 }
 
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum RuleActionDedupePolicy {
+    #[default]
+    Event,
+    Action,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum RuleActionTarget {
+    #[default]
+    None,
+    NotificationChannels {
+        #[serde(rename = "channelIds")]
+        channel_ids: Vec<String>,
+    },
+    MessagingConversation {
+        #[serde(rename = "integrationId")]
+        integration_id: String,
+        #[serde(rename = "conversationId")]
+        conversation_id: String,
+    },
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RuleActionConfig {
+    pub id: String,
+    pub kind: RuleActionKind,
+    pub enabled: bool,
+    pub target: RuleActionTarget,
+    pub dedupe_policy: RuleActionDedupePolicy,
+    pub delay_secs: u64,
+    pub depends_on: Vec<String>,
+    pub level: String,
+}
+
+impl RuleActionConfig {
+    pub fn new(id: impl Into<String>, kind: RuleActionKind) -> Self {
+        Self {
+            id: id.into(),
+            kind,
+            enabled: true,
+            target: RuleActionTarget::None,
+            dedupe_policy: RuleActionDedupePolicy::default(),
+            delay_secs: 0,
+            depends_on: Vec::new(),
+            level: "action".to_string(),
+        }
+    }
+}
+
+impl Default for RuleActionConfig {
+    fn default() -> Self {
+        Self::new(String::new(), RuleActionKind::Review)
+    }
+}
+
 /// One configurable event→action rule (#1371).
 ///
 /// Empty matcher fields are wildcards. Text matchers are case-insensitive `contains`;
@@ -192,7 +255,61 @@ pub struct RuleConfig {
     pub labels_all: Vec<String>,
     pub title_contains: String,
     pub body_contains: String,
-    pub actions: Vec<RuleActionKind>,
+    pub actions: Vec<RuleActionConfig>,
+    pub allow_action_kinds: Vec<RuleActionKind>,
+    pub deny_action_kinds: Vec<RuleActionKind>,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum ReviewLifecycleTarget {
+    NotificationChannels {
+        #[serde(rename = "channelIds")]
+        channel_ids: Vec<String>,
+    },
+    MessagingConversation {
+        #[serde(rename = "integrationId")]
+        integration_id: String,
+        #[serde(rename = "conversationId")]
+        conversation_id: String,
+    },
+}
+
+impl Default for ReviewLifecycleTarget {
+    fn default() -> Self {
+        Self::NotificationChannels {
+            channel_ids: Vec::new(),
+        }
+    }
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ReviewLifecycleNotificationConfig {
+    pub enabled: bool,
+    pub events: Vec<ReviewLifecycleEvent>,
+    pub targets: Vec<ReviewLifecycleTarget>,
+    pub start_delay_secs: u64,
+    pub end_delay_secs: u64,
+}
+
+impl Default for ReviewLifecycleNotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            events: vec![
+                ReviewLifecycleEvent::Started,
+                ReviewLifecycleEvent::Completed,
+                ReviewLifecycleEvent::Failed,
+                ReviewLifecycleEvent::Interrupted,
+            ],
+            targets: vec![ReviewLifecycleTarget::default()],
+            start_delay_secs: 0,
+            end_delay_secs: 0,
+        }
+    }
 }
 
 /// Global notification delivery configuration (AB#1459). The outbox stores only a channel id and
@@ -388,6 +505,9 @@ pub struct AppConfig {
     pub notifications: NotificationSettings,
     /// Bidirectional messaging/bot integrations (#1559). Separate from outbound notifications.
     pub messaging: MessagingSettings,
+    /// Review lifecycle notifications. Routes review started / terminal events to notification
+    /// channels or messaging conversations through the durable outbox.
+    pub review_lifecycle_notifications: ReviewLifecycleNotificationConfig,
     /// Declarative Remote Access entrypoints and tunnels. This is the single runtime source:
     /// each entrypoint owns one bound port and mounts one or more capability routes.
     pub remote_access: RemoteAccessConfig,
@@ -418,6 +538,7 @@ impl Default for AppConfig {
             rules: Vec::new(),
             notifications: NotificationSettings::default(),
             messaging: MessagingSettings::default(),
+            review_lifecycle_notifications: ReviewLifecycleNotificationConfig::default(),
             remote_access: RemoteAccessConfig::default(),
             listeners: Vec::new(),
             tunnels: Vec::new(),
@@ -1238,7 +1359,11 @@ pub fn validate_project(project: &Project) -> AppResult<()> {
     Ok(())
 }
 
-fn validate_rule(rule: &RuleConfig) -> AppResult<()> {
+fn validate_rule(
+    rule: &RuleConfig,
+    notifications: &NotificationSettings,
+    messaging: &MessagingSettings,
+) -> AppResult<()> {
     if rule.id.trim().is_empty()
         || rule.id.contains(':')
         || rule.id.chars().any(char::is_whitespace)
@@ -1256,9 +1381,323 @@ fn validate_rule(rule: &RuleConfig) -> AppResult<()> {
             "actions 不能为空（启用规则至少需要一个动作）",
         ));
     }
+    let mut seen_action_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (idx, action) in rule.actions.iter().enumerate() {
-        if rule.actions[..idx].contains(action) {
-            return Err(AppError::new(format!("actions 不能重复: {:?}", action)));
+        validate_rule_action(action, notifications, messaging)
+            .map_err(|e| AppError::new(format!("actions[{idx}].{}", e.message)))?;
+        if !seen_action_ids.insert(action.id.as_str()) {
+            return Err(AppError::new(format!(
+                "actions[{idx}].id 动作 id 重复: {}",
+                action.id
+            )));
+        }
+        if rule.deny_action_kinds.contains(&action.kind)
+            || (!rule.allow_action_kinds.is_empty()
+                && !rule.allow_action_kinds.contains(&action.kind))
+        {
+            return Err(AppError::new(format!(
+                "actions[{idx}].kind 被组合策略拒绝: {:?}",
+                action.kind
+            )));
+        }
+    }
+    validate_rule_action_dag(&rule.actions)?;
+    Ok(())
+}
+
+fn validate_rule_action(
+    action: &RuleActionConfig,
+    notifications: &NotificationSettings,
+    messaging: &MessagingSettings,
+) -> AppResult<()> {
+    if action.id.trim().is_empty()
+        || action.id.contains(':')
+        || action.id.chars().any(char::is_whitespace)
+    {
+        return Err(AppError::new(format!(
+            "id 非法（不能为空、含 `:` 或空白字符）: {:?}",
+            action.id
+        )));
+    }
+    if action.level.trim().is_empty()
+        || action.level.contains(':')
+        || action.level.chars().any(char::is_whitespace)
+    {
+        return Err(AppError::new(format!(
+            "level 非法（不能为空、含 `:` 或空白字符）: {:?}",
+            action.level
+        )));
+    }
+    validate_delay_secs("delaySecs", action.delay_secs)?;
+    validate_rule_action_target(&action.target, notifications, messaging)?;
+    validate_id_list("dependsOn", &action.depends_on)?;
+    Ok(())
+}
+
+fn validate_rule_action_target(
+    target: &RuleActionTarget,
+    notifications: &NotificationSettings,
+    messaging: &MessagingSettings,
+) -> AppResult<()> {
+    match target {
+        RuleActionTarget::None => {}
+        RuleActionTarget::NotificationChannels { channel_ids } => {
+            validate_id_list("target.channelIds", channel_ids)?;
+            if channel_ids.is_empty()
+                && !notifications.channels.iter().any(|channel| channel.enabled)
+            {
+                return Err(AppError::new(
+                    "target.channelIds 未指定且没有启用的通知渠道",
+                ));
+            }
+            for channel_id in channel_ids {
+                let Some(channel) = notifications
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == *channel_id)
+                else {
+                    return Err(AppError::new(format!(
+                        "target.channelIds 不存在: {channel_id}"
+                    )));
+                };
+                if !channel.enabled {
+                    return Err(AppError::new(format!(
+                        "target.channelIds 已禁用: {channel_id}"
+                    )));
+                }
+            }
+        }
+        RuleActionTarget::MessagingConversation {
+            integration_id,
+            conversation_id,
+        } => {
+            if integration_id.trim().is_empty() {
+                return Err(AppError::new("target.integrationId 不能为空"));
+            }
+            if conversation_id.trim().is_empty() {
+                return Err(AppError::new("target.conversationId 不能为空"));
+            }
+            let Some(integration) = messaging
+                .integrations
+                .iter()
+                .find(|integration| integration.id == *integration_id)
+            else {
+                return Err(AppError::new(format!(
+                    "target.integrationId 不存在: {integration_id}"
+                )));
+            };
+            if !integration.enabled {
+                return Err(AppError::new(format!(
+                    "target.integrationId 已禁用: {integration_id}"
+                )));
+            }
+            if !integration
+                .allowed_conversation_ids
+                .iter()
+                .any(|allowed| allowed.trim() == conversation_id.trim())
+            {
+                return Err(AppError::new(format!(
+                    "target.conversationId 未授权: {conversation_id}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_delay_secs(field: &str, delay_secs: u64) -> AppResult<()> {
+    if delay_secs > MAX_CONFIGURED_DELAY_SECS {
+        return Err(AppError::new(format!(
+            "{field} 不能超过 {MAX_CONFIGURED_DELAY_SECS} 秒"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_id_list(field: &str, ids: &[String]) -> AppResult<()> {
+    let mut seen = std::collections::HashSet::new();
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(AppError::new(format!("{field} 不能包含空值")));
+        }
+        if !seen.insert(id.to_string()) {
+            return Err(AppError::new(format!("{field} 不能包含重复值: {id}")));
+        }
+    }
+    Ok(())
+}
+
+fn validate_rule_action_dag(actions: &[RuleActionConfig]) -> AppResult<()> {
+    let ids: std::collections::HashSet<&str> =
+        actions.iter().map(|action| action.id.as_str()).collect();
+    for action in actions {
+        for dep in &action.depends_on {
+            if dep == &action.id {
+                return Err(AppError::new(format!("actions DAG 自依赖: {}", action.id)));
+            }
+            if !ids.contains(dep.as_str()) {
+                return Err(AppError::new(format!(
+                    "actions DAG 依赖未知动作: {} -> {}",
+                    action.id, dep
+                )));
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mark {
+        New,
+        Visiting,
+        Done,
+    }
+    let mut marks: std::collections::HashMap<&str, Mark> = actions
+        .iter()
+        .map(|action| (action.id.as_str(), Mark::New))
+        .collect();
+    let by_id: std::collections::HashMap<&str, &RuleActionConfig> = actions
+        .iter()
+        .map(|action| (action.id.as_str(), action))
+        .collect();
+
+    fn visit<'a>(
+        id: &'a str,
+        marks: &mut std::collections::HashMap<&'a str, Mark>,
+        by_id: &std::collections::HashMap<&'a str, &'a RuleActionConfig>,
+    ) -> AppResult<()> {
+        match marks.get(id).copied().unwrap_or(Mark::New) {
+            Mark::Done => return Ok(()),
+            Mark::Visiting => {
+                return Err(AppError::new(format!("actions DAG 存在环路: {id}")));
+            }
+            Mark::New => {}
+        }
+        marks.insert(id, Mark::Visiting);
+        if let Some(action) = by_id.get(id) {
+            for dep in &action.depends_on {
+                visit(dep, marks, by_id)?;
+            }
+        }
+        marks.insert(id, Mark::Done);
+        Ok(())
+    }
+
+    for action in actions {
+        visit(action.id.as_str(), &mut marks, &by_id)?;
+    }
+    Ok(())
+}
+
+fn validate_review_lifecycle_notifications(
+    config: &ReviewLifecycleNotificationConfig,
+    notifications: &NotificationSettings,
+    messaging: &MessagingSettings,
+) -> AppResult<()> {
+    if !config.enabled {
+        return Ok(());
+    }
+    validate_review_lifecycle_events(&config.events)?;
+    validate_delay_secs(
+        "reviewLifecycleNotifications.startDelaySecs",
+        config.start_delay_secs,
+    )?;
+    validate_delay_secs(
+        "reviewLifecycleNotifications.endDelaySecs",
+        config.end_delay_secs,
+    )?;
+    if config.enabled && config.targets.is_empty() {
+        return Err(AppError::new(
+            "reviewLifecycleNotifications.targets 不能为空（启用后至少需要一个目标）",
+        ));
+    }
+    for (idx, target) in config.targets.iter().enumerate() {
+        match target {
+            ReviewLifecycleTarget::NotificationChannels { channel_ids } => {
+                if channel_ids.is_empty() {
+                    if !notifications.channels.iter().any(|channel| channel.enabled) {
+                        return Err(AppError::new(format!(
+                            "reviewLifecycleNotifications.targets[{idx}].channelIds 未指定且没有启用的通知渠道"
+                        )));
+                    }
+                } else {
+                    validate_id_list(
+                        &format!("reviewLifecycleNotifications.targets[{idx}].channelIds"),
+                        channel_ids,
+                    )?;
+                }
+                for channel_id in channel_ids {
+                    let Some(channel) = notifications
+                        .channels
+                        .iter()
+                        .find(|channel| channel.id == *channel_id)
+                    else {
+                        return Err(AppError::new(format!(
+                            "reviewLifecycleNotifications.targets[{idx}].channelIds 不存在: {channel_id}"
+                        )));
+                    };
+                    if !channel.enabled {
+                        return Err(AppError::new(format!(
+                            "reviewLifecycleNotifications.targets[{idx}].channelIds 已禁用: {channel_id}"
+                        )));
+                    }
+                }
+            }
+            ReviewLifecycleTarget::MessagingConversation {
+                integration_id,
+                conversation_id,
+            } => {
+                if integration_id.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "reviewLifecycleNotifications.targets[{idx}].integrationId 不能为空"
+                    )));
+                }
+                if conversation_id.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "reviewLifecycleNotifications.targets[{idx}].conversationId 不能为空"
+                    )));
+                }
+                let Some(integration) = messaging
+                    .integrations
+                    .iter()
+                    .find(|integration| integration.id == *integration_id)
+                else {
+                    return Err(AppError::new(format!(
+                        "reviewLifecycleNotifications.targets[{idx}].integrationId 不存在: {integration_id}"
+                    )));
+                };
+                if !integration.enabled {
+                    return Err(AppError::new(format!(
+                        "reviewLifecycleNotifications.targets[{idx}].integrationId 已禁用: {integration_id}"
+                    )));
+                }
+                if !integration
+                    .allowed_conversation_ids
+                    .iter()
+                    .any(|allowed| allowed.trim() == conversation_id.trim())
+                {
+                    return Err(AppError::new(format!(
+                        "reviewLifecycleNotifications.targets[{idx}].conversationId 未授权: {conversation_id}"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_review_lifecycle_events(events: &[ReviewLifecycleEvent]) -> AppResult<()> {
+    if events.is_empty() {
+        return Err(AppError::new(
+            "reviewLifecycleNotifications.events 不能为空",
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for event in events {
+        if !seen.insert(*event) {
+            return Err(AppError::new(format!(
+                "reviewLifecycleNotifications.events 不能重复: {:?}",
+                event
+            )));
         }
     }
     Ok(())
@@ -1581,6 +2020,11 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
 
     validate_notifications(&config.notifications)?;
     validate_messaging(&config.messaging)?;
+    validate_review_lifecycle_notifications(
+        &config.review_lifecycle_notifications,
+        &config.notifications,
+        &config.messaging,
+    )?;
 
     // Per-project fields: validate each ENABLED project; disabled ones are skipped
     // (their fields may be intentionally incomplete). The id/repo of every project
@@ -1640,7 +2084,8 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
 
     let mut seen_rule_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (idx, rule) in config.rules.iter().enumerate() {
-        validate_rule(rule).map_err(|e| AppError::new(format!("rules[{idx}].{}", e.message)))?;
+        validate_rule(rule, &config.notifications, &config.messaging)
+            .map_err(|e| AppError::new(format!("rules[{idx}].{}", e.message)))?;
         if !seen_rule_ids.insert(rule.id.as_str()) {
             return Err(AppError::new(format!(
                 "rules[{idx}].id 规则 id 重复: {}（每条规则的 id 必须唯一）",
@@ -1762,6 +2207,7 @@ mod tests {
             outbox: OutboxConfig::default(),
             notifications: NotificationSettings::default(),
             messaging: MessagingSettings::default(),
+            review_lifecycle_notifications: ReviewLifecycleNotificationConfig::default(),
             remote_access: RemoteAccessConfig::default(),
             listeners: Vec::new(),
             tunnels: Vec::new(),
@@ -1845,10 +2291,12 @@ mod tests {
             title_contains: "ship".to_string(),
             body_contains: "details".to_string(),
             actions: vec![
-                RuleActionKind::Review,
-                RuleActionKind::Check,
-                RuleActionKind::Notify,
+                RuleActionConfig::new("review", RuleActionKind::Review),
+                RuleActionConfig::new("check", RuleActionKind::Check),
+                RuleActionConfig::new("notify", RuleActionKind::Notify),
             ],
+            allow_action_kinds: Vec::new(),
+            deny_action_kinds: Vec::new(),
         };
 
         let v = serde_json::to_value(&rule).expect("RuleConfig serializes");
@@ -1866,7 +2314,40 @@ mod tests {
                 "labelsAll": ["ready"],
                 "titleContains": "ship",
                 "bodyContains": "details",
-                "actions": ["review", "check", "notify"]
+                "actions": [
+                    {
+                        "id": "review",
+                        "kind": "review",
+                        "enabled": true,
+                        "target": { "kind": "none" },
+                        "dedupePolicy": "event",
+                        "delaySecs": 0,
+                        "dependsOn": [],
+                        "level": "action"
+                    },
+                    {
+                        "id": "check",
+                        "kind": "check",
+                        "enabled": true,
+                        "target": { "kind": "none" },
+                        "dedupePolicy": "event",
+                        "delaySecs": 0,
+                        "dependsOn": [],
+                        "level": "action"
+                    },
+                    {
+                        "id": "notify",
+                        "kind": "notify",
+                        "enabled": true,
+                        "target": { "kind": "none" },
+                        "dedupePolicy": "event",
+                        "delaySecs": 0,
+                        "dependsOn": [],
+                        "level": "action"
+                    }
+                ],
+                "allowActionKinds": [],
+                "denyActionKinds": []
             })
         );
 
@@ -2688,7 +3169,10 @@ mod tests {
             id: "r1".to_string(),
             name: "Duplicate action".to_string(),
             enabled: true,
-            actions: vec![RuleActionKind::Review, RuleActionKind::Review],
+            actions: vec![
+                RuleActionConfig::new("dup", RuleActionKind::Review),
+                RuleActionConfig::new("dup", RuleActionKind::Check),
+            ],
             ..RuleConfig::default()
         });
         assert!(validate(&config)
@@ -2702,13 +3186,307 @@ mod tests {
             name: "Dangling project".to_string(),
             enabled: true,
             project_id: "missing".to_string(),
-            actions: vec![RuleActionKind::Notify],
+            actions: vec![RuleActionConfig::new("notify", RuleActionKind::Notify)],
             ..RuleConfig::default()
         });
         assert!(validate(&config)
             .unwrap_err()
             .message
             .starts_with("rules[0].projectId"));
+    }
+
+    #[test]
+    fn validate_rule_action_dag_and_combination_policy_fail_fast() {
+        let mut config = valid_base();
+        let mut action = RuleActionConfig::new("review", RuleActionKind::Review);
+        action.depends_on = vec!["missing".to_string()];
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: "Unknown dep".to_string(),
+            enabled: true,
+            actions: vec![action],
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("依赖未知动作"));
+
+        let mut config = valid_base();
+        let mut action = RuleActionConfig::new("review", RuleActionKind::Review);
+        action.depends_on = vec!["review".to_string()];
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: "Self dep".to_string(),
+            enabled: true,
+            actions: vec![action],
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config).unwrap_err().message.contains("自依赖"));
+
+        let mut config = valid_base();
+        let mut a = RuleActionConfig::new("a", RuleActionKind::Notify);
+        a.depends_on = vec!["c".to_string()];
+        let mut b = RuleActionConfig::new("b", RuleActionKind::Notify);
+        b.depends_on = vec!["a".to_string()];
+        let mut c = RuleActionConfig::new("c", RuleActionKind::Notify);
+        c.depends_on = vec!["b".to_string()];
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: "Cycle".to_string(),
+            enabled: true,
+            actions: vec![a, b, c],
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config).unwrap_err().message.contains("存在环路"));
+
+        let mut config = valid_base();
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: "Allow only review".to_string(),
+            enabled: true,
+            actions: vec![RuleActionConfig::new("notify", RuleActionKind::Notify)],
+            allow_action_kinds: vec![RuleActionKind::Review],
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("被组合策略拒绝"));
+
+        let mut config = valid_base();
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: "Deny wins".to_string(),
+            enabled: true,
+            actions: vec![RuleActionConfig::new("review", RuleActionKind::Review)],
+            allow_action_kinds: vec![RuleActionKind::Review],
+            deny_action_kinds: vec![RuleActionKind::Review],
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("被组合策略拒绝"));
+    }
+
+    #[test]
+    fn validate_rule_action_targets_reject_missing_or_disabled_references() {
+        let mut config = valid_base();
+        config.notifications.channels = vec![valid_notification_channel(NotificationKind::Slack)];
+        let mut notify = RuleActionConfig::new("notify", RuleActionKind::Notify);
+        notify.target = RuleActionTarget::NotificationChannels {
+            channel_ids: vec!["missing".to_string()],
+        };
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: "Notify missing channel".to_string(),
+            enabled: true,
+            actions: vec![notify],
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("target.channelIds 不存在"));
+
+        let mut config = valid_base();
+        let mut disabled = valid_notification_channel(NotificationKind::Slack);
+        disabled.id = "slack-main".to_string();
+        disabled.enabled = false;
+        config.notifications.channels = vec![disabled];
+        let mut notify = RuleActionConfig::new("notify", RuleActionKind::Notify);
+        notify.target = RuleActionTarget::NotificationChannels {
+            channel_ids: vec!["slack-main".to_string()],
+        };
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: "Notify disabled channel".to_string(),
+            enabled: true,
+            actions: vec![notify],
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("target.channelIds 已禁用"));
+
+        let mut config = valid_base();
+        config.messaging.integrations = vec![valid_messaging_integration()];
+        let mut notify = RuleActionConfig::new("notify", RuleActionKind::Notify);
+        notify.target = RuleActionTarget::MessagingConversation {
+            integration_id: "feishu-main".to_string(),
+            conversation_id: "oc_missing".to_string(),
+        };
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: "Notify unauthorized conversation".to_string(),
+            enabled: true,
+            actions: vec![notify],
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("target.conversationId 未授权"));
+    }
+
+    #[test]
+    fn validate_rejects_configured_delay_overflow_guardrail() {
+        let mut config = valid_base();
+        let mut action = RuleActionConfig::new("notify", RuleActionKind::Notify);
+        action.delay_secs = MAX_CONFIGURED_DELAY_SECS + 1;
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: "Too much delay".to_string(),
+            enabled: true,
+            actions: vec![action],
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("delaySecs 不能超过"));
+
+        let mut config = valid_base();
+        config.review_lifecycle_notifications = ReviewLifecycleNotificationConfig {
+            enabled: true,
+            events: vec![ReviewLifecycleEvent::Started],
+            targets: vec![ReviewLifecycleTarget::NotificationChannels {
+                channel_ids: Vec::new(),
+            }],
+            start_delay_secs: MAX_CONFIGURED_DELAY_SECS + 1,
+            end_delay_secs: 0,
+        };
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("reviewLifecycleNotifications.startDelaySecs 不能超过"));
+    }
+
+    #[test]
+    fn validate_review_lifecycle_targets_only_when_enabled() {
+        let mut config = valid_base();
+        config.review_lifecycle_notifications = ReviewLifecycleNotificationConfig {
+            enabled: false,
+            events: Vec::new(),
+            targets: vec![ReviewLifecycleTarget::MessagingConversation {
+                integration_id: String::new(),
+                conversation_id: String::new(),
+            }],
+            start_delay_secs: 0,
+            end_delay_secs: 0,
+        };
+        validate(&config).expect("disabled lifecycle does not validate draft targets");
+    }
+
+    #[test]
+    fn validate_review_lifecycle_rejects_unusable_targets() {
+        let mut config = valid_base();
+        config.notifications.channels = vec![valid_notification_channel(NotificationKind::Slack)];
+        config.review_lifecycle_notifications = ReviewLifecycleNotificationConfig {
+            enabled: true,
+            events: vec![ReviewLifecycleEvent::Started],
+            targets: vec![ReviewLifecycleTarget::NotificationChannels {
+                channel_ids: vec!["missing".to_string()],
+            }],
+            start_delay_secs: 0,
+            end_delay_secs: 0,
+        };
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("channelIds 不存在"));
+
+        let mut config = valid_base();
+        let mut disabled = valid_notification_channel(NotificationKind::Slack);
+        disabled.id = "slack-main".to_string();
+        disabled.enabled = false;
+        config.notifications.channels = vec![disabled];
+        config.review_lifecycle_notifications = ReviewLifecycleNotificationConfig {
+            enabled: true,
+            events: vec![ReviewLifecycleEvent::Started],
+            targets: vec![ReviewLifecycleTarget::NotificationChannels {
+                channel_ids: vec!["slack-main".to_string()],
+            }],
+            start_delay_secs: 0,
+            end_delay_secs: 0,
+        };
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("channelIds 已禁用"));
+
+        let mut config = valid_base();
+        config.notifications.channels = vec![NotificationChannel {
+            enabled: false,
+            ..NotificationChannel::desktop_default()
+        }];
+        config.review_lifecycle_notifications = ReviewLifecycleNotificationConfig {
+            enabled: true,
+            events: vec![ReviewLifecycleEvent::Started],
+            targets: vec![ReviewLifecycleTarget::NotificationChannels {
+                channel_ids: Vec::new(),
+            }],
+            start_delay_secs: 0,
+            end_delay_secs: 0,
+        };
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("没有启用的通知渠道"));
+
+        let mut config = valid_base();
+        config.review_lifecycle_notifications = ReviewLifecycleNotificationConfig {
+            enabled: true,
+            events: vec![ReviewLifecycleEvent::Started],
+            targets: vec![ReviewLifecycleTarget::MessagingConversation {
+                integration_id: "missing".to_string(),
+                conversation_id: "oc_123".to_string(),
+            }],
+            start_delay_secs: 0,
+            end_delay_secs: 0,
+        };
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("integrationId 不存在"));
+
+        let mut config = valid_base();
+        let mut disabled = valid_messaging_integration();
+        disabled.enabled = false;
+        config.messaging.integrations = vec![disabled];
+        config.review_lifecycle_notifications = ReviewLifecycleNotificationConfig {
+            enabled: true,
+            events: vec![ReviewLifecycleEvent::Started],
+            targets: vec![ReviewLifecycleTarget::MessagingConversation {
+                integration_id: "feishu-main".to_string(),
+                conversation_id: "oc_123".to_string(),
+            }],
+            start_delay_secs: 0,
+            end_delay_secs: 0,
+        };
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("integrationId 已禁用"));
+
+        let mut config = valid_base();
+        config.messaging.integrations = vec![valid_messaging_integration()];
+        config.review_lifecycle_notifications = ReviewLifecycleNotificationConfig {
+            enabled: true,
+            events: vec![ReviewLifecycleEvent::Started],
+            targets: vec![ReviewLifecycleTarget::MessagingConversation {
+                integration_id: "feishu-main".to_string(),
+                conversation_id: "oc_missing".to_string(),
+            }],
+            start_delay_secs: 0,
+            end_delay_secs: 0,
+        };
+        assert!(validate(&config)
+            .unwrap_err()
+            .message
+            .contains("conversationId 未授权"));
     }
 
     #[test]

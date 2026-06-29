@@ -75,6 +75,31 @@ fn no_backend_slice_references_a_sibling_slice() {
     );
 }
 
+#[test]
+fn no_backend_slice_references_composition_root_helpers() {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut violations = Vec::new();
+    let mut files_scanned = 0usize;
+    for slice in SLICES {
+        scan_dir_for_needle(
+            &src.join(slice),
+            "crate::composition::",
+            &mut violations,
+            &mut files_scanned,
+        );
+    }
+    assert!(
+        files_scanned > 0,
+        "composition-root scan found no .rs files — src layout changed?"
+    );
+    assert!(
+        violations.is_empty(),
+        "backend slice-boundary violations (a slice references composition-root helpers directly; \
+         install an opaque AppState seam instead):\n{}",
+        violations.join("\n")
+    );
+}
+
 /// Recursively scan `dir` (a slice owned by `owner`) for `crate::<sibling>::` value references.
 fn scan_dir(dir: &Path, owner: &str, violations: &mut Vec<String>, files_scanned: &mut usize) {
     let Ok(entries) = fs::read_dir(dir) else {
@@ -210,6 +235,37 @@ fn scan_dir(dir: &Path, owner: &str, violations: &mut Vec<String>, files_scanned
         }
         if let Some((start_line, statement)) = grouped_use {
             scan_grouped_use(&path, start_line, owner, &statement, violations);
+        }
+    }
+}
+
+fn scan_dir_for_needle(
+    dir: &Path,
+    needle: &str,
+    violations: &mut Vec<String>,
+    files_scanned: &mut usize,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_dir_for_needle(&path, needle, violations, files_scanned);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        *files_scanned += 1;
+        for (i, line) in text.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or(line);
+            if code.contains(needle) {
+                violations.push(format!("{}:{} references {needle}", path.display(), i + 1));
+            }
         }
     }
 }

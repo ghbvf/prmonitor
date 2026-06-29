@@ -7,9 +7,11 @@
 
 use std::collections::HashSet;
 
+use rusqlite::Transaction;
 use tauri::{Manager, Runtime};
 use url::Url;
 
+use crate::config::model::{AppConfig, NotificationSettings};
 use crate::config::service as config_service;
 use crate::error::{AppError, AppResult};
 use crate::model::{
@@ -34,6 +36,13 @@ struct NormalizedRequest {
     channel_ids: Vec<String>,
 }
 
+struct PreparedRow {
+    project_id: String,
+    summary: String,
+    payload: String,
+    dedupe_key: Option<String>,
+}
+
 /// Tauri command entry for desktop/frontend callers.
 #[tauri::command]
 pub async fn send_notification<R: Runtime>(
@@ -56,8 +65,72 @@ pub(crate) fn enqueue_notification_with_dedupe_prefix<R: Runtime>(
     request: SendNotificationRequest,
     dedupe_prefix: Option<&str>,
 ) -> AppResult<SendNotificationResponse> {
+    enqueue_notification_with_dedupe_prefix_after(app, request, dedupe_prefix, 0)
+}
+
+pub(crate) fn enqueue_notification_with_dedupe_prefix_after<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    request: SendNotificationRequest,
+    dedupe_prefix: Option<&str>,
+    delay_secs: u64,
+) -> AppResult<SendNotificationResponse> {
     let request = normalize_request(request)?;
     let channels = selected_channels(app, &request.channel_ids)?;
+    let prepared = prepare_delivery_rows(request, channels, dedupe_prefix)?;
+    let db = app.state::<crate::db::Database>();
+    let now = outbox::store::now_epoch();
+    let rows: Vec<outbox::store::EnqueueInput<'_>> = prepared
+        .iter()
+        .map(|row| outbox::store::EnqueueInput {
+            project_id: &row.project_id,
+            kind: ActionKind::Notification,
+            summary: &row.summary,
+            payload: &row.payload,
+            dedupe_key: row.dedupe_key.as_deref(),
+            next_attempt_at: Some(now.saturating_add(delay_secs)),
+        })
+        .collect();
+    let outbox_ids = db
+        .inner()
+        .with_tx(|tx| enqueue_prepared_in_tx(tx, &prepared, &rows, now))?;
+    for id in &outbox_ids {
+        outbox::service::announce_updated(app, db.inner(), *id);
+    }
+    app.state::<crate::state::AppState>().outbox.wake();
+
+    Ok(SendNotificationResponse { outbox_ids })
+}
+
+pub(crate) fn enqueue_notification_in_tx(
+    tx: &Transaction<'_>,
+    config: &AppConfig,
+    request: SendNotificationRequest,
+    dedupe_prefix: Option<&str>,
+    delay_secs: u64,
+    now: u64,
+) -> AppResult<Vec<i64>> {
+    let request = normalize_request(request)?;
+    let channels = selected_channels_from_settings(&config.notifications, &request.channel_ids)?;
+    let prepared = prepare_delivery_rows(request, channels, dedupe_prefix)?;
+    let rows: Vec<outbox::store::EnqueueInput<'_>> = prepared
+        .iter()
+        .map(|row| outbox::store::EnqueueInput {
+            project_id: &row.project_id,
+            kind: ActionKind::Notification,
+            summary: &row.summary,
+            payload: &row.payload,
+            dedupe_key: row.dedupe_key.as_deref(),
+            next_attempt_at: Some(now.saturating_add(delay_secs)),
+        })
+        .collect();
+    enqueue_prepared_in_tx(tx, &prepared, &rows, now)
+}
+
+fn prepare_delivery_rows(
+    request: NormalizedRequest,
+    channels: Vec<config_service::NotificationChannel>,
+    dedupe_prefix: Option<&str>,
+) -> AppResult<Vec<PreparedRow>> {
     if channels.is_empty() {
         return Err(AppError::new("没有启用的通知渠道可发送".to_string()));
     }
@@ -69,12 +142,6 @@ pub(crate) fn enqueue_notification_with_dedupe_prefix<R: Runtime>(
         RedactedNotificationBody::user_supplied(request.body),
         request.project_id,
     );
-
-    struct PreparedRow {
-        summary: String,
-        payload: String,
-        dedupe_key: Option<String>,
-    }
 
     let mut prepared = Vec::with_capacity(channels.len());
     for channel in &channels {
@@ -88,49 +155,36 @@ pub(crate) fn enqueue_notification_with_dedupe_prefix<R: Runtime>(
             .map_err(|e| AppError::new(format!("outbox 通知序列化失败：{e}")))?;
         let dedupe_key = dedupe_prefix.map(|prefix| format!("{prefix}:{}", channel.id));
         prepared.push(PreparedRow {
+            project_id: note.project_id.clone(),
             summary,
             payload,
             dedupe_key,
         });
     }
-    if dedupe_prefix.is_some() {
-        let db = app.state::<crate::db::Database>();
-        let mut existing_ids = Vec::with_capacity(prepared.len());
-        for row in &prepared {
-            let Some(dedupe_key) = row.dedupe_key.as_deref() else {
-                existing_ids.clear();
-                break;
-            };
-            let Some(id) = outbox::store::id_by_dedupe_key_any_status(
-                db.inner(),
-                &note.project_id,
-                dedupe_key,
-            )?
-            else {
-                existing_ids.clear();
-                break;
-            };
-            existing_ids.push(id);
-        }
-        if existing_ids.len() == prepared.len() {
-            return Ok(SendNotificationResponse {
-                outbox_ids: existing_ids,
-            });
-        }
-    }
-    let rows: Vec<outbox::service::EnqueueInput<'_>> = prepared
-        .iter()
-        .map(|row| outbox::service::EnqueueInput {
-            project_id: &note.project_id,
-            kind: ActionKind::Notification,
-            summary: &row.summary,
-            payload: &row.payload,
-            dedupe_key: row.dedupe_key.as_deref(),
-        })
-        .collect();
-    let outbox_ids = outbox::service::enqueue_many(app, &rows)?;
+    Ok(prepared)
+}
 
-    Ok(SendNotificationResponse { outbox_ids })
+fn enqueue_prepared_in_tx(
+    tx: &Transaction<'_>,
+    prepared: &[PreparedRow],
+    rows: &[outbox::store::EnqueueInput<'_>],
+    now: u64,
+) -> AppResult<Vec<i64>> {
+    let mut ids = Vec::with_capacity(prepared.len());
+    for (prepared_row, row) in prepared.iter().zip(rows.iter()) {
+        if let Some(dedupe_key) = prepared_row.dedupe_key.as_deref() {
+            if let Some(existing_id) = outbox::store::id_by_dedupe_key_any_status_in_tx(
+                tx,
+                &prepared_row.project_id,
+                dedupe_key,
+            )? {
+                ids.push(existing_id);
+                continue;
+            }
+        }
+        ids.push(outbox::store::enqueue_in_tx(tx, row, now)?);
+    }
+    Ok(ids)
 }
 
 fn normalize_request(request: SendNotificationRequest) -> AppResult<NormalizedRequest> {
@@ -225,12 +279,30 @@ fn selected_channels<R: Runtime>(
     app: &tauri::AppHandle<R>,
     channel_ids: &[String],
 ) -> AppResult<Vec<config_service::NotificationChannel>> {
+    let config = config_service::load(app)?;
+    selected_channels_from_settings(&config.notifications, channel_ids)
+}
+
+fn selected_channels_from_settings(
+    notifications: &NotificationSettings,
+    channel_ids: &[String],
+) -> AppResult<Vec<config_service::NotificationChannel>> {
     if channel_ids.is_empty() {
-        return config_service::enabled_notification_channels(app);
+        return Ok(notifications
+            .channels
+            .iter()
+            .filter(|channel| channel.enabled)
+            .cloned()
+            .collect());
     }
     let mut channels = Vec::with_capacity(channel_ids.len());
     for id in channel_ids {
-        let channel = config_service::notification_channel(app, id)?;
+        let channel = notifications
+            .channels
+            .iter()
+            .find(|channel| channel.id == *id)
+            .cloned()
+            .ok_or_else(|| AppError::new(format!("notificationChannelId 不存在: {id}")))?;
         if !channel.enabled {
             return Err(AppError::new(format!("notificationChannelId 已禁用: {id}")));
         }

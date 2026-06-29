@@ -7,7 +7,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import type { PrEvent, TrackedPrView } from "../types";
 import type { PollStatus } from "./types";
-import type { Project } from "../config/types";
+import type { Project, ReviewLifecycleNotificationConfig } from "../config/types";
+
+const REVIEW_LIFECYCLE_NOTIFICATION_CONFIG: ReviewLifecycleNotificationConfig = {
+  enabled: false,
+  events: ["started", "completed", "failed", "interrupted"],
+  targets: [{ kind: "notificationChannels", channelIds: [] }],
+  startDelaySecs: 0,
+  endDelaySecs: 0,
+};
 
 // Captured callback handed to `onPrsUpdated`, so a test can push a `PrEvent`
 // through the same path `subscribe()` wires up.
@@ -147,6 +155,7 @@ beforeEach(() => {
     messaging: { integrations: [] },
     remoteAccess: { entrypoints: [], tunnels: [] },
     rules: [],
+    reviewLifecycleNotifications: REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
   });
 });
 
@@ -294,6 +303,7 @@ describe("usePrStore toggle()", () => {
       messaging: { integrations: [] },
       remoteAccess: { entrypoints: [], tunnels: [] },
       rules: [],
+      reviewLifecycleNotifications: REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
     });
     const store = usePrStore();
     // Start the active project paused so toggle() takes the resume branch.

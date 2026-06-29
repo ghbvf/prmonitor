@@ -12,7 +12,7 @@
 use rusqlite::{OptionalExtension, Transaction};
 
 use crate::db::{map_err, Database};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::model::{ActionKind, ActionStatus, OutboxEntry};
 use crate::outbox::OutboxAction;
 
@@ -62,6 +62,11 @@ pub(crate) fn now_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn sqlite_epoch(field: &str, value: u64) -> AppResult<i64> {
+    i64::try_from(value)
+        .map_err(|_| AppError::new(format!("{field} 超出 SQLite i64 时间戳存储上限: {value}")))
 }
 
 /// [`ActionStatus`] → its pinned wire string (the form stored in the `status` column).
@@ -129,30 +134,7 @@ pub(crate) struct EnqueueInput<'a> {
     pub(crate) summary: &'a str,
     pub(crate) payload: &'a str,
     pub(crate) dedupe_key: Option<&'a str>,
-}
-
-/// Enqueue several produced actions atomically. Either every pending row is present and the caller
-/// receives every id, or the transaction rolls back and no partial multi-channel action remains.
-pub(crate) fn enqueue_many(
-    db: &Database,
-    rows: &[EnqueueInput<'_>],
-    now: u64,
-) -> AppResult<Vec<i64>> {
-    db.with_tx(|tx| {
-        let mut ids = Vec::with_capacity(rows.len());
-        for row in rows {
-            ids.push(enqueue_inner_tx(
-                tx,
-                row.project_id,
-                row.kind,
-                row.summary,
-                row.payload,
-                row.dedupe_key,
-                now,
-            )?);
-        }
-        Ok(ids)
-    })
+    pub(crate) next_attempt_at: Option<u64>,
 }
 
 /// Enqueue one produced action with a live-pending dedupe key (#1379). If the same project already
@@ -196,27 +178,28 @@ pub(crate) fn id_by_dedupe_key_any_status(
     })
 }
 
-/// Transaction-scoped variant used by composition-root producers that must create a related
-/// trace row in the SAME commit as the outbox action. It intentionally does not emit or wake the
-/// worker; callers do that after the outer transaction commits.
-pub(crate) fn enqueue_deduped_in_tx(
+pub(crate) fn id_by_dedupe_key_any_status_in_tx(
     tx: &Transaction<'_>,
     project_id: &str,
-    kind: ActionKind,
-    summary: &str,
-    payload: &str,
     dedupe_key: &str,
+) -> AppResult<Option<i64>> {
+    tx.query_row(
+        "SELECT id FROM action_outbox \
+         WHERE project_id = ?1 AND dedupe_key = ?2 \
+         ORDER BY id LIMIT 1",
+        rusqlite::params![project_id, dedupe_key],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(map_err)
+}
+
+pub(crate) fn enqueue_in_tx(
+    tx: &Transaction<'_>,
+    row: &EnqueueInput<'_>,
     now: u64,
 ) -> AppResult<i64> {
-    enqueue_inner_tx(
-        tx,
-        project_id,
-        kind,
-        summary,
-        payload,
-        Some(dedupe_key),
-        now,
-    )
+    enqueue_inner_tx(tx, row, now)
 }
 
 fn enqueue_inner(
@@ -228,31 +211,37 @@ fn enqueue_inner(
     dedupe_key: Option<&str>,
     now: u64,
 ) -> AppResult<i64> {
-    db.with_tx(|tx| enqueue_inner_tx(tx, project_id, kind, summary, payload, dedupe_key, now))
+    db.with_tx(|tx| {
+        let row = EnqueueInput {
+            project_id,
+            kind,
+            summary,
+            payload,
+            dedupe_key,
+            next_attempt_at: Some(now),
+        };
+        enqueue_inner_tx(tx, &row, now)
+    })
 }
 
-fn enqueue_inner_tx(
-    tx: &Transaction<'_>,
-    project_id: &str,
-    kind: ActionKind,
-    summary: &str,
-    payload: &str,
-    dedupe_key: Option<&str>,
-    now: u64,
-) -> AppResult<i64> {
+fn enqueue_inner_tx(tx: &Transaction<'_>, row: &EnqueueInput<'_>, now: u64) -> AppResult<i64> {
+    let next_attempt_at = row.next_attempt_at.unwrap_or(now);
+    let next_attempt_at = sqlite_epoch("next_attempt_at", next_attempt_at)?;
+    let now = sqlite_epoch("now", now)?;
     tx.execute(
         "INSERT OR IGNORE INTO action_outbox \
          (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, \
           last_error, created_at, updated_at, dedupe_key) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, ?6, ?6, ?7)",
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, ?7, ?7, ?8)",
         rusqlite::params![
-            project_id,
-            kind_as_wire(kind),
-            summary,
-            payload,
+            row.project_id,
+            kind_as_wire(row.kind),
+            row.summary,
+            row.payload,
             status_as_wire(ActionStatus::Pending),
-            now as i64,
-            dedupe_key,
+            next_attempt_at,
+            now,
+            row.dedupe_key,
         ],
     )
     .map_err(map_err)?;
@@ -263,7 +252,7 @@ fn enqueue_inner_tx(
             "SELECT id FROM action_outbox \
              WHERE project_id = ?1 AND dedupe_key = ?2 AND status = 'pending' \
              ORDER BY id LIMIT 1",
-            rusqlite::params![project_id, dedupe_key],
+            rusqlite::params![row.project_id, row.dedupe_key],
             |r| r.get::<_, i64>(0),
         )
         .map_err(map_err)?
@@ -296,6 +285,7 @@ fn enqueue_inner_tx(
 /// `outbox:updated` for the quarantined ids too, so an open panel sees the `dead` transition (the
 /// store has no `AppHandle` to emit itself — all persisted transitions surface through the service).
 pub fn claim_due(db: &Database, now: u64) -> AppResult<(Vec<OutboxAction>, Vec<i64>)> {
+    let now_sql = sqlite_epoch("now", now)?;
     // The 6th column `created_at` (AB#1182) lets the caller dead-letter a row that has sat
     // `pending` past its kind's staleness TTL instead of executing a stale action.
     let rows: Vec<(i64, String, String, String, i64, i64)> = db.with_conn(|conn| {
@@ -304,7 +294,7 @@ pub fn claim_due(db: &Database, now: u64) -> AppResult<(Vec<OutboxAction>, Vec<i
              WHERE status = 'pending' AND next_attempt_at <= ?1 ORDER BY id LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(rusqlite::params![now as i64, CLAIM_LIMIT], |r| {
+            .query_map(rusqlite::params![now_sql, CLAIM_LIMIT], |r| {
                 Ok((
                     r.get(0)?,
                     r.get(1)?,
@@ -360,6 +350,7 @@ pub fn claim_due(db: &Database, now: u64) -> AppResult<(Vec<OutboxAction>, Vec<i
 /// that also write `attempt_count`), stamping `updated_at`, and clearing any prior `last_error`. A
 /// no-op if the id doesn't exist.
 pub fn mark_done(db: &Database, id: i64, attempt_count: u32, now: u64) -> AppResult<()> {
+    let now = sqlite_epoch("now", now)?;
     db.with_conn(|conn| {
         conn.execute(
             "UPDATE action_outbox SET status = ?2, attempt_count = ?3, last_error = NULL, \
@@ -368,7 +359,7 @@ pub fn mark_done(db: &Database, id: i64, attempt_count: u32, now: u64) -> AppRes
                 id,
                 status_as_wire(ActionStatus::Done),
                 attempt_count as i64,
-                now as i64
+                now
             ],
         )
         .map(|_| ())
@@ -386,6 +377,8 @@ pub fn mark_retry(
     error: &str,
     now: u64,
 ) -> AppResult<()> {
+    let next_attempt_at = sqlite_epoch("next_attempt_at", next_attempt_at)?;
+    let now = sqlite_epoch("now", now)?;
     db.with_conn(|conn| {
         conn.execute(
             "UPDATE action_outbox SET attempt_count = ?2, next_attempt_at = ?3, last_error = ?4, \
@@ -393,9 +386,9 @@ pub fn mark_retry(
             rusqlite::params![
                 id,
                 attempt_count as i64,
-                next_attempt_at as i64,
+                next_attempt_at,
                 clamp_error(error),
-                now as i64
+                now
             ],
         )
         .map(|_| ())
@@ -411,6 +404,7 @@ pub fn mark_dead(
     error: &str,
     now: u64,
 ) -> AppResult<()> {
+    let now = sqlite_epoch("now", now)?;
     db.with_conn(|conn| {
         conn.execute(
             "UPDATE action_outbox SET status = ?2, attempt_count = ?3, last_error = ?4, \
@@ -420,10 +414,58 @@ pub fn mark_dead(
                 status_as_wire(ActionStatus::Dead),
                 attempt_count as i64,
                 clamp_error(error),
-                now as i64
+                now
             ],
         )
         .map(|_| ())
+    })
+}
+
+pub(crate) fn mark_pending_by_dedupe_fragment_dead(
+    db: &Database,
+    dedupe_fragment: &str,
+    error: &str,
+    now: u64,
+) -> AppResult<Vec<i64>> {
+    if dedupe_fragment.is_empty() {
+        return Ok(Vec::new());
+    }
+    let now = sqlite_epoch("now", now)?;
+    let error = clamp_error(error);
+    db.with_tx(|tx| {
+        let ids = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT id FROM action_outbox \
+                     WHERE status = ?1 AND dedupe_key IS NOT NULL AND instr(dedupe_key, ?2) > 0 \
+                     ORDER BY id",
+                )
+                .map_err(map_err)?;
+            let ids = stmt
+                .query_map(
+                    rusqlite::params![status_as_wire(ActionStatus::Pending), dedupe_fragment],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(map_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(map_err)?;
+            ids
+        };
+        for id in &ids {
+            tx.execute(
+                "UPDATE action_outbox SET status = ?2, last_error = ?3, updated_at = ?4 \
+                 WHERE id = ?1 AND status = ?5",
+                rusqlite::params![
+                    id,
+                    status_as_wire(ActionStatus::Dead),
+                    &error,
+                    now,
+                    status_as_wire(ActionStatus::Pending),
+                ],
+            )
+            .map_err(map_err)?;
+        }
+        Ok(ids)
     })
 }
 
@@ -457,6 +499,7 @@ pub enum RetryReset {
 /// guard makes the invariant hold at the command boundary regardless of caller. Distinguishes
 /// [`RetryReset::Unknown`] (no such id) from [`RetryReset::NotDead`] (wrong state).
 pub fn reset_for_retry(db: &Database, id: i64, now: u64) -> AppResult<RetryReset> {
+    let now = sqlite_epoch("now", now)?;
     db.with_conn(|conn| {
         let updated = conn.execute(
             "UPDATE action_outbox SET status = ?2, attempt_count = 0, next_attempt_at = ?3, \
@@ -464,7 +507,7 @@ pub fn reset_for_retry(db: &Database, id: i64, now: u64) -> AppResult<RetryReset
             rusqlite::params![
                 id,
                 status_as_wire(ActionStatus::Pending),
-                now as i64,
+                now,
                 status_as_wire(ActionStatus::Dead)
             ],
         )?;
@@ -691,6 +734,79 @@ mod tests {
         // Advancing now past the future row's schedule makes it claimable too.
         let (later, _q) = claim_due(&db, 10_000).expect("claim later");
         assert!(later.iter().any(|x| x.id == future));
+    }
+
+    #[test]
+    fn claim_due_respects_delayed_next_attempt_at() {
+        let db = Database::open_in_memory().expect("open db");
+        let now = 1_000;
+        let id = db
+            .with_tx(|tx| {
+                enqueue_in_tx(
+                    tx,
+                    &EnqueueInput {
+                        project_id: "p1",
+                        kind: ActionKind::Notification,
+                        summary: "delayed",
+                        payload: "{}",
+                        dedupe_key: Some("delayed-key"),
+                        next_attempt_at: Some(now + 60),
+                    },
+                    now,
+                )
+            })
+            .expect("enqueue delayed");
+
+        let (early, _) = claim_due(&db, now + 59).expect("early claim");
+        assert!(
+            early.iter().all(|action| action.id != id),
+            "delayed action must not be claimable before next_attempt_at"
+        );
+
+        let (due, _) = claim_due(&db, now + 60).expect("due claim");
+        assert!(
+            due.iter().any(|action| action.id == id),
+            "delayed action becomes claimable at next_attempt_at"
+        );
+    }
+
+    #[test]
+    fn enqueue_rejects_timestamps_outside_sqlite_i64_range() {
+        let db = Database::open_in_memory().expect("open db");
+        let err = db
+            .with_tx(|tx| {
+                enqueue_in_tx(
+                    tx,
+                    &EnqueueInput {
+                        project_id: "p1",
+                        kind: ActionKind::Notification,
+                        summary: "too far",
+                        payload: "{}",
+                        dedupe_key: Some("too-far"),
+                        next_attempt_at: Some(i64::MAX as u64 + 1),
+                    },
+                    100,
+                )
+            })
+            .expect_err("next_attempt_at beyond SQLite i64 must fail");
+        assert!(
+            err.message.contains("next_attempt_at"),
+            "error should name the invalid timestamp field: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn mark_retry_rejects_timestamps_outside_sqlite_i64_range() {
+        let db = Database::open_in_memory().expect("open db");
+        let id = enqueue_notif(&db, "p1", "a", 100);
+        let err = mark_retry(&db, id, 1, i64::MAX as u64 + 1, "later", 100)
+            .expect_err("retry schedule beyond SQLite i64 must fail");
+        assert!(
+            err.message.contains("next_attempt_at"),
+            "error should name the invalid timestamp field: {}",
+            err.message
+        );
     }
 
     // Status transitions (AB#1066): mark_done → done + clears error; mark_retry bumps attempt +

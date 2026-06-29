@@ -5,6 +5,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import type { AppConfig } from "./types";
+import { DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG } from "./defaults";
 
 vi.mock("./api", () => ({
   getConfig: vi.fn(),
@@ -53,6 +54,7 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
   outbox: { notificationTtlSecs: 7200 },
   notifications: { channels: [] },
   messaging: { integrations: [] },
+  reviewLifecycleNotifications: DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
   remoteAccess: { entrypoints: [], tunnels: [] },
   rules: [],
   ...over,

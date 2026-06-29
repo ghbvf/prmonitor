@@ -13,6 +13,7 @@ import {
   messagingCallbackEndpoints,
   normalizeStringList,
 } from "./remoteAccessOps";
+import { DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG } from "./defaults";
 import type { AppConfig, RemoteAccessRuntimeStatus } from "./types";
 
 function draft(): AppConfig {
@@ -32,6 +33,7 @@ function draft(): AppConfig {
     messaging: { integrations: [] },
     remoteAccess: { entrypoints: [], tunnels: [] },
     rules: [],
+    reviewLifecycleNotifications: DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
   };
 }
 

@@ -5,11 +5,17 @@
 // config/model.rs) so an added/onboarded project is immediately valid except for
 // the user-supplied repo/repoRoot.
 import type { SourceKind } from "../types";
-import type { NotificationChannel, OutboxConfig, Project } from "./types";
+import type {
+  NotificationChannel,
+  OutboxConfig,
+  Project,
+  ReviewLifecycleNotificationConfig,
+} from "./types";
 import {
   DEFAULT_MESSAGING_INTEGRATION as GENERATED_DEFAULT_MESSAGING_INTEGRATION,
   DEFAULT_MESSAGING_SETTINGS as GENERATED_DEFAULT_MESSAGING_SETTINGS,
   DEFAULT_NOTIFICATION_SETTINGS as GENERATED_DEFAULT_NOTIFICATION_SETTINGS,
+  DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG as GENERATED_DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
 } from "./types.generated";
 
 // The fixed id the wizard gives the first project; mirrors the backend migration's
@@ -28,6 +34,8 @@ export const DEFAULT_OUTBOX_CONFIG: OutboxConfig = {
 export const DEFAULT_NOTIFICATION_SETTINGS = GENERATED_DEFAULT_NOTIFICATION_SETTINGS;
 export const DEFAULT_MESSAGING_SETTINGS = GENERATED_DEFAULT_MESSAGING_SETTINGS;
 export const DEFAULT_MESSAGING_INTEGRATION = GENERATED_DEFAULT_MESSAGING_INTEGRATION;
+export const DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG: ReviewLifecycleNotificationConfig =
+  GENERATED_DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG;
 
 export const DEFAULT_NOTIFICATION_CHANNEL: NotificationChannel = {
   ...DEFAULT_NOTIFICATION_SETTINGS.channels[0],

@@ -5,6 +5,44 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Review lifecycle events emitted by the review slice and consumed by horizontal notification
+/// orchestration. Kept in `model.rs` so review/state/config do not import each other's internals.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewLifecycleEvent {
+    #[default]
+    Started,
+    Completed,
+    Failed,
+    Interrupted,
+}
+
+impl ReviewLifecycleEvent {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            ReviewLifecycleEvent::Started => "started",
+            ReviewLifecycleEvent::Completed => "completed",
+            ReviewLifecycleEvent::Failed => "failed",
+            ReviewLifecycleEvent::Interrupted => "interrupted",
+        }
+    }
+}
+
+/// Business payload emitted by review sessions and consumed by the composition-root lifecycle
+/// fan-out. It crosses review/state/composition boundaries, so it belongs in this shared model
+/// contract instead of the composition state holder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewLifecycleDispatch {
+    pub project_id: String,
+    pub pr_number: u64,
+    pub kind: String,
+    pub thread_id: String,
+    pub event: ReviewLifecycleEvent,
+    pub comment_url: Option<String>,
+}
+
 /// A PR discovered by a [`crate::pr::source::EventSourceProvider`] that may need review.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -72,6 +72,10 @@ function toggleAction(rule: RuleConfig, kind: RuleActionKind, event: Event) {
   rule.actions = toggleRuleAction(rule, kind, checked).actions;
   emit("edit");
 }
+
+function hasAction(rule: RuleConfig, kind: RuleActionKind): boolean {
+  return rule.actions.some((action) => action.kind === kind && action.enabled);
+}
 </script>
 
 <template>
@@ -146,7 +150,7 @@ function toggleAction(rule: RuleConfig, kind: RuleActionKind, event: Event) {
           <label v-for="kind in RULE_ACTION_KINDS" :key="kind" class="action">
             <input
               type="checkbox"
-              :checked="rule.actions.includes(kind)"
+              :checked="hasAction(rule, kind)"
               @change="toggleAction(rule, kind, $event)"
             />
             <span>{{ actionLabel(kind) }}</span>

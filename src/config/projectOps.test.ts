@@ -8,7 +8,7 @@ import {
   deleteProjectFromDraft,
   makeProject,
 } from "./projectOps";
-import { NEW_PROJECT_DEFAULTS } from "./defaults";
+import { DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG, NEW_PROJECT_DEFAULTS } from "./defaults";
 import type { AppConfig, Project } from "./types";
 
 function project(id: string, name = id): Project {
@@ -32,6 +32,7 @@ function draft(projects: Project[], activeProjectId: string): AppConfig {
     messaging: { integrations: [] },
     remoteAccess: { entrypoints: [], tunnels: [] },
     rules: [],
+    reviewLifecycleNotifications: DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
   };
 }
 

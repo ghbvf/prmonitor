@@ -158,42 +158,6 @@ pub fn enqueue<R: Runtime>(
     Ok(id)
 }
 
-pub(crate) struct EnqueueInput<'a> {
-    pub(crate) project_id: &'a str,
-    pub(crate) kind: ActionKind,
-    pub(crate) summary: &'a str,
-    pub(crate) payload: &'a str,
-    pub(crate) dedupe_key: Option<&'a str>,
-}
-
-/// Enqueue a logical batch atomically, then announce the committed rows and wake the worker once.
-pub(crate) fn enqueue_many<R: Runtime>(
-    app: &tauri::AppHandle<R>,
-    rows: &[EnqueueInput<'_>],
-) -> AppResult<Vec<i64>> {
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-    let db = app.state::<Database>();
-    let now = store::now_epoch();
-    let store_rows: Vec<store::EnqueueInput<'_>> = rows
-        .iter()
-        .map(|row| store::EnqueueInput {
-            project_id: row.project_id,
-            kind: row.kind,
-            summary: row.summary,
-            payload: row.payload,
-            dedupe_key: row.dedupe_key,
-        })
-        .collect();
-    let ids = store::enqueue_many(db.inner(), &store_rows, now)?;
-    for id in &ids {
-        announce_updated(app, db.inner(), *id);
-    }
-    app.state::<AppState>().outbox.wake();
-    Ok(ids)
-}
-
 /// Enqueue a produced action with a live-pending dedupe key (#1379). Used by default rule
 /// production for review/check actions so repeated poll/webhook processing of the same candidate
 /// reuses one pending outbox row.
@@ -216,6 +180,33 @@ pub fn enqueue_deduped<R: Runtime>(
         dedupe_key,
         now,
     )?;
+    announce_updated(app, db.inner(), id);
+    app.state::<AppState>().outbox.wake();
+    Ok(id)
+}
+
+pub(crate) fn enqueue_deduped_after<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    project_id: &str,
+    kind: ActionKind,
+    summary: &str,
+    payload: &str,
+    dedupe_key: &str,
+    delay_secs: u64,
+) -> AppResult<i64> {
+    let db = app.state::<Database>();
+    let now = store::now_epoch();
+    let id = db.inner().with_tx(|tx| {
+        let row = store::EnqueueInput {
+            project_id,
+            kind,
+            summary,
+            payload,
+            dedupe_key: Some(dedupe_key),
+            next_attempt_at: Some(now.saturating_add(delay_secs)),
+        };
+        store::enqueue_in_tx(tx, &row, now)
+    })?;
     announce_updated(app, db.inner(), id);
     app.state::<AppState>().outbox.wake();
     Ok(id)

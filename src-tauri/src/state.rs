@@ -8,7 +8,7 @@ use std::sync::Mutex as StdMutex;
 
 use crate::config::model::AppConfig;
 use crate::error::{AppError, AppResult};
-use crate::model::{SendNotificationRequest, SendNotificationResponse};
+use crate::model::{ReviewLifecycleDispatch, SendNotificationRequest, SendNotificationResponse};
 
 /// The composition-root-injected post-save reconcile closure. Given the just-saved config, it
 /// drives Remote Access listener and tunnel reconcile. OPAQUE on purpose (an `Arc<dyn Fn>`
@@ -22,6 +22,7 @@ pub type NotificationSendSink = Arc<
 >;
 pub type ReviewWorkflowTriggerSink =
     Arc<dyn Fn(tauri::AppHandle, String, u64, String) -> AppResult<()> + Send + Sync>;
+pub type ReviewLifecycleSink = Arc<dyn Fn(ReviewLifecycleDispatch) -> AppResult<()> + Send + Sync>;
 
 /// The post-`set_config`-save hook seam (AB#1225 F4): a composition-root-injected closure the
 /// `config` slice fires AFTER a successful save, so config never names a sibling horizontal
@@ -110,6 +111,27 @@ impl ReviewWorkflowTrigger {
 }
 
 #[derive(Default)]
+pub struct ReviewLifecycleNotifier {
+    sink: StdMutex<Option<ReviewLifecycleSink>>,
+}
+
+impl ReviewLifecycleNotifier {
+    pub fn set_sink(&self, sink: ReviewLifecycleSink) {
+        *self.sink.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+    }
+
+    pub fn fire(&self, event: ReviewLifecycleDispatch) -> AppResult<()> {
+        let sink = self.sink.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let Some(sink) = sink else {
+            return Err(AppError::new(
+                "review lifecycle notifier 未初始化".to_string(),
+            ));
+        };
+        sink(event)
+    }
+}
+
+#[derive(Default)]
 pub struct AppState {
     /// The per-project scheduled-pull loops (#35): a `project_id → Scheduler` set the
     /// composition root reconciles to the enabled projects. Long-lived; methods take
@@ -157,6 +179,9 @@ pub struct AppState {
     /// Review transport → workflow trigger seam (#1370). This opaque hook is installed in `lib.rs`;
     /// review transports do not name the workflow slice directly.
     pub review_workflow: ReviewWorkflowTrigger,
+    /// Review start/finalize → lifecycle notification seam. The review slice emits normalized
+    /// lifecycle facts; the composition root routes them to notification/messaging outbox rows.
+    pub review_lifecycle: ReviewLifecycleNotifier,
     /// The user-authored notification send funnel (#1460), injected by the composition root so
     /// transports can share one sender without reaching across slice boundaries.
     pub notification_sender: NotificationSender,

@@ -10,11 +10,13 @@
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useConfigStore } from "./useConfigStore";
 import type { AppConfig, Project } from "./types";
+import { cloneReviewLifecycleNotifications, cloneRule } from "./configClone";
 import {
   DEFAULT_MESSAGING_SETTINGS,
   DEFAULT_NOTIFICATION_SETTINGS,
   DEFAULT_OUTBOX_CONFIG,
   DEFAULT_PROJECT_ID,
+  DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
   NEW_PROJECT_DEFAULTS,
   applySourceKindDefaults,
 } from "./defaults";
@@ -169,14 +171,7 @@ function composeConfig(): AppConfig {
     webhookPublicUrl: "",
     localApiToken: "",
     outbox: { ...DEFAULT_OUTBOX_CONFIG },
-    rules: store.config?.rules
-      ? store.config.rules.map((r) => ({
-          ...r,
-          labelsAny: [...r.labelsAny],
-          labelsAll: [...r.labelsAll],
-          actions: [...r.actions],
-        }))
-      : [],
+    rules: store.config?.rules ? store.config.rules.map(cloneRule) : [],
     notifications: {
       ...DEFAULT_NOTIFICATION_SETTINGS,
       channels: DEFAULT_NOTIFICATION_SETTINGS.channels.map((c) => ({ ...c })),
@@ -189,6 +184,9 @@ function composeConfig(): AppConfig {
         }),
       ),
     },
+    reviewLifecycleNotifications: cloneReviewLifecycleNotifications(
+      store.config?.reviewLifecycleNotifications ?? DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
+    ),
     remoteAccess: {
       entrypoints: (store.config?.remoteAccess.entrypoints ?? []).map((entrypoint) => ({
         ...entrypoint,

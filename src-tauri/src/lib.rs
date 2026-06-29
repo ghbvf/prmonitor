@@ -19,6 +19,7 @@
 // `pr::source::EventSourceProvider`, `review::engine::ReviewEngine`) count as reachable API
 // in this skeleton rather than tripping `dead_code` before their first use.
 pub mod cli;
+mod composition;
 pub mod config;
 pub mod db;
 pub mod dispatch;
@@ -26,6 +27,7 @@ pub mod error;
 pub mod events;
 pub mod inbox;
 pub mod messaging;
+pub mod messaging_outbox;
 pub mod model;
 pub mod notification;
 pub mod outbox;
@@ -71,7 +73,6 @@ fn parse_notification_action_payload(payload: &str) -> error::AppResult<Notifica
 }
 
 struct MessagingActionsImpl;
-const MESSAGING_OUTBOX_SCOPE: &str = "__messaging__";
 
 impl<R: tauri::Runtime> messaging::service::MessagingActions<R> for MessagingActionsImpl {
     fn enqueue_reply(
@@ -85,7 +86,7 @@ impl<R: tauri::Runtime> messaging::service::MessagingActions<R> for MessagingAct
     ) -> error::AppResult<i64> {
         outbox::service::enqueue_deduped(
             app,
-            MESSAGING_OUTBOX_SCOPE,
+            messaging_outbox::MESSAGING_OUTBOX_SCOPE,
             kind,
             summary,
             payload_json,
@@ -103,11 +104,59 @@ impl<R: tauri::Runtime> messaging::service::MessagingActions<R> for MessagingAct
     ) -> error::AppResult<i64> {
         outbox::service::enqueue_deduped(
             app,
-            MESSAGING_OUTBOX_SCOPE,
+            messaging_outbox::MESSAGING_OUTBOX_SCOPE,
             kind,
             summary,
             payload_json,
             dedupe_key,
+        )
+    }
+
+    fn enqueue_send_after(
+        &self,
+        app: &tauri::AppHandle<R>,
+        kind: model::ActionKind,
+        summary: &str,
+        payload_json: &str,
+        dedupe_key: &str,
+        delay_secs: u64,
+    ) -> error::AppResult<i64> {
+        outbox::service::enqueue_deduped_after(
+            app,
+            messaging_outbox::MESSAGING_OUTBOX_SCOPE,
+            kind,
+            summary,
+            payload_json,
+            dedupe_key,
+            delay_secs,
+        )
+    }
+
+    fn enqueue_send_once_after(
+        &self,
+        app: &tauri::AppHandle<R>,
+        kind: model::ActionKind,
+        summary: &str,
+        payload_json: &str,
+        dedupe_key: &str,
+        delay_secs: u64,
+    ) -> error::AppResult<i64> {
+        let db = app.state::<db::Database>();
+        if let Some(existing_id) = outbox::store::id_by_dedupe_key_any_status(
+            db.inner(),
+            messaging_outbox::MESSAGING_OUTBOX_SCOPE,
+            dedupe_key,
+        )? {
+            return Ok(existing_id);
+        }
+        outbox::service::enqueue_deduped_after(
+            app,
+            messaging_outbox::MESSAGING_OUTBOX_SCOPE,
+            kind,
+            summary,
+            payload_json,
+            dedupe_key,
+            delay_secs,
         )
     }
 
@@ -117,7 +166,10 @@ impl<R: tauri::Runtime> messaging::service::MessagingActions<R> for MessagingAct
         integration_id: Option<&str>,
     ) -> error::AppResult<Vec<model::OutboxEntry>> {
         let db = app.state::<db::Database>();
-        let entries = outbox::store::list_by_project(db.inner(), Some(MESSAGING_OUTBOX_SCOPE))?;
+        let entries = outbox::store::list_by_project(
+            db.inner(),
+            Some(messaging_outbox::MESSAGING_OUTBOX_SCOPE),
+        )?;
         let mut filtered = Vec::new();
         for entry in entries.into_iter().filter(|entry| {
             matches!(
@@ -282,6 +334,7 @@ fn build_app() {
                     )
                 }
             }));
+            composition::install_review_lifecycle_sink(&state, app.handle().clone());
             let workflow_app = app.handle().clone();
             state.workflow.set_actions(workflow::manager::WorkflowActions {
                 start_review: Arc::new({
@@ -1199,19 +1252,54 @@ fn process_rule_event<R: Runtime>(
             let mut errors = plan.errors.clone();
             let mut blocking = plan.errors.clone();
             for action in &plan.actions {
-                match outbox::store::enqueue_deduped_in_tx(
-                    tx,
-                    &plan.project_id,
-                    action.kind,
-                    &action.summary,
-                    &action.payload,
-                    &action.dedupe_key,
-                    now,
-                ) {
-                    Ok(id) => action_ids.push(id),
-                    Err(e) => {
-                        errors.push(e.message.clone());
-                        blocking.push(e.message);
+                match &action.dispatch {
+                    rule::service::RuleActionDispatch::Outbox { payload } => {
+                        let row = outbox::store::EnqueueInput {
+                            project_id: &plan.project_id,
+                            kind: action.kind,
+                            summary: &action.summary,
+                            payload,
+                            dedupe_key: Some(&action.dedupe_key),
+                            next_attempt_at: Some(now.saturating_add(action.delay_secs)),
+                        };
+                        match outbox::store::enqueue_in_tx(tx, &row, now) {
+                            Ok(id) => action_ids.push(id),
+                            Err(e) => {
+                                errors.push(e.message.clone());
+                                blocking.push(e.message);
+                            }
+                        }
+                    }
+                    rule::service::RuleActionDispatch::Notification { request } => {
+                        match notification::enqueue_notification_in_tx(
+                            tx,
+                            &cfg,
+                            request.clone(),
+                            Some(&action.dedupe_key),
+                            action.delay_secs,
+                            now,
+                        ) {
+                            Ok(ids) => action_ids.extend(ids),
+                            Err(e) => {
+                                errors.push(e.message.clone());
+                                blocking.push(e.message);
+                            }
+                        }
+                    }
+                    rule::service::RuleActionDispatch::Messaging { request } => {
+                        match messaging_outbox::enqueue_send_once_after_in_tx(
+                            tx,
+                            &cfg,
+                            request.clone(),
+                            action.delay_secs,
+                            now,
+                        ) {
+                            Ok(id) => action_ids.push(id),
+                            Err(e) => {
+                                errors.push(e.message.clone());
+                                blocking.push(e.message);
+                            }
+                        }
                     }
                 }
             }
@@ -1316,9 +1404,18 @@ mod tests {
                 project_id: "p1".to_string(),
                 labels_any: vec!["ready".to_string()],
                 actions: vec![
-                    config::model::RuleActionKind::Review,
-                    config::model::RuleActionKind::Check,
-                    config::model::RuleActionKind::Notify,
+                    config::model::RuleActionConfig::new(
+                        "review",
+                        config::model::RuleActionKind::Review,
+                    ),
+                    config::model::RuleActionConfig::new(
+                        "check",
+                        config::model::RuleActionKind::Check,
+                    ),
+                    config::model::RuleActionConfig::new(
+                        "notify",
+                        config::model::RuleActionKind::Notify,
+                    ),
                 ],
                 ..config::model::RuleConfig::default()
             }],
@@ -1403,7 +1500,10 @@ mod tests {
                 event_type: Some(model::EventType::PullRequest),
                 project_id: "p1".to_string(),
                 labels_any: vec!["ready".to_string()],
-                actions: vec![config::model::RuleActionKind::Review],
+                actions: vec![config::model::RuleActionConfig::new(
+                    "review",
+                    config::model::RuleActionKind::Review,
+                )],
                 ..config::model::RuleConfig::default()
             }],
             ..config::model::AppConfig::default()

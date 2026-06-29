@@ -1,9 +1,11 @@
-use crate::config::service::{RuleActionKind, RuleConfig};
+use crate::config::service::{
+    RuleActionConfig, RuleActionDedupePolicy, RuleActionKind, RuleActionTarget, RuleConfig,
+};
 use crate::dispatch;
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    ActionKind, Candidate, Event, Notification, NotificationLevel, RedactedNotificationBody,
-    ReviewActionPayload,
+    ActionKind, Candidate, Event, NotificationLevel, ReviewActionPayload, SendMessagingRequest,
+    SendNotificationRequest,
 };
 
 pub fn matches(rule: &RuleConfig, event: &Event) -> bool {
@@ -61,8 +63,18 @@ pub struct RuleMatchPlan {
 pub struct RuleActionPlan {
     pub kind: ActionKind,
     pub summary: String,
-    pub payload: String,
+    pub dispatch: RuleActionDispatch,
     pub dedupe_key: String,
+    pub delay_secs: u64,
+    pub action_id: String,
+    pub level: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum RuleActionDispatch {
+    Outbox { payload: String },
+    Notification { request: SendNotificationRequest },
+    Messaging { request: SendMessagingRequest },
 }
 
 pub fn plan_event(
@@ -74,11 +86,16 @@ pub fn plan_event(
     for rule in rules.iter().filter(|rule| matches(rule, event)) {
         let mut actions = Vec::new();
         let mut errors = Vec::new();
-        for action in &rule.actions {
-            match plan_action(rule, event, candidate, *action) {
-                Ok(plan) => actions.push(plan),
-                Err(e) => errors.push(e.message),
+        match ordered_enabled_actions(rule) {
+            Ok(ordered) => {
+                for action in ordered {
+                    match plan_action(rule, event, candidate, action) {
+                        Ok(plan) => actions.push(plan),
+                        Err(e) => errors.push(e.message),
+                    }
+                }
             }
+            Err(e) => errors.push(e.message),
         }
         plans.push(RuleMatchPlan {
             rule_id: rule.id.clone(),
@@ -91,22 +108,82 @@ pub fn plan_event(
     plans
 }
 
+fn ordered_enabled_actions(rule: &RuleConfig) -> AppResult<Vec<&RuleActionConfig>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Mark {
+        New,
+        Visiting,
+        Done,
+    }
+
+    let by_id: std::collections::HashMap<&str, &RuleActionConfig> = rule
+        .actions
+        .iter()
+        .map(|action| (action.id.as_str(), action))
+        .collect();
+    let mut marks: std::collections::HashMap<&str, Mark> = rule
+        .actions
+        .iter()
+        .map(|action| (action.id.as_str(), Mark::New))
+        .collect();
+    let mut ordered = Vec::new();
+
+    fn visit<'a>(
+        id: &'a str,
+        by_id: &std::collections::HashMap<&'a str, &'a RuleActionConfig>,
+        marks: &mut std::collections::HashMap<&'a str, Mark>,
+        ordered: &mut Vec<&'a RuleActionConfig>,
+    ) -> AppResult<()> {
+        match marks.get(id).copied().unwrap_or(Mark::New) {
+            Mark::Done => return Ok(()),
+            Mark::Visiting => {
+                return Err(AppError::new(format!("actions DAG 存在环路: {id}")));
+            }
+            Mark::New => {}
+        }
+        let Some(action) = by_id.get(id).copied() else {
+            return Err(AppError::new(format!("actions DAG 依赖未知动作: {id}")));
+        };
+        marks.insert(id, Mark::Visiting);
+        for dep in &action.depends_on {
+            visit(dep, by_id, marks, ordered)?;
+        }
+        marks.insert(id, Mark::Done);
+        if action.enabled {
+            ordered.push(action);
+        }
+        Ok(())
+    }
+
+    for action in &rule.actions {
+        if action.enabled {
+            visit(action.id.as_str(), &by_id, &mut marks, &mut ordered)?;
+        }
+    }
+    Ok(ordered)
+}
+
 fn plan_action(
     rule: &RuleConfig,
     event: &Event,
     candidate: Option<&Candidate>,
-    action: RuleActionKind,
+    action: &RuleActionConfig,
 ) -> AppResult<RuleActionPlan> {
-    match action {
-        RuleActionKind::Review => plan_review_like(rule, candidate, RuleActionKind::Review),
-        RuleActionKind::Check => plan_review_like(rule, candidate, RuleActionKind::Check),
-        RuleActionKind::Notify => plan_notification(rule, event),
-    }
+    let mut plan = match action.kind {
+        RuleActionKind::Review => plan_review_like(rule, candidate, action, RuleActionKind::Review),
+        RuleActionKind::Check => plan_review_like(rule, candidate, action, RuleActionKind::Check),
+        RuleActionKind::Notify => plan_notification(rule, event, action),
+    }?;
+    plan.delay_secs = action.delay_secs;
+    plan.action_id = action.id.clone();
+    plan.level = action.level.clone();
+    Ok(plan)
 }
 
 fn plan_review_like(
     rule: &RuleConfig,
     candidate: Option<&Candidate>,
+    action_config: &RuleActionConfig,
     action: RuleActionKind,
 ) -> AppResult<RuleActionPlan> {
     let (candidate_kind, action_kind) = review_like_kinds(action);
@@ -123,15 +200,26 @@ fn plan_review_like(
     })
     .map_err(|e| AppError::new(format!("rule action 序列化失败：{e}")))?;
     let summary = format!(
-        "Rule {} -> PR #{} {candidate_kind}",
-        rule.name, candidate.number
+        "Rule {} action {} -> PR #{} {candidate_kind}",
+        rule.name,
+        action_node_id(action_config),
+        candidate.number
     );
-    let dedupe_key = dispatch::review_action_dedupe_key(&candidate);
+    let base_dedupe_key = dispatch::review_action_dedupe_key(&candidate);
+    let dedupe_key = match action_config.dedupe_policy {
+        RuleActionDedupePolicy::Event => base_dedupe_key,
+        RuleActionDedupePolicy::Action => {
+            format!("rule:{}:{}:{base_dedupe_key}", rule.id, action_config.id)
+        }
+    };
     Ok(RuleActionPlan {
         kind: action_kind,
         summary,
-        payload,
+        dispatch: RuleActionDispatch::Outbox { payload },
         dedupe_key,
+        delay_secs: action_config.delay_secs,
+        action_id: action_config.id.clone(),
+        level: action_config.level.clone(),
     })
 }
 
@@ -143,28 +231,100 @@ fn review_like_kinds(action: RuleActionKind) -> (&'static str, ActionKind) {
     }
 }
 
-fn plan_notification(rule: &RuleConfig, event: &Event) -> AppResult<RuleActionPlan> {
+fn plan_notification(
+    rule: &RuleConfig,
+    event: &Event,
+    action: &RuleActionConfig,
+) -> AppResult<RuleActionPlan> {
+    let node_id = action_node_id(action);
     let title = if let Some(number) = event.number {
-        format!("Rule {} matched PR #{}", rule.name, number)
+        format!("Rule {} action {node_id} matched PR #{}", rule.name, number)
     } else {
-        format!("Rule {} matched event", rule.name)
+        format!("Rule {} action {node_id} matched event", rule.name)
     };
-    let note = Notification::new(
-        NotificationLevel::Info,
-        title.clone(),
-        event.url.clone(),
-        RedactedNotificationBody::fixed("Rule matched an inbound event"),
-        event.project_id.clone(),
-    );
-    let payload = serde_json::to_string(&note)
-        .map_err(|e| AppError::new(format!("rule notification 序列化失败：{e}")))?;
-    let dedupe_key = format!("rule:{}:{}:notify", rule.id, event.dedupe_key);
+    let body = format!("Rule matched an inbound event\nnodeId: {node_id}");
+    let dedupe_key = rule_action_dedupe_key(rule, action, event, "notify");
+    let (kind, dispatch) = match &action.target {
+        RuleActionTarget::None => (
+            ActionKind::Notification,
+            RuleActionDispatch::Notification {
+                request: SendNotificationRequest {
+                    level: Some(NotificationLevel::Info),
+                    title: title.clone(),
+                    body: Some(body),
+                    url: Some(event.url.clone()).filter(|url| !url.is_empty()),
+                    project_id: Some(event.project_id.clone()),
+                    channel_ids: Vec::new(),
+                },
+            },
+        ),
+        RuleActionTarget::NotificationChannels { channel_ids } => (
+            ActionKind::Notification,
+            RuleActionDispatch::Notification {
+                request: SendNotificationRequest {
+                    level: Some(NotificationLevel::Info),
+                    title: title.clone(),
+                    body: Some(body),
+                    url: Some(event.url.clone()).filter(|url| !url.is_empty()),
+                    project_id: Some(event.project_id.clone()),
+                    channel_ids: channel_ids.clone(),
+                },
+            },
+        ),
+        RuleActionTarget::MessagingConversation {
+            integration_id,
+            conversation_id,
+        } => {
+            let text = if event.url.is_empty() {
+                format!("{title}\n{body}")
+            } else {
+                format!("{title}\n{body}\n{}", event.url)
+            };
+            (
+                ActionKind::MessagingSend,
+                RuleActionDispatch::Messaging {
+                    request: SendMessagingRequest {
+                        integration_id: integration_id.clone(),
+                        conversation_id: conversation_id.clone(),
+                        text,
+                        request_id: dedupe_key.clone(),
+                    },
+                },
+            )
+        }
+    };
     Ok(RuleActionPlan {
-        kind: ActionKind::Notification,
+        kind,
         summary: title,
-        payload,
+        dispatch,
         dedupe_key,
+        delay_secs: action.delay_secs,
+        action_id: action.id.clone(),
+        level: action.level.clone(),
     })
+}
+
+fn rule_action_dedupe_key(
+    rule: &RuleConfig,
+    action: &RuleActionConfig,
+    event: &Event,
+    suffix: &str,
+) -> String {
+    match action.dedupe_policy {
+        RuleActionDedupePolicy::Event => {
+            format!("rule:{}:{}:{suffix}", rule.id, event.dedupe_key)
+        }
+        RuleActionDedupePolicy::Action => {
+            format!(
+                "rule:{}:{}:{}:{suffix}",
+                rule.id, action.id, event.dedupe_key
+            )
+        }
+    }
+}
+
+fn action_node_id(action: &RuleActionConfig) -> String {
+    format!("{}:{}", action.level.trim(), action.id.trim())
 }
 
 #[cfg(test)]
@@ -201,7 +361,9 @@ mod tests {
             labels_all: vec!["urgent".to_string()],
             title_contains: "login".to_string(),
             body_contains: "BODY".to_string(),
-            actions: vec![RuleActionKind::Review],
+            actions: vec![RuleActionConfig::new("review", RuleActionKind::Review)],
+            allow_action_kinds: Vec::new(),
+            deny_action_kinds: Vec::new(),
         }
     }
 
@@ -223,7 +385,7 @@ mod tests {
             id: "r".to_string(),
             name: "all".to_string(),
             enabled: true,
-            actions: vec![RuleActionKind::Notify],
+            actions: vec![RuleActionConfig::new("notify", RuleActionKind::Notify)],
             ..RuleConfig::default()
         };
         assert!(matches(&r, &event()));
@@ -245,9 +407,9 @@ mod tests {
     fn plan_event_builds_review_check_and_notify_actions() {
         let mut r = rule();
         r.actions = vec![
-            RuleActionKind::Review,
-            RuleActionKind::Check,
-            RuleActionKind::Notify,
+            RuleActionConfig::new("review", RuleActionKind::Review),
+            RuleActionConfig::new("check", RuleActionKind::Check),
+            RuleActionConfig::new("notify", RuleActionKind::Notify),
         ];
         let plans = plan_event(&[r], &event(), Some(&candidate()));
 
@@ -274,10 +436,10 @@ mod tests {
     fn review_like_actions_share_dispatch_dedupe_across_rules() {
         let mut first = rule();
         first.id = "r1".to_string();
-        first.actions = vec![RuleActionKind::Review];
+        first.actions = vec![RuleActionConfig::new("review", RuleActionKind::Review)];
         let mut second = rule();
         second.id = "r2".to_string();
-        second.actions = vec![RuleActionKind::Review];
+        second.actions = vec![RuleActionConfig::new("review", RuleActionKind::Review)];
 
         let plans = plan_event(&[first, second], &event(), Some(&candidate()));
 
@@ -294,5 +456,90 @@ mod tests {
         assert!(plans[0].actions.is_empty());
         assert_eq!(plans[0].errors.len(), 1);
         assert!(plans[0].errors[0].contains("需要 PR candidate"));
+    }
+
+    #[test]
+    fn plan_event_orders_actions_by_dependencies() {
+        let mut r = rule();
+        let mut notify = RuleActionConfig::new("notify", RuleActionKind::Notify);
+        notify.depends_on = vec!["review".to_string()];
+        r.actions = vec![
+            notify,
+            RuleActionConfig::new("review", RuleActionKind::Review),
+        ];
+
+        let plans = plan_event(&[r], &event(), Some(&candidate()));
+
+        assert_eq!(
+            plans[0]
+                .actions
+                .iter()
+                .map(|action| action.action_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["review", "notify"]
+        );
+    }
+
+    #[test]
+    fn plan_event_consumes_action_dedupe_policy() {
+        let mut event_policy = rule();
+        event_policy.id = "event-rule".to_string();
+        event_policy.actions = vec![RuleActionConfig::new("review", RuleActionKind::Review)];
+        let mut action_policy = rule();
+        action_policy.id = "action-rule".to_string();
+        let mut action = RuleActionConfig::new("review", RuleActionKind::Review);
+        action.dedupe_policy = RuleActionDedupePolicy::Action;
+        action_policy.actions = vec![action];
+
+        let plans = plan_event(&[event_policy, action_policy], &event(), Some(&candidate()));
+
+        assert_eq!(plans[0].actions[0].dedupe_key, "7@abc123:review");
+        assert_eq!(
+            plans[1].actions[0].dedupe_key,
+            "rule:action-rule:review:7@abc123:review"
+        );
+    }
+
+    #[test]
+    fn plan_notification_targets_channels_and_messaging_conversation() {
+        let mut notify_rule = rule();
+        let mut channel_action = RuleActionConfig::new("notify", RuleActionKind::Notify);
+        channel_action.target = RuleActionTarget::NotificationChannels {
+            channel_ids: vec!["desktop".to_string()],
+        };
+        let mut messaging_action = RuleActionConfig::new("message", RuleActionKind::Notify);
+        messaging_action.target = RuleActionTarget::MessagingConversation {
+            integration_id: "feishu-main".to_string(),
+            conversation_id: "oc_123".to_string(),
+        };
+        notify_rule.actions = vec![channel_action, messaging_action];
+
+        let plans = plan_event(&[notify_rule], &event(), Some(&candidate()));
+
+        assert_eq!(plans[0].actions.len(), 2);
+        match &plans[0].actions[0].dispatch {
+            RuleActionDispatch::Notification { request } => {
+                assert_eq!(request.channel_ids, vec!["desktop"]);
+                assert!(request.title.contains("action:notify"));
+                assert!(request
+                    .body
+                    .as_deref()
+                    .is_some_and(|body| body.contains("nodeId: action:notify")));
+            }
+            RuleActionDispatch::Outbox { .. } | RuleActionDispatch::Messaging { .. } => {
+                panic!("expected notification dispatch")
+            }
+        }
+        match &plans[0].actions[1].dispatch {
+            RuleActionDispatch::Messaging { request } => {
+                assert_eq!(request.integration_id, "feishu-main");
+                assert_eq!(request.conversation_id, "oc_123");
+                assert!(request.text.contains("action:message"));
+                assert_eq!(request.request_id, "rule:r1:k:notify");
+            }
+            RuleActionDispatch::Outbox { .. } | RuleActionDispatch::Notification { .. } => {
+                panic!("expected messaging dispatch")
+            }
+        }
     }
 }

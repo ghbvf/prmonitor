@@ -41,6 +41,26 @@ pub trait MessagingActions<R: Runtime>: Send + Sync + 'static {
         dedupe_key: &str,
     ) -> AppResult<i64>;
 
+    fn enqueue_send_after(
+        &self,
+        app: &tauri::AppHandle<R>,
+        kind: ActionKind,
+        summary: &str,
+        payload_json: &str,
+        dedupe_key: &str,
+        delay_secs: u64,
+    ) -> AppResult<i64>;
+
+    fn enqueue_send_once_after(
+        &self,
+        app: &tauri::AppHandle<R>,
+        kind: ActionKind,
+        summary: &str,
+        payload_json: &str,
+        dedupe_key: &str,
+        delay_secs: u64,
+    ) -> AppResult<i64>;
+
     fn list_sends(
         &self,
         app: &tauri::AppHandle<R>,
@@ -215,7 +235,68 @@ pub fn enqueue_send<R: Runtime>(
     actions: &dyn MessagingActions<R>,
     request: SendMessagingRequest,
 ) -> AppResult<SendMessagingResponse> {
+    enqueue_send_after(app, actions, request, 0)
+}
+
+pub(crate) fn enqueue_send_after<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    actions: &dyn MessagingActions<R>,
+    request: SendMessagingRequest,
+    delay_secs: u64,
+) -> AppResult<SendMessagingResponse> {
+    enqueue_send_scoped_after(app, actions, request, delay_secs, false)
+}
+
+pub(crate) fn enqueue_send_once_after<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    actions: &dyn MessagingActions<R>,
+    request: SendMessagingRequest,
+    delay_secs: u64,
+) -> AppResult<SendMessagingResponse> {
+    enqueue_send_scoped_after(app, actions, request, delay_secs, true)
+}
+
+fn enqueue_send_scoped_after<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    actions: &dyn MessagingActions<R>,
+    request: SendMessagingRequest,
+    delay_secs: u64,
+    all_status_dedupe: bool,
+) -> AppResult<SendMessagingResponse> {
     let integration = config_service::messaging_integration(app, &request.integration_id)?;
+    let prepared = prepare_send(&integration, request)?;
+    let outbox_id = if all_status_dedupe {
+        actions.enqueue_send_once_after(
+            app,
+            ActionKind::MessagingSend,
+            &prepared.summary,
+            &prepared.payload_json,
+            &prepared.dedupe_key,
+            delay_secs,
+        )?
+    } else {
+        actions.enqueue_send_after(
+            app,
+            ActionKind::MessagingSend,
+            &prepared.summary,
+            &prepared.payload_json,
+            &prepared.dedupe_key,
+            delay_secs,
+        )?
+    };
+    Ok(SendMessagingResponse { outbox_id })
+}
+
+pub(crate) struct PreparedSend {
+    pub(crate) summary: String,
+    pub(crate) payload_json: String,
+    pub(crate) dedupe_key: String,
+}
+
+pub(crate) fn prepare_send(
+    integration: &MessagingIntegration,
+    request: SendMessagingRequest,
+) -> AppResult<PreparedSend> {
     if !integration.enabled {
         return Err(AppError::new(format!(
             "消息集成「{}」已禁用，不能发送",
@@ -223,7 +304,7 @@ pub fn enqueue_send<R: Runtime>(
         )));
     }
     let conversation_id = request.conversation_id.trim();
-    if !conversation_allowed(&integration, conversation_id) {
+    if !conversation_allowed(integration, conversation_id) {
         return Err(AppError::new(format!(
             "conversationId 未授权使用消息集成「{}」",
             integration.name
@@ -251,14 +332,11 @@ pub fn enqueue_send<R: Runtime>(
         payload.conversation_id
     );
     let dedupe_key = active_send_dedupe_key(&integration.id, request_id);
-    let outbox_id = actions.enqueue_send(
-        app,
-        ActionKind::MessagingSend,
-        &summary,
-        &payload_json,
-        &dedupe_key,
-    )?;
-    Ok(SendMessagingResponse { outbox_id })
+    Ok(PreparedSend {
+        summary,
+        payload_json,
+        dedupe_key,
+    })
 }
 
 fn active_send_dedupe_key(integration_id: &str, request_id: &str) -> String {
@@ -692,6 +770,30 @@ mod tests {
             Ok(43)
         }
 
+        fn enqueue_send_after(
+            &self,
+            app: &tauri::AppHandle<R>,
+            kind: ActionKind,
+            summary: &str,
+            payload_json: &str,
+            dedupe_key: &str,
+            _delay_secs: u64,
+        ) -> AppResult<i64> {
+            self.enqueue_send(app, kind, summary, payload_json, dedupe_key)
+        }
+
+        fn enqueue_send_once_after(
+            &self,
+            app: &tauri::AppHandle<R>,
+            kind: ActionKind,
+            summary: &str,
+            payload_json: &str,
+            dedupe_key: &str,
+            delay_secs: u64,
+        ) -> AppResult<i64> {
+            self.enqueue_send_after(app, kind, summary, payload_json, dedupe_key, delay_secs)
+        }
+
         fn list_sends(
             &self,
             _app: &tauri::AppHandle<R>,
@@ -782,6 +884,30 @@ mod tests {
         ) -> AppResult<i64> {
             *self.dedupe_key.lock().expect("lock") = Some(dedupe_key.to_string());
             Ok(43)
+        }
+
+        fn enqueue_send_after(
+            &self,
+            app: &tauri::AppHandle<R>,
+            kind: ActionKind,
+            summary: &str,
+            payload_json: &str,
+            dedupe_key: &str,
+            _delay_secs: u64,
+        ) -> AppResult<i64> {
+            self.enqueue_send(app, kind, summary, payload_json, dedupe_key)
+        }
+
+        fn enqueue_send_once_after(
+            &self,
+            app: &tauri::AppHandle<R>,
+            kind: ActionKind,
+            summary: &str,
+            payload_json: &str,
+            dedupe_key: &str,
+            delay_secs: u64,
+        ) -> AppResult<i64> {
+            self.enqueue_send_after(app, kind, summary, payload_json, dedupe_key, delay_secs)
         }
 
         fn list_sends(

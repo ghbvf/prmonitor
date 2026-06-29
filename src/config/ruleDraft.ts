@@ -1,4 +1,4 @@
-import type { AppConfig, RuleActionKind, RuleConfig } from "./types";
+import type { AppConfig, RuleActionConfig, RuleActionKind, RuleConfig } from "./types";
 
 export function parseRuleCsv(value: string): string[] {
   return value
@@ -12,6 +12,19 @@ export function nextRuleId(rules: Pick<RuleConfig, "id">[]): string {
   let n = 1;
   while (used.has(`rule-${n}`)) n += 1;
   return `rule-${n}`;
+}
+
+export function createRuleAction(kind: RuleActionKind): RuleActionConfig {
+  return {
+    id: kind,
+    kind,
+    enabled: true,
+    target: { kind: "none" },
+    dedupePolicy: "event",
+    delaySecs: 0,
+    dependsOn: [],
+    level: "action",
+  };
 }
 
 export function createDefaultRule(draft: AppConfig): RuleConfig {
@@ -29,7 +42,9 @@ export function createDefaultRule(draft: AppConfig): RuleConfig {
     labelsAll: [],
     titleContains: "",
     bodyContains: "",
-    actions: ["review"],
+    actions: [createRuleAction("review")],
+    allowActionKinds: [],
+    denyActionKinds: [],
   };
 }
 
@@ -38,11 +53,19 @@ export function toggleRuleAction(
   kind: RuleActionKind,
   checked: boolean,
 ): RuleConfig {
-  if (checked && !rule.actions.includes(kind)) {
-    return { ...rule, actions: [...rule.actions, kind] };
+  if (checked) {
+    if (!rule.actions.some((action) => action.kind === kind)) {
+      return { ...rule, actions: [...rule.actions, createRuleAction(kind)] };
+    }
+    return {
+      ...rule,
+      actions: rule.actions.map((action) =>
+        action.kind === kind ? { ...action, enabled: true } : action,
+      ),
+    };
   }
   if (!checked) {
-    return { ...rule, actions: rule.actions.filter((action) => action !== kind) };
+    return { ...rule, actions: rule.actions.filter((action) => action.kind !== kind) };
   }
   return rule;
 }

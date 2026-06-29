@@ -9,12 +9,19 @@
 import { onMounted, reactive, ref, watch } from "vue";
 import { useConfigStore } from "./useConfigStore";
 import type { AppConfig } from "./types";
-import { DEFAULT_MESSAGING_SETTINGS, DEFAULT_NOTIFICATION_SETTINGS, DEFAULT_OUTBOX_CONFIG } from "./defaults";
+import { cloneReviewLifecycleNotifications, cloneRuleAction } from "./configClone";
+import {
+  DEFAULT_MESSAGING_SETTINGS,
+  DEFAULT_NOTIFICATION_SETTINGS,
+  DEFAULT_OUTBOX_CONFIG,
+  DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
+} from "./defaults";
 import { GLOBAL_GROUPS, type FieldDef, type GlobalFieldKey } from "./fields";
 import ConfigField from "./ConfigField.vue";
 import MessagingIntegrationsManager from "./MessagingIntegrationsManager.vue";
 import NotificationChannelsManager from "./NotificationChannelsManager.vue";
 import ProjectsManager from "./ProjectsManager.vue";
+import ReviewLifecycleNotificationsManager from "./ReviewLifecycleNotificationsManager.vue";
 import RemoteAccessManager from "./RemoteAccessManager.vue";
 import RulesManager from "./RulesManager.vue";
 // The webhook control panel lives in the `pr` slice; mounting it here would be a
@@ -69,6 +76,9 @@ const draft = reactive<AppConfig>({
   messaging: { integrations: DEFAULT_MESSAGING_SETTINGS.integrations.map((i) => ({ ...i, allowedConversationIds: [...i.allowedConversationIds] })) },
   remoteAccess: { entrypoints: [], tunnels: [] },
   rules: [],
+  reviewLifecycleNotifications: cloneReviewLifecycleNotifications(
+    DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
+  ),
 });
 
 function hydrate(cfg: AppConfig) {
@@ -92,8 +102,13 @@ function hydrate(cfg: AppConfig) {
     ...r,
     labelsAny: [...r.labelsAny],
     labelsAll: [...r.labelsAll],
-    actions: [...r.actions],
+    actions: r.actions.map(cloneRuleAction),
+    allowActionKinds: [...r.allowActionKinds],
+    denyActionKinds: [...r.denyActionKinds],
   }));
+  draft.reviewLifecycleNotifications = cloneReviewLifecycleNotifications(
+    cfg.reviewLifecycleNotifications ?? DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
+  );
   draft.notifications = {
     ...(cfg.notifications ?? DEFAULT_NOTIFICATION_SETTINGS),
     channels: (cfg.notifications?.channels ?? DEFAULT_NOTIFICATION_SETTINGS.channels).map((c) => ({
@@ -172,6 +187,9 @@ async function onSave() {
       ...draft.notifications,
       channels: draft.notifications.channels.map((c) => ({ ...c })),
     },
+    reviewLifecycleNotifications: cloneReviewLifecycleNotifications(
+      draft.reviewLifecycleNotifications,
+    ),
     messaging: {
       ...draft.messaging,
       integrations: draft.messaging.integrations.map((i) => ({
@@ -196,7 +214,9 @@ async function onSave() {
       ...r,
       labelsAny: [...r.labelsAny],
       labelsAll: [...r.labelsAll],
-      actions: [...r.actions],
+      actions: r.actions.map(cloneRuleAction),
+      allowActionKinds: [...r.allowActionKinds],
+      denyActionKinds: [...r.denyActionKinds],
     })),
   });
   if (store.savedOk) {
@@ -212,6 +232,7 @@ async function onSave() {
       store.error.startsWith("notificationChannelId") ||
       store.error.startsWith("notificationTimeoutSecs") ||
       store.error.startsWith("notificationWebhookUrl") ||
+      store.error.startsWith("reviewLifecycleNotifications") ||
       store.error.startsWith("telegramBotToken") ||
       store.error.startsWith("telegramChatId") ||
       store.error.startsWith("smtpHost") ||
@@ -345,6 +366,7 @@ async function onSave() {
           class="group projects-group"
         >
           <NotificationChannelsManager :draft="draft" @edit="onEdit" />
+          <ReviewLifecycleNotificationsManager :draft="draft" @edit="onEdit" />
         </div>
 
         <div

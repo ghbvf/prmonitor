@@ -33,7 +33,22 @@ notificationTtlSecs: number, };
 export type RuleActionKind = "review" | "check" | "notify";
 export const RULE_ACTION_KINDS = ["review","check","notify"] as const;
 
-export type RuleConfig = { id: string, name: string, enabled: boolean, source: SourceKind | null, eventType: EventType | null, projectId: string, repo: string, labelsAny: Array<string>, labelsAll: Array<string>, titleContains: string, bodyContains: string, actions: Array<RuleActionKind>, };
+export type RuleActionDedupePolicy = "event" | "action";
+export const RULE_ACTION_DEDUPE_POLICIES = ["event","action"] as const;
+
+export type RuleActionTarget = { "kind": "none" } | { "kind": "notificationChannels", channelIds: Array<string>, } | { "kind": "messagingConversation", integrationId: string, conversationId: string, };
+
+export type RuleActionConfig = { id: string, kind: RuleActionKind, enabled: boolean, target: RuleActionTarget, dedupePolicy: RuleActionDedupePolicy, delaySecs: number, dependsOn: Array<string>, level: string, };
+
+export type ReviewLifecycleEvent = "started" | "completed" | "failed" | "interrupted";
+export const REVIEW_LIFECYCLE_EVENTS = ["started","completed","failed","interrupted"] as const;
+
+export type ReviewLifecycleTarget = { "kind": "notificationChannels", channelIds: Array<string>, } | { "kind": "messagingConversation", integrationId: string, conversationId: string, };
+
+export type ReviewLifecycleNotificationConfig = { enabled: boolean, events: Array<ReviewLifecycleEvent>, targets: Array<ReviewLifecycleTarget>, startDelaySecs: number, endDelaySecs: number, };
+export const DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG: ReviewLifecycleNotificationConfig = {"enabled":false,"events":["started","completed","failed","interrupted"],"targets":[{"kind":"notificationChannels","channelIds":[]}],"startDelaySecs":0,"endDelaySecs":0};
+
+export type RuleConfig = { id: string, name: string, enabled: boolean, source: SourceKind | null, eventType: EventType | null, projectId: string, repo: string, labelsAny: Array<string>, labelsAll: Array<string>, titleContains: string, bodyContains: string, actions: Array<RuleActionConfig>, allowActionKinds: Array<RuleActionKind>, denyActionKinds: Array<RuleActionKind>, };
 
 export type NotificationChannel = { id: string, name: string, kind: NotificationKind, enabled: boolean, webhookUrl: string, webhookSecret: string, telegramBotToken: string, telegramChatId: string, smtpHost: string, smtpPort: number, smtpUsername: string, smtpPassword: string, smtpFrom: string, smtpTo: string, timeoutSecs: number, };
 
@@ -240,6 +255,11 @@ notifications: NotificationSettings,
  * Bidirectional messaging/bot integrations (#1559). Separate from outbound notifications.
  */
 messaging: MessagingSettings,
+/**
+ * Review lifecycle notifications. Routes review started / terminal events to notification
+ * channels or messaging conversations through the durable outbox.
+ */
+reviewLifecycleNotifications: ReviewLifecycleNotificationConfig,
 /**
  * Declarative Remote Access entrypoints and tunnels. This is the single runtime source:
  * each entrypoint owns one bound port and mounts one or more capability routes.

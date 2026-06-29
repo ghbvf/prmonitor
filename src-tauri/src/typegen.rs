@@ -13,14 +13,16 @@ use crate::{
     config::model::{
         AppConfig, MessagingIntegration, MessagingSettings, NotificationChannel,
         NotificationSettings, OutboxConfig, Project, RemoteAccessConfig, RemoteCapability,
-        RemoteEntrypoint, RemoteRoute, RemoteTunnel, RemoteTunnelMode, RuleActionKind, RuleConfig,
-        SourcePolicy, SourcePolicyMode,
+        RemoteEntrypoint, RemoteRoute, RemoteTunnel, RemoteTunnelMode,
+        ReviewLifecycleNotificationConfig, ReviewLifecycleTarget, RuleActionConfig,
+        RuleActionDedupePolicy, RuleActionKind, RuleActionTarget, RuleConfig, SourcePolicy,
+        SourcePolicyMode,
     },
     model::{
         ActionStatus, EngineKind, EventType, LabelSource, MessagingEvent, MessagingEventEntry,
         MessagingEventStatus, MessagingIntegrationOption, MessagingProviderCapability,
         MessagingProviderKind, MessagingReplyAudit, NotificationKind, NotificationLevel,
-        SendMessagingRequest, SendMessagingResponse, SendNotificationRequest,
+        ReviewLifecycleEvent, SendMessagingRequest, SendMessagingResponse, SendNotificationRequest,
         SendNotificationResponse, SourceKind, UpdateMode, WebhookTunnelMode,
     },
     remote::status::{
@@ -175,6 +177,29 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     config_types.push('\n');
     config_types.push_str(&declaration::<RuleActionKind>(&cfg));
     config_types.push_str(&option_array::<RuleActionKind>("RULE_ACTION_KINDS"));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<RuleActionDedupePolicy>(&cfg));
+    config_types.push_str(&option_array::<RuleActionDedupePolicy>(
+        "RULE_ACTION_DEDUPE_POLICIES",
+    ));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<RuleActionTarget>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<RuleActionConfig>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<ReviewLifecycleEvent>(&cfg));
+    config_types.push_str(&option_array::<ReviewLifecycleEvent>(
+        "REVIEW_LIFECYCLE_EVENTS",
+    ));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<ReviewLifecycleTarget>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<ReviewLifecycleNotificationConfig>(&cfg));
+    config_types.push_str(&default_const(
+        "DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG",
+        "ReviewLifecycleNotificationConfig",
+        &ReviewLifecycleNotificationConfig::default(),
+    ));
     config_types.push('\n');
     config_types.push_str(&declaration::<RuleConfig>(&cfg));
     config_types.push('\n');
