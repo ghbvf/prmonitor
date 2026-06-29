@@ -38,9 +38,8 @@ use crate::model::{
     Notification, NotificationKind, NotificationLevel, RedactedNotificationBody,
     SendNotificationRequest,
 };
-use crate::review::commands::{self, validate_kind, validate_pr_number};
+use crate::review::commands::{validate_kind, validate_pr_number};
 use crate::review::notify;
-use crate::review::session::CompletionOutcome;
 use crate::state::AppState;
 
 /// The deeplink URL scheme. Single source for both the parser's scheme check and the golden that
@@ -51,6 +50,7 @@ pub(crate) const SCHEME: &str = "prmonitor";
 /// be added here + routed in [`parse_review_deeplink`]; an unknown action is rejected.
 const ACTION_REVIEW: &str = "review";
 const ACTION_NOTIFY: &str = "notify";
+const MAX_REVIEW_REFERENCE_CHARS: usize = 256;
 
 /// Default `kind` when the deeplink omits `?kind=` (parity with the CLI, where the absence of
 /// `--check` means a review). Kept distinct from [`ACTION_REVIEW`]: they coincide as `"review"`
@@ -149,6 +149,11 @@ pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedTrigger> {
     let reference = reference.trim().to_string();
     if reference.is_empty() {
         return Err(AppError::new("deeplink repo/projectId 为空"));
+    }
+    if reference.chars().count() > MAX_REVIEW_REFERENCE_CHARS {
+        return Err(AppError::new(format!(
+            "deeplink repo/projectId 过长（最多 {MAX_REVIEW_REFERENCE_CHARS} 字符）"
+        )));
     }
 
     // `kind`: default "review"; otherwise the SAME whitelist the funnel enforces.
@@ -273,7 +278,7 @@ pub(crate) fn parse_notify_deeplink(url: &Url) -> AppResult<ParsedNotify> {
 /// long-running review for `urls[0]` never blocks triggering `urls[1]` (multiple URLs in one
 /// event is rare, but serial `.await` would stall behind a full review). Synchronous: it only
 /// fans out spawns and returns, so the `on_open_url` callback calls it directly (no outer spawn).
-pub(crate) fn handle_review_deeplink<R: Runtime>(app: AppHandle<R>, urls: Vec<Url>) {
+pub(crate) fn handle_review_deeplink(app: AppHandle, urls: Vec<Url>) {
     focus_main_window(&app);
     for url in urls {
         tauri::async_runtime::spawn(handle_one(app.clone(), url));
@@ -281,7 +286,7 @@ pub(crate) fn handle_review_deeplink<R: Runtime>(app: AppHandle<R>, urls: Vec<Ur
 }
 
 /// Trigger one deeplink URL through the funnel, then await its terminal completion and notify.
-async fn handle_one<R: Runtime>(app: AppHandle<R>, url: Url) {
+async fn handle_one(app: AppHandle, url: Url) {
     match url.host_str() {
         Some(ACTION_REVIEW) => handle_review_one(app, url).await,
         Some(ACTION_NOTIFY) => handle_notify_one(app, url).await,
@@ -416,7 +421,7 @@ fn notify_deeplink_key_seen(key: &str) -> bool {
     seen.iter().any(|existing| existing == key)
 }
 
-async fn handle_review_one<R: Runtime>(app: AppHandle<R>, url: Url) {
+async fn handle_review_one(app: AppHandle, url: Url) {
     let trigger = match parse_review_deeplink(&url) {
         Ok(t) => t,
         // Malformed / forged URL: reject — no trigger, no panic (acceptance ③). Fire-and-forget
@@ -449,110 +454,24 @@ async fn handle_review_one<R: Runtime>(app: AppHandle<R>, url: Url) {
         kind,
     } = trigger;
 
-    // Reuse the transport-agnostic funnel EXACTLY as `local_api::handle_create` does: take the
-    // managed `State` from the owned handle and pass a cloned handle alongside it (same lifetime
-    // shape `trigger_review` itself uses; the State borrow lives across the await).
     let state = app.state::<AppState>();
-    let session_id = match commands::trigger_review(
-        app.clone(),
-        state,
-        reference,
-        pr_number,
-        kind.clone(),
-    )
-    .await
+    if let Err(e) = state
+        .review_workflow
+        .start(app.clone(), reference, pr_number, kind.clone())
     {
-        Ok(id) => id,
-        // Dedup ("already in flight") / unknown project / validation: log the full reason, then a
-        // REDACTED user toast. `e.message` from project resolution embeds the external `reference`
-        // (`match_project_ref`: "找不到项目…: {reference}" / "repo 不唯一…: {reference}") — it must
-        // NOT reach the notification center (codex --check 回归). `pr_number` is safe to show.
-        Err(e) => {
-            eprintln!(
-                "deeplink 触发失败（pr={pr_number} kind={kind}）: {}",
-                e.message
-            );
-            notify_failure(
-                &app,
-                "prmonitor review 未触发",
-                RedactedNotificationBody::review_trigger_rejected(pr_number),
-            )
-            .await;
-            return;
-        }
-    };
-
-    // Subscribe AFTER trigger: `subscribe_completion` is get-or-create and RETAINS the last value,
-    // so even if the turn finalized between trigger and here, the receiver reads the retained
-    // `Some(outcome)` — there is no "subscribed too late" race (proven by
-    // `session.rs::tests::signal_completion_carries_each_terminal_status` + the get-or-create doc).
-    // This task owns NO subprocess (the engine's child is tracked by codex/claude `shutdown` on
-    // `RunEvent::Exit`); on app exit the registry's watch senders drop, `rx.changed()` errors, and
-    // the loop returns — so it needs no explicit abort registration.
-    let mut rx = app
-        .state::<AppState>()
-        .sessions
-        .subscribe_completion(&session_id);
-    let outcome = loop {
-        if let Some(o) = rx.borrow_and_update().clone() {
-            break o;
-        }
-        // Sender dropped without ever signalling (registry gone / app shutting down): give up.
-        if rx.changed().await.is_err() {
-            return;
-        }
-    };
-
-    notify_completion(&app, pr_number, &outcome);
-    focus_main_window(&app);
-}
-
-/// Build the normalized completion [`Notification`] for a finished review (AB#1066). PURE (no
-/// `AppHandle` / no IO), so the `wire_status` → (title, body) mapping is unit-tested directly (F6).
-/// `wire_status` (not the `Done`/`Failed` collapse) distinguishes completed vs interrupted vs failed;
-/// the body carries the pr-review comment URL (the actionable artifact) when one was resolved, else a
-/// fixed no-link fallback. `project_id` is empty — a deeplink isn't project-scoped.
-fn build_completion_notification(pr_number: u64, outcome: &CompletionOutcome) -> Notification {
-    // Whitelist the known terminal statuses; never reflect codex's raw `wire_status` (it comes from
-    // the codex subprocess) into the notification title. An unexpected value gets a fixed label +
-    // a diagnostic log rather than surfacing arbitrary content.
-    let (status_label, no_link_body) = match outcome.wire_status.as_str() {
-        "completed" => ("完成", "本次 review 完成（无评论链接）"),
-        "interrupted" => ("已中断", "本次 review 已中断（无评论链接）"),
-        "failed" => ("失败", "本次 review 失败（无评论链接）"),
-        other => {
-            eprintln!("deeplink 通知：未知 wire_status {other:?}");
-            ("结束", "本次 review 结束（无评论链接）")
-        }
-    };
-    // Normalized AB#1070 payload through the `NotificationProvider` seam. `body` keeps the prior
-    // displayed text (comment URL when present, else the no-link fallback); `url` carries the same
-    // comment URL so the seam knows the actionable artifact (the desktop notifier folds them so the
-    // shown text is unchanged).
-    let body = match outcome.comment_url.clone() {
-        Some(url) => RedactedNotificationBody::action_url(url),
-        None => RedactedNotificationBody::fixed(no_link_body),
-    };
-    Notification::new(
-        NotificationLevel::Info,
-        format!("PR #{pr_number} review {status_label}"),
-        outcome.comment_url.clone().unwrap_or_default(),
-        body,
-        String::new(),
-    )
-}
-
-/// ENQUEUE the completion notification into the durable action outbox (AB#1066) instead of
-/// delivering it inline: the worker performs the desktop notification, so a pending notification
-/// survives an app restart and a failed delivery retries to a dead-letter. Enqueues through the
-/// composition-root-injected `notify_outbox` sink — `review` never names the `outbox` slice (F1);
-/// the sink (in `lib.rs`) serializes the `Notification` + enqueues it. Synchronous — enqueue is a
-/// durable write + a worker wake, no await.
-fn notify_completion<R: Runtime>(app: &AppHandle<R>, pr_number: u64, outcome: &CompletionOutcome) {
-    let note = build_completion_notification(pr_number, outcome);
-    if let Err(e) = app.state::<AppState>().notify_outbox.enqueue(note) {
-        eprintln!("deeplink 通知入队失败: {}", e.message);
+        eprintln!(
+            "deeplink workflow 触发失败（pr={pr_number} kind={kind}）: {}",
+            e.message
+        );
+        notify_failure(
+            &app,
+            "prmonitor review 未触发",
+            RedactedNotificationBody::review_trigger_rejected(pr_number),
+        )
+        .await;
+        return;
     }
+    focus_main_window(&app);
 }
 
 /// Surface a deeplink FAILURE to the user (codex F3). A deeplink is fire-and-forget with no return
@@ -658,47 +577,12 @@ mod tests {
         assert_eq!(p.kind, "review");
     }
 
-    fn outcome(wire_status: &str, comment_url: Option<&str>) -> CompletionOutcome {
-        CompletionOutcome {
-            status: crate::review::session::SessionStatus::Done,
-            wire_status: wire_status.to_string(),
-            comment_url: comment_url.map(str::to_string),
-        }
-    }
-
-    // F6 (AB#1066): the outbox producer's payload mapping is characterization-tested. A `completed`
-    // outcome WITH a comment URL → title「完成」+ body/url = the comment URL (the actionable
-    // artifact); the project_id stays empty (a deeplink isn't project-scoped).
     #[test]
-    fn build_completion_notification_completed_with_url() {
-        let note =
-            build_completion_notification(7, &outcome("completed", Some("https://x/pr/7#c")));
-        assert_eq!(note.title, "PR #7 review 完成");
-        assert_eq!(note.url, "https://x/pr/7#c");
-        assert_eq!(note.body.as_str(), "https://x/pr/7#c");
-        assert_eq!(note.project_id, "");
-    }
-
-    // F6: interrupted / failed map to their labels with the fixed no-link body when no URL resolved;
-    // an unknown wire_status falls back to「结束」(never echoes the raw codex status into the title).
-    #[test]
-    fn build_completion_notification_status_label_and_no_link_body() {
-        let interrupted = build_completion_notification(7, &outcome("interrupted", None));
-        assert_eq!(interrupted.title, "PR #7 review 已中断");
-        assert_eq!(interrupted.url, "");
-        assert_eq!(
-            interrupted.body.as_str(),
-            "本次 review 已中断（无评论链接）"
-        );
-
-        let failed = build_completion_notification(7, &outcome("failed", None));
-        assert_eq!(failed.title, "PR #7 review 失败");
-
-        let unknown = build_completion_notification(7, &outcome("weird-codex-status", None));
-        assert_eq!(
-            unknown.title, "PR #7 review 结束",
-            "unknown status uses a fixed label"
-        );
+    fn review_reference_has_length_limit_before_persistence() {
+        let repo = "a".repeat(MAX_REVIEW_REFERENCE_CHARS + 1);
+        let err = parse(&format!("prmonitor://review?pr=7&repo={repo}"))
+            .expect_err("overlong repo rejected");
+        assert!(err.message.contains("repo/projectId 过长"));
     }
 
     #[test]

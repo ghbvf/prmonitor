@@ -387,6 +387,88 @@ export type OutboxEvent =
   | { kind: "updated"; projectId: string; entry: OutboxEntry }
   | { kind: "error"; operation: string; message: string };
 
+// ── Workflow / saga contracts (#1370) ────────────────────────────────────────────
+export const WORKFLOW_TYPES = ["reviewNotify"] as const;
+export type WorkflowType = (typeof WORKFLOW_TYPES)[number];
+
+export const WORKFLOW_STATUSES = ["pending", "running", "waiting", "done", "failed"] as const;
+export type WorkflowStatus = (typeof WORKFLOW_STATUSES)[number];
+
+export const WORKFLOW_STEPS = ["startReview", "waitReview", "enqueueNotify", "done"] as const;
+export type WorkflowStep = (typeof WORKFLOW_STEPS)[number];
+
+export function workflowStatusLabel(s: WorkflowStatus): string {
+  switch (s) {
+    case "pending":
+      return "待启动 / Pending";
+    case "running":
+      return "运行中 / Running";
+    case "waiting":
+      return "等待中 / Waiting";
+    case "done":
+      return "完成 / Done";
+    case "failed":
+      return "失败 / Failed";
+    default:
+      return assertNever(s);
+  }
+}
+
+export function workflowStepLabel(s: WorkflowStep): string {
+  switch (s) {
+    case "startReview":
+      return "启动 review / Start review";
+    case "waitReview":
+      return "等待完成 / Wait review";
+    case "enqueueNotify":
+      return "入队通知 / Enqueue notify";
+    case "done":
+      return "完成 / Done";
+    default:
+      return assertNever(s);
+  }
+}
+
+export interface ReviewNotifyInput {
+  reference: string;
+  prNumber: number;
+  kind: string;
+}
+
+export interface ReviewNotifyState {
+  reviewThreadId?: string;
+  reviewWireStatus?: string;
+  commentUrl?: string | null;
+  notificationOutboxIds?: number[];
+}
+
+interface WorkflowInstanceBase<T extends WorkflowType, I, S> {
+  id: number;
+  projectId: string;
+  type: T;
+  status: WorkflowStatus;
+  currentStep: WorkflowStep;
+  input: I;
+  state: S;
+  attemptCount: number;
+  nextWakeAt: number;
+  lastError: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export type ReviewNotifyWorkflowInstance = WorkflowInstanceBase<
+  "reviewNotify",
+  ReviewNotifyInput,
+  ReviewNotifyState
+>;
+
+export type WorkflowInstance = ReviewNotifyWorkflowInstance;
+
+export type WorkflowEvent =
+  | { kind: "updated"; projectId: string; instance: WorkflowInstance }
+  | { kind: "error"; operation: string; message: string };
+
 // ── Remote terminal contracts (#1383, #1372) ──────────────────────────────────────
 // Mirror `src-tauri/src/model.rs` (TerminalSession / CreateSessionOpts) + `events.rs`
 // (TerminalEvent), serde camelCase, locked by the model.rs / events.rs golden tests

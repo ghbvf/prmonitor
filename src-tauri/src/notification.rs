@@ -7,7 +7,7 @@
 
 use std::collections::HashSet;
 
-use tauri::Runtime;
+use tauri::{Manager, Runtime};
 use url::Url;
 
 use crate::config::service as config_service;
@@ -92,6 +92,31 @@ pub(crate) fn enqueue_notification_with_dedupe_prefix<R: Runtime>(
             payload,
             dedupe_key,
         });
+    }
+    if dedupe_prefix.is_some() {
+        let db = app.state::<crate::db::Database>();
+        let mut existing_ids = Vec::with_capacity(prepared.len());
+        for row in &prepared {
+            let Some(dedupe_key) = row.dedupe_key.as_deref() else {
+                existing_ids.clear();
+                break;
+            };
+            let Some(id) = outbox::store::id_by_dedupe_key_any_status(
+                db.inner(),
+                &note.project_id,
+                dedupe_key,
+            )?
+            else {
+                existing_ids.clear();
+                break;
+            };
+            existing_ids.push(id);
+        }
+        if existing_ids.len() == prepared.len() {
+            return Ok(SendNotificationResponse {
+                outbox_ids: existing_ids,
+            });
+        }
     }
     let rows: Vec<outbox::service::EnqueueInput<'_>> = prepared
         .iter()
@@ -332,6 +357,57 @@ mod tests {
             assert!(!raw.contains("smtp-secret"), "{raw}");
             assert!(!raw.contains("authorization"), "{raw}");
         }
+    }
+
+    #[test]
+    fn dedupe_prefix_reuses_terminal_outbox_rows() {
+        let app = tauri::test::mock_app();
+        app.manage(AppState::default());
+        let db = Database::open_in_memory().expect("open db");
+        crate::config::service::persist_db(
+            &db,
+            &AppConfig {
+                notifications: crate::config::model::NotificationSettings {
+                    channels: vec![channel("desktop", NotificationKind::Desktop)],
+                },
+                ..AppConfig::default()
+            },
+        )
+        .expect("persist config");
+        app.manage(db);
+
+        let first =
+            enqueue_notification_with_dedupe_prefix(app.handle(), req(), Some("workflow:1:notify"))
+                .expect("first enqueue");
+        assert_eq!(first.outbox_ids.len(), 1);
+        app.state::<Database>()
+            .inner()
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE action_outbox SET status = 'done' WHERE id = ?1",
+                    rusqlite::params![first.outbox_ids[0]],
+                )
+                .map(|_| ())
+            })
+            .expect("terminalize row");
+
+        let second =
+            enqueue_notification_with_dedupe_prefix(app.handle(), req(), Some("workflow:1:notify"))
+                .expect("second enqueue");
+
+        assert_eq!(second.outbox_ids, first.outbox_ids);
+        let count: i64 = app
+            .state::<Database>()
+            .inner()
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM action_outbox WHERE dedupe_key = 'workflow:1:notify:desktop'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .expect("count rows");
+        assert_eq!(count, 1, "terminal row is reused, not duplicated");
     }
 
     #[test]

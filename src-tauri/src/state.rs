@@ -20,6 +20,8 @@ pub type NotificationSendSink = Arc<
         + Send
         + Sync,
 >;
+pub type ReviewWorkflowTriggerSink =
+    Arc<dyn Fn(tauri::AppHandle, String, u64, String) -> AppResult<()> + Send + Sync>;
 
 /// The post-`set_config`-save hook seam (AB#1225 F4): a composition-root-injected closure the
 /// `config` slice fires AFTER a successful save, so config never names a sibling horizontal
@@ -78,6 +80,35 @@ impl NotificationSender {
     }
 }
 
+/// Composition-root-injected review workflow trigger (#1370). Deeplink remains a review transport,
+/// but the workflow slice is named only by the composition root.
+#[derive(Default)]
+pub struct ReviewWorkflowTrigger {
+    sink: StdMutex<Option<ReviewWorkflowTriggerSink>>,
+}
+
+impl ReviewWorkflowTrigger {
+    pub fn set_sink(&self, sink: ReviewWorkflowTriggerSink) {
+        *self.sink.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+    }
+
+    pub fn start(
+        &self,
+        app: tauri::AppHandle,
+        reference: String,
+        pr_number: u64,
+        kind: String,
+    ) -> AppResult<()> {
+        let sink = self.sink.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let Some(sink) = sink else {
+            return Err(AppError::new(
+                "review workflow trigger 未初始化".to_string(),
+            ));
+        };
+        sink(app, reference, pr_number, kind)
+    }
+}
+
 #[derive(Default)]
 pub struct AppState {
     /// The per-project scheduled-pull loops (#35): a `project_id → Scheduler` set the
@@ -115,11 +146,17 @@ pub struct AppState {
     /// spawned task handle. Started once in `lib.rs` `setup()`; killed on app shutdown. Methods
     /// take `&self`.
     pub outbox: crate::outbox::manager::OutboxManager,
+    /// Durable workflow/saga orchestrator (#1370). Holds the worker and composition-root-injected
+    /// action closures, so slices can request a workflow without naming sibling slices.
+    pub workflow: crate::workflow::manager::WorkflowManager,
     /// The review slice's durable-notification producer seam (AB#1066): holds the composition-root-
     /// injected sink that enqueues a `model::Notification` into the action outbox. Lets `review`
     /// produce durable notifications WITHOUT naming the `outbox` slice (the sink closure, installed in
     /// `lib.rs`, is the only place that bridges review→outbox). Methods take `&self`.
     pub notify_outbox: crate::review::notify::NotificationOutbox,
+    /// Review transport → workflow trigger seam (#1370). This opaque hook is installed in `lib.rs`;
+    /// review transports do not name the workflow slice directly.
+    pub review_workflow: ReviewWorkflowTrigger,
     /// The user-authored notification send funnel (#1460), injected by the composition root so
     /// transports can share one sender without reaching across slice boundaries.
     pub notification_sender: NotificationSender,

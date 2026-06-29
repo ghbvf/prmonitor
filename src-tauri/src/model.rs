@@ -738,6 +738,58 @@ pub struct SendNotificationResponse {
     pub outbox_ids: Vec<i64>,
 }
 
+/// Durable workflow type (#1370). V1 has one concrete saga: review completion notification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkflowType {
+    #[default]
+    ReviewNotify,
+}
+
+/// Durable workflow lifecycle (#1370). The current step carries the fine-grained progress; this
+/// status is the coarse list/filter state shown in the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkflowStatus {
+    #[default]
+    Pending,
+    Running,
+    Waiting,
+    Done,
+    Failed,
+}
+
+/// Current step of a workflow instance (#1370).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkflowStep {
+    #[default]
+    StartReview,
+    WaitReview,
+    EnqueueNotify,
+    Done,
+}
+
+/// One persisted workflow instance (#1370). `input` and `state` are intentionally JSON values:
+/// workflow-specific payloads remain non-secret and inspectable without adding a second table in v1.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowInstance {
+    pub id: i64,
+    pub project_id: String,
+    #[serde(rename = "type")]
+    pub workflow_type: WorkflowType,
+    pub status: WorkflowStatus,
+    pub current_step: WorkflowStep,
+    pub input: serde_json::Value,
+    pub state: serde_json::Value,
+    pub attempt_count: u32,
+    pub next_wake_at: u64,
+    pub last_error: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
 /// Runtime delivery config for one notification channel (AB#1459).
 ///
 /// Horizontal DTO: config owns persisted settings, review owns delivery adapters, and `lib.rs`
@@ -1787,6 +1839,79 @@ mod tests {
         let fv = serde_json::to_value(&fresh).expect("OutboxEntry serializes");
         assert_eq!(fv["status"], "done");
         assert_eq!(fv["lastError"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn workflow_contract_wire_shape_is_camel_case() {
+        assert_eq!(
+            serde_json::to_value(WorkflowType::ReviewNotify).expect("WorkflowType serializes"),
+            "reviewNotify"
+        );
+        assert_eq!(
+            serde_json::to_value(WorkflowStatus::Pending).expect("WorkflowStatus serializes"),
+            "pending"
+        );
+        assert_eq!(
+            serde_json::to_value(WorkflowStatus::Running).expect("WorkflowStatus serializes"),
+            "running"
+        );
+        assert_eq!(
+            serde_json::to_value(WorkflowStatus::Waiting).expect("WorkflowStatus serializes"),
+            "waiting"
+        );
+        assert_eq!(
+            serde_json::to_value(WorkflowStatus::Done).expect("WorkflowStatus serializes"),
+            "done"
+        );
+        assert_eq!(
+            serde_json::to_value(WorkflowStatus::Failed).expect("WorkflowStatus serializes"),
+            "failed"
+        );
+        assert_eq!(
+            serde_json::to_value(WorkflowStep::StartReview).expect("WorkflowStep serializes"),
+            "startReview"
+        );
+        assert_eq!(
+            serde_json::to_value(WorkflowStep::WaitReview).expect("WorkflowStep serializes"),
+            "waitReview"
+        );
+        assert_eq!(
+            serde_json::to_value(WorkflowStep::EnqueueNotify).expect("WorkflowStep serializes"),
+            "enqueueNotify"
+        );
+        assert_eq!(
+            serde_json::to_value(WorkflowStep::Done).expect("WorkflowStep serializes"),
+            "done"
+        );
+
+        let instance = WorkflowInstance {
+            id: 7,
+            project_id: "p1".to_string(),
+            workflow_type: WorkflowType::ReviewNotify,
+            status: WorkflowStatus::Waiting,
+            current_step: WorkflowStep::WaitReview,
+            input: serde_json::json!({"prNumber": 7}),
+            state: serde_json::json!({"reviewThreadId": "t1"}),
+            attempt_count: 1,
+            next_wake_at: 20,
+            last_error: None,
+            created_at: 10,
+            updated_at: 11,
+        };
+        let v = serde_json::to_value(&instance).expect("WorkflowInstance serializes");
+
+        assert_eq!(v["type"], "reviewNotify");
+        assert_eq!(v["status"], "waiting");
+        assert_eq!(v["currentStep"], "waitReview");
+        assert!(v.get("projectId").is_some());
+        assert!(v.get("attemptCount").is_some());
+        assert!(v.get("nextWakeAt").is_some());
+        assert!(v.get("lastError").is_some());
+        assert!(v.get("project_id").is_none());
+        assert!(v.get("workflow_type").is_none());
+        assert!(v.get("current_step").is_none());
+        assert!(v.get("next_wake_at").is_none());
+        assert_eq!(v["lastError"], serde_json::Value::Null);
     }
 
     // Wire lock for the AB#1069 review/check action payload (Medium carrier per ai-robust.md):

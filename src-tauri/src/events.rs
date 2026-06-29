@@ -5,7 +5,7 @@
 
 use serde::Serialize;
 
-use crate::model::{InboxEntry, OutboxEntry, TrackedPrView};
+use crate::model::{InboxEntry, OutboxEntry, TrackedPrView, WorkflowInstance};
 
 /// Tauri event name carrying a [`PrEvent`] (scheduled/manual PR-list refresh).
 pub const PRS_UPDATED_EVENT: &str = "prs:updated";
@@ -36,6 +36,10 @@ pub const INBOX_UPDATED_EVENT: &str = "inbox:updated";
 /// transitioned (executed / retried / dead-lettered). Mirrored by `OUTBOX_UPDATED_EVENT` in
 /// `src/outbox/api.ts`.
 pub const OUTBOX_UPDATED_EVENT: &str = "outbox:updated";
+
+/// Tauri event name carrying a [`WorkflowEvent`] (#1370): one workflow instance was created or
+/// transitioned. Mirrored by `WORKFLOW_UPDATED_EVENT` in `src/workflow/api.ts`.
+pub const WORKFLOW_UPDATED_EVENT: &str = "workflow:updated";
 
 /// Payload emitted on [`PRS_UPDATED_EVENT`] each poll cycle (scheduled or manual).
 ///
@@ -108,6 +112,19 @@ pub enum OutboxEvent {
     /// per-row upsert. `operation` names the failing site (`"claim"` / `"record"` / `"announce"`)
     /// so the banner is actionable. Its own `#[serde(rename_all)]` so `operation`/`message`
     /// serialize camelCase (the container tag rename maps only the variant name to `"error"`).
+    #[serde(rename_all = "camelCase")]
+    Error { operation: String, message: String },
+}
+
+/// Payload emitted on [`WORKFLOW_UPDATED_EVENT`] when a workflow instance changes.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum WorkflowEvent {
+    #[serde(rename_all = "camelCase")]
+    Updated {
+        project_id: String,
+        instance: WorkflowInstance,
+    },
     #[serde(rename_all = "camelCase")]
     Error { operation: String, message: String },
 }
@@ -263,6 +280,8 @@ pub enum StreamEvent {
     /// An action-outbox event (row enqueued / transitioned / cycle error). Desktop channel:
     /// `outbox:updated`.
     Action(OutboxEvent),
+    /// A workflow/saga event (#1370). Desktop channel: `workflow:updated`.
+    Workflow(WorkflowEvent),
     /// An iTerm-backed terminal-session event (#1383): the `terminal` domain the doc above
     /// anticipated, now that its producer (`crate::terminal`) has landed. Desktop channel:
     /// `terminal:event`. The bus broadcast also feeds the PR2 terminal SSE consumer with no
@@ -291,7 +310,8 @@ mod tests {
     use super::*;
     use crate::model::{
         ActionKind, ActionStatus, Event, EventType, InboxStatus, OutboxEntry, PrPresence,
-        PullRequestView, SourceKind, TrackedPrView,
+        PullRequestView, SourceKind, TrackedPrView, WorkflowInstance, WorkflowStatus, WorkflowStep,
+        WorkflowType,
     };
 
     fn sample_view() -> TrackedPrView {
@@ -483,6 +503,46 @@ mod tests {
     }
 
     #[test]
+    fn workflow_updated_event_name_is_pinned() {
+        assert_eq!(WORKFLOW_UPDATED_EVENT, "workflow:updated");
+    }
+
+    #[test]
+    fn workflow_updated_wire_shape_is_camel_case() {
+        let event = WorkflowEvent::Updated {
+            project_id: "p1".to_string(),
+            instance: WorkflowInstance {
+                id: 1,
+                project_id: "p1".to_string(),
+                workflow_type: WorkflowType::ReviewNotify,
+                status: WorkflowStatus::Waiting,
+                current_step: WorkflowStep::WaitReview,
+                input: serde_json::json!({"prNumber": 7}),
+                state: serde_json::json!({"reviewThreadId": "t1"}),
+                attempt_count: 0,
+                next_wake_at: 10,
+                last_error: None,
+                created_at: 1,
+                updated_at: 2,
+            },
+        };
+
+        let v = serde_json::to_value(&event).expect("WorkflowEvent serializes");
+
+        assert_eq!(v["kind"], "updated");
+        assert!(v.get("projectId").is_some());
+        assert!(v.get("project_id").is_none());
+        let instance = &v["instance"];
+        assert_eq!(instance["type"], "reviewNotify");
+        assert_eq!(instance["status"], "waiting");
+        assert_eq!(instance["currentStep"], "waitReview");
+        assert!(instance.get("projectId").is_some());
+        assert!(instance.get("current_step").is_none());
+        assert!(instance.get("nextWakeAt").is_some());
+        assert!(instance.get("next_wake_at").is_none());
+    }
+
+    #[test]
     fn review_event_name_is_pinned() {
         // Mirrored by `REVIEW_EVENT` in `src/review/api.ts`; a drift breaks the
         // frontend's `listen` registration.
@@ -663,6 +723,21 @@ mod tests {
 
         assert_eq!(v["domain"], "action");
         // The inner OutboxEvent's `kind` tag + fields coexist with `domain`.
+        assert_eq!(v["kind"], "error");
+        assert!(v.get("operation").is_some());
+        assert!(v.get("message").is_some());
+    }
+
+    #[test]
+    fn stream_event_workflow_wire_shape_has_domain_and_inner_kind() {
+        let event = StreamEvent::Workflow(WorkflowEvent::Error {
+            operation: "announce".to_string(),
+            message: "database is locked".to_string(),
+        });
+
+        let v = serde_json::to_value(&event).expect("StreamEvent serializes");
+
+        assert_eq!(v["domain"], "workflow");
         assert_eq!(v["kind"], "error");
         assert!(v.get("operation").is_some());
         assert!(v.get("message").is_some());

@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -209,6 +209,9 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 13 {
         apply_v13(conn)?;
     }
+    if version < 14 {
+        apply_v14(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -331,6 +334,11 @@ fn apply_v12(conn: &Connection) -> AppResult<()> {
 /// v13 (#1559): link inbound messaging audit rows to the reply outbox action they enqueue.
 fn apply_v13(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(SCHEMA_V13).map_err(map_err)?;
+    Ok(())
+}
+
+fn apply_v14(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(SCHEMA_V14).map_err(map_err)?;
     Ok(())
 }
 
@@ -626,6 +634,31 @@ CREATE INDEX IF NOT EXISTS idx_messaging_event_reply_outbox
     ON messaging_event(reply_outbox_id);
 "#;
 
+const SCHEMA_V14: &str = r#"
+CREATE TABLE IF NOT EXISTS workflow_instance (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id      TEXT    NOT NULL,
+    workflow_type   TEXT    NOT NULL,
+    status          TEXT    NOT NULL,
+    current_step    TEXT    NOT NULL,
+    input_json      TEXT    NOT NULL,
+    state_json      TEXT    NOT NULL,
+    attempt_count   INTEGER NOT NULL DEFAULT 0,
+    next_wake_at    INTEGER NOT NULL,
+    last_error      TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    dedupe_key      TEXT    NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_active_dedupe
+    ON workflow_instance(project_id, workflow_type, dedupe_key)
+    WHERE status IN ('pending','running','waiting');
+CREATE INDEX IF NOT EXISTS idx_workflow_due
+    ON workflow_instance(status, next_wake_at, updated_at);
+CREATE INDEX IF NOT EXISTS idx_workflow_project
+    ON workflow_instance(project_id, updated_at DESC, id DESC);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -731,7 +764,7 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 13, "current schema is v13");
+            assert_eq!(SCHEMA_VERSION, 14, "current schema is v14");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"
@@ -824,9 +857,63 @@ mod tests {
                 index_exists(conn, "idx_messaging_event_reply_outbox"),
                 "fresh v0 → v13 has the messaging_event reply outbox index"
             );
+            assert!(
+                table_exists(conn, "workflow_instance"),
+                "fresh v0 → v14 has the workflow_instance table"
+            );
+            assert!(
+                index_exists(conn, "idx_workflow_active_dedupe"),
+                "fresh v0 → v14 has the active workflow dedupe index"
+            );
+            assert!(
+                index_exists(conn, "idx_workflow_due"),
+                "fresh v0 → v14 has the workflow recovery index"
+            );
+            assert!(
+                index_exists(conn, "idx_workflow_project"),
+                "fresh v0 → v14 has the workflow project listing index"
+            );
             Ok(())
         })
         .expect("query");
+    }
+
+    #[test]
+    fn migrate_v13_to_current_adds_workflow_instance_table() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        apply_v1(&conn).expect("v1");
+        apply_v2(&conn).expect("v2");
+        apply_v3(&conn).expect("v3");
+        apply_v4(&conn).expect("v4");
+        apply_v5(&conn).expect("v5");
+        apply_v6(&conn).expect("v6");
+        apply_v7(&conn).expect("v7");
+        apply_v8(&conn).expect("v8");
+        apply_v9(&conn).expect("v9");
+        apply_v10(&conn).expect("v10");
+        apply_v11(&conn).expect("v11");
+        apply_v12(&conn).expect("v12");
+        apply_v13(&conn).expect("v13");
+        conn.pragma_update(None, "user_version", 13)
+            .expect("stamp v13");
+        assert!(
+            !table_exists(&conn, "workflow_instance"),
+            "v13 must not already have workflow_instance"
+        );
+
+        run_migrations(&conn).expect("v13 → current migrates");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read version");
+        assert_eq!(version, SCHEMA_VERSION, "stamped to the current schema");
+        assert!(
+            table_exists(&conn, "workflow_instance"),
+            "v14 added workflow_instance"
+        );
+        assert!(index_exists(&conn, "idx_workflow_active_dedupe"));
+        assert!(index_exists(&conn, "idx_workflow_due"));
+        assert!(index_exists(&conn, "idx_workflow_project"));
     }
 
     /// v2 → current migration lock: persisted review sessions must carry the engine that created

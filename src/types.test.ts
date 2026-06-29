@@ -8,6 +8,12 @@ import {
   manualPullEligible,
   TERMINAL_BACKENDS,
   terminalBackendLabel,
+  WORKFLOW_STATUSES,
+  WORKFLOW_STEPS,
+  WORKFLOW_TYPES,
+  workflowStatusLabel,
+  workflowStepLabel,
+  type WorkflowInstance,
 } from "./types";
 
 describe("periodicPollEligible", () => {
@@ -49,5 +55,47 @@ describe("terminalBackendLabel", () => {
     for (const b of TERMINAL_BACKENDS) {
       expect(terminalBackendLabel(b).length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("workflow contracts", () => {
+  it("pins workflow literal sets", () => {
+    expect([...WORKFLOW_TYPES]).toEqual(["reviewNotify"]);
+    expect([...WORKFLOW_STATUSES]).toEqual(["pending", "running", "waiting", "done", "failed"]);
+    expect([...WORKFLOW_STEPS]).toEqual(["startReview", "waitReview", "enqueueNotify", "done"]);
+  });
+
+  it("returns non-empty labels for every workflow status and step", () => {
+    for (const s of WORKFLOW_STATUSES) {
+      expect(workflowStatusLabel(s).length).toBeGreaterThan(0);
+    }
+    for (const s of WORKFLOW_STEPS) {
+      expect(workflowStepLabel(s).length).toBeGreaterThan(0);
+    }
+  });
+
+  it("types reviewNotify input and state keys as a cross-end contract", () => {
+    const row: WorkflowInstance = {
+      id: 1,
+      projectId: "p1",
+      type: "reviewNotify",
+      status: "done",
+      currentStep: "done",
+      input: { reference: "repo", prNumber: 7, kind: "review" },
+      state: {
+        reviewThreadId: "t1",
+        reviewWireStatus: "completed",
+        commentUrl: "https://example.com/pr/7#comment",
+        notificationOutboxIds: [9],
+      },
+      attemptCount: 0,
+      nextWakeAt: 0,
+      lastError: null,
+      createdAt: 10,
+      updatedAt: 11,
+    };
+
+    expect(row.input.prNumber).toBe(7);
+    expect(row.state.notificationOutboxIds).toEqual([9]);
   });
 });

@@ -1,7 +1,7 @@
 //! Rust slice-boundary enforcement test (Medium, per `.claude/rules/prmonitor/ai-robust.md`).
 //!
 //! The backend vertical slices (`config` / `pr` / `review` / `inbox` / `outbox` / `rule` /
-//! `messaging`) must be
+//! `messaging` / `workflow`) must be
 //! self-contained: a file in one slice must NOT make a runtime VALUE reference (`crate::<sibling>::`)
 //! into a SIBLING slice. Cross-slice wiring is the composition root's job (`lib.rs` + the horizontal
 //! modules `model` / `error` / `events` / `db` / `state` / `dispatch`, none of which are slices).
@@ -30,7 +30,7 @@ use std::fs;
 use std::path::Path;
 
 /// The backend vertical slices scanned for boundary violations.
-const SLICES: [&str; 8] = [
+const SLICES: [&str; 9] = [
     "config",
     "pr",
     "review",
@@ -39,6 +39,7 @@ const SLICES: [&str; 8] = [
     "rule",
     "terminal",
     "messaging",
+    "workflow",
 ];
 
 /// The ONE cross-slice consumable. `config` is the shared configuration provider consumed by
@@ -193,6 +194,16 @@ fn scan_dir(dir: &Path, owner: &str, violations: &mut Vec<String>, files_scanned
                         path.display(),
                         i + 1,
                         target
+                    ));
+                }
+                let app_state_field = format!("state.{target}");
+                if code.contains(&app_state_field) {
+                    violations.push(format!(
+                        "{}:{} reaches sibling slice AppState field `{}` — expose an opaque \
+                         composition-root hook instead",
+                        path.display(),
+                        i + 1,
+                        app_state_field
                     ));
                 }
             }

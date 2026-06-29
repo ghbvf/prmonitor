@@ -36,6 +36,7 @@ pub mod rule;
 pub mod state;
 pub mod stream;
 pub mod terminal;
+pub mod workflow;
 
 /// Rust slice-boundary enforcement test (AB#1066 F1, Medium carrier) — test-only module.
 #[cfg(test)]
@@ -195,6 +196,132 @@ fn build_app() {
                         dedupe_prefix.as_deref(),
                     )
                 }
+            }));
+            let workflow_app = app.handle().clone();
+            state.workflow.set_actions(workflow::manager::WorkflowActions {
+                start_review: Arc::new({
+                    let app = workflow_app.clone();
+                    move |request, workflow_created_at| {
+                    let app = app.clone();
+                    Box::pin(async move {
+                        let project = config::service::project_by_ref_validated(
+                            &app,
+                            &request.reference,
+                        )?;
+                        let db = app.state::<db::Database>();
+                        if let Some(existing) =
+                            review::history_store::get_pr_sessions(
+                                db.inner(),
+                                &project.id,
+                                request.pr_number,
+                            )?
+                            .into_iter()
+                            .find(|session| {
+                                session.kind == request.kind
+                                    && session.created_at_epoch >= workflow_created_at
+                            })
+                        {
+                            return Ok(workflow::manager::StartedReview {
+                                thread_id: existing.thread_id,
+                                project_id: existing.project_id,
+                            });
+                        }
+                        let state = app.state::<AppState>();
+                        let thread_id = review::commands::trigger_review(
+                            app.clone(),
+                            state,
+                            project.id.clone(),
+                            request.pr_number,
+                            request.kind.clone(),
+                        )
+                        .await?;
+                        let project_id = review::history_store::get_session(db.inner(), &thread_id)?
+                            .map(|s| s.project_id)
+                            .unwrap_or(project.id);
+                        Ok(workflow::manager::StartedReview {
+                            thread_id,
+                            project_id,
+                        })
+                    })
+                    }
+                }),
+                wait_review: Arc::new({
+                    let app = workflow_app.clone();
+                    move |thread_id| {
+                    let app = app.clone();
+                    Box::pin(async move {
+                        let state = app.state::<AppState>();
+                        if let Some(info) = state.sessions.get(&thread_id) {
+                            match info.status {
+                                review::session::SessionStatus::Done => {
+                                    return Ok(workflow::manager::ReviewCompletion {
+                                        wire_status: "completed".to_string(),
+                                        comment_url: info.comment_url,
+                                    });
+                                }
+                                review::session::SessionStatus::Failed => {
+                                    return Ok(workflow::manager::ReviewCompletion {
+                                        wire_status: "failed".to_string(),
+                                        comment_url: info.comment_url,
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                        let db = app.state::<db::Database>();
+                        if let Some(info) = review::history_store::get_session(db.inner(), &thread_id)? {
+                            match info.status {
+                                review::session::SessionStatus::Done => {
+                                    return Ok(workflow::manager::ReviewCompletion {
+                                        wire_status: "completed".to_string(),
+                                        comment_url: info.comment_url,
+                                    });
+                                }
+                                review::session::SessionStatus::Failed => {
+                                    return Ok(workflow::manager::ReviewCompletion {
+                                        wire_status: "failed".to_string(),
+                                        comment_url: info.comment_url,
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                        let mut rx = state.sessions.subscribe_completion(&thread_id);
+                        loop {
+                            if let Some(outcome) = rx.borrow_and_update().clone() {
+                                return Ok(workflow::manager::ReviewCompletion {
+                                    wire_status: outcome.wire_status,
+                                    comment_url: outcome.comment_url,
+                                });
+                            }
+                            if rx.changed().await.is_err() {
+                                return Err(error::AppError::new(format!(
+                                    "review completion watcher closed before terminal outcome: {thread_id}"
+                                )));
+                            }
+                        }
+                    })
+                    }
+                }),
+                send_notification: Arc::new({
+                    let app = workflow_app.clone();
+                    move |request, dedupe_prefix| {
+                    let app = app.clone();
+                    Box::pin(async move {
+                        let state = app.state::<AppState>();
+                        state
+                            .notification_sender
+                            .send(request, Some(dedupe_prefix))
+                    })
+                    }
+                }),
+            });
+            state.review_workflow.set_sink(Arc::new(|app, reference, pr_number, kind| {
+                let app_for_state = app.clone();
+                let state = app_for_state.state::<AppState>();
+                state
+                    .workflow
+                    .start_review_notify(app, reference, pr_number, kind)
             }));
             // Install the auto-trigger dispatcher BEFORE starting the loop, so the
             // immediate first tick already persists dispatchable reviews/checks into
@@ -500,6 +627,7 @@ fn build_app() {
                 claim_releaser,
                 reconcile_before_worker,
             );
+            state.workflow.start(app.handle().clone());
 
             // Install the review→outbox notification sink (AB#1066) — the ONLY bridge from the review
             // slice's notification producer to the outbox slice. `review::deeplink` builds a
@@ -643,6 +771,10 @@ fn build_app() {
             review::commands::list_review_sessions,
             review::commands::get_session_history,
             review::commands::get_pr_sessions,
+            workflow::commands::workflow_list,
+            workflow::commands::workflow_get,
+            workflow::commands::workflow_get_raw,
+            workflow::commands::workflow_retry,
             config::commands::set_active_project,
             remote::commands::get_remote_access_runtime_status,
             terminal::commands::list_terminal_sessions,
@@ -677,6 +809,8 @@ fn build_app() {
                 // Stop the action-outbox worker (AB#1066): signal + abort the task so it never
                 // outlives the app (same "软件关闭时一起关闭" contract).
                 state.outbox.shutdown();
+                // Stop the workflow worker (#1370) so no background saga task outlives the app.
+                state.workflow.shutdown();
                 // Kill the resident iTerm daemon (#1383): same "软件关闭时一起关闭" contract as
                 // codex — the python child never outlives the app.
                 state.terminal.shutdown();

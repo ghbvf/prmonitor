@@ -26,6 +26,7 @@ use tokio::sync::broadcast;
 
 use crate::events::{
     StreamEvent, OUTBOX_UPDATED_EVENT, PRS_UPDATED_EVENT, REVIEW_EVENT, TERMINAL_EVENT,
+    WORKFLOW_UPDATED_EVENT,
 };
 use crate::state::AppState;
 
@@ -92,6 +93,9 @@ pub fn emit<R: Runtime>(app: &AppHandle<R>, event: StreamEvent) {
         }
         StreamEvent::Action(e) => {
             let _ = app.emit(OUTBOX_UPDATED_EVENT, e);
+        }
+        StreamEvent::Workflow(e) => {
+            let _ = app.emit(WORKFLOW_UPDATED_EVENT, e);
         }
         StreamEvent::Terminal(e) => {
             let _ = app.emit(TERMINAL_EVENT, e);
@@ -166,14 +170,16 @@ mod tests {
         // `events.rs` defines + golden-tests the consts (and their wire literals); `stream.rs` is
         // the funnel that emits them. Every other file naming the const OR the literal is a bypass.
         const ALLOWED: [&str; 2] = ["events.rs", "stream.rs"];
-        const FUNNELLED: [&str; 8] = [
+        const FUNNELLED: [&str; 10] = [
             "PRS_UPDATED_EVENT",
             "REVIEW_EVENT",
             "OUTBOX_UPDATED_EVENT",
+            "WORKFLOW_UPDATED_EVENT",
             "TERMINAL_EVENT",
             "\"prs:updated\"",
             "\"review:event\"",
             "\"outbox:updated\"",
+            "\"workflow:updated\"",
             "\"terminal:event\"",
         ];
 

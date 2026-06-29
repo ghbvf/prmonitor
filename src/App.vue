@@ -17,6 +17,7 @@ import ReviewPanel from "./review/ReviewPanel.vue";
 import ReviewSessions from "./review/ReviewSessions.vue";
 import InboxPanel from "./inbox/InboxPanel.vue";
 import OutboxPanel from "./outbox/OutboxPanel.vue";
+import WorkflowPanel from "./workflow/WorkflowPanel.vue";
 import MessagingPanel from "./messaging/MessagingPanel.vue";
 import TerminalView from "./terminal/TerminalView.vue";
 import { useReviewStore } from "./review/useReviewStore";
@@ -39,6 +40,7 @@ const {
   goOnboarding,
   goInbox,
   goOutbox,
+  goWorkflow,
   goMessaging,
   goTerminal,
 } = useAppView();
@@ -274,6 +276,14 @@ watch(selectedNumber, (n) => {
         v-if="!booting && currentView === 'monitor'"
         type="button"
         class="nav-btn"
+        @click="goWorkflow"
+      >
+        Workflow
+      </button>
+      <button
+        v-if="!booting && currentView === 'monitor'"
+        type="button"
+        class="nav-btn"
         @click="goMessaging"
       >
         Messaging
@@ -299,6 +309,7 @@ watch(selectedNumber, (n) => {
           currentView === 'settings' ||
           currentView === 'inbox' ||
           currentView === 'outbox' ||
+          currentView === 'workflow' ||
           currentView === 'messaging' ||
           currentView === 'terminal'
         "
@@ -345,6 +356,12 @@ watch(selectedNumber, (n) => {
          the composition root only routes to it — no central listener wiring here. -->
     <OutboxPanel
       v-else-if="currentView === 'outbox'"
+      class="view"
+      :active-project-id="activeProjectId"
+    />
+
+    <WorkflowPanel
+      v-else-if="currentView === 'workflow'"
       class="view"
       :active-project-id="activeProjectId"
     />

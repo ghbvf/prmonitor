@@ -179,6 +179,23 @@ pub fn enqueue_deduped(
     )
 }
 
+pub(crate) fn id_by_dedupe_key_any_status(
+    db: &Database,
+    project_id: &str,
+    dedupe_key: &str,
+) -> AppResult<Option<i64>> {
+    db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT id FROM action_outbox \
+             WHERE project_id = ?1 AND dedupe_key = ?2 \
+             ORDER BY id LIMIT 1",
+            rusqlite::params![project_id, dedupe_key],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+    })
+}
+
 /// Transaction-scoped variant used by composition-root producers that must create a related
 /// trace row in the SAME commit as the outbox action. It intentionally does not emit or wake the
 /// worker; callers do that after the outer transaction commits.

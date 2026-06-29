@@ -11,6 +11,7 @@ export type AppView =
   | "onboarding"
   | "inbox"
   | "outbox"
+  | "workflow"
   | "messaging"
   | "terminal";
 
@@ -24,6 +25,7 @@ export function useAppView() {
     goOnboarding: () => (currentView.value = "onboarding"),
     goInbox: () => (currentView.value = "inbox"),
     goOutbox: () => (currentView.value = "outbox"),
+    goWorkflow: () => (currentView.value = "workflow"),
     goMessaging: () => (currentView.value = "messaging"),
     goTerminal: () => (currentView.value = "terminal"),
   };
