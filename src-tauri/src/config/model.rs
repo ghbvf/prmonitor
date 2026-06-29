@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use base64::{engine::general_purpose, Engine as _};
 use lettre::message::Mailbox;
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -844,6 +845,20 @@ fn validate_notifications(settings: &NotificationSettings) -> AppResult<()> {
     Ok(())
 }
 
+fn validate_wechat_work_encoding_aes_key(value: &str) -> AppResult<()> {
+    let padded = match value.len() % 4 {
+        0 => value.to_string(),
+        n => format!("{value}{}", "=".repeat(4 - n)),
+    };
+    let decoded = general_purpose::STANDARD
+        .decode(padded)
+        .map_err(|e| AppError::new(format!("weChatWorkEncodingAesKey base64 解码失败: {e}")))?;
+    if decoded.len() != 32 {
+        return Err(AppError::new("weChatWorkEncodingAesKey 必须解码为 32 字节"));
+    }
+    Ok(())
+}
+
 fn validate_messaging(settings: &MessagingSettings) -> AppResult<()> {
     let mut seen_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for integration in &settings.integrations {
@@ -920,6 +935,71 @@ fn validate_messaging(settings: &MessagingSettings) -> AppResult<()> {
                 if integration.require_mention && integration.bot_open_id.trim().is_empty() {
                     return Err(AppError::new(format!(
                         "feishuBotOpenId 不能为空（消息集成「{}」启用 @Bot 触发时必须配置）",
+                        integration.name
+                    )));
+                }
+            }
+            MessagingProviderKind::WeChatWork => {
+                if integration.verification_token.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "weChatWorkToken 不能为空（消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.verification_token.trim().chars().count() < WEBHOOK_SECRET_MIN_LEN {
+                    return Err(AppError::new(format!(
+                        "weChatWorkToken 太短（至少 {WEBHOOK_SECRET_MIN_LEN} 个字符；消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.encrypt_key.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "weChatWorkEncodingAesKey 不能为空（消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                validate_wechat_work_encoding_aes_key(integration.encrypt_key.trim())?;
+                if integration.app_id.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "weChatWorkCorpId 不能为空（消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.app_secret.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "weChatWorkCorpSecret 不能为空（消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.bot_open_id.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "weChatWorkAgentId 不能为空（消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+            }
+            MessagingProviderKind::DingTalk => {
+                if integration.verification_token.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "dingTalkToken 不能为空（消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.verification_token.trim().chars().count() < WEBHOOK_SECRET_MIN_LEN {
+                    return Err(AppError::new(format!(
+                        "dingTalkToken 太短（至少 {WEBHOOK_SECRET_MIN_LEN} 个字符；消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.app_secret.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "dingTalkAppSecret 不能为空（消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.bot_open_id.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "dingTalkRobotCode 不能为空（消息集成「{}」）",
                         integration.name
                     )));
                 }
@@ -1936,6 +2016,66 @@ mod tests {
         integration.id = "bad id".to_string();
         cfg.messaging.integrations = vec![integration];
         assert_error_prefix(validate(&cfg), "messagingIntegrationId 非法");
+    }
+
+    #[test]
+    fn validate_messaging_enforces_wechat_work_and_dingtalk_fields() {
+        let mut cfg = valid_base();
+        let mut integration = valid_messaging_integration();
+
+        integration.kind = MessagingProviderKind::WeChatWork;
+        integration.id = "wecom-main".to_string();
+        integration.name = "WeCom".to_string();
+        integration.verification_token = String::new();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "weChatWorkToken 不能为空");
+
+        integration.verification_token = "verify-token-1234".to_string();
+        integration.encrypt_key = String::new();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "weChatWorkEncodingAesKey 不能为空");
+
+        integration.encrypt_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
+        integration.app_id = String::new();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "weChatWorkCorpId 不能为空");
+
+        integration.app_id = "corp-id".to_string();
+        integration.app_secret = String::new();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "weChatWorkCorpSecret 不能为空");
+
+        integration.app_secret = "corp-secret".to_string();
+        integration.bot_open_id = String::new();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "weChatWorkAgentId 不能为空");
+
+        integration.bot_open_id = "1000002".to_string();
+        integration.encrypt_key = "AAAA".to_string();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(
+            validate(&cfg),
+            "weChatWorkEncodingAesKey 必须解码为 32 字节",
+        );
+
+        integration.kind = MessagingProviderKind::DingTalk;
+        integration.id = "dingtalk-main".to_string();
+        integration.name = "DingTalk".to_string();
+        integration.verification_token = String::new();
+        integration.app_secret = "dingtalk-secret".to_string();
+        integration.bot_open_id = "robot-code".to_string();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "dingTalkToken 不能为空");
+
+        integration.verification_token = "token-1234567890".to_string();
+        integration.app_secret = String::new();
+        cfg.messaging.integrations = vec![integration.clone()];
+        assert_error_prefix(validate(&cfg), "dingTalkAppSecret 不能为空");
+
+        integration.app_secret = "dingtalk-secret".to_string();
+        integration.bot_open_id = String::new();
+        cfg.messaging.integrations = vec![integration];
+        assert_error_prefix(validate(&cfg), "dingTalkRobotCode 不能为空");
     }
 
     fn valid_notification_channel(kind: NotificationKind) -> NotificationChannel {

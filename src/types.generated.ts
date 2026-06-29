@@ -18,8 +18,8 @@ export const EVENT_TYPES = ["pullRequest","issue","comment","label","generic"] a
 export type NotificationKind = "desktop" | "email" | "slack" | "telegram" | "weChatWork" | "feishu" | "dingTalk";
 export const NOTIFICATION_KINDS = ["desktop","email","slack","telegram","weChatWork","feishu","dingTalk"] as const;
 
-export type MessagingProviderKind = "feishu";
-export const MESSAGING_PROVIDER_KINDS = ["feishu"] as const;
+export type MessagingProviderKind = "feishu" | "weChatWork" | "dingTalk";
+export const MESSAGING_PROVIDER_KINDS = ["feishu","weChatWork","dingTalk"] as const;
 
 export type MessagingEventStatus = "received" | "processed" | "failed";
 export const MESSAGING_EVENT_STATUSES = ["received","processed","failed"] as const;
@@ -28,6 +28,8 @@ export type ActionStatus = "pending" | "done" | "dead";
 export const ACTION_STATUSES = ["pending","done","dead"] as const;
 
 export type MessagingProviderCapability = { provider: MessagingProviderKind, supportsReply: boolean, supportsSend: boolean, requiresAllowedConversations: boolean, };
+
+export type MessagingIntegrationOption = { id: string, name: string, kind: MessagingProviderKind, allowedConversationIds: Array<string>, };
 
 export type MessagingEvent = { provider: MessagingProviderKind, integrationId: string, eventId: string, conversationId: string, threadId: string, senderId: string, text: string, mentionedBot: boolean, rawPayload: string, receivedAtEpoch: number, };
 
@@ -41,5 +43,9 @@ export const NOTIFICATION_LEVELS = ["info","warning","error"] as const;
 export type SendNotificationRequest = { level?: NotificationLevel | null, title: string, body?: string | null, url?: string | null, projectId?: string | null, channelIds?: Array<string>, };
 
 export type SendNotificationResponse = { outboxIds: Array<number>, };
+
+export type SendMessagingRequest = { integrationId: string, conversationId: string, text: string, requestId: string, };
+
+export type SendMessagingResponse = { outboxId: number, };
 
 export type RuleMatchEntry = { id: number, ruleId: string, ruleName: string, inboxEventId: number, projectId: string, actionCount: number, error: string | null, createdAt: number, actionOutboxIds: Array<number>, };

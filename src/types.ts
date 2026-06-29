@@ -324,7 +324,8 @@ export function outboxStatusLabel(s: OutboxStatus): string {
 // serde form (locked by the model.rs golden test). Single-sourced as an `as const` array
 // (mirrors OUTBOX_STATUSES): the type is DERIVED from the array. `notification` (AB#1066) +
 // `review`/`check`/`stopReview` (AB#1069 action executor — reuse the review funnel) +
-// `messagingReply` (#1559 bot reply executor). Email/IM notification channels are still
+// `messagingReply` (#1559 bot reply executor) + `messagingSend` active messaging sends.
+// Email/IM notification channels are still
 // `NotificationKind` variants under `notification`.
 export const ACTION_KINDS = [
   "notification",
@@ -332,6 +333,7 @@ export const ACTION_KINDS = [
   "check",
   "stopReview",
   "messagingReply",
+  "messagingSend",
 ] as const;
 export type ActionKind = (typeof ACTION_KINDS)[number];
 
@@ -350,6 +352,8 @@ export function outboxKindLabel(k: ActionKind): string {
       return "停止评审 / Stop Review";
     case "messagingReply":
       return "消息回复 / Messaging Reply";
+    case "messagingSend":
+      return "消息发送 / Messaging Send";
     default:
       return assertNever(k);
   }

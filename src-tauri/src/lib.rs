@@ -71,12 +71,13 @@ fn parse_notification_action_payload(payload: &str) -> error::AppResult<Notifica
 }
 
 struct MessagingActionsImpl;
+const MESSAGING_OUTBOX_SCOPE: &str = "__messaging__";
 
 impl<R: tauri::Runtime> messaging::service::MessagingActions<R> for MessagingActionsImpl {
     fn enqueue_reply(
         &self,
         app: &tauri::AppHandle<R>,
-        integration_id: &str,
+        _integration_id: &str,
         kind: model::ActionKind,
         summary: &str,
         payload_json: &str,
@@ -84,12 +85,55 @@ impl<R: tauri::Runtime> messaging::service::MessagingActions<R> for MessagingAct
     ) -> error::AppResult<i64> {
         outbox::service::enqueue_deduped(
             app,
-            integration_id,
+            MESSAGING_OUTBOX_SCOPE,
             kind,
             summary,
             payload_json,
             dedupe_key,
         )
+    }
+
+    fn enqueue_send(
+        &self,
+        app: &tauri::AppHandle<R>,
+        kind: model::ActionKind,
+        summary: &str,
+        payload_json: &str,
+        dedupe_key: &str,
+    ) -> error::AppResult<i64> {
+        outbox::service::enqueue_deduped(
+            app,
+            MESSAGING_OUTBOX_SCOPE,
+            kind,
+            summary,
+            payload_json,
+            dedupe_key,
+        )
+    }
+
+    fn list_sends(
+        &self,
+        app: &tauri::AppHandle<R>,
+        integration_id: Option<&str>,
+    ) -> error::AppResult<Vec<model::OutboxEntry>> {
+        let db = app.state::<db::Database>();
+        let entries = outbox::store::list_by_project(db.inner(), Some(MESSAGING_OUTBOX_SCOPE))?;
+        let mut filtered = Vec::new();
+        for entry in entries.into_iter().filter(|entry| {
+            matches!(
+                entry.kind,
+                model::ActionKind::MessagingReply | model::ActionKind::MessagingSend
+            )
+        }) {
+            if let Some(expected) = integration_id {
+                let payload = outbox::store::get_raw(db.inner(), entry.id)?.unwrap_or_default();
+                if !messaging_outbox_integration_matches(&payload, expected) {
+                    continue;
+                }
+            }
+            filtered.push(entry);
+        }
+        Ok(filtered)
     }
 
     fn trigger_review<'a>(
@@ -104,6 +148,44 @@ impl<R: tauri::Runtime> messaging::service::MessagingActions<R> for MessagingAct
             review::commands::trigger_review_with_state(app, &state, reference, pr_number, kind)
                 .await
         })
+    }
+}
+
+fn messaging_outbox_integration_matches(payload_json: &str, integration_id: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(payload_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("integrationId")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|id| id == integration_id)
+}
+
+pub(crate) fn make_local_api_ctx<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    port: u16,
+    base_path: String,
+    remote_entrypoint_id: Option<String>,
+) -> review::local_api::Ctx<R> {
+    review::local_api::Ctx {
+        app,
+        port,
+        base_path,
+        remote_entrypoint_id,
+    }
+}
+
+pub(crate) fn make_messaging_local_api_ctx<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    port: u16,
+    remote_entrypoint_id: Option<String>,
+) -> messaging::local_api::Ctx<R> {
+    messaging::local_api::Ctx {
+        app,
+        port,
+        remote_entrypoint_id,
     }
 }
 
@@ -139,6 +221,9 @@ pub fn run() {
     match cli::parse() {
         cli::Invocation::Review(args) => std::process::exit(cli::run_client_blocking(&args)),
         cli::Invocation::Notify(args) => std::process::exit(cli::run_notify_client_blocking(&args)),
+        cli::Invocation::Message(args) => {
+            std::process::exit(cli::run_message_client_blocking(&args))
+        }
         cli::Invocation::Gui => build_app(),
     }
 }
@@ -575,6 +660,22 @@ fn build_app() {
                                     };
                                 messaging::service::execute_reply(&app, payload).await
                             }
+                            model::ActionKind::MessagingSend => {
+                                let payload =
+                                    match serde_json::from_str::<model::MessagingSendPayload>(
+                                        &action.payload,
+                                    ) {
+                                        Ok(payload) => payload,
+                                        Err(e) => {
+                                            return Ok(model::ActionExecutionResult::Dead {
+                                                message: format!(
+                                                    "messaging send payload 反序列化失败: {e}"
+                                                ),
+                                            });
+                                        }
+                                    };
+                                messaging::service::execute_send(&app, payload).await
+                            }
                         }
                     })
                 });
@@ -756,6 +857,9 @@ fn build_app() {
             messaging::commands::messaging_events_list,
             messaging::commands::messaging_event_raw,
             messaging::commands::messaging_event_replay,
+            messaging::commands::messaging_send,
+            messaging::commands::messaging_sends_list,
+            messaging::commands::messaging_integrations_list,
             outbox::commands::outbox_list,
             outbox::commands::outbox_get_raw,
             outbox::commands::outbox_retry,

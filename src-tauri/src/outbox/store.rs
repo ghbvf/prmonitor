@@ -844,6 +844,7 @@ mod tests {
             (ActionKind::Check, "check"),
             (ActionKind::StopReview, "stopReview"),
             (ActionKind::MessagingReply, "messagingReply"),
+            (ActionKind::MessagingSend, "messagingSend"),
         ] {
             assert_eq!(kind_as_wire(kind), wire, "{kind:?} → {wire}");
             assert_eq!(
@@ -871,6 +872,8 @@ mod tests {
             ActionKind::Review,
             ActionKind::Check,
             ActionKind::StopReview,
+            ActionKind::MessagingReply,
+            ActionKind::MessagingSend,
         ]
         .into_iter()
         .enumerate()

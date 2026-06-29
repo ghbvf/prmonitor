@@ -20,13 +20,19 @@
 //! it must restate is the bundle identifier (to find `prmonitor.db` without a Tauri app); that
 //! restatement is locked **Medium** by [`tests::app_identifier_matches_tauri_conf`].
 
-use std::time::Duration;
+use std::{
+    future::Future,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::config::service as config_service;
 use crate::db::Database;
-use crate::model::{NotificationLevel, SendNotificationRequest, SendNotificationResponse};
+use crate::model::{
+    MessagingEventEntry, NotificationLevel, OutboxEntry, SendMessagingRequest,
+    SendMessagingResponse, SendNotificationRequest, SendNotificationResponse,
+};
 use crate::review::local_api::{ErrorBody, StatusResponse, TriggerRequest, TriggerResponse};
 use crate::review::session::SessionStatus;
 
@@ -57,6 +63,8 @@ enum Command {
     Review(ReviewArgs),
     /// Enqueue a user-authored notification through the running prmonitor app.
     Notify(NotifyArgs),
+    /// Send or inspect bidirectional messaging integration logs.
+    Message(MessageArgs),
 }
 
 /// `prmonitor review` arguments. Exactly one of `--repo` / `--project-id` identifies the project
@@ -129,6 +137,50 @@ pub struct NotifyArgs {
     pub token: Option<String>,
 }
 
+#[derive(Args, Clone, Debug)]
+pub struct MessageArgs {
+    #[command(subcommand)]
+    pub command: MessageCommand,
+}
+
+#[derive(Subcommand, Clone)]
+pub enum MessageCommand {
+    /// Enqueue an active messaging send.
+    Send(MessageSendArgs),
+    /// List received messaging events.
+    Events(MessageLogArgs),
+    /// List messaging send/reply outbox rows.
+    Sends(MessageLogArgs),
+}
+
+#[derive(Args, Clone)]
+pub struct MessageSendArgs {
+    #[arg(long = "integration-id")]
+    pub integration_id: String,
+    #[arg(long = "conversation-id")]
+    pub conversation_id: String,
+    #[arg(long)]
+    pub text: String,
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub json: Option<String>,
+    #[arg(long)]
+    pub port: Option<u16>,
+    #[arg(long)]
+    pub token: Option<String>,
+}
+
+#[derive(Args, Clone)]
+pub struct MessageLogArgs {
+    #[arg(long = "integration-id")]
+    pub integration_id: Option<String>,
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub json: Option<String>,
+    #[arg(long)]
+    pub port: Option<u16>,
+    #[arg(long)]
+    pub token: Option<String>,
+}
+
 impl ReviewArgs {
     /// The free-form `reference` the trigger funnel resolves (id-or-repo). The clap `target`
     /// group guarantees exactly one of repo / project_id is set.
@@ -173,6 +225,17 @@ impl NotifyArgs {
     }
 }
 
+impl MessageSendArgs {
+    fn send_request(&self) -> SendMessagingRequest {
+        SendMessagingRequest {
+            integration_id: self.integration_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            text: self.text.clone(),
+            request_id: new_request_id(),
+        }
+    }
+}
+
 fn parse_notification_level(value: &str) -> Result<NotificationLevel, String> {
     value.parse()
 }
@@ -211,12 +274,47 @@ impl std::fmt::Debug for NotifyArgs {
     }
 }
 
+impl std::fmt::Debug for MessageSendArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageSendArgs")
+            .field("integration_id", &self.integration_id)
+            .field("conversation_id", &self.conversation_id)
+            .field("text", &"[REDACTED]")
+            .field("json", &self.json)
+            .field("port", &self.port)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for MessageLogArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageLogArgs")
+            .field("integration_id", &self.integration_id)
+            .field("json", &self.json)
+            .field("port", &self.port)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for MessageCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MessageCommand::Send(args) => f.debug_tuple("Send").field(args).finish(),
+            MessageCommand::Events(args) => f.debug_tuple("Events").field(args).finish(),
+            MessageCommand::Sends(args) => f.debug_tuple("Sends").field(args).finish(),
+        }
+    }
+}
+
 /// What [`parse`] resolved the process invocation to.
 pub enum Invocation {
     /// `prmonitor review …` — run the CLI client (which itself launches the app on a cold start).
     Review(ReviewArgs),
     /// `prmonitor notify …` — enqueue a notification through the same local API client path.
     Notify(NotifyArgs),
+    Message(MessageArgs),
     /// Anything else — boot the GUI normally.
     Gui,
 }
@@ -227,13 +325,14 @@ pub enum Invocation {
 /// for a CLI.
 pub fn parse() -> Invocation {
     let first = std::env::args().nth(1);
-    let is_cli = matches!(first.as_deref(), Some("review" | "notify"));
+    let is_cli = matches!(first.as_deref(), Some("review" | "notify" | "message"));
     if !is_cli {
         return Invocation::Gui;
     }
     match Cli::parse().command {
         Some(Command::Review(args)) => Invocation::Review(args),
         Some(Command::Notify(args)) => Invocation::Notify(args),
+        Some(Command::Message(args)) => Invocation::Message(args),
         None => Invocation::Gui,
     }
 }
@@ -285,6 +384,20 @@ pub fn run_notify_client_blocking(args: &NotifyArgs) -> i32 {
     rt.block_on(run_notify_client(args))
 }
 
+pub fn run_message_client_blocking(args: &MessageArgs) -> i32 {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("无法创建运行时: {e}");
+            return 1;
+        }
+    };
+    rt.block_on(run_message_client(args))
+}
+
 async fn run_client(args: &ReviewArgs) -> i32 {
     let endpoint = resolve_endpoint(args.port, args.token.clone());
     if endpoint.port == 0 {
@@ -307,7 +420,7 @@ async fn run_client(args: &ReviewArgs) -> i32 {
             return 1;
         }
     };
-    let base = format!("http://127.0.0.1:{}", endpoint.port);
+    let base = endpoint.base_url();
 
     // 1) Trigger. If the app is running, this succeeds immediately. If it is NOT running, launch it
     //    and retry-connect until its local API binds — the CLI stays a thin HTTP client throughout
@@ -369,7 +482,7 @@ async fn run_notify_client(args: &NotifyArgs) -> i32 {
             return 1;
         }
     };
-    let base = format!("http://127.0.0.1:{}", endpoint.port);
+    let base = endpoint.base_url();
     match post_notification(&client, &base, &endpoint.token, args).await {
         NotifyPost::Ok(response) => {
             let value = serde_json::to_value(&response).unwrap_or(serde_json::Value::Null);
@@ -407,6 +520,227 @@ async fn run_notify_client(args: &NotifyArgs) -> i32 {
                     NotifyPost::Failed(code) => return code,
                 }
             }
+        }
+    }
+}
+
+async fn run_message_client(args: &MessageArgs) -> i32 {
+    match &args.command {
+        MessageCommand::Send(send) => run_message_send_client(send).await,
+        MessageCommand::Events(logs) => run_message_events_client(logs).await,
+        MessageCommand::Sends(logs) => run_message_sends_client(logs).await,
+    }
+}
+
+async fn run_message_send_client(args: &MessageSendArgs) -> i32 {
+    let endpoint = resolve_endpoint(args.port, args.token.clone());
+    if endpoint.port == 0 {
+        eprintln!("本地 API 已禁用（端口为 0）；请在「设置 → 远程访问」中为 local-api 监听器设置端口并启用后重试");
+        return 1;
+    }
+    let client = match cli_http_client() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let base = endpoint.base_url();
+    let request = args.send_request();
+    match with_message_cold_start(|| post_message_send(&client, &base, &endpoint.token, &request))
+        .await
+    {
+        Ok(response) => {
+            let value = serde_json::to_value(&response).unwrap_or(serde_json::Value::Null);
+            emit(&args.json, &value, || {
+                format!("message 已入队：{}", response.outbox_id)
+            });
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+async fn run_message_events_client(args: &MessageLogArgs) -> i32 {
+    let endpoint = resolve_endpoint(args.port, args.token.clone());
+    if endpoint.port == 0 {
+        eprintln!("本地 API 已禁用（端口为 0）；请在「设置 → 远程访问」中为 local-api 监听器设置端口并启用后重试");
+        return 1;
+    }
+    let client = match cli_http_client() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let base = endpoint.base_url();
+    match with_message_cold_start(|| get_message_events(&client, &base, &endpoint.token, args))
+        .await
+    {
+        Ok(entries) => {
+            let value = serde_json::to_value(&entries).unwrap_or(serde_json::Value::Null);
+            emit(&args.json, &value, || format_message_events(&entries));
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+async fn run_message_sends_client(args: &MessageLogArgs) -> i32 {
+    let endpoint = resolve_endpoint(args.port, args.token.clone());
+    if endpoint.port == 0 {
+        eprintln!("本地 API 已禁用（端口为 0）；请在「设置 → 远程访问」中为 local-api 监听器设置端口并启用后重试");
+        return 1;
+    }
+    let client = match cli_http_client() {
+        Ok(c) => c,
+        Err(code) => return code,
+    };
+    let base = endpoint.base_url();
+    match with_message_cold_start(|| get_message_sends(&client, &base, &endpoint.token, args)).await
+    {
+        Ok(entries) => {
+            let value = serde_json::to_value(&entries).unwrap_or(serde_json::Value::Null);
+            emit(&args.json, &value, || format_message_sends(&entries));
+            0
+        }
+        Err(code) => code,
+    }
+}
+
+fn cli_http_client() -> Result<reqwest::Client, i32> {
+    reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| {
+            eprintln!("无法创建 HTTP 客户端: {e}");
+            1
+        })
+}
+
+async fn with_message_cold_start<T, F, Fut>(mut attempt: F) -> Result<T, i32>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = MessageAttempt<T>>,
+{
+    let mut waited = Duration::ZERO;
+    loop {
+        match attempt().await {
+            MessageAttempt::NotRunning if waited == Duration::ZERO => {
+                eprintln!("app 未运行：正在启动 app…");
+                if let Err(e) = spawn_detached_gui() {
+                    eprintln!("启动 app 失败：{e}");
+                    return Err(1);
+                }
+            }
+            MessageAttempt::NotRunning => {
+                if waited >= COLD_START_DEADLINE {
+                    eprintln!("启动 app 后本地 API 未在 {COLD_START_DEADLINE:?} 内就绪");
+                    return Err(1);
+                }
+            }
+            MessageAttempt::Ok(value) => return Ok(value),
+            MessageAttempt::Failed(code) => return Err(code),
+        }
+        tokio::time::sleep(COLD_START_POLL).await;
+        waited += COLD_START_POLL;
+    }
+}
+
+enum MessageAttempt<T> {
+    Ok(T),
+    NotRunning,
+    Failed(i32),
+}
+
+async fn post_message_send(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    request: &SendMessagingRequest,
+) -> MessageAttempt<SendMessagingResponse> {
+    let resp = client
+        .post(format!("{base}/messaging/send"))
+        .bearer_auth(token)
+        .json(request)
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) if e.is_connect() => return MessageAttempt::NotRunning,
+        Err(e) => {
+            eprintln!("消息发送请求失败: {e}");
+            return MessageAttempt::Failed(1);
+        }
+    };
+    if !resp.status().is_success() {
+        return MessageAttempt::Failed(report_http_error(resp).await);
+    }
+    match resp.json::<SendMessagingResponse>().await {
+        Ok(response) => MessageAttempt::Ok(response),
+        Err(e) => {
+            eprintln!("解析消息发送响应失败: {e}");
+            MessageAttempt::Failed(1)
+        }
+    }
+}
+
+async fn get_message_events(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    args: &MessageLogArgs,
+) -> MessageAttempt<Vec<MessagingEventEntry>> {
+    let mut req = client
+        .get(format!("{base}/messaging/events"))
+        .bearer_auth(token);
+    if let Some(id) = args.integration_id.as_deref() {
+        req = req.query(&[("integrationId", id)]);
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) if e.is_connect() => return MessageAttempt::NotRunning,
+        Err(e) => {
+            eprintln!("消息接收日志请求失败: {e}");
+            return MessageAttempt::Failed(1);
+        }
+    };
+    if !resp.status().is_success() {
+        return MessageAttempt::Failed(report_http_error(resp).await);
+    }
+    match resp.json::<Vec<MessagingEventEntry>>().await {
+        Ok(entries) => MessageAttempt::Ok(entries),
+        Err(e) => {
+            eprintln!("解析消息接收日志响应失败: {e}");
+            MessageAttempt::Failed(1)
+        }
+    }
+}
+
+async fn get_message_sends(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    args: &MessageLogArgs,
+) -> MessageAttempt<Vec<OutboxEntry>> {
+    let mut req = client
+        .get(format!("{base}/messaging/sends"))
+        .bearer_auth(token);
+    if let Some(id) = args.integration_id.as_deref() {
+        req = req.query(&[("integrationId", id)]);
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) if e.is_connect() => return MessageAttempt::NotRunning,
+        Err(e) => {
+            eprintln!("消息发送日志请求失败: {e}");
+            return MessageAttempt::Failed(1);
+        }
+    };
+    if !resp.status().is_success() {
+        return MessageAttempt::Failed(report_http_error(resp).await);
+    }
+    match resp.json::<Vec<OutboxEntry>>().await {
+        Ok(entries) => MessageAttempt::Ok(entries),
+        Err(e) => {
+            eprintln!("解析消息发送日志响应失败: {e}");
+            MessageAttempt::Failed(1)
         }
     }
 }
@@ -583,6 +917,13 @@ async fn report_http_error(resp: reqwest::Response) -> i32 {
 struct Endpoint {
     port: u16,
     token: String,
+    base_path: String,
+}
+
+impl Endpoint {
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}{}", self.port, self.base_path)
+    }
 }
 
 /// Resolve (port, token): flag > env > saved config (or its defaults). Never hard-fails — a
@@ -595,10 +936,23 @@ fn resolve_endpoint(port: Option<u16>, token: Option<String>) -> Endpoint {
     let port = port
         .or_else(env_port)
         .unwrap_or(crate::config::service::local_api_port(&cfg));
+    let base_path = crate::config::service::local_api_path(&cfg);
     let token = token
         .or_else(|| std::env::var("PRMONITOR_LOCAL_API_TOKEN").ok())
         .unwrap_or(cfg.local_api_token);
-    Endpoint { port, token }
+    Endpoint {
+        port,
+        token,
+        base_path,
+    }
+}
+
+fn new_request_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("cli-{}-{nanos}", std::process::id())
 }
 
 fn env_port() -> Option<u16> {
@@ -623,6 +977,56 @@ fn emit(json_opt: &Option<String>, value: &serde_json::Value, human: impl FnOnce
     match json_opt {
         None => println!("{}", human()),
         Some(fields) => println!("{}", render_json(value, fields)),
+    }
+}
+
+fn format_message_events(entries: &[MessagingEventEntry]) -> String {
+    if entries.is_empty() {
+        return "messaging events: 0".to_string();
+    }
+    let mut lines = vec![format!("messaging events: {}", entries.len())];
+    for entry in entries.iter().take(20) {
+        lines.push(format!(
+            "#{} {} {} {} {}",
+            entry.id,
+            entry.status.as_wire(),
+            entry.event.provider.as_wire(),
+            entry.event.integration_id,
+            compact_text(&entry.event.text)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn format_message_sends(entries: &[OutboxEntry]) -> String {
+    if entries.is_empty() {
+        return "messaging sends: 0".to_string();
+    }
+    let mut lines = vec![format!("messaging sends: {}", entries.len())];
+    for entry in entries.iter().take(20) {
+        let error = entry
+            .last_error
+            .as_deref()
+            .map(|e| format!(" error={}", compact_text(e)))
+            .unwrap_or_default();
+        lines.push(format!(
+            "#{} {:?} {:?} attempts={} {}{}",
+            entry.id, entry.kind, entry.status, entry.attempt_count, entry.summary, error
+        ));
+    }
+    lines.join("\n")
+}
+
+fn compact_text(value: &str) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.len() <= 80 {
+        value
+    } else {
+        let mut end = 80;
+        while end > 0 && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &value[..end])
     }
 }
 
@@ -726,6 +1130,13 @@ mod tests {
         }
     }
 
+    fn parse_message(argv: &[&str]) -> Result<MessageArgs, clap::Error> {
+        match Cli::try_parse_from(argv)?.command {
+            Some(Command::Message(a)) => Ok(a),
+            _ => panic!("expected a message subcommand"),
+        }
+    }
+
     #[test]
     fn parses_repo_target_and_defaults() {
         let a = parse_review(&["prmonitor", "review", "--pr", "7", "--repo", "owner/name"])
@@ -803,6 +1214,53 @@ mod tests {
         ])
         .expect("valid");
         assert_eq!(fields.json.as_deref(), Some("status,commentUrl"));
+    }
+
+    #[test]
+    fn parses_message_send_request_and_redacts_debug() {
+        let args = parse_message(&[
+            "prmonitor",
+            "message",
+            "send",
+            "--integration-id",
+            "wx",
+            "--conversation-id",
+            "c1",
+            "--text",
+            "secret message",
+            "--token",
+            "local-token",
+        ])
+        .expect("valid");
+        let MessageCommand::Send(send) = args.command else {
+            panic!("expected send");
+        };
+        let request = send.send_request();
+        assert_eq!(request.integration_id, "wx");
+        assert_eq!(request.conversation_id, "c1");
+        assert_eq!(request.text, "secret message");
+        assert!(request.request_id.starts_with("cli-"));
+        let debug = format!("{send:?}");
+        assert!(!debug.contains("secret message"));
+        assert!(!debug.contains("local-token"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn message_log_args_redact_token_in_debug() {
+        let args = parse_message(&[
+            "prmonitor",
+            "message",
+            "events",
+            "--integration-id",
+            "wx",
+            "--token",
+            "local-token",
+        ])
+        .expect("valid");
+        let debug = format!("{args:?}");
+        assert!(!debug.contains("local-token"));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]

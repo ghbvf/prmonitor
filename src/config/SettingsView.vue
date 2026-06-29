@@ -228,7 +228,15 @@ async function onSave() {
       store.error.startsWith("feishuEncryptKey") ||
       store.error.startsWith("feishuAppId") ||
       store.error.startsWith("feishuAppSecret") ||
-      store.error.startsWith("feishuBotOpenId")
+      store.error.startsWith("feishuBotOpenId") ||
+      store.error.startsWith("weChatWorkToken") ||
+      store.error.startsWith("weChatWorkEncodingAesKey") ||
+      store.error.startsWith("weChatWorkCorpId") ||
+      store.error.startsWith("weChatWorkCorpSecret") ||
+      store.error.startsWith("weChatWorkAgentId") ||
+      store.error.startsWith("dingTalkToken") ||
+      store.error.startsWith("dingTalkAppSecret") ||
+      store.error.startsWith("dingTalkRobotCode")
     ) {
       activeGroupId.value = MESSAGING_NAV_ID;
     } else if (

@@ -563,18 +563,24 @@ pub enum NotificationKind {
 pub enum MessagingProviderKind {
     #[default]
     Feishu,
+    WeChatWork,
+    DingTalk,
 }
 
 impl MessagingProviderKind {
     pub fn as_wire(self) -> &'static str {
         match self {
             MessagingProviderKind::Feishu => "feishu",
+            MessagingProviderKind::WeChatWork => "weChatWork",
+            MessagingProviderKind::DingTalk => "dingTalk",
         }
     }
 
     pub fn from_wire(value: &str) -> Option<Self> {
         match value {
             "feishu" => Some(MessagingProviderKind::Feishu),
+            "weChatWork" => Some(MessagingProviderKind::WeChatWork),
+            "dingTalk" => Some(MessagingProviderKind::DingTalk),
             _ => None,
         }
     }
@@ -589,6 +595,17 @@ pub struct MessagingProviderCapability {
     pub supports_reply: bool,
     pub supports_send: bool,
     pub requires_allowed_conversations: bool,
+}
+
+/// Secret-free integration selector for the messaging panel active-send form.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagingIntegrationOption {
+    pub id: String,
+    pub name: String,
+    pub kind: MessagingProviderKind,
+    pub allowed_conversation_ids: Vec<String>,
 }
 
 /// Normalized inbound messaging event (#1559).
@@ -687,6 +704,43 @@ pub struct MessagingReplyPayload {
     pub provider: MessagingProviderKind,
     pub target: MessagingReplyTarget,
     pub text: String,
+}
+
+/// Secret-free outbox payload for an operator-authored active messaging send.
+///
+/// Distinct from [`MessagingReplyPayload`]: replies acknowledge an inbound event and carry a
+/// provider reply target, while active sends address a configured conversation directly. Keeping
+/// this as a separate payload is the Hard channel-separation carrier with
+/// [`ActionKind::MessagingSend`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessagingSendPayload {
+    pub integration_id: String,
+    pub provider: MessagingProviderKind,
+    pub conversation_id: String,
+    pub text: String,
+}
+
+/// Transport-agnostic request to enqueue one active messaging send.
+///
+/// `deny_unknown_fields` keeps provider credentials/webhook URLs from being silently accepted into
+/// the request funnel. Credentials are always live-loaded from the referenced integration at
+/// execution time.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SendMessagingRequest {
+    pub integration_id: String,
+    pub conversation_id: String,
+    pub text: String,
+    pub request_id: String,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendMessagingResponse {
+    pub outbox_id: i64,
 }
 
 /// Persisted payload for one notification delivery row (AB#1459).
@@ -865,6 +919,8 @@ pub enum ActionKind {
     StopReview,
     /// Reply to an inbound messaging event (#1559) → `"messagingReply"`.
     MessagingReply,
+    /// Send an operator-authored message to a configured messaging conversation → `"messagingSend"`.
+    MessagingSend,
     // future genuinely-distinct kinds (AB#1069/1070): WebhookForward, WorkItemComment.
     // Email/IM notification channels are NOT kinds here — see the doc comment.
 }
@@ -945,12 +1001,11 @@ pub enum ActionStatus {
 /// backend-internal — a `Notification` JSON today); the panel fetches it on demand via
 /// `outbox_get_raw`, mirroring the inbox's `inbox_get_raw`.
 ///
-/// `Serialize` only (like [`InboxEntry`]): a front/back contract mirrored in `src/types.ts`
-/// (`OutboxEntry`) — a field change must be synced there in lockstep (the open end of this funnel;
-/// future Hard path = codegen `types.ts` from `model.rs` + `git diff --exit-code`). The store
-/// hydrates it from columns, so no `Deserialize`. The serde golden below
-/// (`outbox_entry_wire_shape_is_camel_case`) is the **Medium** carrier locking the camelCase shape.
-#[derive(Debug, Clone, Serialize)]
+/// Front/back contract mirrored in `src/types.ts` (`OutboxEntry`) and reused by the local CLI
+/// client for `/messaging/sends`; a field change must be synced there in lockstep. The serde golden
+/// below (`outbox_entry_wire_shape_is_camel_case`) is the **Medium** carrier locking the camelCase
+/// shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OutboxEntry {
     /// The outbox row id (the `action_outbox` table PRIMARY KEY) — the get-raw / retry key.
@@ -1603,6 +1658,80 @@ mod tests {
         assert!(rv.get("outbox_ids").is_none());
     }
 
+    #[test]
+    fn send_messaging_request_response_wire_shape_and_secret_exclusion() {
+        let req = SendMessagingRequest {
+            integration_id: "feishu-main".to_string(),
+            conversation_id: "oc_123".to_string(),
+            text: "hello".to_string(),
+            request_id: "req-1".to_string(),
+        };
+        let v = serde_json::to_value(&req).expect("SendMessagingRequest serializes");
+        assert_eq!(v["integrationId"], "feishu-main");
+        assert_eq!(v["conversationId"], "oc_123");
+        assert_eq!(v["text"], "hello");
+        assert_eq!(v["requestId"], "req-1");
+        assert!(v.get("integration_id").is_none());
+
+        let err = serde_json::from_value::<SendMessagingRequest>(serde_json::json!({
+            "integrationId": "feishu-main",
+            "conversationId": "oc_123",
+            "text": "hello",
+            "requestId": "req-1",
+            "webhookUrl": "https://secret.example/hook"
+        }))
+        .expect_err("unknown secret-looking fields are rejected");
+        assert!(err.to_string().contains("unknown field"), "{err}");
+
+        let payload = MessagingSendPayload {
+            integration_id: "feishu-main".to_string(),
+            provider: MessagingProviderKind::Feishu,
+            conversation_id: "oc_123".to_string(),
+            text: "hello".to_string(),
+        };
+        let json = serde_json::to_string(&payload).expect("payload serializes");
+        for denied in [
+            "secret",
+            "token",
+            "webhookUrl",
+            "appSecret",
+            "authorization",
+        ] {
+            assert!(
+                !json.contains(denied),
+                "messaging send payload must not contain {denied}: {json}"
+            );
+        }
+
+        let response = SendMessagingResponse { outbox_id: 7 };
+        let rv = serde_json::to_value(&response).expect("SendMessagingResponse serializes");
+        assert_eq!(rv["outboxId"], serde_json::json!(7));
+        assert!(rv.get("outbox_id").is_none());
+    }
+
+    #[test]
+    fn messaging_integration_option_wire_shape_and_secret_exclusion() {
+        let option = MessagingIntegrationOption {
+            id: "wx-main".to_string(),
+            name: "企业微信".to_string(),
+            kind: MessagingProviderKind::WeChatWork,
+            allowed_conversation_ids: vec!["room-1".to_string()],
+        };
+        let v = serde_json::to_value(&option).expect("MessagingIntegrationOption serializes");
+        assert_eq!(v["id"], "wx-main");
+        assert_eq!(v["name"], "企业微信");
+        assert_eq!(v["kind"], "weChatWork");
+        assert_eq!(v["allowedConversationIds"], serde_json::json!(["room-1"]));
+        assert!(v.get("allowed_conversation_ids").is_none());
+        let json = v.to_string();
+        for denied in ["secret", "token", "webhookUrl", "appSecret", "encryptKey"] {
+            assert!(
+                !json.contains(denied),
+                "messaging integration option must not contain {denied}: {json}"
+            );
+        }
+    }
+
     // Cross-Rust-slice wire contract lock for `NotificationLevel` / `NotificationKind`
     // (AB#1070, Medium carrier): a variant rename or `rename_all` change surfaces here. The
     // exhaustive `match NotificationKind` in `review::notify::deliver` is the Hard carrier.
@@ -1743,6 +1872,10 @@ mod tests {
             "messagingReply"
         );
         assert_eq!(
+            serde_json::to_value(ActionKind::MessagingSend).expect("ActionKind serializes"),
+            "messagingSend"
+        );
+        assert_eq!(
             serde_json::to_value(ActionKind::default()).expect("ActionKind serializes"),
             "notification"
         );
@@ -1755,10 +1888,30 @@ mod tests {
                 .expect("MessagingProviderKind serializes"),
             "feishu"
         );
+        assert_eq!(
+            serde_json::to_value(MessagingProviderKind::WeChatWork)
+                .expect("MessagingProviderKind serializes"),
+            "weChatWork"
+        );
+        assert_eq!(
+            serde_json::to_value(MessagingProviderKind::DingTalk)
+                .expect("MessagingProviderKind serializes"),
+            "dingTalk"
+        );
         assert_eq!(MessagingProviderKind::Feishu.as_wire(), "feishu");
+        assert_eq!(MessagingProviderKind::WeChatWork.as_wire(), "weChatWork");
+        assert_eq!(MessagingProviderKind::DingTalk.as_wire(), "dingTalk");
         assert_eq!(
             MessagingProviderKind::from_wire("feishu"),
             Some(MessagingProviderKind::Feishu)
+        );
+        assert_eq!(
+            MessagingProviderKind::from_wire("weChatWork"),
+            Some(MessagingProviderKind::WeChatWork)
+        );
+        assert_eq!(
+            MessagingProviderKind::from_wire("dingTalk"),
+            Some(MessagingProviderKind::DingTalk)
         );
         assert_eq!(MessagingProviderKind::from_wire("slack"), None);
 

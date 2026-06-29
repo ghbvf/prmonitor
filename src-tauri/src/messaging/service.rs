@@ -13,9 +13,11 @@ use crate::error::{AppError, AppResult};
 use crate::messaging::feishu::FeishuProvider;
 use crate::messaging::provider::{MessagingProvider, Verification};
 use crate::messaging::store;
+use crate::messaging::{dingtalk::DingTalkProvider, wechat_work::WeChatWorkProvider};
 use crate::model::{
     ActionExecutionResult, ActionKind, MessagingEvent, MessagingEventStatus, MessagingProviderKind,
-    MessagingReplyPayload, MessagingReplyTarget,
+    MessagingReplyPayload, MessagingReplyTarget, MessagingSendPayload, OutboxEntry,
+    SendMessagingRequest, SendMessagingResponse,
 };
 use crate::state::AppState;
 
@@ -29,6 +31,21 @@ pub trait MessagingActions<R: Runtime>: Send + Sync + 'static {
         payload_json: &str,
         dedupe_key: &str,
     ) -> AppResult<i64>;
+
+    fn enqueue_send(
+        &self,
+        app: &tauri::AppHandle<R>,
+        kind: ActionKind,
+        summary: &str,
+        payload_json: &str,
+        dedupe_key: &str,
+    ) -> AppResult<i64>;
+
+    fn list_sends(
+        &self,
+        app: &tauri::AppHandle<R>,
+        integration_id: Option<&str>,
+    ) -> AppResult<Vec<OutboxEntry>>;
 
     fn trigger_review<'a>(
         &'a self,
@@ -193,6 +210,99 @@ pub async fn execute_reply<R: Runtime>(
         .await
 }
 
+pub fn enqueue_send<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    actions: &dyn MessagingActions<R>,
+    request: SendMessagingRequest,
+) -> AppResult<SendMessagingResponse> {
+    let integration = config_service::messaging_integration(app, &request.integration_id)?;
+    if !integration.enabled {
+        return Err(AppError::new(format!(
+            "消息集成「{}」已禁用，不能发送",
+            integration.name
+        )));
+    }
+    let conversation_id = request.conversation_id.trim();
+    if !conversation_allowed(&integration, conversation_id) {
+        return Err(AppError::new(format!(
+            "conversationId 未授权使用消息集成「{}」",
+            integration.name
+        )));
+    }
+    let text = request.text.trim();
+    if text.is_empty() {
+        return Err(AppError::new("消息正文不能为空"));
+    }
+    let request_id = request.request_id.trim();
+    if request_id.is_empty() {
+        return Err(AppError::new("messaging requestId 不能为空"));
+    }
+    let payload = MessagingSendPayload {
+        integration_id: integration.id.clone(),
+        provider: integration.kind,
+        conversation_id: conversation_id.to_string(),
+        text: crate::messaging::truncate_utf8_boundary(text, MAX_SEND_TEXT_BYTES),
+    };
+    let payload_json = serde_json::to_string(&payload)
+        .map_err(|e| AppError::new(format!("messaging send payload 序列化失败: {e}")))?;
+    let summary = format!(
+        "Messaging send {} → {}",
+        payload.provider.as_wire(),
+        payload.conversation_id
+    );
+    let dedupe_key = active_send_dedupe_key(&integration.id, request_id);
+    let outbox_id = actions.enqueue_send(
+        app,
+        ActionKind::MessagingSend,
+        &summary,
+        &payload_json,
+        &dedupe_key,
+    )?;
+    Ok(SendMessagingResponse { outbox_id })
+}
+
+fn active_send_dedupe_key(integration_id: &str, request_id: &str) -> String {
+    format!(
+        "messaging-send:{}:{}",
+        integration_id.trim(),
+        request_id.trim()
+    )
+}
+
+pub async fn execute_send<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    payload: MessagingSendPayload,
+) -> AppResult<ActionExecutionResult> {
+    let integration = match config_service::messaging_integration(app, &payload.integration_id) {
+        Ok(integration) => integration,
+        Err(e) if e.message.contains("messagingIntegrationId 不存在") => {
+            return Ok(ActionExecutionResult::Dead { message: e.message });
+        }
+        Err(e) => return Err(e),
+    };
+    if !integration.enabled {
+        return Ok(ActionExecutionResult::Dead {
+            message: format!("消息集成「{}」已禁用，停止发送", integration.name),
+        });
+    }
+    if integration.kind != payload.provider {
+        return Ok(ActionExecutionResult::Dead {
+            message: format!(
+                "消息集成「{}」kind 已从 {:?} 改为 {:?}，停止发送",
+                integration.name, payload.provider, integration.kind
+            ),
+        });
+    }
+    if !conversation_allowed(&integration, &payload.conversation_id) {
+        return Ok(ActionExecutionResult::Dead {
+            message: format!("conversationId 未授权使用消息集成「{}」", integration.name),
+        });
+    }
+    provider_for(integration.kind)
+        .send(&integration, &payload.conversation_id, &payload.text)
+        .await
+}
+
 async fn process_event<R: Runtime>(
     app: &tauri::AppHandle<R>,
     actions: &dyn MessagingActions<R>,
@@ -296,10 +406,13 @@ async fn process_event<R: Runtime>(
 fn provider_for(kind: MessagingProviderKind) -> &'static dyn MessagingProvider {
     match kind {
         MessagingProviderKind::Feishu => &FeishuProvider,
+        MessagingProviderKind::WeChatWork => &WeChatWorkProvider,
+        MessagingProviderKind::DingTalk => &DingTalkProvider,
     }
 }
 
 fn conversation_allowed(integration: &MessagingIntegration, conversation_id: &str) -> bool {
+    let conversation_id = conversation_id.trim();
     integration
         .allowed_conversation_ids
         .iter()
@@ -453,6 +566,8 @@ fn enqueue_reply<R: Runtime>(
     })
 }
 
+const MAX_SEND_TEXT_BYTES: usize = 4096;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +680,26 @@ mod tests {
             Ok(42)
         }
 
+        fn enqueue_send(
+            &self,
+            _app: &tauri::AppHandle<R>,
+            _kind: ActionKind,
+            _summary: &str,
+            _payload_json: &str,
+            _dedupe_key: &str,
+        ) -> AppResult<i64> {
+            self.enqueued.fetch_add(1, Ordering::SeqCst);
+            Ok(43)
+        }
+
+        fn list_sends(
+            &self,
+            _app: &tauri::AppHandle<R>,
+            _integration_id: Option<&str>,
+        ) -> AppResult<Vec<OutboxEntry>> {
+            Ok(Vec::new())
+        }
+
         fn trigger_review<'a>(
             &'a self,
             _app: &'a tauri::AppHandle<R>,
@@ -618,5 +753,102 @@ mod tests {
         let reply = entry.reply.expect("reply");
         assert_eq!(reply.outbox_id, 42);
         assert_eq!(reply.kind, "review-failed");
+    }
+
+    struct CapturingSendActions {
+        dedupe_key: std::sync::Mutex<Option<String>>,
+    }
+
+    impl<R: Runtime> MessagingActions<R> for CapturingSendActions {
+        fn enqueue_reply(
+            &self,
+            _app: &tauri::AppHandle<R>,
+            _integration_id: &str,
+            _kind: ActionKind,
+            _summary: &str,
+            _payload_json: &str,
+            _dedupe_key: &str,
+        ) -> AppResult<i64> {
+            Ok(42)
+        }
+
+        fn enqueue_send(
+            &self,
+            _app: &tauri::AppHandle<R>,
+            _kind: ActionKind,
+            _summary: &str,
+            _payload_json: &str,
+            dedupe_key: &str,
+        ) -> AppResult<i64> {
+            *self.dedupe_key.lock().expect("lock") = Some(dedupe_key.to_string());
+            Ok(43)
+        }
+
+        fn list_sends(
+            &self,
+            _app: &tauri::AppHandle<R>,
+            _integration_id: Option<&str>,
+        ) -> AppResult<Vec<OutboxEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn trigger_review<'a>(
+            &'a self,
+            _app: &'a tauri::AppHandle<R>,
+            _reference: String,
+            _pr_number: u64,
+            _kind: String,
+        ) -> Pin<Box<dyn Future<Output = AppResult<String>> + Send + 'a>> {
+            Box::pin(async { Ok("session".to_string()) })
+        }
+    }
+
+    #[test]
+    fn active_send_uses_request_id_as_pending_dedupe_key() {
+        let app = tauri::test::mock_app();
+        let db = Database::open_in_memory().expect("open");
+        let config = serde_json::json!({
+            "projects": [],
+            "activeProjectId": "",
+            "messaging": {
+                "integrations": [{
+                    "id": "fs",
+                    "name": "Feishu",
+                    "kind": "feishu",
+                    "enabled": true,
+                    "allowedConversationIds": ["chat"]
+                }]
+            }
+        });
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO config_blob (id, json) VALUES (1, ?1)",
+                [config.to_string()],
+            )?;
+            Ok(())
+        })
+        .expect("seed config");
+        app.manage(db);
+        let actions = CapturingSendActions {
+            dedupe_key: std::sync::Mutex::new(None),
+        };
+
+        let response = enqueue_send(
+            app.handle(),
+            &actions,
+            SendMessagingRequest {
+                integration_id: "fs".to_string(),
+                conversation_id: " chat ".to_string(),
+                text: " hello ".to_string(),
+                request_id: "req-123".to_string(),
+            },
+        )
+        .expect("enqueue send");
+
+        assert_eq!(response.outbox_id, 43);
+        assert_eq!(
+            actions.dedupe_key.lock().expect("lock").as_deref(),
+            Some("messaging-send:fs:req-123")
+        );
     }
 }

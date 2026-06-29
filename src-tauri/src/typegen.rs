@@ -18,8 +18,9 @@ use crate::{
     },
     model::{
         ActionStatus, EngineKind, EventType, LabelSource, MessagingEvent, MessagingEventEntry,
-        MessagingEventStatus, MessagingProviderCapability, MessagingProviderKind,
-        MessagingReplyAudit, NotificationKind, NotificationLevel, SendNotificationRequest,
+        MessagingEventStatus, MessagingIntegrationOption, MessagingProviderCapability,
+        MessagingProviderKind, MessagingReplyAudit, NotificationKind, NotificationLevel,
+        SendMessagingRequest, SendMessagingResponse, SendNotificationRequest,
         SendNotificationResponse, SourceKind, UpdateMode, WebhookTunnelMode,
     },
     remote::status::{
@@ -125,6 +126,8 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push('\n');
     shared.push_str(&declaration::<MessagingProviderCapability>(&cfg));
     shared.push('\n');
+    shared.push_str(&declaration::<MessagingIntegrationOption>(&cfg));
+    shared.push('\n');
     shared.push_str(&declaration::<MessagingEvent>(&cfg));
     shared.push('\n');
     shared.push_str(&declaration::<MessagingReplyAudit>(&cfg));
@@ -137,6 +140,10 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push_str(&declaration::<SendNotificationRequest>(&cfg));
     shared.push('\n');
     shared.push_str(&declaration::<SendNotificationResponse>(&cfg));
+    shared.push('\n');
+    shared.push_str(&declaration::<SendMessagingRequest>(&cfg));
+    shared.push('\n');
+    shared.push_str(&declaration::<SendMessagingResponse>(&cfg));
     shared.push('\n');
     shared.push_str(&declaration::<RuleMatchEntry>(&cfg));
 

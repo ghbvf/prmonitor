@@ -1,11 +1,28 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
-import { assertNever } from "../types";
+import { computed, onMounted, ref, watch } from "vue";
+import { assertNever, outboxKindLabel, outboxStatusLabel } from "../types";
 import type { MessagingEventStatus } from "../types.generated";
 import { useMessagingStore } from "./useMessagingStore";
 
 const store = useMessagingStore();
 const rawOpen = ref<Set<number>>(new Set());
+const sendDraft = ref({
+  integrationId: "",
+  conversationId: "",
+  text: "",
+});
+const enabledIntegrations = computed(() => store.integrations);
+const selectedIntegration = computed(() => enabledIntegrations.value.find((item) => item.id === sendDraft.value.integrationId) ?? null);
+const allowedConversationIds = computed(() => selectedIntegration.value?.allowedConversationIds ?? []);
+const normalizedConversationId = computed(() => sendDraft.value.conversationId.trim());
+const conversationAllowed = computed(() => allowedConversationIds.value.includes(normalizedConversationId.value));
+const sendDisabled = computed(() =>
+  store.sendLoading ||
+  !sendDraft.value.integrationId.trim() ||
+  !normalizedConversationId.value ||
+  !sendDraft.value.text.trim() ||
+  !conversationAllowed.value,
+);
 
 function toggleRaw(id: number) {
   if (rawOpen.value.has(id)) {
@@ -48,8 +65,35 @@ function replayDisabled(entry: { id: number; status: MessagingEventStatus }): bo
 }
 
 onMounted(() => {
+  void store.refreshIntegrations();
   void store.refresh();
+  void store.refreshSends();
 });
+
+watch(enabledIntegrations, (items) => {
+  if (!sendDraft.value.integrationId && items[0]) {
+    sendDraft.value.integrationId = items[0].id;
+  }
+}, { immediate: true });
+
+watch(selectedIntegration, (integration) => {
+  if (!integration) {
+    sendDraft.value.conversationId = "";
+    return;
+  }
+  if (!integration.allowedConversationIds.includes(normalizedConversationId.value)) {
+    sendDraft.value.conversationId = integration.allowedConversationIds[0] ?? "";
+  }
+});
+
+function sendTest() {
+  void store.send({
+    integrationId: sendDraft.value.integrationId.trim(),
+    conversationId: normalizedConversationId.value,
+    text: sendDraft.value.text.trim(),
+    requestId: crypto.randomUUID(),
+  });
+}
 </script>
 
 <template>
@@ -59,12 +103,58 @@ onMounted(() => {
       <button type="button" class="refresh" :disabled="store.loading" @click="store.refresh()">
         {{ store.loading ? "刷新中…" : "刷新 / refresh" }}
       </button>
+      <button type="button" class="refresh" :disabled="store.sendsLoading" @click="store.refreshSends()">
+        {{ store.sendsLoading ? "发送日志刷新中…" : "发送日志 / sends" }}
+      </button>
     </header>
 
     <p v-if="store.error" class="error banner">
       <span>{{ store.error }}</span>
       <button type="button" class="dismiss" aria-label="关闭 / dismiss" @click="store.error = null">x</button>
     </p>
+
+    <form class="send-form" @submit.prevent="sendTest">
+      <select v-model="sendDraft.integrationId">
+        <option value="" disabled>integration</option>
+        <option v-for="integration in enabledIntegrations" :key="integration.id" :value="integration.id">
+          {{ integration.name || integration.id }} · {{ integration.kind }}
+        </option>
+      </select>
+      <input v-model="sendDraft.conversationId" type="text" list="messaging-conversation-options" placeholder="conversation id" />
+      <datalist id="messaging-conversation-options">
+        <option v-for="id in allowedConversationIds" :key="id" :value="id" />
+      </datalist>
+      <input v-model="sendDraft.text" type="text" placeholder="message text" />
+      <button
+        type="submit"
+        class="refresh"
+        :disabled="sendDisabled"
+      >
+        {{ store.sendLoading ? "发送中…" : "发送消息 / send" }}
+      </button>
+    </form>
+    <p v-if="store.sendError" class="error banner">
+      <span>{{ store.sendError }}</span>
+      <button type="button" class="dismiss" aria-label="关闭 / dismiss" @click="store.sendError = null">x</button>
+    </p>
+
+    <section class="send-log">
+      <h3>发送日志 / Send log</h3>
+      <p v-if="store.sendsLoading && store.sends.length === 0" class="muted">加载中… / loading</p>
+      <p v-else-if="!store.sendsLoading && store.sends.length === 0" class="muted">暂无发送记录 / No sends yet.</p>
+      <ul class="entries compact">
+        <li v-for="entry in store.sends" :key="entry.id" class="entry send-entry">
+          <div class="row-head">
+            <span class="badge type">{{ outboxKindLabel(entry.kind) }}</span>
+            <span class="badge status" :class="entry.status === 'done' ? 'ok' : entry.status === 'dead' ? 'fail' : 'pending'">
+              {{ outboxStatusLabel(entry.status) }}
+            </span>
+            <span class="title">#{{ entry.id }} · {{ entry.summary }}</span>
+          </div>
+          <p v-if="entry.lastError" class="error fail-reason">{{ entry.lastError }}</p>
+        </li>
+      </ul>
+    </section>
 
     <p v-if="store.loading && store.entries.length === 0" class="muted">加载中… / loading</p>
     <p v-else-if="!store.loading && store.entries.length === 0" class="muted">暂无消息事件 / No messaging events yet.</p>
@@ -145,6 +235,22 @@ onMounted(() => {
   justify-content: space-between;
   gap: var(--space-3);
 }
+.send-form {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) minmax(140px, 1fr) minmax(180px, 2fr) auto;
+  gap: var(--space-2);
+  align-items: center;
+}
+.send-form input,
+.send-form select {
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  font: inherit;
+}
+.send-log h3 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-size-md);
+}
 .entries {
   display: flex;
   flex-direction: column;
@@ -158,6 +264,9 @@ onMounted(() => {
   border-radius: var(--radius-sm);
   padding: var(--space-4);
   background: var(--color-surface);
+}
+.entries.compact .entry {
+  padding: var(--space-3);
 }
 .row-head,
 .meta,
@@ -207,5 +316,10 @@ onMounted(() => {
 }
 .muted {
   color: var(--color-text-muted);
+}
+@media (max-width: 760px) {
+  .send-form {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

@@ -58,17 +58,19 @@ describe("outboxKindLabel", () => {
     expect(outboxKindLabel("check")).toBe("复查 / Check");
     expect(outboxKindLabel("stopReview")).toBe("停止评审 / Stop Review");
     expect(outboxKindLabel("messagingReply")).toBe("消息回复 / Messaging Reply");
+    expect(outboxKindLabel("messagingSend")).toBe("消息发送 / Messaging Send");
   });
 
   it("includes the action-executor kinds (mirrors Rust ActionKind)", () => {
     // Pins the `as const` set membership — review/check/stopReview are the AB#1069 additions;
-    // messagingReply is the #1559 bot reply executor.
+    // messagingReply is the #1559 bot reply executor; messagingSend is active messaging egress.
     expect([...ACTION_KINDS]).toEqual([
       "notification",
       "review",
       "check",
       "stopReview",
       "messagingReply",
+      "messagingSend",
     ]);
   });
 });

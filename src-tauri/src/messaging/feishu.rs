@@ -9,7 +9,7 @@ use subtle::ConstantTimeEq;
 use crate::config::service::MessagingIntegration;
 use crate::error::{AppError, AppResult};
 use crate::messaging::provider::{MessagingProvider, ProviderFuture, Verification};
-use crate::messaging::truncate_utf8_boundary;
+use crate::messaging::redact_raw_summary;
 use crate::model::{
     ActionExecutionResult, MessagingEvent, MessagingProviderCapability, MessagingProviderKind,
     MessagingReplyTarget,
@@ -17,7 +17,6 @@ use crate::model::{
 
 pub struct FeishuProvider;
 
-const MAX_RAW_SUMMARY: usize = 4096;
 const MAX_SIGNATURE_AGE_SECS: i64 = 5 * 60;
 
 impl FeishuProvider {
@@ -76,7 +75,7 @@ impl MessagingProvider for FeishuProvider {
         MessagingProviderCapability {
             provider: MessagingProviderKind::Feishu,
             supports_reply: true,
-            supports_send: false,
+            supports_send: true,
             requires_allowed_conversations: true,
         }
     }
@@ -154,6 +153,15 @@ impl MessagingProvider for FeishuProvider {
     ) -> ProviderFuture<'a> {
         Box::pin(async move { reply_message(integration, target, text).await })
     }
+
+    fn send<'a>(
+        &'a self,
+        integration: &'a MessagingIntegration,
+        conversation_id: &'a str,
+        text: &'a str,
+    ) -> ProviderFuture<'a> {
+        Box::pin(async move { send_message(integration, conversation_id, text).await })
+    }
 }
 
 fn header(headers: &HeaderMap, name: &str) -> AppResult<String> {
@@ -177,40 +185,6 @@ fn verify_timestamp_fresh(timestamp: &str) -> AppResult<()> {
         return Err(AppError::new("飞书事件 timestamp 已过期"));
     }
     Ok(())
-}
-
-fn redact_raw_summary(raw: &[u8]) -> String {
-    let text = String::from_utf8_lossy(raw);
-    let mut value: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({ "raw": text }));
-    redact_value(&mut value);
-    let out = serde_json::to_string(&value).unwrap_or_default();
-    truncate_utf8_boundary(&out, MAX_RAW_SUMMARY)
-}
-
-fn redact_value(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            for (key, value) in map.iter_mut() {
-                let lower = key.to_ascii_lowercase();
-                if lower.contains("secret")
-                    || lower.contains("token")
-                    || lower.contains("authorization")
-                    || lower.contains("encryptkey")
-                    || lower.contains("encrypt_key")
-                {
-                    *value = Value::String("[redacted]".to_string());
-                } else {
-                    redact_value(value);
-                }
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                redact_value(value);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn mentions_bot(mentions: &[Value], bot_open_id: &str) -> bool {
@@ -256,6 +230,31 @@ async fn reply_message(
         .await
         .map_err(|e| AppError::new(format!("飞书回复请求失败: {e}")))?;
     classify_feishu_response(resp, "飞书回复消息").await
+}
+
+async fn send_message(
+    integration: &MessagingIntegration,
+    conversation_id: &str,
+    text: &str,
+) -> AppResult<ActionExecutionResult> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(integration.timeout_secs))
+        .build()
+        .map_err(|e| AppError::new(format!("飞书 HTTP client 初始化失败: {e}")))?;
+    let token = tenant_access_token(&client, integration).await?;
+    let resp = client
+        .post("https://open.feishu.cn/open-apis/im/v1/messages")
+        .query(&[("receive_id_type", "chat_id")])
+        .bearer_auth(token)
+        .json(&json!({
+            "receive_id": conversation_id,
+            "msg_type": "text",
+            "content": serde_json::to_string(&json!({ "text": text })).expect("text content serializes"),
+        }))
+        .send()
+        .await
+        .map_err(|e| AppError::new(format!("飞书发送消息请求失败: {e}")))?;
+    classify_feishu_response(resp, "飞书发送消息").await
 }
 
 async fn tenant_access_token(
@@ -556,7 +555,7 @@ mod tests {
     fn raw_summary_truncates_non_ascii_on_char_boundary() {
         let raw = serde_json::to_vec(&json!({ "text": "错误".repeat(3000) })).expect("json");
         let summary = redact_raw_summary(&raw);
-        assert!(summary.len() <= MAX_RAW_SUMMARY);
+        assert!(summary.len() <= crate::messaging::MAX_RAW_SUMMARY);
         assert!(summary.is_char_boundary(summary.len()));
     }
 

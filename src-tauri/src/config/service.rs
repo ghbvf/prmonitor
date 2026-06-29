@@ -501,6 +501,30 @@ pub fn local_api_port(cfg: &AppConfig) -> u16 {
         .unwrap_or(0)
 }
 
+pub fn local_api_path(cfg: &AppConfig) -> String {
+    cfg.remote_access
+        .entrypoints
+        .iter()
+        .find(|entrypoint| {
+            entrypoint.enabled
+                && entrypoint.routes.iter().any(|route| {
+                    route.enabled
+                        && route.capability == crate::config::model::RemoteCapability::LocalApi
+                })
+        })
+        .and_then(|entrypoint| {
+            entrypoint
+                .routes
+                .iter()
+                .find(|route| {
+                    route.enabled
+                        && route.capability == crate::config::model::RemoteCapability::LocalApi
+                })
+                .and_then(|route| crate::config::model::normalize_route_path(&route.path).ok())
+        })
+        .unwrap_or_else(|| crate::config::model::RemoteRoute::local_api().path)
+}
+
 pub fn notification_channel<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     channel_id: &str,
@@ -1206,6 +1230,15 @@ mod tests {
             ..AppConfig::default()
         };
         assert_eq!(local_api_port(&none), 0);
+    }
+
+    #[test]
+    fn local_api_path_helper_resolves_enabled_route_path() {
+        assert_eq!(local_api_path(&AppConfig::default()), "/api");
+
+        let mut custom = AppConfig::default();
+        custom.remote_access.entrypoints[0].routes[0].path = "/local-api/".to_string();
+        assert_eq!(local_api_path(&custom), "/local-api");
     }
 
     /// A bare project with the given `id` / `repo` for the `match_project_ref` cases

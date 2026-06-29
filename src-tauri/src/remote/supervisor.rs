@@ -24,7 +24,8 @@ use crate::config::model::{
     RemoteCapability, RemoteEntrypoint, RemoteTunnel, RemoteTunnelMode, SourcePolicyMode,
 };
 use crate::db::Database;
-use crate::review::local_api::{build_router as build_local_api_router, Ctx as LocalApiCtx};
+use crate::messaging::local_api::build_router as build_messaging_local_api_router;
+use crate::review::local_api::build_router as build_review_local_api_router;
 use crate::state::AppState;
 
 use super::status::{
@@ -521,12 +522,19 @@ fn build_entrypoint_router<R: tauri::Runtime>(
             ),
             RemoteCapability::LocalApi => router.nest(
                 route.path.as_str(),
-                build_local_api_router(Arc::new(LocalApiCtx {
-                    app: app.clone(),
+                build_review_local_api_router(Arc::new(crate::make_local_api_ctx(
+                    app.clone(),
                     port,
-                    base_path: route.path.clone(),
-                    remote_entrypoint_id: Some(entrypoint.id.clone()),
-                })),
+                    route.path.clone(),
+                    Some(entrypoint.id.clone()),
+                )))
+                .merge(build_messaging_local_api_router(Arc::new(
+                    crate::make_messaging_local_api_ctx(
+                        app.clone(),
+                        port,
+                        Some(entrypoint.id.clone()),
+                    ),
+                ))),
             ),
             RemoteCapability::Messaging => router.nest(
                 route.path.as_str(),

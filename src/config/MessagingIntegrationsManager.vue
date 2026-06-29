@@ -7,8 +7,16 @@ import { normalizeStringList } from "./remoteAccessOps";
 const props = defineProps<{ draft: AppConfig }>();
 const emit = defineEmits<{ edit: [] }>();
 
-const KIND_META: Record<MessagingProviderKind, { label: string; form: "feishu" }> = {
+const KIND_META: Record<MessagingProviderKind, { label: string; form: "feishu" | "weChatWork" | "dingTalk" }> = {
   feishu: { label: "飞书", form: "feishu" },
+  weChatWork: { label: "企业微信", form: "weChatWork" },
+  dingTalk: { label: "钉钉", form: "dingTalk" },
+};
+
+const CONVERSATION_META: Record<MessagingProviderKind, { label: string; placeholder: string }> = {
+  feishu: { label: "允许 chat_id", placeholder: "oc_xxx, oc_yyy" },
+  weChatWork: { label: "允许 userId/chatId/roomId", placeholder: "zhangsan, chat_xxx, room_xxx" },
+  dingTalk: { label: "允许 default/openConversationId", placeholder: "default, cid_xxx" },
 };
 
 function nextId(kind: MessagingProviderKind): string {
@@ -116,11 +124,11 @@ function setAllowed(integration: MessagingIntegration, event: Event) {
           <input type="number" min="1" :value="integration.timeoutSecs" @input="setNumber(integration, 'timeoutSecs', $event)" />
         </label>
         <label class="wide">
-          <span>允许会话 ID</span>
+          <span>{{ CONVERSATION_META[integration.kind].label }}</span>
           <input
             type="text"
             :value="integration.allowedConversationIds.join(', ')"
-            placeholder="oc_xxx, oc_yyy"
+            :placeholder="CONVERSATION_META[integration.kind].placeholder"
             @input="setAllowed(integration, $event)"
           />
         </label>
@@ -149,6 +157,42 @@ function setAllowed(integration: MessagingIntegration, event: Event) {
           <label>
             <span>Bot Open ID</span>
             <input type="text" :value="integration.botOpenId" placeholder="ou_xxx" @input="setText(integration, 'botOpenId', $event)" />
+          </label>
+        </template>
+        <template v-else-if="KIND_META[integration.kind].form === 'weChatWork'">
+          <label>
+            <span>Token</span>
+            <input type="password" :value="integration.verificationToken" @input="setText(integration, 'verificationToken', $event)" />
+          </label>
+          <label>
+            <span>Encoding AES Key</span>
+            <input type="password" :value="integration.encryptKey" @input="setText(integration, 'encryptKey', $event)" />
+          </label>
+          <label>
+            <span>Corp ID</span>
+            <input type="password" :value="integration.appId" @input="setText(integration, 'appId', $event)" />
+          </label>
+          <label>
+            <span>Corp Secret</span>
+            <input type="password" :value="integration.appSecret" @input="setText(integration, 'appSecret', $event)" />
+          </label>
+          <label>
+            <span>Agent ID</span>
+            <input type="text" :value="integration.botOpenId" placeholder="1000002" @input="setText(integration, 'botOpenId', $event)" />
+          </label>
+        </template>
+        <template v-else>
+          <label>
+            <span>Robot Access Token</span>
+            <input type="password" :value="integration.verificationToken" @input="setText(integration, 'verificationToken', $event)" />
+          </label>
+          <label>
+            <span>Callback / Robot Secret</span>
+            <input type="password" :value="integration.appSecret" @input="setText(integration, 'appSecret', $event)" />
+          </label>
+          <label>
+            <span>Robot Code</span>
+            <input type="text" :value="integration.botOpenId" @input="setText(integration, 'botOpenId', $event)" />
           </label>
         </template>
       </div>

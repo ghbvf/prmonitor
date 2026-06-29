@@ -119,7 +119,7 @@ fn decide_outcome(new_attempt_count: u32, now: u64, is_err: bool, seed: u64) -> 
 /// add its own TTL arm here.
 fn ttl_secs(kind: ActionKind, notification_ttl_secs: u64) -> Option<u64> {
     match kind {
-        ActionKind::Notification | ActionKind::MessagingReply => {
+        ActionKind::Notification | ActionKind::MessagingReply | ActionKind::MessagingSend => {
             (notification_ttl_secs > 0).then_some(notification_ttl_secs)
         }
         ActionKind::Review | ActionKind::Check | ActionKind::StopReview => None,
@@ -554,34 +554,38 @@ mod tests {
     // `match ActionKind` (Hard carrier); `0` disables it; `is_expired` is the pure sweep predicate
     // `run_due_once` applies — true at/after `created_at + ttl`, false strictly before.
     #[test]
-    fn ttl_expires_notification_after_window_and_zero_disables() {
+    fn ttl_expires_ephemeral_delivery_kinds_after_window_and_zero_disables() {
         const TTL: u64 = 7200; // 2h
-        let kind = ActionKind::Notification;
+        for kind in [
+            ActionKind::Notification,
+            ActionKind::MessagingReply,
+            ActionKind::MessagingSend,
+        ] {
+            assert_eq!(ttl_secs(kind, TTL), Some(TTL));
+            assert_eq!(ttl_secs(kind, 0), None, "0 disables the TTL");
 
-        assert_eq!(ttl_secs(kind, TTL), Some(TTL));
-        assert_eq!(ttl_secs(kind, 0), None, "0 disables the TTL");
-
-        let created = 1_000u64;
-        assert!(
-            !is_expired(kind, created, created, TTL),
-            "fresh row not expired"
-        );
-        assert!(
-            !is_expired(kind, created, created + TTL - 1, TTL),
-            "1s before the window closes"
-        );
-        assert!(
-            is_expired(kind, created, created + TTL, TTL),
-            "expired exactly at the TTL boundary"
-        );
-        assert!(
-            is_expired(kind, created, created + TTL + 100, TTL),
-            "expired past the window"
-        );
-        assert!(
-            !is_expired(kind, created, created + 10_000_000, 0),
-            "ttl=0 never expires (disabled)"
-        );
+            let created = 1_000u64;
+            assert!(
+                !is_expired(kind, created, created, TTL),
+                "{kind:?}: fresh row not expired"
+            );
+            assert!(
+                !is_expired(kind, created, created + TTL - 1, TTL),
+                "{kind:?}: 1s before the window closes"
+            );
+            assert!(
+                is_expired(kind, created, created + TTL, TTL),
+                "{kind:?}: expired exactly at the TTL boundary"
+            );
+            assert!(
+                is_expired(kind, created, created + TTL + 100, TTL),
+                "{kind:?}: expired past the window"
+            );
+            assert!(
+                !is_expired(kind, created, created + 10_000_000, 0),
+                "{kind:?}: ttl=0 never expires (disabled)"
+            );
+        }
     }
 
     // End-to-end staleness sweep over the REAL store (AB#1182), WITHOUT an AppHandle: a row enqueued

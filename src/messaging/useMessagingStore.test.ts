@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import type { MessagingEventEntry } from "../types.generated";
+import type { OutboxEntry } from "../types";
+import type { MessagingEventEntry, MessagingIntegrationOption } from "../types.generated";
 
 vi.mock("./api", () => ({
   messagingEventsList: vi.fn(() => Promise.resolve([])),
   messagingEventRaw: vi.fn(() => Promise.resolve("{}")),
   messagingEventReplay: vi.fn(() => Promise.resolve()),
+  messagingIntegrationsList: vi.fn(() => Promise.resolve([])),
+  messagingSend: vi.fn(() => Promise.resolve({ outboxId: 9 })),
+  messagingSendsList: vi.fn(() => Promise.resolve([])),
 }));
 
 import * as api from "./api";
@@ -31,12 +35,49 @@ const entry = (id: number): MessagingEventEntry => ({
   reply: null,
 });
 
+const sendEntry = (id: number): OutboxEntry => ({
+  id,
+  projectId: "feishu-main",
+  kind: "messagingSend",
+  summary: "Messaging send feishu -> oc_123",
+  status: "pending",
+  attemptCount: 0,
+  nextAttemptAt: 1,
+  lastError: null,
+  createdAt: 1,
+  updatedAt: 1,
+});
+
+const integrationOption = (): MessagingIntegrationOption => ({
+  id: "wx-main",
+  name: "企业微信",
+  kind: "weChatWork",
+  allowedConversationIds: ["room-1"],
+});
+
 beforeEach(() => {
   setActivePinia(createPinia());
   vi.clearAllMocks();
   vi.mocked(api.messagingEventsList).mockResolvedValue([]);
   vi.mocked(api.messagingEventRaw).mockResolvedValue("{}");
   vi.mocked(api.messagingEventReplay).mockResolvedValue(undefined);
+  vi.mocked(api.messagingIntegrationsList).mockResolvedValue([]);
+  vi.mocked(api.messagingSend).mockResolvedValue({ outboxId: 9 });
+  vi.mocked(api.messagingSendsList).mockResolvedValue([]);
+});
+
+describe("useMessagingStore refreshIntegrations()", () => {
+  it("loads secret-free active send integration options", async () => {
+    vi.mocked(api.messagingIntegrationsList).mockResolvedValueOnce([integrationOption()]);
+    const store = useMessagingStore();
+
+    await store.refreshIntegrations();
+
+    expect(api.messagingIntegrationsList).toHaveBeenCalledOnce();
+    expect(store.integrations).toEqual([integrationOption()]);
+    expect(store.integrationsLoading).toBe(false);
+    expect(store.error).toBeNull();
+  });
 });
 
 describe("useMessagingStore refresh()", () => {
@@ -63,6 +104,57 @@ describe("useMessagingStore refresh()", () => {
     expect(store.entries.map((item) => item.id)).toEqual([1]);
     expect(store.error).toBe("boom");
     expect(store.loading).toBe(false);
+  });
+});
+
+describe("useMessagingStore send logs", () => {
+  it("loads messaging send/reply outbox rows", async () => {
+    vi.mocked(api.messagingSendsList).mockResolvedValueOnce([sendEntry(9)]);
+    const store = useMessagingStore();
+
+    await store.refreshSends();
+
+    expect(api.messagingSendsList).toHaveBeenCalledWith();
+    expect(store.sends.map((item) => item.id)).toEqual([9]);
+    expect(store.sendsLoading).toBe(false);
+  });
+
+  it("enqueues a send and refreshes send logs", async () => {
+    vi.mocked(api.messagingSendsList).mockResolvedValueOnce([sendEntry(9)]);
+    const store = useMessagingStore();
+
+    await store.send({
+      integrationId: "feishu-main",
+      conversationId: "oc_123",
+      text: "hello",
+      requestId: "req-1",
+    });
+
+    expect(api.messagingSend).toHaveBeenCalledWith({
+      integrationId: "feishu-main",
+      conversationId: "oc_123",
+      text: "hello",
+      requestId: "req-1",
+    });
+    expect(store.sends.map((item) => item.id)).toEqual([9]);
+    expect(store.sendError).toBeNull();
+    expect(store.sendLoading).toBe(false);
+  });
+
+  it("keeps send failures scoped to the send form", async () => {
+    vi.mocked(api.messagingSend).mockRejectedValueOnce({ message: "send failed" });
+    const store = useMessagingStore();
+
+    await store.send({
+      integrationId: "feishu-main",
+      conversationId: "oc_123",
+      text: "hello",
+      requestId: "req-1",
+    });
+
+    expect(store.sendError).toBe("send failed");
+    expect(store.error).toBeNull();
+    expect(api.messagingSendsList).not.toHaveBeenCalled();
   });
 });
 

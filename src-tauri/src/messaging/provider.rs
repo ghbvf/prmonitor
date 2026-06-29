@@ -42,4 +42,10 @@ pub trait MessagingProvider: Send + Sync {
         target: &'a MessagingReplyTarget,
         text: &'a str,
     ) -> ProviderFuture<'a>;
+    fn send<'a>(
+        &'a self,
+        integration: &'a MessagingIntegration,
+        conversation_id: &'a str,
+        text: &'a str,
+    ) -> ProviderFuture<'a>;
 }
