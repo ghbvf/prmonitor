@@ -696,15 +696,11 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
                 },
                 UserInput::Text { text: prompt },
             ],
-            // Unattended: never prompt for approval (the reader auto-answers any
-            // reverse approval request as a backstop). Workspace-write + network
-            // so the pr-review skill can run `git`/`gh` and post comments.
+            // Unattended + full access: never prompt for approval (the reader auto-answers
+            // any reverse approval request as a backstop) and run in Codex's dangerous
+            // full-access sandbox so the skill can perform whatever repo/network work it needs.
             approval_policy: "never".to_string(),
-            sandbox_policy: SandboxPolicy {
-                kind: "workspaceWrite".to_string(),
-                network_access: true,
-                writable_roots: vec![repo_root.to_string()],
-            },
+            sandbox_policy: review_turn_sandbox_policy(),
             cwd: Some(repo_root.to_string()),
             // Per-turn model override: blank config → None → codex's configured default.
             // Trim to match the emptiness check — a padded name must not reach the RPC
@@ -850,10 +846,8 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
     persist_user_message(app, project_id, thread_id, user_item_id, message);
 
     // Issue a SECOND turn on the EXISTING thread. The pr-review skill is NOT re-attached —
-    // it is already in this thread's context; we send only the raw user message. This is a
-    // chat-answer turn, not an unattended code-action turn: keep the workspace read-only and
-    // network disabled so a follow-up cannot modify files or reach external services. If a
-    // user wants code changes, they should trigger the `/fix` workflow explicitly.
+    // it is already in this thread's context; we send only the raw user message. Follow-ups
+    // default to dangerous full access so an operator message can continue into tool-using work.
     let turn_id = match process::start_turn(
         &client,
         TurnStartParams {
@@ -862,11 +856,7 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
                 text: message.to_string(),
             }],
             approval_policy: "never".to_string(),
-            sandbox_policy: SandboxPolicy {
-                kind: "readOnly".to_string(),
-                network_access: false,
-                writable_roots: Vec::new(),
-            },
+            sandbox_policy: follow_up_turn_sandbox_policy(),
             cwd: Some(repo_root.to_string()),
             model: (!codex_model.trim().is_empty()).then(|| codex_model.trim().to_string()),
         },
@@ -1472,6 +1462,14 @@ fn skill_command(pr_number: u64, kind: &str) -> String {
     }
 }
 
+fn review_turn_sandbox_policy() -> SandboxPolicy {
+    SandboxPolicy::DangerFullAccess
+}
+
+fn follow_up_turn_sandbox_policy() -> SandboxPolicy {
+    SandboxPolicy::DangerFullAccess
+}
+
 /// The turn's instruction text. Ported from `router.py:590-597`; the
 /// machine-block clause is dropped because prmonitor's pr-review skill posts plain
 /// `pm:` comments (no machine block — see #24).
@@ -1616,6 +1614,22 @@ mod tests {
     fn skill_command_matches_kind() {
         assert_eq!(skill_command(7, "review"), "/pr-review 7");
         assert_eq!(skill_command(7, "check"), "/pr-review 7 --check");
+    }
+
+    #[test]
+    fn review_turn_defaults_to_danger_full_access() {
+        assert_eq!(
+            review_turn_sandbox_policy(),
+            SandboxPolicy::DangerFullAccess
+        );
+    }
+
+    #[test]
+    fn follow_up_turn_defaults_to_danger_full_access() {
+        assert_eq!(
+            follow_up_turn_sandbox_policy(),
+            SandboxPolicy::DangerFullAccess
+        );
     }
 
     #[test]

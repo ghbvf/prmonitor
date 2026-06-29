@@ -294,8 +294,8 @@ fn claude_cli_args(model: &str, prompt: &str, resume: Option<&str>) -> Vec<Strin
 
 /// Build args for a follow-up chat turn. Unlike the initial `/pr-review` prompt, the user's
 /// free-form message is sensitive and must not be placed in argv; the caller writes it to
-/// stdin. Tools are disabled and permission mode is default because this is a read-only chat
-/// answer path, not an unattended code-action path.
+/// stdin. Follow-ups use `bypassPermissions` by default so operator messages can continue
+/// into tool-using work without an interactive approval prompt.
 fn claude_stdin_chat_args(model: &str, resume: &str) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
@@ -306,9 +306,7 @@ fn claude_stdin_chat_args(model: &str, resume: &str) -> Vec<String> {
         "--verbose".to_string(),
         "--include-partial-messages".to_string(),
         "--permission-mode".to_string(),
-        "default".to_string(),
-        "--tools".to_string(),
-        String::new(),
+        "bypassPermissions".to_string(),
         "--resume".to_string(),
         resume.to_string(),
     ];
@@ -550,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn stdin_chat_args_do_not_include_prompt_and_disable_tools() {
+    fn stdin_chat_args_do_not_include_prompt_and_bypass_permissions() {
         let args = claude_stdin_chat_args(" sonnet ", "sess-1");
         assert!(args.contains(&"-p".to_string()));
         assert!(args.contains(&"--input-format".to_string()));
@@ -558,8 +556,11 @@ mod tests {
         assert!(args.contains(&"--resume".to_string()));
         assert!(args.contains(&"sess-1".to_string()));
         assert!(args.contains(&"--permission-mode".to_string()));
-        assert!(args.contains(&"default".to_string()));
-        assert!(args.contains(&"--tools".to_string()));
+        assert!(args.contains(&"bypassPermissions".to_string()));
+        assert!(
+            !args.contains(&"--tools".to_string()),
+            "follow-up must not disable Claude tools"
+        );
         assert!(
             !args.contains(&"user secret prompt".to_string()),
             "the chat prompt is written to stdin, never argv"

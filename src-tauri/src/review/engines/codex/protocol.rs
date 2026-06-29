@@ -123,16 +123,21 @@ pub enum UserInput {
     Text { text: String },
 }
 
-/// `turn/start` sandbox policy. `workspaceWrite` + network so the pr-review skill
-/// can run `git`/`gh` and write within the repo. Serializes camelCase
-/// (`networkAccess` / `writableRoots`); the `type` tag stays `type`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SandboxPolicy {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub network_access: bool,
-    pub writable_roots: Vec<String>,
+/// `turn/start` sandbox policy. Serializes as the app-server's tagged union
+/// (`{"type":"dangerFullAccess"}` or `{"type":"workspaceWrite", ...}`), with
+/// workspace-write fields in camelCase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type")]
+pub enum SandboxPolicy {
+    #[serde(rename = "dangerFullAccess")]
+    DangerFullAccess,
+    #[serde(rename = "readOnly")]
+    ReadOnly,
+    #[serde(rename = "workspaceWrite", rename_all = "camelCase")]
+    WorkspaceWrite {
+        network_access: bool,
+        writable_roots: Vec<String>,
+    },
 }
 
 /// `turn/start` result — we extract only `turn.id`.
@@ -483,8 +488,7 @@ mod tests {
                 },
             ],
             approval_policy: "never".to_string(),
-            sandbox_policy: SandboxPolicy {
-                kind: "workspaceWrite".to_string(),
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
                 network_access: true,
                 writable_roots: vec!["/repo".to_string()],
             },
@@ -513,13 +517,29 @@ mod tests {
     }
 
     #[test]
+    fn turn_start_params_serialize_danger_full_access_sandbox() {
+        let v = serde_json::to_value(TurnStartParams {
+            thread_id: "th_1".to_string(),
+            input: vec![],
+            approval_policy: "never".to_string(),
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            cwd: Some("/repo".to_string()),
+            model: None,
+        })
+        .expect("TurnStartParams serializes");
+
+        assert_eq!(v["sandboxPolicy"]["type"], "dangerFullAccess");
+        assert!(v["sandboxPolicy"].get("networkAccess").is_none());
+        assert!(v["sandboxPolicy"].get("writableRoots").is_none());
+    }
+
+    #[test]
     fn turn_start_params_serialize_model_override_when_set() {
         let v = serde_json::to_value(TurnStartParams {
             thread_id: "th_1".to_string(),
             input: vec![],
             approval_policy: "never".to_string(),
-            sandbox_policy: SandboxPolicy {
-                kind: "workspaceWrite".to_string(),
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
                 network_access: true,
                 writable_roots: vec![],
             },
