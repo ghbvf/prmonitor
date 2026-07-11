@@ -544,6 +544,43 @@ pub enum EngineKind {
     Claude,
 }
 
+/// Per-turn reasoning effort accepted by the Codex app-server protocol.
+///
+/// **Hard carrier**: project configuration cannot contain an arbitrary effort string, and the
+/// review adapter must exhaustively convert every variant into the private protocol wire type.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CodexReasoningEffort {
+    #[default]
+    Default,
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Ultra,
+}
+
+/// Reasoning effort accepted by the Claude CLI.
+///
+/// The sealed enum plus exhaustive argv construction makes unsupported raw strings
+/// unrepresentable after the serde boundary.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ClaudeEffort {
+    #[default]
+    Default,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
 /// How the webhook receiver's local port is exposed to the public internet (#9).
 ///
 /// Lives here (not in `pr/webhook.rs`) because, like [`SourceKind`] / [`EngineKind`],
@@ -1741,6 +1778,41 @@ pub struct OutboxEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_effort_wire_values_are_closed_and_pinned() {
+        let codex = [
+            (CodexReasoningEffort::Default, "default"),
+            (CodexReasoningEffort::None, "none"),
+            (CodexReasoningEffort::Minimal, "minimal"),
+            (CodexReasoningEffort::Low, "low"),
+            (CodexReasoningEffort::Medium, "medium"),
+            (CodexReasoningEffort::High, "high"),
+            (CodexReasoningEffort::Xhigh, "xhigh"),
+            (CodexReasoningEffort::Max, "max"),
+            (CodexReasoningEffort::Ultra, "ultra"),
+        ];
+        for (value, wire) in codex {
+            assert_eq!(serde_json::to_value(value).unwrap(), wire);
+        }
+        assert_eq!(
+            CodexReasoningEffort::default(),
+            CodexReasoningEffort::Default
+        );
+
+        let claude = [
+            (ClaudeEffort::Default, "default"),
+            (ClaudeEffort::Low, "low"),
+            (ClaudeEffort::Medium, "medium"),
+            (ClaudeEffort::High, "high"),
+            (ClaudeEffort::Xhigh, "xhigh"),
+            (ClaudeEffort::Max, "max"),
+        ];
+        for (value, wire) in claude {
+            assert_eq!(serde_json::to_value(value).unwrap(), wire);
+        }
+        assert_eq!(ClaudeEffort::default(), ClaudeEffort::Default);
+    }
 
     #[test]
     fn typed_event_envelope_and_review_request_wire_contract() {

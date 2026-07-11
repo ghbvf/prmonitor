@@ -19,8 +19,8 @@ use tokio::sync::{broadcast, watch};
 
 use super::engines::codex::process;
 use super::engines::codex::protocol::{
-    SandboxPolicy, ServerNotification, ThreadStartParams, TurnInterruptParams, TurnStartParams,
-    UserInput,
+    CodexReasoningEffortWire, SandboxPolicy, ServerNotification, ThreadStartParams,
+    TurnInterruptParams, TurnStartParams, UserInput,
 };
 use super::engines::codex::CodexManager;
 use super::history_store::HistoryItemKind;
@@ -602,6 +602,7 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
     repo_root: &str,
     skill_abs_path: &str,
     codex_model: &str,
+    codex_reasoning_effort: crate::model::CodexReasoningEffort,
     project_id: &str,
     pr_number: u64,
     kind: ReviewKind,
@@ -690,6 +691,7 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
             // Trim to match the emptiness check — a padded name must not reach the RPC
             // with surrounding whitespace (e.g. `{"model":"  gpt-5.1-codex  "}`).
             model: (!codex_model.trim().is_empty()).then(|| codex_model.trim().to_string()),
+            effort: CodexReasoningEffortWire::from_config(codex_reasoning_effort),
         },
     )
     .await
@@ -767,6 +769,7 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
     codex_cli: &ResolvedCli,
     repo_root: &str,
     codex_model: &str,
+    codex_reasoning_effort: crate::model::CodexReasoningEffort,
     project_id: &str,
     pr_number: u64,
     durable_info: &SessionInfo,
@@ -843,26 +846,22 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
             sandbox_policy: follow_up_turn_sandbox_policy(),
             cwd: Some(repo_root.to_string()),
             model: (!codex_model.trim().is_empty()).then(|| codex_model.trim().to_string()),
+            effort: CodexReasoningEffortWire::from_config(codex_reasoning_effort),
         },
     )
     .await
     {
         Ok(turn_id) => turn_id,
-        // KNOWN LIMITATION (not a bug): codex follow-up works only WITHIN the same app run.
-        // The resident app-server keeps the thread in memory; the codex app-server protocol
-        // has NO `thread/resume`, so after an app restart the thread is gone and this
-        // `turn/start` fails. Mark the session `Failed` (so it isn't stuck `Running`) and
-        // surface a clear, user-facing error directing them to re-start a review. (Claude
-        // works cross-restart via `--resume` — only codex has this limit.)
-        Err(_) => {
+        // A restart can invalidate the in-memory Codex thread, but `turn/start` can also reject
+        // the configured model/effort or fail for transport reasons. Preserve the RPC reason so
+        // callers are not incorrectly told every failure means the thread was lost.
+        Err(e) => {
             registry.set_status(thread_id, SessionStatus::Failed);
             persist_status(app, thread_id, SessionStatus::Failed);
             // No `finalize_turn` runs on this failure, so discard the rehydrated URL context
             // to avoid leaking it in `url_contexts` (no-op `None` if never rehydrated).
             let _ = registry.take_url_context(thread_id);
-            return Err(AppError::new(
-                "codex 线程已失效（应用重启后无法续聊，请重新发起 review）".to_string(),
-            ));
+            return Err(codex_follow_up_start_error(e));
         }
     };
 
@@ -1496,6 +1495,10 @@ fn follow_up_turn_sandbox_policy() -> SandboxPolicy {
     SandboxPolicy::DangerFullAccess
 }
 
+fn codex_follow_up_start_error(error: AppError) -> AppError {
+    AppError::new(format!("Codex 续聊 turn/start 失败: {}", error.message))
+}
+
 /// The turn's instruction text. Ported from `router.py:590-597`; the
 /// machine-block clause is dropped because prmonitor's pr-review skill posts plain
 /// `pm:` comments (no machine block — see #24).
@@ -1538,6 +1541,17 @@ mod tests {
             azure_org: String::new(),
             azure_project: String::new(),
         }
+    }
+
+    #[test]
+    fn codex_follow_up_start_error_preserves_the_rpc_reason() {
+        let error = codex_follow_up_start_error(AppError::new(
+            "turn/start rejected: unsupported effort xhigh",
+        ));
+
+        assert!(error.message.contains("Codex 续聊 turn/start 失败"));
+        assert!(error.message.contains("unsupported effort xhigh"));
+        assert!(!error.message.contains("线程已失效"));
     }
 
     #[test]

@@ -43,6 +43,8 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
       engineKind: "codex",
       codexModel: "",
       claudeModel: "",
+      codexReasoningEffort: "default",
+      claudeEffort: "default",
     },
   ],
   activeProjectId: "default",

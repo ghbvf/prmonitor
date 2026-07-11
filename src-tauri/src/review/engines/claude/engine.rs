@@ -16,7 +16,7 @@ use super::process::{self, ParsedEvent, ParserState};
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, StreamEvent};
-use crate::model::{EngineKind, ReviewKind};
+use crate::model::{ClaudeEffort, EngineKind, ReviewKind};
 use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, StartReviewOutcome};
 use crate::review::history_store::{self, HistoryItemKind};
 use crate::review::session::{
@@ -45,6 +45,7 @@ pub struct ClaudeEngine<'a, R: tauri::Runtime> {
     /// Hand-typed claude model name (empty = claude CLI default). Passed as `--model`
     /// to the `claude -p` subprocess when non-blank.
     pub claude_model: &'a str,
+    pub claude_effort: ClaudeEffort,
     /// IMMUTABLE comment-URL source context (AB#1042), built from the project at dispatch.
     /// Owned so it moves into `start_review` → the `Starting` session, pinning the terminal
     /// `finalize_turn`'s URL resolve to the project the review ran against (not a mid-review
@@ -83,6 +84,7 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
             self.project_id,
             self.repo_root,
             self.claude_model,
+            self.claude_effort,
             pr_number,
             kind,
             // `&self` start can't move the field; clone the owned context for this turn.
@@ -108,6 +110,7 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
             self.project_id,
             self.repo_root,
             self.claude_model,
+            self.claude_effort,
             self.pr_number,
             self.session_info
                 .as_ref()
@@ -142,6 +145,7 @@ async fn start_review<R: tauri::Runtime>(
     project_id: &str,
     repo_root: &str,
     claude_model: &str,
+    claude_effort: ClaudeEffort,
     pr_number: u64,
     kind: ReviewKind,
     // IMMUTABLE comment-URL source context (AB#1042); handed to the `Starting` session in
@@ -172,7 +176,14 @@ async fn start_review<R: tauri::Runtime>(
     // Spawn the one-shot child. `?` releases the reservation (guard Drop) on failure.
     // `None` resume → a FRESH review (no `--resume`); the follow-up path is `resume_review`.
     let prompt = process::review_prompt(pr_number, kind);
-    let proc = process::spawn_claude(claude_cli, repo_root, claude_model, &prompt, None)?;
+    let proc = process::spawn_claude(
+        claude_cli,
+        repo_root,
+        claude_model,
+        claude_effort,
+        &prompt,
+        None,
+    )?;
     let process::ClaudeProcess {
         child,
         stdout,
@@ -285,6 +296,7 @@ async fn resume_review<R: tauri::Runtime>(
     project_id: &str,
     repo_root: &str,
     claude_model: &str,
+    claude_effort: ClaudeEffort,
     pr_number: u64,
     durable_info: &SessionInfo,
     thread_id: &str,
@@ -326,6 +338,7 @@ async fn resume_review<R: tauri::Runtime>(
         claude_cli,
         repo_root,
         claude_model,
+        claude_effort,
         message,
         thread_id,
     )

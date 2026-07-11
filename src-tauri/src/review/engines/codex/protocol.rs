@@ -13,6 +13,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::model::CodexReasoningEffort;
+
 /// Request/notification method names this client issues.
 pub mod rpc_methods {
     /// v1 handshake request (expects [`super::InitializeResult`]).
@@ -95,7 +97,7 @@ pub struct ThreadRef {
 /// snake_case on the wire (we omit it — it defaults to `[]`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TurnStartParams {
+pub(crate) struct TurnStartParams {
     pub thread_id: String,
     pub input: Vec<UserInput>,
     /// `"never"` for unattended reviews (no human approval prompts).
@@ -109,6 +111,39 @@ pub struct TurnStartParams {
     /// `None` (config left blank) omits the key → codex uses its configured default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Typed per-turn reasoning override. Crate-private wire enum prevents raw strings from
+    /// entering the app-server request; `None` omits the key and preserves Codex defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<CodexReasoningEffortWire>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CodexReasoningEffortWire {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+    Ultra,
+}
+
+impl CodexReasoningEffortWire {
+    pub(crate) fn from_config(value: CodexReasoningEffort) -> Option<Self> {
+        match value {
+            CodexReasoningEffort::Default => None,
+            CodexReasoningEffort::None => Some(Self::None),
+            CodexReasoningEffort::Minimal => Some(Self::Minimal),
+            CodexReasoningEffort::Low => Some(Self::Low),
+            CodexReasoningEffort::Medium => Some(Self::Medium),
+            CodexReasoningEffort::High => Some(Self::High),
+            CodexReasoningEffort::Xhigh => Some(Self::Xhigh),
+            CodexReasoningEffort::Max => Some(Self::Max),
+            CodexReasoningEffort::Ultra => Some(Self::Ultra),
+        }
+    }
 }
 
 /// One input item for `turn/start`. The pr-review turn sends a [`Self::Skill`]
@@ -494,6 +529,7 @@ mod tests {
             },
             cwd: Some("/repo".to_string()),
             model: None,
+            effort: None,
         })
         .expect("TurnStartParams serializes");
 
@@ -501,6 +537,7 @@ mod tests {
         assert_eq!(v["approvalPolicy"], "never");
         assert!(v.get("thread_id").is_none()); // snake_case absent.
         assert!(v.get("model").is_none()); // None → key omitted (codex default).
+        assert!(v.get("effort").is_none()); // default → key omitted.
 
         // Skill input item.
         assert_eq!(v["input"][0]["type"], "skill");
@@ -525,6 +562,7 @@ mod tests {
             sandbox_policy: SandboxPolicy::DangerFullAccess,
             cwd: Some("/repo".to_string()),
             model: None,
+            effort: None,
         })
         .expect("TurnStartParams serializes");
 
@@ -545,10 +583,33 @@ mod tests {
             },
             cwd: None,
             model: Some("gpt-5.1-codex".to_string()),
+            effort: Some(CodexReasoningEffortWire::High),
         })
         .expect("TurnStartParams serializes");
         // Some → key present with the configured model (the per-turn override).
         assert_eq!(v["model"], "gpt-5.1-codex");
+        assert_eq!(v["effort"], "high");
+    }
+
+    #[test]
+    fn codex_config_effort_conversion_is_exhaustive_and_default_omits() {
+        assert!(CodexReasoningEffortWire::from_config(CodexReasoningEffort::Default).is_none());
+        for (config, wire) in [
+            (CodexReasoningEffort::None, "none"),
+            (CodexReasoningEffort::Minimal, "minimal"),
+            (CodexReasoningEffort::Low, "low"),
+            (CodexReasoningEffort::Medium, "medium"),
+            (CodexReasoningEffort::High, "high"),
+            (CodexReasoningEffort::Xhigh, "xhigh"),
+            (CodexReasoningEffort::Max, "max"),
+            (CodexReasoningEffort::Ultra, "ultra"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(CodexReasoningEffortWire::from_config(config).unwrap())
+                    .unwrap(),
+                wire
+            );
+        }
     }
 
     #[test]

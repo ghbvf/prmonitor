@@ -129,6 +129,8 @@ const project = (id: string): Project => ({
   engineKind: "codex",
   codexModel: "",
   claudeModel: "",
+  codexReasoningEffort: "default",
+  claudeEffort: "default",
 });
 
 beforeEach(() => {

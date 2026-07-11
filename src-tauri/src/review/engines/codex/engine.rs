@@ -7,6 +7,7 @@
 use super::CodexManager;
 use crate::config::service::ResolvedCli;
 use crate::error::AppResult;
+use crate::model::CodexReasoningEffort;
 use crate::model::ReviewKind;
 use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, StartReviewOutcome};
 use crate::review::session::{self, CommentUrlContext, SessionInfo, SessionRegistry};
@@ -35,6 +36,7 @@ pub struct CodexEngine<'a, R: tauri::Runtime> {
     /// per-turn `model` override on `turn/start` (the app-server is shared, so model
     /// selection can't be a spawn flag).
     pub codex_model: &'a str,
+    pub codex_reasoning_effort: CodexReasoningEffort,
     /// IMMUTABLE comment-URL source context (AB#1042), built from the project at dispatch.
     /// Owned (not a borrow) so it can move into `start_review` → the `Starting` session,
     /// pinning the terminal `finalize_turn`'s URL resolve to the project the review ran
@@ -76,6 +78,7 @@ impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
             self.repo_root,
             self.skill_abs_path,
             self.codex_model,
+            self.codex_reasoning_effort,
             self.project_id,
             pr_number,
             kind,
@@ -101,6 +104,7 @@ impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
             self.codex_cli,
             self.repo_root,
             self.codex_model,
+            self.codex_reasoning_effort,
             self.project_id,
             self.pr_number,
             self.session_info

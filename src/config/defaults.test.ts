@@ -7,7 +7,12 @@
 // backend-seeded remoteAccess entrypoints through instead of keeping a TS-side literal.
 import { describe, expect, it } from "vitest";
 import type { RemoteEntrypoint, Project } from "./types";
-import { DEFAULT_OUTBOX_CONFIG, applySourceKindDefaults } from "./defaults";
+import {
+  DEFAULT_OUTBOX_CONFIG,
+  NEW_PROJECT_DEFAULTS,
+  applySourceKindDefaults,
+  hydrateProjectDraft,
+} from "./defaults";
 
 // A github-shaped project carrying the github-friendly defaults (labelSource "native",
 // updateMode "webhook-only") the backend rejects for a Bitbucket source.
@@ -33,6 +38,8 @@ function githubProject(): Project {
     engineKind: "codex",
     codexModel: "",
     claudeModel: "",
+    codexReasoningEffort: "default",
+    claudeEffort: "default",
   };
 }
 
@@ -91,6 +98,29 @@ describe("applySourceKindDefaults (717 F9)", () => {
     expect(p.azureProject).toBe("gocell");
     expect(p.labelSource).toBe("native");
     expect(p.updateMode).toBe("webhook-only");
+  });
+});
+
+describe("generated project defaults and onboarding hydration", () => {
+  it("uses generated effort defaults and only clears the repo product seed", () => {
+    expect(NEW_PROJECT_DEFAULTS.repo).toBe("");
+    expect(NEW_PROJECT_DEFAULTS.codexReasoningEffort).toBe("default");
+    expect(NEW_PROJECT_DEFAULTS.claudeEffort).toBe("default");
+  });
+
+  it("copies every Project field while cloning authors", () => {
+    const draft = githubProject();
+    const persisted: Project = {
+      ...githubProject(),
+      codexModel: "gpt-5-codex",
+      claudeModel: "opus",
+      codexReasoningEffort: "ultra",
+      claudeEffort: "max",
+      authors: ["octocat"],
+    };
+    hydrateProjectDraft(draft, persisted);
+    expect(draft).toEqual(persisted);
+    expect(draft.authors).not.toBe(persisted.authors);
   });
 });
 

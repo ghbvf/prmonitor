@@ -20,7 +20,7 @@ use tokio::process::{Child, ChildStderr, ChildStdout};
 
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
-use crate::model::ReviewKind;
+use crate::model::{ClaudeEffort, ReviewKind};
 
 /// Wall-clock budget for the `claude --version` availability probe. Mirrors codex's
 /// status probe discipline; `kill_on_drop(true)` kills a hung child.
@@ -258,11 +258,17 @@ pub struct ClaudeProcess {
 /// Build the `claude -p` argument vector. Pure (no spawn) so the `--model` / `--resume`
 /// insertion is unit-testable — `spawn_claude` itself needs a real child and can't be. A
 /// non-blank `model` appends `--model <name>`; a blank one (config left empty) is omitted,
-/// so claude falls back to its own default model. A `resume: Some(id)` appends `--resume
+/// so claude falls back to its own default model. Non-default typed effort appends
+/// `--effort <value>`. A `resume: Some(id)` appends `--resume
 /// <id>` to continue an existing on-disk transcript (the chat-continuation follow-up path —
 /// cross-restart capable, since claude persists transcripts on disk); the initial
 /// `start_review` call site passes `None`.
-fn claude_cli_args(model: &str, prompt: &str, resume: Option<&str>) -> Vec<String> {
+fn claude_cli_args(
+    model: &str,
+    effort: ClaudeEffort,
+    prompt: &str,
+    resume: Option<&str>,
+) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
         prompt.to_string(),
@@ -279,6 +285,7 @@ fn claude_cli_args(model: &str, prompt: &str, resume: Option<&str>) -> Vec<Strin
         // must reach claude as "sonnet", not with surrounding spaces (an unknown model).
         args.push(model.trim().to_string());
     }
+    push_effort_arg(&mut args, effort);
     // Follow-up turn: resume the existing transcript by its session id. `--resume` makes the
     // continuation cross-restart (claude reads the persisted transcript from disk), unlike
     // codex which keeps the thread only in the resident process's memory.
@@ -289,11 +296,24 @@ fn claude_cli_args(model: &str, prompt: &str, resume: Option<&str>) -> Vec<Strin
     args
 }
 
+fn push_effort_arg(args: &mut Vec<String>, effort: ClaudeEffort) {
+    let value = match effort {
+        ClaudeEffort::Default => return,
+        ClaudeEffort::Low => "low",
+        ClaudeEffort::Medium => "medium",
+        ClaudeEffort::High => "high",
+        ClaudeEffort::Xhigh => "xhigh",
+        ClaudeEffort::Max => "max",
+    };
+    args.push("--effort".to_string());
+    args.push(value.to_string());
+}
+
 /// Build args for a follow-up chat turn. Unlike the initial `/pr-review` prompt, the user's
 /// free-form message is sensitive and must not be placed in argv; the caller writes it to
 /// stdin. Follow-ups use `bypassPermissions` by default so operator messages can continue
 /// into tool-using work without an interactive approval prompt.
-fn claude_stdin_chat_args(model: &str, resume: &str) -> Vec<String> {
+fn claude_stdin_chat_args(model: &str, effort: ClaudeEffort, resume: &str) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
         "--input-format".to_string(),
@@ -311,6 +331,7 @@ fn claude_stdin_chat_args(model: &str, resume: &str) -> Vec<String> {
         args.push("--model".to_string());
         args.push(model.trim().to_string());
     }
+    push_effort_arg(&mut args, effort);
     args
 }
 
@@ -325,11 +346,12 @@ pub fn spawn_claude(
     claude: &ResolvedCli,
     repo_root: &str,
     model: &str,
+    effort: ClaudeEffort,
     prompt: &str,
     resume: Option<&str>,
 ) -> AppResult<ClaudeProcess> {
     let mut cmd = claude.command();
-    cmd.args(claude_cli_args(model, prompt, resume))
+    cmd.args(claude_cli_args(model, effort, prompt, resume))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -362,11 +384,12 @@ pub async fn spawn_claude_stdin_chat(
     claude: &ResolvedCli,
     repo_root: &str,
     model: &str,
+    effort: ClaudeEffort,
     prompt: &str,
     resume: &str,
 ) -> AppResult<ClaudeProcess> {
     let mut cmd = claude.command();
-    cmd.args(claude_stdin_chat_args(model, resume))
+    cmd.args(claude_stdin_chat_args(model, effort, resume))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -545,6 +568,7 @@ mod tests {
             &first_cli,
             repo.to_str().unwrap(),
             " sonnet ",
+            ClaudeEffort::High,
             "/pr-review 41",
             None,
         )
@@ -574,6 +598,8 @@ mod tests {
                 "bypassPermissions",
                 "--model",
                 "sonnet",
+                "--effort",
+                "high",
             ]
         );
         assert_eq!(fs::read(first_root.join("stdin")).unwrap(), b"");
@@ -583,6 +609,7 @@ mod tests {
             &chat_cli,
             repo.to_str().unwrap(),
             " opus ",
+            ClaudeEffort::Max,
             "follow-up secret",
             "session-41",
         )
@@ -614,6 +641,8 @@ mod tests {
                 "session-41",
                 "--model",
                 "opus",
+                "--effort",
+                "max",
             ]
         );
         assert!(!chat_args.contains("follow-up secret"));
@@ -731,7 +760,7 @@ mod tests {
 
     #[test]
     fn stdin_chat_args_do_not_include_prompt_and_bypass_permissions() {
-        let args = claude_stdin_chat_args(" sonnet ", "sess-1");
+        let args = claude_stdin_chat_args(" sonnet ", ClaudeEffort::Default, "sess-1");
         assert!(args.contains(&"-p".to_string()));
         assert!(args.contains(&"--input-format".to_string()));
         assert!(args.contains(&"text".to_string()));
@@ -751,11 +780,47 @@ mod tests {
         assert_eq!(args[model_pos + 1], "sonnet");
     }
 
+    #[test]
+    fn claude_effort_is_omitted_by_default_and_typed_for_start_and_resume() {
+        let default_args = claude_cli_args(
+            "",
+            crate::model::ClaudeEffort::Default,
+            "/pr-review 7",
+            None,
+        );
+        assert!(!default_args.iter().any(|arg| arg == "--effort"));
+
+        let start_args =
+            claude_cli_args("", crate::model::ClaudeEffort::Xhigh, "/pr-review 7", None);
+        let start_pos = start_args.iter().position(|arg| arg == "--effort").unwrap();
+        assert_eq!(start_args[start_pos + 1], "xhigh");
+
+        let resume_args = claude_stdin_chat_args("", crate::model::ClaudeEffort::Max, "sess-1");
+        let resume_pos = resume_args
+            .iter()
+            .position(|arg| arg == "--effort")
+            .unwrap();
+        assert_eq!(resume_args[resume_pos + 1], "max");
+        assert!(!resume_args.contains(&"user secret prompt".to_string()));
+
+        for (effort, wire) in [
+            (ClaudeEffort::Low, "low"),
+            (ClaudeEffort::Medium, "medium"),
+            (ClaudeEffort::High, "high"),
+            (ClaudeEffort::Xhigh, "xhigh"),
+            (ClaudeEffort::Max, "max"),
+        ] {
+            let args = claude_cli_args("", effort, "/pr-review 7", None);
+            let pos = args.iter().position(|arg| arg == "--effort").unwrap();
+            assert_eq!(args[pos + 1], wire);
+        }
+    }
+
     // ── CLI arg builder (the --model injection seam — NO subprocess) ─────────────
     #[test]
     fn claude_cli_args_omit_model_when_blank() {
         for blank in ["", "   "] {
-            let args = claude_cli_args(blank, "/pr-review 7", None);
+            let args = claude_cli_args(blank, ClaudeEffort::Default, "/pr-review 7", None);
             assert!(
                 !args.iter().any(|a| a == "--model"),
                 "blank model must not add --model: {args:?}"
@@ -769,7 +834,12 @@ mod tests {
 
     #[test]
     fn claude_cli_args_append_model_when_set() {
-        let args = claude_cli_args("claude-opus-4-1", "/pr-review 7", None);
+        let args = claude_cli_args(
+            "claude-opus-4-1",
+            ClaudeEffort::Default,
+            "/pr-review 7",
+            None,
+        );
         // `--model <name>` is appended as the trailing pair (no `--resume` on the start path).
         let n = args.len();
         assert_eq!(args[n - 2], "--model");
@@ -784,7 +854,12 @@ mod tests {
     fn claude_cli_args_trim_padded_model_name() {
         // A padded name reaches claude trimmed (matches the emptiness check) — not with
         // surrounding spaces that the CLI would treat as an unknown model.
-        let args = claude_cli_args("  claude-opus-4-1  ", "/pr-review 7", None);
+        let args = claude_cli_args(
+            "  claude-opus-4-1  ",
+            ClaudeEffort::Default,
+            "/pr-review 7",
+            None,
+        );
         let n = args.len();
         assert_eq!(args[n - 2], "--model");
         assert_eq!(args[n - 1], "claude-opus-4-1");
@@ -795,7 +870,12 @@ mod tests {
         // The follow-up (chat-continuation) path passes `Some(session_id)` → `--resume <id>`
         // is present so claude continues the on-disk transcript. The initial review passes
         // `None` (asserted above), so this flag distinguishes a follow-up from a fresh review.
-        let args = claude_cli_args("", "follow-up question", Some("sess-42"));
+        let args = claude_cli_args(
+            "",
+            ClaudeEffort::Default,
+            "follow-up question",
+            Some("sess-42"),
+        );
         let idx = args
             .iter()
             .position(|a| a == "--resume")

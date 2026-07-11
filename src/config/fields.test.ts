@@ -8,6 +8,8 @@
 import { describe, expect, it } from "vitest";
 import type { Project } from "./types";
 import {
+  CLAUDE_EFFORTS,
+  CODEX_REASONING_EFFORTS,
   UPDATE_MODES,
   ENGINE_KINDS,
   autoReviewSourceCli,
@@ -49,6 +51,8 @@ function validProject(): Project {
     engineKind: "codex",
     codexModel: "",
     claudeModel: "",
+    codexReasoningEffort: "default",
+    claudeEffort: "default",
   };
 }
 
@@ -117,6 +121,8 @@ describe("PROJECT_GROUPS", () => {
     expect(byKey.get("bitbucketProject")?.kind).toBe("text");
     expect(byKey.get("bitbucketToken")?.kind).toBe("text");
     expect(byKey.get("bitbucketToken")?.secret).toBe(true);
+    expect(byKey.get("codexReasoningEffort")?.options).toEqual(CODEX_REASONING_EFFORTS);
+    expect(byKey.get("claudeEffort")?.options).toEqual(CLAUDE_EFFORTS);
   });
 
   it("updateMode is a select single-sourced from UPDATE_MODES (818)", () => {
@@ -166,7 +172,7 @@ describe("PROJECT_GROUPS", () => {
     expect(f?.optionLabels?.title).toBeTruthy();
   });
 
-  it("only the azure + bitbucket source fields and the per-engine skill/model fields carry a visibleWhen predicate", () => {
+  it("only the source fields and per-engine settings carry a visibleWhen predicate", () => {
     // sourceKind, repo, updateMode, labelSource, etc. must NOT be conditionally hidden —
     // only the per-source connection fields (gated on sourceKind), skillRelPath +
     // codexModel (gated on engineKind === codex, #718), and claudeModel (gated on
@@ -181,8 +187,10 @@ describe("PROJECT_GROUPS", () => {
       "bitbucketHost",
       "bitbucketProject",
       "bitbucketToken",
+      "claudeEffort",
       "claudeModel",
       "codexModel",
+      "codexReasoningEffort",
       "skillRelPath",
     ]);
   });

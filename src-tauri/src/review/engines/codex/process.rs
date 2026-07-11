@@ -191,7 +191,10 @@ where
 }
 
 /// Start a turn (the pr-review skill invocation), returning its id.
-pub async fn start_turn<W>(client: &RpcClient<W>, params: TurnStartParams) -> AppResult<String>
+pub(crate) async fn start_turn<W>(
+    client: &RpcClient<W>,
+    params: TurnStartParams,
+) -> AppResult<String>
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {

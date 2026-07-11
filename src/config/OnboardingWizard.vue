@@ -20,6 +20,7 @@ import {
   DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
   NEW_PROJECT_DEFAULTS,
   applySourceKindDefaults,
+  hydrateProjectDraft,
 } from "./defaults";
 import { cloneCliTools } from "./cliTools";
 import type { SourceKind } from "../types";
@@ -57,24 +58,7 @@ const authorsInput = ref("");
 function hydrate(cfg: AppConfig) {
   const p = cfg.projects[0];
   if (!p) return;
-  draft.id = p.id;
-  draft.name = p.name;
-  draft.enabled = p.enabled;
-  draft.repo = p.repo;
-  draft.repoRoot = p.repoRoot;
-  draft.pollIntervalSecs = p.pollIntervalSecs;
-  draft.authors = [...p.authors];
-  draft.skillRelPath = p.skillRelPath;
-  draft.prCooldownSeconds = p.prCooldownSeconds;
-  draft.sourceKind = p.sourceKind;
-  draft.engineKind = p.engineKind;
-  draft.updateMode = p.updateMode;
-  draft.labelSource = p.labelSource;
-  draft.azureOrg = p.azureOrg;
-  draft.azureProject = p.azureProject;
-  draft.bitbucketHost = p.bitbucketHost;
-  draft.bitbucketProject = p.bitbucketProject;
-  draft.bitbucketToken = p.bitbucketToken;
+  hydrateProjectDraft(draft, p);
   authorsInput.value = p.authors.join(", ");
 }
 

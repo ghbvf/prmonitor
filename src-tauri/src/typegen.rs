@@ -19,15 +19,15 @@ use crate::{
         SourcePolicy, SourcePolicyMode,
     },
     model::{
-        ActionStatus, CliResolutionSource, CliTool, EngineKind, EventEnvelope, EventPayload,
-        EventSubject, EventType, ExternalRequestId, ExternalTriggerOrigin, InboxDedupeKey,
-        InboxEventId, LabelSource, MessagingEvent, MessagingEventEntry, MessagingEventStatus,
-        MessagingIntegrationOption, MessagingProviderCapability, MessagingProviderKind,
-        MessagingReplyAudit, NotificationKind, NotificationLevel, OutboxProducerKey,
-        PullRequestView, ReviewActionKey, ReviewKind, ReviewLifecycleEvent, ReviewReceiptId,
-        ReviewReceiptSnapshot, ReviewReceiptStatus, SendMessagingRequest, SendMessagingResponse,
-        SendNotificationRequest, SendNotificationResponse, SourceKind, UpdateMode,
-        WebhookTunnelMode,
+        ActionStatus, ClaudeEffort, CliResolutionSource, CliTool, CodexReasoningEffort, EngineKind,
+        EventEnvelope, EventPayload, EventSubject, EventType, ExternalRequestId,
+        ExternalTriggerOrigin, InboxDedupeKey, InboxEventId, LabelSource, MessagingEvent,
+        MessagingEventEntry, MessagingEventStatus, MessagingIntegrationOption,
+        MessagingProviderCapability, MessagingProviderKind, MessagingReplyAudit, NotificationKind,
+        NotificationLevel, OutboxProducerKey, PullRequestView, ReviewActionKey, ReviewKind,
+        ReviewLifecycleEvent, ReviewReceiptId, ReviewReceiptSnapshot, ReviewReceiptStatus,
+        SendMessagingRequest, SendMessagingResponse, SendNotificationRequest,
+        SendNotificationResponse, SourceKind, UpdateMode, WebhookTunnelMode,
     },
     remote::status::{
         RemoteAccessRuntimeStatus, RemoteEntrypointRuntimeStatus, RemoteEntrypointState,
@@ -124,6 +124,14 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push('\n');
     shared.push_str(&declaration::<EngineKind>(&cfg));
     shared.push_str(&option_array::<EngineKind>("ENGINE_KINDS"));
+    shared.push('\n');
+    shared.push_str(&declaration::<CodexReasoningEffort>(&cfg));
+    shared.push_str(&option_array::<CodexReasoningEffort>(
+        "CODEX_REASONING_EFFORTS",
+    ));
+    shared.push('\n');
+    shared.push_str(&declaration::<ClaudeEffort>(&cfg));
+    shared.push_str(&option_array::<ClaudeEffort>("CLAUDE_EFFORTS"));
     shared.push('\n');
     shared.push_str(&declaration::<LabelSource>(&cfg));
     shared.push_str(&option_array::<LabelSource>("LABEL_SOURCES"));
@@ -242,7 +250,7 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
 
     let mut config_types = String::from(HEADER);
     config_types.push_str(
-        "import type { CliResolutionSource, CliTool, EngineKind, EventType, LabelSource, MessagingProviderKind, NotificationKind, SourceKind, UpdateMode } from \"../types.generated\";\n\n",
+        "import type { ClaudeEffort, CliResolutionSource, CliTool, CodexReasoningEffort, EngineKind, EventType, LabelSource, MessagingProviderKind, NotificationKind, SourceKind, UpdateMode } from \"../types.generated\";\n\n",
     );
     config_types.push_str(&declaration::<WebhookTunnelMode>(&cfg));
     config_types.push_str(&option_array::<WebhookTunnelMode>("WEBHOOK_TUNNEL_MODES"));
@@ -339,6 +347,11 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     config_types.push_str(&declaration::<CliToolProbeStatus>(&cfg));
     config_types.push('\n');
     config_types.push_str(&declaration::<Project>(&cfg));
+    config_types.push_str(&default_const(
+        "DEFAULT_PROJECT",
+        "Project",
+        &Project::default(),
+    ));
     config_types.push('\n');
     config_types.push_str(&declaration::<AppConfig>(&cfg));
     config_types.push('\n');

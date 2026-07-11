@@ -188,6 +188,7 @@ impl ReviewStartCapability {
                     repo_root: &project.repo_root,
                     skill_abs_path: &skill_abs,
                     codex_model: &project.codex_model,
+                    codex_reasoning_effort: project.codex_reasoning_effort,
                     url_ctx,
                     // `start` takes `pr_number` as a method arg; the field is the follow-up path's.
                     pr_number: 0,
@@ -208,6 +209,7 @@ impl ReviewStartCapability {
                     repo: &project.repo,
                     repo_root: &project.repo_root,
                     claude_model: &project.claude_model,
+                    claude_effort: project.claude_effort,
                     url_ctx,
                     // `start` takes `pr_number` as a method arg; the field is the follow-up path's.
                     pr_number: 0,
@@ -587,6 +589,7 @@ pub async fn send_review_message<R: tauri::Runtime>(
                 repo_root: &project.repo_root,
                 skill_abs_path: "",
                 codex_model: &project.codex_model,
+                codex_reasoning_effort: project.codex_reasoning_effort,
                 url_ctx,
                 pr_number,
                 session_info: Some(session_info.clone()),
@@ -608,6 +611,7 @@ pub async fn send_review_message<R: tauri::Runtime>(
                 repo: &project.repo,
                 repo_root: &project.repo_root,
                 claude_model: &project.claude_model,
+                claude_effort: project.claude_effort,
                 url_ctx,
                 pr_number,
                 session_info: Some(session_info.clone()),

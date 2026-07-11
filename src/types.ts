@@ -13,6 +13,8 @@ import type {
 export {
   CLI_RESOLUTION_SOURCES,
   CLI_TOOLS,
+  CLAUDE_EFFORTS,
+  CODEX_REASONING_EFFORTS,
   ENGINE_KINDS,
   EVENT_TYPES,
   externalRequestId,
@@ -27,8 +29,10 @@ export {
   UPDATE_MODES,
 } from "./types.generated";
 export type {
+  ClaudeEffort,
   CliResolutionSource,
   CliTool,
+  CodexReasoningEffort,
   EngineKind,
   EventType,
   LabelSource,

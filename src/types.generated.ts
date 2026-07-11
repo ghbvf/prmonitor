@@ -12,6 +12,12 @@ export const SOURCE_KINDS = ["github","azure","bitbucket"] as const;
 export type EngineKind = "codex" | "claude";
 export const ENGINE_KINDS = ["codex","claude"] as const;
 
+export type CodexReasoningEffort = "default" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra";
+export const CODEX_REASONING_EFFORTS = ["default","none","minimal","low","medium","high","xhigh","max","ultra"] as const;
+
+export type ClaudeEffort = "default" | "low" | "medium" | "high" | "xhigh" | "max";
+export const CLAUDE_EFFORTS = ["default","low","medium","high","xhigh","max"] as const;
+
 export type LabelSource = "native" | "title";
 export const LABEL_SOURCES = ["native","title"] as const;
 

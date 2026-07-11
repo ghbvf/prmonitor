@@ -18,6 +18,7 @@ import {
   DEFAULT_MESSAGING_SETTINGS as GENERATED_DEFAULT_MESSAGING_SETTINGS,
   DEFAULT_NOTIFICATION_SETTINGS as GENERATED_DEFAULT_NOTIFICATION_SETTINGS,
   DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG as GENERATED_DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
+  DEFAULT_PROJECT as GENERATED_DEFAULT_PROJECT,
 } from "./types.generated";
 
 // The fixed id the wizard gives the first project; mirrors the backend migration's
@@ -49,32 +50,20 @@ export const DEFAULT_NOTIFICATION_CHANNEL: NotificationChannel = {
 // Per-project field defaults sans identity (`id`/`name`): callers supply those.
 // ProjectsManager spreads this with `{ id: crypto.randomUUID(), name: "新项目" }`;
 // OnboardingWizard seeds its draft with `{ id: DEFAULT_PROJECT_ID, name: "默认项目" }`.
+const { id: _defaultId, name: _defaultName, ...generatedProjectDefaults } =
+  GENERATED_DEFAULT_PROJECT;
+
 export const NEW_PROJECT_DEFAULTS: Omit<Project, "id" | "name"> = {
-  enabled: true,
+  ...generatedProjectDefaults,
+  // A newly added project must ask for its repository instead of inheriting the backend's
+  // historical first-project seed. Every other field stays Rust-generated.
   repo: "",
-  repoRoot: "",
-  pollIntervalSecs: 120,
-  authors: [],
-  // Label source defaults to "native" (717): use the provider's own PR labels. A
-  // bitbucket source must switch this to "title" (no native labels).
-  labelSource: "native",
-  skillRelPath: ".codex/skills/pr-review/SKILL.md",
-  prCooldownSeconds: 1800,
-  // Default webhook-only (818): push-driven, no CLI poll loop — avoids the account/API
-  // risk control that CLI polling can trigger. Source defaults to github with empty
-  // Azure/Bitbucket fields (only used when sourceKind switches to "azure"/"bitbucket").
-  updateMode: "webhook-only",
-  sourceKind: "github",
-  azureOrg: "",
-  azureProject: "",
-  bitbucketHost: "",
-  bitbucketProject: "",
-  bitbucketToken: "",
-  engineKind: "codex",
-  // Empty = each engine uses its own default model (no --model / turn model injected).
-  codexModel: "",
-  claudeModel: "",
+  authors: [...generatedProjectDefaults.authors],
 };
+
+export function hydrateProjectDraft(draft: Project, project: Project): void {
+  Object.assign(draft, project, { authors: [...project.authors] });
+}
 
 // Auto-correct the project fields a Bitbucket source REQUIRES (717), applied in-place
 // whenever the user changes `sourceKind`. The backend `validate_project` rejects a

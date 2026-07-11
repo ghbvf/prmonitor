@@ -10,8 +10,9 @@ use url::Url;
 
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    CliTool, EngineKind, EventType, LabelSource, MessagingProviderKind, NotificationKind,
-    ReviewLifecycleEvent, SourceKind, UpdateMode, WebhookTunnelMode,
+    ClaudeEffort, CliTool, CodexReasoningEffort, EngineKind, EventType, LabelSource,
+    MessagingProviderKind, NotificationKind, ReviewLifecycleEvent, SourceKind, UpdateMode,
+    WebhookTunnelMode,
 };
 
 /// A user-configured executable path. Empty means automatic discovery; every non-empty value is
@@ -253,6 +254,10 @@ pub struct Project {
     /// 手填的 claude 模型名（仅 [`EngineKind::Claude`] 用）。非空时作为 `claude -p` 的
     /// `--model` 参数；留空=claude CLI 默认。自由文本不校验。
     pub claude_model: String,
+    /// Codex `turn/start.effort`; `default` omits the protocol field.
+    pub codex_reasoning_effort: CodexReasoningEffort,
+    /// Claude CLI `--effort`; `default` omits the argument.
+    pub claude_effort: ClaudeEffort,
     /// 本项目 PR 列表的更新模式（#818）。默认 [`UpdateMode::WebhookOnly`]：**启动不自动
     /// 轮询 CLI**，列表仅由 webhook 推送更新。`pull-only`/`hybrid` 才起周期轮询；`manual`
     /// 只在「立即拉取」时跑一次性发现。调度器据此 gate 是否为本项目起轮询 loop。
@@ -296,6 +301,8 @@ impl Default for Project {
             // 模型留空 = 各引擎用自身默认（不注入 --model / turn model）。
             codex_model: String::new(),
             claude_model: String::new(),
+            codex_reasoning_effort: CodexReasoningEffort::default(),
+            claude_effort: ClaudeEffort::default(),
             // #818: boot defaults to webhook-only — NO automatic CLI polling at startup
             // (the scheduler does not start a loop for this mode). Flip-back guarded by
             // `default_update_mode_is_webhook_only`.
@@ -2802,6 +2809,8 @@ mod tests {
             engine_kind: EngineKind::default(),
             codex_model: "gpt-5.1-codex".to_string(),
             claude_model: "claude-opus-4-1".to_string(),
+            codex_reasoning_effort: crate::model::CodexReasoningEffort::High,
+            claude_effort: crate::model::ClaudeEffort::Max,
             update_mode: UpdateMode::WebhookOnly,
             azure_org: "myorg".to_string(),
             azure_project: "myproject".to_string(),
@@ -2832,6 +2841,8 @@ mod tests {
         // 手填模型字段 wire camelCase + 值（Medium 载体；与 engineKind 的值断言风格一致）。
         assert_eq!(v["codexModel"], "gpt-5.1-codex");
         assert_eq!(v["claudeModel"], "claude-opus-4-1");
+        assert_eq!(v["codexReasoningEffort"], "high");
+        assert_eq!(v["claudeEffort"], "max");
         assert!(v.get("autoReview").is_none());
         // #818: the new data-source-mode fields.
         assert!(v.get("updateMode").is_some());
@@ -2856,6 +2867,8 @@ mod tests {
         assert!(v.get("engine_kind").is_none());
         assert!(v.get("codex_model").is_none());
         assert!(v.get("claude_model").is_none());
+        assert!(v.get("codex_reasoning_effort").is_none());
+        assert!(v.get("claude_effort").is_none());
         assert!(v.get("auto_review").is_none());
         // #818: snake_case forms of the new fields absent.
         assert!(v.get("update_mode").is_none());
@@ -2866,6 +2879,20 @@ mod tests {
         assert!(v.get("bitbucket_host").is_none());
         assert!(v.get("bitbucket_project").is_none());
         assert!(v.get("bitbucket_token").is_none());
+    }
+
+    #[test]
+    fn project_missing_effort_fields_uses_explicit_defaults() {
+        let project: Project = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            project.codex_reasoning_effort,
+            crate::model::CodexReasoningEffort::Default
+        );
+        assert_eq!(project.claude_effort, crate::model::ClaudeEffort::Default);
+        assert!(serde_json::from_value::<Project>(serde_json::json!({
+            "codexReasoningEffort": "invented"
+        }))
+        .is_err());
     }
 
     /// First-launch marker lock (Medium). The frontend routes a fresh install into

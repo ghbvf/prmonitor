@@ -11,6 +11,8 @@
 import type { AppConfig, Project } from "./types";
 import {
   SOURCE_KINDS,
+  CLAUDE_EFFORTS,
+  CODEX_REASONING_EFFORTS,
   ENGINE_KINDS,
   LABEL_SOURCES,
   UPDATE_MODES,
@@ -259,12 +261,28 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         visibleWhen: (p) => p.engineKind === "claude",
       },
       {
+        key: "claudeEffort",
+        label: "Claude 思考强度",
+        kind: "select",
+        options: CLAUDE_EFFORTS,
+        hint: "default=不传 --effort；若模型不支持所选档位，review 会失败",
+        visibleWhen: (p) => p.engineKind === "claude",
+      },
+      {
         key: "codexModel",
         label: "Codex 模型",
         kind: "text",
         hint: "codex turn 的 model 覆盖，如 gpt-5.1-codex；留空=codex 默认（仅 codex 引擎）",
         // codex-only: the app-server is shared, so model rides the per-turn RPC. Hidden
         // (value preserved) for a claude project; empty = codex's configured default.
+        visibleWhen: (p) => p.engineKind === "codex",
+      },
+      {
+        key: "codexReasoningEffort",
+        label: "Codex 思考强度",
+        kind: "select",
+        options: CODEX_REASONING_EFFORTS,
+        hint: "default=不覆盖 turn effort；若模型不支持所选档位，review 会失败",
         visibleWhen: (p) => p.engineKind === "codex",
       },
     ],
