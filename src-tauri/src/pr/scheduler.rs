@@ -2,8 +2,8 @@
 //!
 //! A `tokio::time::interval` drives discovery, plus a manual `wake` (the "立即
 //! 拉取" button) and live period changes (`reconfigure`). The loop never exits on
-//! a discovery error — `discover_emit_dispatch` swallows it into a
-//! [`PrEvent::Error`] and the loop continues. The first `interval` tick fires
+//! a discovery error — `run_discovery_cycle` emits [`PrEvent::Error`], the periodic caller
+//! records and ignores the returned error, and the loop continues. The first `interval` tick fires
 //! immediately (t=0), so `start`/`reconfigure` each trigger an immediate
 //! discovery ("启动即跑").
 //!
@@ -21,19 +21,19 @@
 //! longer drops a row — it flips presence `Current`→`Stale` after the grace window.
 //!
 //! **Auto-trigger (#8).** Each cycle also passes its dispatchable candidates (the
-//! clean rows) to an injected [`ProjectDispatcher`] hook. The hook is the seam that
+//! clean rows) to an injected [`DiscoveredEventSink`] hook. The hook is the seam that
 //! keeps the `pr` slice review-agnostic: the loop knows nothing about how a review
 //! starts, only that a closure consumes `(project_id, Vec<Candidate>)`. The
-//! composition root ([`crate::dispatch`]) installs the real dispatcher via
-//! [`SchedulerSet::set_dispatcher`] before reconciling, so even the immediate first
+//! composition root installs the real event sink via
+//! [`SchedulerSet::set_event_sink`] before reconciling, so even the immediate first
 //! tick dispatches.
 //!
 //! **Multi-project (#35).** A single [`Scheduler`] drives ONE project's poll loop;
 //! [`SchedulerSet`] owns a `project_id → Arc<Scheduler>` map and reconciles it to the
 //! enabled projects (create/stop/reconfigure). Each scheduler captures its
 //! `project_id` into the cycle closure, so every `PrEvent` it emits and every
-//! dispatcher call it makes carries the routing key (#35). The dispatcher is shared:
-//! [`SchedulerSet::set_dispatcher`] is installed once and cloned into each scheduler
+//! event_sink call it makes carries the routing key (#35). The event_sink is shared:
+//! [`SchedulerSet::set_event_sink`] is installed once and cloned into each scheduler
 //! on `reconcile`, so a project added later still inherits it.
 
 use std::collections::{HashMap, HashSet};
@@ -49,7 +49,7 @@ use tokio::sync::Notify;
 use tokio::time::MissedTickBehavior;
 
 use crate::config::service::{self as config_service, Project};
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::events::{PrEvent, StreamEvent};
 use crate::model::{TrackedPrView, UpdateMode};
 
@@ -135,13 +135,15 @@ pub struct PollStatus {
 /// Abstract per-cycle dispatch hook: consumes a cycle's `project_id` plus its
 /// dispatchable [`Candidate`]s and drives them to completion (in practice:
 /// auto-start their reviews concurrently). The leading `project_id` (#35) is the
-/// routing key the composition root's dispatcher needs to resolve the project's repo
+/// routing key the composition root's event_sink needs to resolve the project's repo
 /// / engine / ledger partition. Boxed-future + `Arc` so it is `Clone`able into each
 /// scheduler's cycle closure and erased of the review slice's types — the `pr` slice
 /// stays review-agnostic (the only cross-slice contract it sees is `Candidate`). The
-/// real implementation lives in the composition root ([`crate::dispatch`]).
-pub type ProjectDispatcher = Arc<
-    dyn Fn(String, Vec<DiscoveredEvent>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
+/// real implementation lives in the composition root.
+pub type DiscoveredEventSink = Arc<
+    dyn Fn(String, Vec<DiscoveredEvent>) -> Pin<Box<dyn Future<Output = AppResult<()>> + Send>>
+        + Send
+        + Sync,
 >;
 
 /// Default poll period when config is unreadable or non-positive. Mirrors
@@ -158,12 +160,12 @@ pub(crate) const DEFAULT_POLL_INTERVAL_SECS: u64 = 120;
 #[derive(Default)]
 pub struct Scheduler {
     task: StdMutex<Option<RunningTask>>,
-    /// The auto-trigger dispatch hook (#8), installed via [`Self::set_dispatcher`]
-    /// before `start` ([`SchedulerSet::reconcile`] clones the set's shared dispatcher
+    /// The auto-trigger dispatch hook (#8), installed via [`Self::set_event_sink`]
+    /// before `start` ([`SchedulerSet::reconcile`] clones the set's shared event_sink
     /// into each scheduler). `Mutex<Option<_>>` defaults to `None` (so
-    /// `#[derive(Default)]` still holds) — a `None` dispatcher means a cycle discovers
+    /// `#[derive(Default)]` still holds) — a `None` event_sink means a cycle discovers
     /// + emits but starts no reviews (the pre-#8 behavior).
-    dispatcher: StdMutex<Option<ProjectDispatcher>>,
+    event_sink: StdMutex<Option<DiscoveredEventSink>>,
     /// Per-loop poll diagnostics (#62), shared with the cycle closure so each cycle
     /// records its started / discovered / persist / error timestamps. `Arc<StdMutex<_>>`
     /// (defaults to an empty `PollDiag`, so `#[derive(Default)]` still holds) read by
@@ -181,11 +183,11 @@ struct RunningTask {
 
 impl Scheduler {
     /// Installs the auto-trigger dispatch hook (#8). Called *before* `start` (by
-    /// [`SchedulerSet::reconcile`], cloning the set's shared dispatcher), so the
+    /// [`SchedulerSet::reconcile`], cloning the set's shared event_sink), so the
     /// immediate first tick already dispatches. Replaces any prior hook (last writer
-    /// wins); a never-set dispatcher leaves cycles discover-and-emit only.
-    pub fn set_dispatcher(&self, d: ProjectDispatcher) {
-        *self.dispatcher.lock().unwrap() = Some(d);
+    /// wins); a never-set event_sink leaves cycles discover-and-emit only.
+    pub fn set_event_sink(&self, d: DiscoveredEventSink) {
+        *self.event_sink.lock().unwrap() = Some(d);
     }
 
     /// Spawns this project's poll loop (#35), capturing `project_id` into the cycle so
@@ -204,11 +206,11 @@ impl Scheduler {
         let reconfigure = Arc::new(Notify::new());
         let stop = Arc::new(Notify::new());
 
-        // Snapshot the installed dispatcher once into the cycle closure: the loop
+        // Snapshot the installed event_sink once into the cycle closure: the loop
         // task outlives this `start` call, so it captures an owned
-        // `Option<ProjectDispatcher>` rather than re-locking `self` each cycle.
+        // `Option<DiscoveredEventSink>` rather than re-locking `self` each cycle.
         // `None` ⇒ no auto-trigger.
-        let dispatcher = self.dispatcher.lock().unwrap().clone();
+        let event_sink = self.event_sink.lock().unwrap().clone();
 
         // Production wiring: the period comes from THIS project's live config each
         // rebuild (resolved by id, with a default fallback if the project is gone), and
@@ -233,10 +235,11 @@ impl Scheduler {
             move || {
                 let app = app.clone();
                 let project_id = project_id.clone();
-                let dispatcher = dispatcher.clone();
+                let event_sink = event_sink.clone();
                 let diag = diag.clone();
                 async move {
-                    discover_emit_dispatch(&app, &project_id, dispatcher.as_ref(), &diag).await
+                    let _ =
+                        run_discovery_cycle(&app, &project_id, event_sink.as_ref(), &diag).await;
                 }
             }
         };
@@ -335,7 +338,7 @@ fn periodic_polling(p: &Project) -> bool {
 /// The composition-root handle for ALL projects' poll loops (#35). Lives in
 /// [`crate::state::AppState`]; all methods take `&self` and use interior mutability so
 /// a single shared `State<AppState>` can drive every project. Owns a
-/// `project_id → Arc<Scheduler>` map plus the one shared [`ProjectDispatcher`] cloned
+/// `project_id → Arc<Scheduler>` map plus the one shared [`DiscoveredEventSink`] cloned
 /// into each scheduler on [`Self::reconcile`].
 #[derive(Default)]
 pub struct SchedulerSet {
@@ -344,9 +347,9 @@ pub struct SchedulerSet {
     /// reference; the map only holds the control handle).
     inner: StdMutex<HashMap<String, Arc<Scheduler>>>,
     /// The auto-trigger dispatch hook (#8), installed once by the composition root via
-    /// [`Self::set_dispatcher`] and cloned into each scheduler on `reconcile`. `None`
+    /// [`Self::set_event_sink`] and cloned into each scheduler on `reconcile`. `None`
     /// (the `#[derive(Default)]` value) leaves every cycle discover-and-emit only.
-    dispatcher: StdMutex<Option<ProjectDispatcher>>,
+    event_sink: StdMutex<Option<DiscoveredEventSink>>,
     /// Retained per-project [`PollDiag`] for MANUAL projects (#818 F15), keyed by
     /// `project_id`. A manual project has NO live [`Scheduler`] (so no `inner` entry and no
     /// loop diag), yet its last "立即拉取" still needs to surface its time / discovered count /
@@ -358,7 +361,7 @@ pub struct SchedulerSet {
     manual_diags: StdMutex<HashMap<String, Arc<StdMutex<PollDiag>>>>,
     /// In-flight project ids for MANUAL one-shot discoveries (#124 F4). Rapid "立即拉取"
     /// presses would otherwise spawn concurrent `az` discoveries for the same project (the
-    /// double-DISPATCH is already backstopped by the dispatcher's in-flight registry + the
+    /// double-DISPATCH is already backstopped by the event_sink's in-flight registry + the
     /// ledger, so this guards mainly against redundant `az` calls). [`Self::try_begin_manual`]
     /// inserts the id under this lock and returns a [`ManualInflightGuard`] that removes it on
     /// drop (every exit path, incl. panic); a second concurrent pull for the same id is
@@ -389,9 +392,9 @@ impl SchedulerSet {
     /// composition root *before* the first [`Self::reconcile`], so a scheduler created
     /// by that reconcile inherits it and its immediate first tick already dispatches.
     /// Replaces any prior hook (last writer wins); already-running schedulers keep the
-    /// dispatcher they were created with (a re-install only affects future creates).
-    pub fn set_dispatcher(&self, d: ProjectDispatcher) {
-        *self.dispatcher.lock().unwrap() = Some(d);
+    /// event_sink they were created with (a re-install only affects future creates).
+    pub fn set_event_sink(&self, d: DiscoveredEventSink) {
+        *self.event_sink.lock().unwrap() = Some(d);
     }
 
     /// Reconciles the running schedulers to `projects` (#35, #818). Idempotent — safe to
@@ -400,13 +403,13 @@ impl SchedulerSet {
     /// / disabled project gets NO loop (the #818 safety change — app launch must not
     /// auto-poll those):
     /// - a poll-eligible project NOT yet in the map → create a [`Scheduler`], install the
-    ///   shared dispatcher, and `start` it (captures the project's id);
+    ///   shared event_sink, and `start` it (captures the project's id);
     /// - a mapped id that is no longer poll-eligible (disabled, removed, mode flipped to
     ///   webhook-only/manual, or absent from `projects`) → `stop` it and drop it;
     /// - a surviving poll-eligible project → `reconfigure` (re-read its period; the first
     ///   tick fires immediately, so this also re-polls).
     pub fn reconcile<R: tauri::Runtime>(&self, app: &tauri::AppHandle<R>, projects: &[Project]) {
-        let dispatcher = self.dispatcher.lock().unwrap().clone();
+        let event_sink = self.event_sink.lock().unwrap().clone();
         let mut map = self.inner.lock().unwrap();
 
         // The set of ids that SHOULD be running (poll-eligible projects: enabled +
@@ -439,8 +442,8 @@ impl SchedulerSet {
                 Some(scheduler) => scheduler.reconfigure(), // survivor: re-read period + re-poll.
                 None => {
                     let scheduler = Arc::new(Scheduler::default());
-                    if let Some(d) = dispatcher.clone() {
-                        scheduler.set_dispatcher(d);
+                    if let Some(d) = event_sink.clone() {
+                        scheduler.set_event_sink(d);
                     }
                     scheduler.start(app.clone(), project.id.clone());
                     map.insert(project.id.clone(), scheduler);
@@ -489,9 +492,9 @@ impl SchedulerSet {
     /// Runs ONE one-shot discovery cycle for `project_id` WITHOUT a running poll loop
     /// (#818). The `Manual` mode's "立即拉取" path: `poll_now` calls this when no scheduler
     /// exists for the project (manual has no periodic loop). Drives the same per-cycle body
-    /// the loop runs — [`discover_emit_dispatch`] — so a manual pull discovers, persists,
-    /// emits `prs:updated`, and hands gated events to the rule-engine dispatcher exactly like a
-    /// periodic cycle. Uses the set's shared dispatcher (the same one `reconcile` clones into each
+    /// the loop runs — [`run_discovery_cycle`] — so a manual pull discovers, persists,
+    /// emits `prs:updated`, and hands gated events to the rule-engine event_sink exactly like a
+    /// periodic cycle. Uses the set's shared event_sink (the same one `reconcile` clones into each
     /// scheduler).
     ///
     /// Records the cycle into the RETAINED per-project [`PollDiag`] sidecar (#818 F15) so
@@ -499,20 +502,20 @@ impl SchedulerSet {
     /// with no live loop. Get-or-insert the project's `Arc<StdMutex<PollDiag>>` while holding
     /// ONLY the `manual_diags` map lock, then clone the `Arc` OUT and drop the map lock
     /// BEFORE the await — so no `StdMutex` (neither the map's nor the diag's) is held across
-    /// `discover_emit_dispatch` (the same discipline the poll loop uses). `async` — awaited
+    /// `run_discovery_cycle` (the same discipline the poll loop uses). `async` — awaited
     /// by the caller.
     pub async fn discover_once<R: tauri::Runtime>(
         &self,
         app: &tauri::AppHandle<R>,
         project_id: &str,
-    ) {
+    ) -> AppResult<()> {
         // In-flight coalesce (#124 F4): admit ONE manual pull per project. If one is already
         // running, return early — it will emit `prs:updated` for everyone. The `_guard`
         // removes the id on EVERY exit path of this fn (drop at scope end), incl. a panic.
         let Some(_guard) = self.try_begin_manual(project_id) else {
-            return;
+            return Ok(());
         };
-        let dispatcher = self.dispatcher.lock().unwrap().clone();
+        let event_sink = self.event_sink.lock().unwrap().clone();
         // Get-or-insert the retained diag, cloning the Arc out under ONLY the map lock; the
         // map lock is released at the end of this block (before the await below).
         let diag = {
@@ -523,11 +526,11 @@ impl SchedulerSet {
                     .or_insert_with(|| Arc::new(StdMutex::new(PollDiag::default()))),
             )
         };
-        // No StdMutex held here: `discover_emit_dispatch` locks the inner `PollDiag` only for
+        // No StdMutex held here: `run_discovery_cycle` locks the inner `PollDiag` only for
         // the brief mark_* calls, never across its own awaits (same as the loop's cycle).
         // `_guard` (the in-flight mark) is held across the await but it is a plain owned value,
         // NOT a lock guard — no StdMutex spans the await.
-        discover_emit_dispatch(app, project_id, dispatcher.as_ref(), &diag).await;
+        run_discovery_cycle(app, project_id, event_sink.as_ref(), &diag).await
     }
 
     /// Tries to mark `project_id` as having a MANUAL one-shot discovery in flight (#124 F4).
@@ -678,20 +681,20 @@ async fn run_loop<P, C, Fut>(
 /// start-review decision independent of persistence, so it still runs on a persist
 /// failure.
 ///
-/// The dispatch is *spawned detached* (not awaited) after the emit — see the body
-/// for why the scheduler's stop must not be able to cancel a start in flight; an
-/// empty dispatchable list skips the hook entirely.
-async fn discover_emit_dispatch<R: tauri::Runtime>(
+/// Discovered events are submitted to the durable inbox sink after the retained-list emit. The
+/// sink only persists and wakes the single consumer; an empty dispatchable list skips it entirely.
+async fn run_discovery_cycle<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     project_id: &str,
-    dispatcher: Option<&ProjectDispatcher>,
+    event_sink: Option<&DiscoveredEventSink>,
     diag: &Arc<StdMutex<PollDiag>>,
-) {
+) -> AppResult<()> {
     // Mark this cycle as started (#62) before the (possibly slow) discovery, so the panel
     // shows the loop is actively working even while `gh` is in flight.
     diag.lock()
         .unwrap()
         .mark_started(super::ledger::now_epoch());
+    let mut cycle_error = None;
     let (event, dispatchable) = match super::commands::discover(app, project_id).await {
         Ok((views, dispatchable)) => {
             // Discovery succeeded: record the success epoch + count (#62).
@@ -734,10 +737,12 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
             diag.lock()
                 .unwrap()
                 .mark_error(e.message.clone(), super::ledger::now_epoch());
+            let message = e.message;
+            cycle_error = Some(AppError::new(message.clone()));
             (
                 PrEvent::Error {
                     project_id: project_id.to_string(),
-                    message: e.message,
+                    message,
                 },
                 Vec::new(),
             )
@@ -745,27 +750,21 @@ async fn discover_emit_dispatch<R: tauri::Runtime>(
     };
     crate::stream::emit(app, StreamEvent::Pr(event.clone()));
 
-    if let Some(d) = dispatcher {
+    if let Some(d) = event_sink {
         if !dispatchable.is_empty() {
-            // Spawn the dispatch DETACHED rather than awaiting it inline. This cycle
-            // runs inside the loop's stop-cancellable `select!` (the F1 cancellation
-            // domain that lets a stop reap the in-flight `gh` child). Awaiting
-            // `start_review` here would put it in that same domain, so a
-            // `stop_polling` landing mid-start would drop a half-started review —
-            // leaving a `Starting` session that `stop_review` can't interrupt
-            // (`begin_interrupt` is a no-op on `Starting`). The dispatcher future is
-            // `Send + 'static`, so the spawned task runs to its terminal
-            // (`Running`/`Failed`) regardless of the poll loop. Cross-cycle dedup is
-            // unaffected: an in-flight dispatch is still covered by the next
-            // discovery's ledger gate and the dispatcher's own in-flight registry
-            // guard. Discovery itself stays cancellable (it is awaited above), so a
-            // stop still reaps `gh`. The JoinHandle is dropped explicitly (detached):
-            // the task runs to completion regardless of the poll loop.
-            drop(tauri::async_runtime::spawn(d(
-                project_id.to_string(),
-                dispatchable,
-            )));
+            // The sink only persists inbox rows and wakes the single consumer, so awaiting it is
+            // bounded and keeps persistence in the poll cycle's error/cancellation domain.
+            if let Err(error) = d(project_id.to_string(), dispatchable).await {
+                diag.lock()
+                    .unwrap()
+                    .mark_error(error.message.clone(), super::ledger::now_epoch());
+                cycle_error.get_or_insert(error);
+            }
         }
+    }
+    match cycle_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -805,7 +804,9 @@ pub(crate) fn resolve_period(loaded: AppResult<u64>) -> u64 {
 mod tests {
     use super::*;
     use crate::error::AppError;
-    use crate::model::{Candidate, Event, EventType, SourceKind};
+    use crate::model::{
+        Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, SourceKind,
+    };
     use tokio::sync::mpsc;
 
     #[test]
@@ -911,19 +912,19 @@ mod tests {
     }
 
     #[test]
-    fn default_scheduler_has_no_dispatcher() {
+    fn default_scheduler_has_no_event_sink() {
         // `#[derive(Default)]` must keep working with the new field: an
-        // un-installed dispatcher is `None`, so cycles discover-and-emit only.
+        // un-installed event_sink is `None`, so cycles discover-and-emit only.
         let scheduler = Scheduler::default();
-        assert!(scheduler.dispatcher.lock().unwrap().is_none());
+        assert!(scheduler.event_sink.lock().unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn set_dispatcher_stores_and_retrieves_the_hook() {
+    async fn set_event_sink_stores_and_retrieves_the_hook() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex as TestMutex;
 
-        // The hook plumbing in isolation: `set_dispatcher` stores a counting
+        // The hook plumbing in isolation: `set_event_sink` stores a counting
         // closure; retrieving it (the same `lock().clone()` `start` does) and
         // invoking it with a project id + sample candidates must run the closure.
         // Verifies storage/retrieval AND that the leading `project_id` (#35) reaches
@@ -932,7 +933,7 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let seen = Arc::new(AtomicUsize::new(0));
         let seen_pid: Arc<TestMutex<Option<String>>> = Arc::new(TestMutex::new(None));
-        let dispatcher: ProjectDispatcher = {
+        let event_sink: DiscoveredEventSink = {
             let count = Arc::clone(&count);
             let seen = Arc::clone(&seen);
             let seen_pid = Arc::clone(&seen_pid);
@@ -944,22 +945,24 @@ mod tests {
                     count.fetch_add(1, Ordering::SeqCst);
                     seen.fetch_add(cands.len(), Ordering::SeqCst);
                     *seen_pid.lock().unwrap() = Some(project_id);
+                    Ok(())
                 })
             })
         };
-        scheduler.set_dispatcher(dispatcher);
+        scheduler.set_event_sink(event_sink);
 
         let stored = scheduler
-            .dispatcher
+            .event_sink
             .lock()
             .unwrap()
             .clone()
-            .expect("set_dispatcher stores the hook");
+            .expect("set_event_sink stores the hook");
         stored(
             "p1".to_string(),
             vec![candidate(1, "review"), candidate(2, "check")],
         )
-        .await;
+        .await
+        .expect("event sink succeeds");
 
         assert_eq!(count.load(Ordering::SeqCst), 1, "hook ran once");
         assert_eq!(seen.load(Ordering::SeqCst), 2, "hook saw both candidates");
@@ -973,14 +976,14 @@ mod tests {
     // ── SchedulerSet (#35) ──────────────────────────────────────────────────
     // The map-management methods that don't need an `AppHandle` (`reconcile` does,
     // so it's exercised in the live app). These lock the multi-project invariants:
-    // a default set is empty + dispatcher-less, `wake`/`reconfigure` on an unknown
+    // a default set is empty + event_sink-less, `wake`/`reconfigure` on an unknown
     // project are safe no-ops, and `stop_all` clears the map.
 
     #[test]
-    fn default_scheduler_set_is_empty_and_dispatcherless() {
+    fn default_scheduler_set_is_empty_and_event_sinkless() {
         let set = SchedulerSet::default();
         assert!(set.inner.lock().unwrap().is_empty());
-        assert!(set.dispatcher.lock().unwrap().is_none());
+        assert!(set.event_sink.lock().unwrap().is_none());
     }
 
     #[test]
@@ -1000,15 +1003,15 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_set_set_dispatcher_stores_shared_hook() {
-        // The set's shared dispatcher is what `reconcile` clones into each scheduler;
+    fn scheduler_set_set_event_sink_stores_shared_hook() {
+        // The set's shared event_sink is what `reconcile` clones into each scheduler;
         // installing it before any reconcile is what lets a later-added project
         // inherit auto-dispatch.
         let set = SchedulerSet::default();
-        let dispatcher: ProjectDispatcher =
-            Arc::new(|_pid: String, _cands: Vec<DiscoveredEvent>| Box::pin(async {}));
-        set.set_dispatcher(dispatcher);
-        assert!(set.dispatcher.lock().unwrap().is_some());
+        let event_sink: DiscoveredEventSink =
+            Arc::new(|_pid: String, _cands: Vec<DiscoveredEvent>| Box::pin(async { Ok(()) }));
+        set.set_event_sink(event_sink);
+        assert!(set.event_sink.lock().unwrap().is_some());
     }
 
     #[test]
@@ -1144,22 +1147,25 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: kind.to_string(),
+            kind: kind.parse().unwrap(),
         };
         DiscoveredEvent {
-            event: Event {
-                dedupe_key: format!("github:pullRequest:owner/repo#{number}@sha"),
-                source: SourceKind::Github,
-                event_type: EventType::PullRequest,
-                project_id: "p1".to_string(),
-                repo: "owner/repo".to_string(),
-                number: Some(number),
-                title: format!("PR {number}"),
-                body: String::new(),
-                labels: Vec::new(),
-                url: format!("https://github.com/owner/repo/pull/{number}"),
-                received_at_epoch: 0,
-            },
+            event: EventEnvelope::observation(
+                InboxDedupeKey::new(format!("github:pullRequest:owner/repo#{number}@sha")).unwrap(),
+                SourceKind::Github,
+                "p1",
+                "owner/repo",
+                EventType::PullRequest,
+                EventSubject {
+                    number: Some(number),
+                    title: format!("PR {number}"),
+                    body: String::new(),
+                    labels: Vec::new(),
+                    url: format!("https://github.com/owner/repo/pull/{number}"),
+                },
+                0,
+            )
+            .unwrap(),
             candidate,
             conflict: false,
         }

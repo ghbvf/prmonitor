@@ -1,40 +1,37 @@
 //! `prmonitor review …` CLI subcommand (AB#1044 — CLI/Deeplink Phase 2).
 //!
-//! Composition-layer module (a sibling of [`crate::dispatch`]): it consumes the `review`
-//! slice's local-API wire types + the `config` slice's loader, so it is composition, not a
-//! slice.
+//! Composition-layer module: it consumes the `review` slice's local-API wire types + the `config`
+//! slice's loader, so it is composition, not a slice.
 //!
 //! The binary is ALWAYS a THIN HTTP CLIENT over the AB#1043 local API — the request/response
 //! channel that plays VS Code's `VSCODE_IPC_HOOK_CLI` / `code --wait` role: `POST /reviews`, then
 //! with `--watch` poll `GET /reviews/{id}` to a terminal state and print the comment URL. The CLI
 //! process NEVER becomes the GUI; exit codes follow `gh run watch` (always 0 unless `--exit-status`).
-//!  - **App running** → trigger succeeds immediately.
+//!  - **App running** → request succeeds immediately.
 //!  - **App not running** (connection refused) → the CLI LAUNCHES the app as a DETACHED child and
 //!    keeps polling until its local API binds, then runs the same client path. Because the CLI
 //!    stays a pure HTTP client (it never forwards argv via single-instance), `--watch`/`--json`/
 //!    `--exit-status` work on cold start too AND no single-instance race can drop the request.
 //!
-//! **Governance (AB-robust).** The client REUSES the local API's `TriggerRequest` /
-//! `TriggerResponse` / `StatusResponse` / `ErrorBody` structs — ONE definition, both sides
+//! **Governance (AB-robust).** The client REUSES the local API's `ReviewRequestBody` /
+//! `ReviewReceiptAccepted` / `StatusResponse` / `ErrorBody` structs — ONE definition, both sides
 //! (Hard; the round-trip goldens live next to those structs in `local_api.rs`). The only datum
 //! it must restate is the bundle identifier (to find `prmonitor.db` without a Tauri app); that
 //! restatement is locked **Medium** by [`tests::app_identifier_matches_tauri_conf`].
 
-use std::{
-    future::Future,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{future::Future, time::Duration};
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
 use crate::config::service as config_service;
 use crate::db::Database;
 use crate::model::{
-    MessagingEventEntry, NotificationLevel, OutboxEntry, SendMessagingRequest,
-    SendMessagingResponse, SendNotificationRequest, SendNotificationResponse,
+    ExternalRequestId, MessagingEventEntry, NotificationLevel, OutboxEntry, ReviewReceiptStatus,
+    SendMessagingRequest, SendMessagingResponse, SendNotificationRequest, SendNotificationResponse,
 };
-use crate::review::local_api::{ErrorBody, StatusResponse, TriggerRequest, TriggerResponse};
-use crate::review::session::SessionStatus;
+use crate::review::local_api::{
+    ErrorBody, ReviewReceiptAccepted, ReviewRequestBody, StatusResponse,
+};
 
 /// The bundle identifier (`tauri.conf.json` `identifier`). The CLI runs BEFORE any Tauri app
 /// exists, so it cannot ask Tauri for `app_data_dir()`; it reconstructs the DB path as
@@ -46,7 +43,7 @@ const APP_IDENTIFIER: &str = "com.ghbvf.prmonitor";
 /// `--watch` poll cadence (mirrors `gh run watch`'s steady low-frequency poll).
 const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 
-/// Per-request HTTP timeout (the trigger + each poll). Generous, but a hung socket must not
+/// Per-request HTTP timeout (the review request + each poll). Generous, but a hung socket must not
 /// block a CI `&&` chain forever.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -59,7 +56,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Trigger a PR review on the running prmonitor app (or launch it, then trigger).
+    /// Request a PR review from the running prmonitor app (or launch it, then request).
     Review(ReviewArgs),
     /// Enqueue a user-authored notification through the running prmonitor app.
     Notify(NotifyArgs),
@@ -74,7 +71,7 @@ enum Command {
 #[derive(Args, Clone)]
 #[command(group = ArgGroup::new("target").required(true))]
 pub struct ReviewArgs {
-    /// PR / MR number (must be > 0; the trigger funnel rejects 0).
+    /// PR / MR number (must be > 0; the request funnel rejects 0).
     #[arg(long)]
     pub pr: u64,
     /// Target project by `owner/name` repo (case-insensitive). One of --repo / --project-id.
@@ -96,6 +93,9 @@ pub struct ReviewArgs {
     /// With `--watch`, exit non-zero unless the review COMPLETED (a comment was posted).
     #[arg(long = "exit-status")]
     pub exit_status: bool,
+    /// Reuse a logical request id after an ambiguous response to recover the original receipt.
+    #[arg(long = "request-id", value_parser = parse_external_request_id)]
+    pub request_id: Option<ExternalRequestId>,
     /// Override the local API port (else `PRMONITOR_LOCAL_API_PORT`, else saved config).
     #[arg(long)]
     pub port: Option<u16>,
@@ -182,7 +182,7 @@ pub struct MessageLogArgs {
 }
 
 impl ReviewArgs {
-    /// The free-form `reference` the trigger funnel resolves (id-or-repo). The clap `target`
+    /// The free-form `reference` the request funnel resolves (id-or-repo). The clap `target`
     /// group guarantees exactly one of repo / project_id is set.
     pub fn reference(&self) -> String {
         self.repo
@@ -202,12 +202,13 @@ impl ReviewArgs {
     }
 
     /// Build the POST body — the SAME struct the server deserializes (Hard, single-source).
-    fn trigger_request(&self) -> TriggerRequest {
-        TriggerRequest {
+    fn review_request_body(&self, request_id: ExternalRequestId) -> ReviewRequestBody {
+        ReviewRequestBody {
             project_id: self.project_id.clone(),
             repo: self.repo.clone(),
             pr: self.pr,
-            kind: self.kind().to_string(),
+            kind: self.kind().parse().expect("CLI kind is sealed"),
+            request_id,
         }
     }
 }
@@ -231,13 +232,17 @@ impl MessageSendArgs {
             integration_id: self.integration_id.clone(),
             conversation_id: self.conversation_id.clone(),
             text: self.text.clone(),
-            request_id: new_request_id(),
+            request_id: new_request_id().into_inner(),
         }
     }
 }
 
 fn parse_notification_level(value: &str) -> Result<NotificationLevel, String> {
     value.parse()
+}
+
+fn parse_external_request_id(value: &str) -> Result<ExternalRequestId, String> {
+    ExternalRequestId::parse(value)
 }
 
 /// Hand-written so the bearer `token` never appears in debug output (only whether one is set).
@@ -251,6 +256,7 @@ impl std::fmt::Debug for ReviewArgs {
             .field("watch", &self.watch)
             .field("json", &self.json)
             .field("exit_status", &self.exit_status)
+            .field("request_id", &self.request_id)
             .field("port", &self.port)
             .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
             .finish()
@@ -342,15 +348,19 @@ pub fn parse() -> Invocation {
 /// becomes the GUI), so `--watch`/`--json`/`--exit-status` work on cold start too.
 const COLD_START_DEADLINE: Duration = Duration::from_secs(30);
 const COLD_START_POLL: Duration = Duration::from_millis(300);
+const AMBIGUOUS_REQUEST_RETRIES: usize = 3;
+const AMBIGUOUS_REQUEST_RETRY_DELAY: Duration = Duration::from_millis(300);
 
-/// The result of a single trigger POST.
-enum Trigger {
-    /// The app accepted the trigger (202) — carries the session id + status URL.
-    Ok(TriggerResponse),
+/// The result of a single review-request POST.
+enum ReviewRequestAttempt {
+    /// The app accepted the durable request (202) — carries the receipt id + status URL.
+    Accepted(ReviewReceiptAccepted),
     /// Connection refused — nothing is listening (the app is not running yet).
     NotRunning,
+    /// The server may have persisted the request, but the client did not receive a usable response.
+    Ambiguous(String),
     /// A definitive failure (HTTP 4xx/5xx, parse/transport error) — exit with this code.
-    Failed(i32),
+    Rejected(i32),
 }
 
 /// Synchronous entry for [`crate::run`] — owns a single-threaded tokio runtime for the client
@@ -421,24 +431,33 @@ async fn run_client(args: &ReviewArgs) -> i32 {
         }
     };
     let base = endpoint.base_url();
+    // One id for the logical CLI request, reused across cold-start/reconnect retries. Generating
+    // inside the POST helper would turn a transport retry into a second durable review request.
+    let request_id = args.request_id.clone().unwrap_or_else(new_request_id);
 
-    // 1) Trigger. If the app is running, this succeeds immediately. If it is NOT running, launch it
+    // 1) Submit. If the app is running, this succeeds immediately. If it is NOT running, launch it
     //    and retry-connect until its local API binds — the CLI stays a thin HTTP client throughout
     //    (it never becomes the GUI nor forwards argv via single-instance), so `--watch`/`--json`/
     //    `--exit-status` work on cold start AND no single-instance race can drop the request.
-    let trigger = match post_trigger(&client, &base, &endpoint.token, args).await {
-        Trigger::Ok(tr) => tr,
-        Trigger::Failed(code) => return code,
-        Trigger::NotRunning => {
+    let accepted = match submit_review_request(&client, &base, &endpoint.token, args, &request_id)
+        .await
+    {
+        ReviewRequestAttempt::Accepted(response) => response,
+        ReviewRequestAttempt::Rejected(code) => return code,
+        ReviewRequestAttempt::Ambiguous(_) => unreachable!("ambiguity is settled by retry wrapper"),
+        ReviewRequestAttempt::NotRunning => {
             eprintln!("app 未运行：正在启动 app…");
             if let Err(e) = spawn_detached_gui() {
                 eprintln!("启动 app 失败：{e}");
                 return 1;
             }
-            match await_app_then_trigger(&client, &base, &endpoint.token, args).await {
-                Trigger::Ok(tr) => tr,
-                Trigger::Failed(code) => return code,
-                Trigger::NotRunning => {
+            match await_app_then_request(&client, &base, &endpoint.token, args, &request_id).await {
+                ReviewRequestAttempt::Accepted(response) => response,
+                ReviewRequestAttempt::Rejected(code) => return code,
+                ReviewRequestAttempt::Ambiguous(_) => {
+                    unreachable!("ambiguity is settled by retry wrapper")
+                }
+                ReviewRequestAttempt::NotRunning => {
                     eprintln!("启动 app 后本地 API 未在 {COLD_START_DEADLINE:?} 内就绪");
                     return 1;
                 }
@@ -446,11 +465,15 @@ async fn run_client(args: &ReviewArgs) -> i32 {
         }
     };
 
-    // 2) No --watch: print the trigger result (id + statusUrl) and return success.
+    // 2) No --watch: print the accepted receipt (id + statusUrl) and return success.
     if !args.watch {
-        let value = serde_json::to_value(&trigger).unwrap_or(serde_json::Value::Null);
+        let value = serde_json::to_value(&accepted).unwrap_or(serde_json::Value::Null);
         emit(&args.json, &value, || {
-            format!("review 已触发：{}\n{}", trigger.id, trigger.status_url)
+            format!(
+                "review 已入队（receipt {}）：\n{}",
+                accepted.receipt_id.get(),
+                accepted.status_url
+            )
         });
         return 0;
     }
@@ -458,11 +481,11 @@ async fn run_client(args: &ReviewArgs) -> i32 {
     // 3) --watch: poll the server-provided status URL to a terminal state. The URL is
     // server-provided, so before polling it WITH the bearer token, confirm it is loopback — a
     // hijacked/rogue listener must never receive the token off-box.
-    if !is_loopback_http_url(&trigger.status_url) {
-        eprintln!("拒绝轮询非 loopback 的 statusUrl：{}", trigger.status_url);
+    if !is_loopback_http_url(&accepted.status_url) {
+        eprintln!("拒绝轮询非 loopback 的 statusUrl：{}", accepted.status_url);
         return 1;
     }
-    watch_to_terminal(&client, &endpoint.token, &trigger.status_url, args).await
+    watch_to_terminal(&client, &endpoint.token, &accepted.status_url, args).await
 }
 
 async fn run_notify_client(args: &NotifyArgs) -> i32 {
@@ -783,54 +806,84 @@ async fn post_notification(
     }
 }
 
-/// One trigger POST. Connection-refused is reported distinctly ([`Trigger::NotRunning`]) so the
-/// caller can launch the app and retry; every other failure is terminal.
-async fn post_trigger(
+/// One review-request POST. Connection-refused is distinct so the caller can launch the app.
+/// Transport/response-decode failures are ambiguous: the durable insert may already have committed.
+async fn post_review_request_once(
     client: &reqwest::Client,
     base: &str,
     token: &str,
     args: &ReviewArgs,
-) -> Trigger {
+    request_id: &ExternalRequestId,
+) -> ReviewRequestAttempt {
     let resp = client
         .post(format!("{base}/reviews"))
         .bearer_auth(token)
-        .json(&args.trigger_request())
+        .header("x-prmonitor-client", "cli")
+        .json(&args.review_request_body(request_id.clone()))
         .send()
         .await;
     let resp = match resp {
         Ok(r) => r,
-        Err(e) if e.is_connect() => return Trigger::NotRunning,
+        Err(e) if e.is_connect() => return ReviewRequestAttempt::NotRunning,
         Err(e) => {
-            eprintln!("触发请求失败: {e}");
-            return Trigger::Failed(1);
+            return ReviewRequestAttempt::Ambiguous(format!("review 请求响应不确定: {e}"));
         }
     };
     if !resp.status().is_success() {
-        return Trigger::Failed(report_http_error(resp).await);
+        return ReviewRequestAttempt::Rejected(report_http_error(resp).await);
     }
-    match resp.json::<TriggerResponse>().await {
-        Ok(tr) => Trigger::Ok(tr),
-        Err(e) => {
-            eprintln!("解析触发响应失败: {e}");
-            Trigger::Failed(1)
-        }
+    match resp.json::<ReviewReceiptAccepted>().await {
+        Ok(response) => ReviewRequestAttempt::Accepted(response),
+        Err(e) => ReviewRequestAttempt::Ambiguous(format!("解析 review receipt 响应失败: {e}")),
     }
 }
 
-/// After launching the app, retry [`post_trigger`] until its local API binds (the first non-refused
-/// result wins — so exactly one review is triggered) or the cold-start deadline elapses.
-async fn await_app_then_trigger(
+/// Retry ambiguous request outcomes with the SAME request id. The server's durable request-id
+/// dedupe makes this safe when the first POST committed but its response was lost.
+async fn submit_review_request(
     client: &reqwest::Client,
     base: &str,
     token: &str,
     args: &ReviewArgs,
-) -> Trigger {
+    request_id: &ExternalRequestId,
+) -> ReviewRequestAttempt {
+    for attempt in 0..=AMBIGUOUS_REQUEST_RETRIES {
+        match post_review_request_once(client, base, token, args, request_id).await {
+            ReviewRequestAttempt::Ambiguous(message) if attempt < AMBIGUOUS_REQUEST_RETRIES => {
+                eprintln!(
+                    "{message}；使用同一 requestId 重试（{}/{AMBIGUOUS_REQUEST_RETRIES}）",
+                    attempt + 1
+                );
+                tokio::time::sleep(AMBIGUOUS_REQUEST_RETRY_DELAY).await;
+            }
+            ReviewRequestAttempt::Ambiguous(message) => {
+                eprintln!(
+                    "{message}；重试已耗尽。请求可能已经入队，请用相同参数加 --request-id={} 重试以恢复原 receipt。",
+                    request_id.as_str()
+                );
+                return ReviewRequestAttempt::Rejected(1);
+            }
+            settled => return settled,
+        }
+    }
+    unreachable!("bounded retry loop always returns")
+}
+
+/// After launching the app, retry [`submit_review_request`] until its local API binds (the first non-refused
+/// result wins — so exactly one durable request is submitted) or the cold-start deadline elapses.
+async fn await_app_then_request(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    args: &ReviewArgs,
+    request_id: &ExternalRequestId,
+) -> ReviewRequestAttempt {
     let mut waited = Duration::ZERO;
     loop {
-        match post_trigger(client, base, token, args).await {
-            Trigger::NotRunning => {
+        match submit_review_request(client, base, token, args, request_id).await {
+            ReviewRequestAttempt::NotRunning => {
                 if waited >= COLD_START_DEADLINE {
-                    return Trigger::NotRunning;
+                    return ReviewRequestAttempt::NotRunning;
                 }
                 tokio::time::sleep(COLD_START_POLL).await;
                 waited += COLD_START_POLL;
@@ -889,7 +942,11 @@ async fn watch_to_terminal(
             let has_url = status.comment_url.is_some();
             let value = serde_json::to_value(&status).unwrap_or(serde_json::Value::Null);
             emit(&args.json, &value, || {
-                human_status(status.status, status.comment_url.as_deref())
+                human_status(
+                    status.status,
+                    status.comment_url.as_deref(),
+                    status.error.as_deref(),
+                )
             });
             return exit_code(status.status, has_url, args.exit_status);
         }
@@ -947,12 +1004,9 @@ fn resolve_endpoint(port: Option<u16>, token: Option<String>) -> Endpoint {
     }
 }
 
-fn new_request_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
-    format!("cli-{}-{nanos}", std::process::id())
+fn new_request_id() -> ExternalRequestId {
+    ExternalRequestId::parse(uuid::Uuid::new_v4().simple().to_string())
+        .expect("UUID v4 simple form is 32 lowercase hexadecimal characters")
 }
 
 fn env_port() -> Option<u16> {
@@ -1057,11 +1111,19 @@ pub(crate) fn render_json(value: &serde_json::Value, fields: &str) -> String {
     format!("{{{}}}", parts.join(","))
 }
 
-fn human_status(status: SessionStatus, comment_url: Option<&str>) -> String {
+fn human_status(
+    status: ReviewReceiptStatus,
+    comment_url: Option<&str>,
+    error: Option<&str>,
+) -> String {
     match (status, comment_url) {
-        (SessionStatus::Done, Some(url)) => format!("✓ review 完成：{url}"),
-        (SessionStatus::Done, None) => "⚠ review 结束但未生成评论链接（可能被中断）".to_string(),
-        (SessionStatus::Failed, _) => "✗ review 失败".to_string(),
+        (ReviewReceiptStatus::Done, Some(url)) => format!("✓ review 完成：{url}"),
+        (ReviewReceiptStatus::Done, None) => {
+            "⚠ review 结束但未生成评论链接（可能被中断）".to_string()
+        }
+        (ReviewReceiptStatus::Failed, _) => error
+            .map(|message| format!("✗ review 失败：{message}"))
+            .unwrap_or_else(|| "✗ review 失败".to_string()),
         // Unreachable: only Done/Failed are terminal, but stay total.
         _ => format!("review 状态：{status:?}"),
     }
@@ -1090,8 +1152,11 @@ pub(crate) fn is_loopback_http_url(url: &str) -> bool {
 }
 
 /// Terminal = the review reached an end state (`done` or `failed`); polling stops. Pure.
-pub(crate) fn is_terminal(status: SessionStatus) -> bool {
-    matches!(status, SessionStatus::Done | SessionStatus::Failed)
+pub(crate) fn is_terminal(status: ReviewReceiptStatus) -> bool {
+    matches!(
+        status,
+        ReviewReceiptStatus::Done | ReviewReceiptStatus::Failed
+    )
 }
 
 /// `gh run watch` exit semantics. Without `--exit-status`, ALWAYS 0 (the trigger/poll succeeded
@@ -1099,7 +1164,7 @@ pub(crate) fn is_terminal(status: SessionStatus) -> bool {
 /// was posted; an interrupted (`Done` + no URL) or `Failed` review exits non-zero so a CI `&&`
 /// chain stops. A rare completed-but-URL-unresolved review is a (documented) false negative. Pure.
 pub(crate) fn exit_code(
-    status: SessionStatus,
+    status: ReviewReceiptStatus,
     has_comment_url: bool,
     exit_status_flag: bool,
 ) -> i32 {
@@ -1107,7 +1172,7 @@ pub(crate) fn exit_code(
         return 0;
     }
     match status {
-        SessionStatus::Done if has_comment_url => 0,
+        ReviewReceiptStatus::Done if has_comment_url => 0,
         _ => 1,
     }
 }
@@ -1164,11 +1229,45 @@ mod tests {
         .expect("valid");
         assert_eq!(a.reference(), "p1");
         assert_eq!(a.kind(), "check");
-        let body = a.trigger_request();
+        let body = a.review_request_body(
+            ExternalRequestId::parse("0123456789abcdef0123456789abcdef").expect("request id"),
+        );
         assert_eq!(body.project_id.as_deref(), Some("p1"));
         assert_eq!(body.repo, None);
         assert_eq!(body.pr, 3);
-        assert_eq!(body.kind, "check");
+        assert_eq!(body.kind, crate::model::ReviewKind::Check);
+        assert_eq!(body.request_id.as_str(), "0123456789abcdef0123456789abcdef");
+    }
+
+    #[test]
+    fn parses_reusable_request_id_for_cross_process_recovery() {
+        let a = parse_review(&[
+            "prmonitor",
+            "review",
+            "--pr",
+            "3",
+            "--project-id",
+            "p1",
+            "--request-id",
+            "0123456789abcdef0123456789abcdef",
+        ])
+        .expect("valid reusable request id");
+        assert_eq!(
+            a.request_id.as_ref().map(ExternalRequestId::as_str),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+
+        assert!(parse_review(&[
+            "prmonitor",
+            "review",
+            "--pr",
+            "3",
+            "--project-id",
+            "p1",
+            "--request-id",
+            "not-a-request-id",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1239,11 +1338,104 @@ mod tests {
         assert_eq!(request.integration_id, "wx");
         assert_eq!(request.conversation_id, "c1");
         assert_eq!(request.text, "secret message");
-        assert!(request.request_id.starts_with("cli-"));
+        assert_eq!(request.request_id.len(), 32);
+        assert!(request
+            .request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
         let debug = format!("{send:?}");
         assert!(!debug.contains("secret message"));
         assert!(!debug.contains("local-token"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn generated_request_ids_match_external_contract_and_do_not_repeat() {
+        let first = new_request_id();
+        let second = new_request_id();
+        assert_ne!(first, second);
+        for id in [first, second] {
+            assert_eq!(id.as_str().len(), 32);
+            assert!(id
+                .as_str()
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_review_response_retries_with_the_same_request_id() {
+        use axum::body::Bytes;
+        use axum::extract::State;
+        use axum::http::{header, StatusCode};
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::post;
+        use axum::Router;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Seen {
+            bodies: Mutex<Vec<serde_json::Value>>,
+        }
+
+        async fn reviews(State(seen): State<Arc<Seen>>, body: Bytes) -> Response {
+            let value: serde_json::Value = serde_json::from_slice(&body).expect("request json");
+            let attempt = {
+                let mut bodies = seen.bodies.lock().expect("bodies");
+                bodies.push(value);
+                bodies.len()
+            };
+            if attempt == 1 {
+                return (
+                    StatusCode::ACCEPTED,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    "not-json",
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::ACCEPTED,
+                [(header::CONTENT_TYPE, "application/json")],
+                r#"{"receiptId":17,"statusUrl":"http://127.0.0.1:8788/reviews/17"}"#,
+            )
+                .into_response()
+        }
+
+        let seen = Arc::new(Seen::default());
+        let app = Router::new()
+            .route("/reviews", post(reviews))
+            .with_state(Arc::clone(&seen));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+
+        let args =
+            parse_review(&["prmonitor", "review", "--pr", "7", "--repo", "o/r"]).expect("args");
+        let request_id =
+            ExternalRequestId::parse("0123456789abcdef0123456789abcdef").expect("request id");
+        let client = reqwest::Client::new();
+        let result = submit_review_request(
+            &client,
+            &format!("http://{addr}"),
+            "token",
+            &args,
+            &request_id,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            ReviewRequestAttempt::Accepted(ReviewReceiptAccepted { receipt_id, .. })
+                if receipt_id.get() == 17
+        ));
+        let bodies = seen.bodies.lock().expect("bodies");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["requestId"], request_id.as_str());
+        assert_eq!(bodies[1]["requestId"], request_id.as_str());
+        server.abort();
     }
 
     #[test]
@@ -1285,8 +1477,8 @@ mod tests {
     #[test]
     fn pr_zero_parses_at_cli_and_is_left_to_the_funnel() {
         // clap accepts `--pr 0` (no value_parser bound) ON PURPOSE: pr>0 is validated by the
-        // single `trigger_review` funnel (`validate_pr_number`), so the CLI does not duplicate
-        // that rule. A 0 reaches the server, which rejects it with a 400 → non-zero exit.
+        // external ingress constructor, so the CLI does not duplicate that rule. A 0 reaches the
+        // server, which rejects it with a 400 → non-zero exit.
         let a =
             parse_review(&["prmonitor", "review", "--pr", "0", "--repo", "o/n"]).expect("valid");
         assert_eq!(a.pr, 0);
@@ -1294,25 +1486,44 @@ mod tests {
 
     #[test]
     fn is_terminal_only_done_and_failed() {
-        assert!(is_terminal(SessionStatus::Done));
-        assert!(is_terminal(SessionStatus::Failed));
-        assert!(!is_terminal(SessionStatus::Starting));
-        assert!(!is_terminal(SessionStatus::Running));
-        assert!(!is_terminal(SessionStatus::Interrupting));
+        assert!(is_terminal(ReviewReceiptStatus::Done));
+        assert!(is_terminal(ReviewReceiptStatus::Failed));
+        assert!(!is_terminal(ReviewReceiptStatus::Received));
+        assert!(!is_terminal(ReviewReceiptStatus::Queued));
+        assert!(!is_terminal(ReviewReceiptStatus::Blocked));
+        assert!(!is_terminal(ReviewReceiptStatus::Starting));
+        assert!(!is_terminal(ReviewReceiptStatus::Running));
+        assert!(!is_terminal(ReviewReceiptStatus::Interrupting));
+    }
+
+    #[test]
+    fn human_failed_status_includes_receipt_error() {
+        assert_eq!(
+            human_status(
+                ReviewReceiptStatus::Failed,
+                None,
+                Some("executor unavailable")
+            ),
+            "✗ review 失败：executor unavailable"
+        );
+        assert_eq!(
+            human_status(ReviewReceiptStatus::Failed, None, None),
+            "✗ review 失败"
+        );
     }
 
     #[test]
     fn exit_code_follows_gh_run_watch() {
         // Without --exit-status: always 0, even on failure.
-        assert_eq!(exit_code(SessionStatus::Failed, false, false), 0);
-        assert_eq!(exit_code(SessionStatus::Done, false, false), 0);
+        assert_eq!(exit_code(ReviewReceiptStatus::Failed, false, false), 0);
+        assert_eq!(exit_code(ReviewReceiptStatus::Done, false, false), 0);
         // With --exit-status: 0 only for a completed review (Done + URL).
-        assert_eq!(exit_code(SessionStatus::Done, true, true), 0);
+        assert_eq!(exit_code(ReviewReceiptStatus::Done, true, true), 0);
         // Done without a URL = interrupted → non-zero.
-        assert_eq!(exit_code(SessionStatus::Done, false, true), 1);
-        assert_eq!(exit_code(SessionStatus::Failed, false, true), 1);
+        assert_eq!(exit_code(ReviewReceiptStatus::Done, false, true), 1);
+        assert_eq!(exit_code(ReviewReceiptStatus::Failed, false, true), 1);
         // Failed is non-zero even if a URL is somehow present (only `Done` can succeed).
-        assert_eq!(exit_code(SessionStatus::Failed, true, true), 1);
+        assert_eq!(exit_code(ReviewReceiptStatus::Failed, true, true), 1);
     }
 
     #[test]

@@ -20,6 +20,7 @@ use tokio::process::{Child, ChildStderr, ChildStdout};
 
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
+use crate::model::ReviewKind;
 
 /// Wall-clock budget for the `claude --version` availability probe. Mirrors codex's
 /// status probe discipline; `kill_on_drop(true)` kills a hung child.
@@ -237,11 +238,10 @@ fn item_id_for(state: &ParserState, session_id: &str, index: u64) -> String {
 /// local `.claude/skills/pr-review/` skill (cwd = repo_root), so no skill path is
 /// passed. These strings contain none of the gh-write denylist substrings (the
 /// `/pr-review` hyphen form is safe vs `dispatch.rs`'s governance scan).
-pub fn review_prompt(pr_number: u64, kind: &str) -> String {
-    if kind == "check" {
-        format!("/pr-review {pr_number} --check")
-    } else {
-        format!("/pr-review {pr_number}")
+pub fn review_prompt(pr_number: u64, kind: ReviewKind) -> String {
+    match kind {
+        ReviewKind::Review => format!("/pr-review {pr_number}"),
+        ReviewKind::Check => format!("/pr-review {pr_number} --check"),
     }
 }
 
@@ -702,10 +702,8 @@ mod tests {
     // ── prompt builder ──────────────────────────────────────────────────────────
     #[test]
     fn review_prompt_matches_kind() {
-        assert_eq!(review_prompt(7, "review"), "/pr-review 7");
-        assert_eq!(review_prompt(7, "check"), "/pr-review 7 --check");
-        // Any non-"check" kind is a review (mirrors session.rs::skill_command).
-        assert_eq!(review_prompt(9, "anything"), "/pr-review 9");
+        assert_eq!(review_prompt(7, ReviewKind::Review), "/pr-review 7");
+        assert_eq!(review_prompt(7, ReviewKind::Check), "/pr-review 7 --check");
     }
 
     #[test]
@@ -721,7 +719,10 @@ mod tests {
             format!("pr com{}", "ment"),
             format!("pr ed{}", "it"),
         ];
-        for p in [review_prompt(7, "review"), review_prompt(7, "check")] {
+        for p in [
+            review_prompt(7, ReviewKind::Review),
+            review_prompt(7, ReviewKind::Check),
+        ] {
             for pat in &forbidden {
                 assert!(!p.contains(pat.as_str()), "{p:?} must not contain {pat:?}");
             }

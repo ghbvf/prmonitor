@@ -227,7 +227,7 @@ async fn classify_dingtalk_response(
         .await
         .map_err(|e| AppError::new(format!("{op} 响应解析失败: {e}")))?;
     if body.errcode == 0 {
-        Ok(ActionExecutionResult::Done)
+        Ok(ActionExecutionResult::done())
     } else if body.errcode == 130101 || body.errcode == 130102 {
         Ok(ActionExecutionResult::Retry {
             message: format!("{op} 暂时失败: {}", body.errmsg),

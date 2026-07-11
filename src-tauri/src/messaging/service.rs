@@ -1,10 +1,9 @@
 //! Messaging ingress + command processing (#1559).
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
+use sha2::{Digest, Sha256};
 use tauri::{Manager, Runtime};
 
 use crate::config::service::{self as config_service, MessagingIntegration};
@@ -15,9 +14,9 @@ use crate::messaging::provider::{MessagingProvider, Verification};
 use crate::messaging::store;
 use crate::messaging::{dingtalk::DingTalkProvider, wechat_work::WeChatWorkProvider};
 use crate::model::{
-    ActionExecutionResult, ActionKind, MessagingEvent, MessagingEventStatus, MessagingProviderKind,
-    MessagingReplyPayload, MessagingReplyTarget, MessagingSendPayload, OutboxEntry,
-    SendMessagingRequest, SendMessagingResponse,
+    ActionExecutionResult, ActionKind, ExternalRequestId, MessagingEvent, MessagingEventStatus,
+    MessagingProviderKind, MessagingReplyPayload, MessagingReplyTarget, MessagingSendPayload,
+    OutboxEntry, ReviewKind, ReviewReceiptId, SendMessagingRequest, SendMessagingResponse,
 };
 use crate::state::AppState;
 
@@ -67,13 +66,14 @@ pub trait MessagingActions<R: Runtime>: Send + Sync + 'static {
         integration_id: Option<&str>,
     ) -> AppResult<Vec<OutboxEntry>>;
 
-    fn trigger_review<'a>(
-        &'a self,
-        app: &'a tauri::AppHandle<R>,
+    fn submit_review(
+        &self,
+        app: &tauri::AppHandle<R>,
         reference: String,
         pr_number: u64,
-        kind: String,
-    ) -> Pin<Box<dyn Future<Output = AppResult<String>> + Send + 'a>>;
+        kind: ReviewKind,
+        request_id: ExternalRequestId,
+    ) -> AppResult<ReviewReceiptId>;
 }
 
 pub struct MessagingRuntime<R: Runtime> {
@@ -104,11 +104,15 @@ enum ReviewCommandKind {
 }
 
 impl ReviewCommandKind {
-    fn as_wire(self) -> &'static str {
+    fn as_model(self) -> ReviewKind {
         match self {
-            ReviewCommandKind::Review => "review",
-            ReviewCommandKind::Check => "check",
+            ReviewCommandKind::Review => ReviewKind::Review,
+            ReviewCommandKind::Check => ReviewKind::Check,
         }
+    }
+
+    fn as_wire(self) -> &'static str {
+        self.as_model().as_str()
     }
 }
 
@@ -438,24 +442,24 @@ async fn process_event<R: Runtime>(
             pr_number,
             kind,
         } => {
-            let outcome = match actions
-                .trigger_review(
-                    app,
-                    reference.clone(),
-                    pr_number,
-                    kind.as_wire().to_string(),
-                )
-                .await
-            {
-                Ok(session_id) => {
+            let request_id = messaging_review_request_id(event);
+            let outcome = match actions.submit_review(
+                app,
+                reference.clone(),
+                pr_number,
+                kind.as_model(),
+                request_id,
+            ) {
+                Ok(receipt_id) => {
                     let reply = enqueue_reply(
                         actions,
                         app,
                         integration,
                         event,
-                        ReplyKind::ReviewStarted,
+                        ReplyKind::ReviewQueued,
                         &format!(
-                            "已启动 {mode}：{reference} #{pr_number}\nSession: {session_id}",
+                            "已入队 {mode}：{reference} #{pr_number}\nReceipt: {}",
+                            receipt_id.get(),
                             mode = kind.as_wire()
                         ),
                     )?;
@@ -468,7 +472,7 @@ async fn process_event<R: Runtime>(
                         integration,
                         event,
                         ReplyKind::ReviewFailed,
-                        &format!("启动 review 失败：{}", e.message),
+                        &format!("review 入队失败：{}", e.message),
                     )?;
                     ProcessingOutcome {
                         reply: Some(reply),
@@ -479,6 +483,25 @@ async fn process_event<R: Runtime>(
             Ok(outcome)
         }
     }
+}
+
+fn messaging_review_request_id(event: &MessagingEvent) -> ExternalRequestId {
+    let provider_message_id = if event.thread_id.trim().is_empty() {
+        event.event_id.as_str()
+    } else {
+        event.thread_id.as_str()
+    };
+    let digest = Sha256::digest(
+        format!(
+            "{}\0{}\0{}",
+            event.provider.as_wire(),
+            event.integration_id,
+            provider_message_id
+        )
+        .as_bytes(),
+    );
+    ExternalRequestId::parse(hex::encode(&digest[..16]))
+        .expect("SHA-256 prefix is lowercase hexadecimal")
 }
 
 fn provider_for(kind: MessagingProviderKind) -> &'static dyn MessagingProvider {
@@ -569,7 +592,7 @@ enum ReplyKind {
     InvalidCommand,
     Help,
     Status,
-    ReviewStarted,
+    ReviewQueued,
     ReviewFailed,
 }
 
@@ -595,7 +618,7 @@ impl ReplyKind {
             ReplyKind::InvalidCommand => "invalid-command",
             ReplyKind::Help => "help",
             ReplyKind::Status => "status",
-            ReplyKind::ReviewStarted => "review-started",
+            ReplyKind::ReviewQueued => "review-queued",
             ReplyKind::ReviewFailed => "review-failed",
         }
     }
@@ -802,14 +825,15 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn trigger_review<'a>(
-            &'a self,
-            _app: &'a tauri::AppHandle<R>,
+        fn submit_review(
+            &self,
+            _app: &tauri::AppHandle<R>,
             _reference: String,
             _pr_number: u64,
-            _kind: String,
-        ) -> Pin<Box<dyn Future<Output = AppResult<String>> + Send + 'a>> {
-            Box::pin(async { Err(AppError::new("review boom")) })
+            _kind: ReviewKind,
+            _request_id: ExternalRequestId,
+        ) -> AppResult<ReviewReceiptId> {
+            Err(AppError::new("review boom"))
         }
     }
 
@@ -855,6 +879,29 @@ mod tests {
         let reply = entry.reply.expect("reply");
         assert_eq!(reply.outbox_id, 42);
         assert_eq!(reply.kind, "review-failed");
+    }
+
+    #[test]
+    fn review_request_id_is_stable_per_provider_message() {
+        let event = MessagingEvent {
+            provider: MessagingProviderKind::Feishu,
+            integration_id: "fs".to_string(),
+            event_id: "delivery-1".to_string(),
+            conversation_id: "chat".to_string(),
+            thread_id: "provider-message-1".to_string(),
+            sender_id: "u".to_string(),
+            text: "/review repo/name 7".to_string(),
+            mentioned_bot: true,
+            raw_payload: "{}".to_string(),
+            received_at_epoch: 1,
+        };
+        let first = messaging_review_request_id(&event);
+        assert_eq!(first, messaging_review_request_id(&event));
+        assert_eq!(first.as_str().len(), 32);
+
+        let mut another = event;
+        another.thread_id = "provider-message-2".to_string();
+        assert_ne!(first, messaging_review_request_id(&another));
     }
 
     struct CapturingSendActions {
@@ -918,15 +965,56 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn trigger_review<'a>(
-            &'a self,
-            _app: &'a tauri::AppHandle<R>,
+        fn submit_review(
+            &self,
+            _app: &tauri::AppHandle<R>,
             _reference: String,
             _pr_number: u64,
-            _kind: String,
-        ) -> Pin<Box<dyn Future<Output = AppResult<String>> + Send + 'a>> {
-            Box::pin(async { Ok("session".to_string()) })
+            _kind: ReviewKind,
+            _request_id: ExternalRequestId,
+        ) -> AppResult<ReviewReceiptId> {
+            ReviewReceiptId::new(17).map_err(AppError::new)
         }
+    }
+
+    #[tokio::test]
+    async fn successful_review_command_replies_with_queued_receipt() {
+        let app = tauri::test::mock_app().handle().clone();
+        let db = Database::open_in_memory().expect("open");
+        let integration = MessagingIntegration {
+            id: "fs".to_string(),
+            name: "Feishu".to_string(),
+            allowed_conversation_ids: vec!["chat".to_string()],
+            require_mention: true,
+            ..MessagingIntegration::feishu_default()
+        };
+        let event = MessagingEvent {
+            provider: MessagingProviderKind::Feishu,
+            integration_id: "fs".to_string(),
+            event_id: "evt".to_string(),
+            conversation_id: "chat".to_string(),
+            thread_id: "provider-message".to_string(),
+            sender_id: "u".to_string(),
+            text: "/review repo/name 7".to_string(),
+            mentioned_bot: true,
+            raw_payload: "{}".to_string(),
+            received_at_epoch: 1,
+        };
+        let id = match store::insert_dedup(&db, &event).expect("insert") {
+            store::DedupInsert::Inserted(id) => id,
+            store::DedupInsert::Existing(_) => panic!("first insert must be new"),
+        };
+        let actions = CapturingSendActions {
+            dedupe_key: std::sync::Mutex::new(None),
+        };
+
+        process_and_mark(&app, &actions, &db, id, &integration, &event)
+            .await
+            .expect("queued receipt is acked");
+
+        let entry = store::get_entry(&db, id).expect("get").expect("entry");
+        assert_eq!(entry.status, MessagingEventStatus::Processed);
+        assert_eq!(entry.reply.expect("reply").kind, "review-queued");
     }
 
     #[test]

@@ -87,7 +87,10 @@ use subtle::ConstantTimeEq;
 use super::ledger;
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
-use crate::model::{Candidate, Event, EventType, LabelSource, SourceKind, WebhookTunnelMode};
+use crate::model::{
+    Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, LabelSource, ReviewKind,
+    SourceKind, WebhookTunnelMode,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -97,8 +100,8 @@ type HmacSha256 = Hmac<Sha256>;
 /// processing — keeping the axum handler runtime-agnostic (the closure holds the concrete
 /// `AppHandle<R>`, the handler never names it). Boxed-future + `Arc` so it is `Clone`able
 /// into the `WebhookCtx` the handler shares. Installed once as a closure and Arc-shared —
-/// the same lifecycle convention as [`super::scheduler::ProjectDispatcher`] (their
-/// signatures differ: this takes a [`WebhookEvent`], `ProjectDispatcher` takes
+/// the same lifecycle convention as the scheduler event sink (their
+/// signatures differ: this takes a [`WebhookEvent`], the event sink takes
 /// `(String, Vec<Candidate>)`).
 ///
 /// **AB#1065 seam widening (single seam, no dual path).** The signature carries
@@ -112,7 +115,7 @@ type HmacSha256 = Hmac<Sha256>;
 /// **Returns [`AppResult`] = DURABLE PERSIST success (AB#1065 F1).** The handler AWAITS this and
 /// gates the HTTP ACK on it: `Ok` → 200 (the delivery is durably persisted), `Err` → 500 (the
 /// platform retries, so no delivery is lost between ACK and the SQLite commit). The closure
-/// returns AFTER the durable insert, having SPAWNED the post-ACK processing (refeed/dispatch);
+/// returns after the durable insert and wakes the single inbox worker for post-ACK processing;
 /// the persist gates the ACK, the processing does not.
 pub type WebhookIngestor = Arc<
     dyn Fn(
@@ -179,8 +182,6 @@ pub enum DeliveryStatus {
     /// A single trigger label, but a gate (conflict / draft / fork / author / cooldown)
     /// blocked rule processing — list updated, review NOT auto-started.
     Gated,
-    /// Historical terminal value for an older auto-dispatch path.
-    Dispatched,
     /// A clean candidate entered the list; the rule engine decides follow-up actions.
     ListUpdated,
     /// An Azure DevOps PR Service Hook (created/updated) was received and triggered a
@@ -292,24 +293,31 @@ pub struct WebhookEvent {
 /// [`event_dedupe_key`]; the display fields mirror the `WebhookEvent`; `body` is `""` (the PR
 /// webhook carries no body the inbox needs); `received_at_epoch` is the handler-stamped receipt
 /// time, falling back to `now` when the pure parser left it `0`.
-pub(crate) fn event_from_webhook(ev: &WebhookEvent, guid: Option<&str>, raw: &str) -> Event {
-    Event {
-        dedupe_key: event_dedupe_key(guid, raw),
-        source: SourceKind::Github,
-        event_type: EventType::PullRequest,
-        project_id: ev.project_id.clone(),
-        repo: ev.repo.clone(),
-        number: Some(ev.number),
-        title: ev.title.clone(),
-        body: String::new(),
-        labels: ev.labels.clone(),
-        url: ev.url.clone(),
-        received_at_epoch: if ev.received_at > 0 {
+pub(crate) fn event_from_webhook(
+    ev: &WebhookEvent,
+    guid: Option<&str>,
+    raw: &str,
+) -> EventEnvelope {
+    EventEnvelope::observation(
+        InboxDedupeKey::new(event_dedupe_key(guid, raw)).expect("webhook dedupe key is non-empty"),
+        SourceKind::Github,
+        ev.project_id.clone(),
+        ev.repo.clone(),
+        EventType::PullRequest,
+        EventSubject {
+            number: Some(ev.number),
+            title: ev.title.clone(),
+            body: String::new(),
+            labels: ev.labels.clone(),
+            url: ev.url.clone(),
+        },
+        if ev.received_at > 0 {
             ev.received_at
         } else {
             ledger::now_epoch()
         },
-    }
+    )
+    .expect("routed webhook event has a project id")
 }
 
 /// The inbox dedupe key for a GitHub delivery (AB#1065): `github:{guid}` when the
@@ -520,8 +528,8 @@ pub struct ProjectRoute {
 /// lives in `AppState` (which stays `Default`), mirroring `Scheduler`/`CodexManager`.
 #[derive(Default)]
 pub struct WebhookManager {
-    /// Installed once by the composition root (lib.rs) BEFORE any start, like
-    /// [`super::scheduler::Scheduler::set_dispatcher`]. The closure is called with one
+    /// Installed once by the composition root (lib.rs) BEFORE any start, like the
+    /// scheduler's event sink. The closure is called with one
     /// parsed, routed [`WebhookEvent`] (#61); its body upserts the persisted PR list,
     /// emits `prs:updated`, and (when gated-clean) dispatches — keeping the axum handler
     /// runtime-agnostic (the closure holds the concrete `AppHandle<R>`).
@@ -1223,10 +1231,10 @@ async fn handle_github_delivery(
                 .map(str::to_string);
             let ingestor = ctx.ingestor.clone();
             // AB#1065 F1: AWAIT the DURABLE PERSIST and gate the ACK on it. `Ok` = the delivery is
-            // persisted (the ingestor has SPAWNED the post-ACK processing — refeed/dispatch — and
-            // returned); `Err` = the durable insert failed → 500 so the platform RETRIES (a 2xx is
+            // persisted and the single inbox worker has been woken; `Err` = the durable insert
+            // failed → 500 so the platform RETRIES (a 2xx is
             // never retried, so persisting before ACK is what stops a crash from losing a delivery).
-            // The terminal processing status (Processed/Failed) is recorded by the spawned task,
+            // The terminal processing status (Processed/Failed) is recorded by that worker,
             // independently of this ACK.
             match ingestor(raw, guid, *ev).await {
                 Ok(()) => StatusCode::OK,
@@ -1653,7 +1661,7 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
             is_cross_repository,
             is_draft,
             // The rule engine stamps the concrete review/check action kind later.
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
         }),
         conflict: false,
     };
@@ -1960,14 +1968,15 @@ mod tests {
     fn event_from_webhook_uses_guid_key_and_mirrors_fields() {
         let ev = sample_webhook_event("p1", 7);
         let event = event_from_webhook(&ev, Some("abc-123"), "{\"raw\":1}");
-        assert_eq!(event.dedupe_key, "github:abc-123");
-        assert_eq!(event.source, SourceKind::Github);
-        assert_eq!(event.event_type, EventType::PullRequest);
-        assert_eq!(event.project_id, "p1");
-        assert_eq!(event.number, Some(7));
-        assert_eq!(event.labels, vec!["pr-review".to_string()]);
+        let observation = event.as_observation().unwrap();
+        assert_eq!(event.dedupe_key().as_str(), "github:abc-123");
+        assert_eq!(event.source(), SourceKind::Github);
+        assert_eq!(observation.event_type, EventType::PullRequest);
+        assert_eq!(event.project_id(), "p1");
+        assert_eq!(observation.subject.number, Some(7));
+        assert_eq!(observation.subject.labels, vec!["pr-review".to_string()]);
         // received_at (1_700_000_000) > 0, so it wins over the `now` fallback.
-        assert_eq!(event.received_at_epoch, 1_700_000_000);
+        assert_eq!(event.received_at_epoch(), 1_700_000_000);
     }
 
     // `event_from_webhook` guid-less fallback (AB#1065): an absent / empty guid hashes the body, so
@@ -1978,12 +1987,17 @@ mod tests {
         let a = event_from_webhook(&ev, None, "body-A");
         let a2 = event_from_webhook(&ev, Some(""), "body-A");
         let b = event_from_webhook(&ev, None, "body-B");
-        assert!(a.dedupe_key.starts_with("github:sha256:"));
+        assert!(a.dedupe_key().starts_with("github:sha256:"));
         assert_eq!(
-            a.dedupe_key, a2.dedupe_key,
+            a.dedupe_key(),
+            a2.dedupe_key(),
             "empty guid == no guid (body hash)"
         );
-        assert_ne!(a.dedupe_key, b.dedupe_key, "different body → different key");
+        assert_ne!(
+            a.dedupe_key(),
+            b.dedupe_key(),
+            "different body → different key"
+        );
     }
 
     // `event_from_webhook` with received_at == 0 (AB#1065): the pure parser leaves received_at 0;
@@ -1994,7 +2008,7 @@ mod tests {
         ev.received_at = 0; // the pure parser leaves it 0
         let event = event_from_webhook(&ev, Some("g1"), "raw");
         assert!(
-            event.received_at_epoch > 0,
+            event.received_at_epoch() > 0,
             "received_at == 0 falls back to a non-zero now"
         );
     }
@@ -2028,7 +2042,7 @@ mod tests {
                     author: "octocat".to_string(),
                     is_cross_repository: false,
                     is_draft: false,
-                    kind: "review".to_string(),
+                    kind: ReviewKind::Review,
                 }),
                 conflict: false,
             },
@@ -2247,7 +2261,7 @@ mod tests {
         assert_eq!(ev.action.as_deref(), Some("labeled"));
         let c = dispatch_candidate(&p, &single_route("needs-review", "needs-check"));
         assert_eq!(c.number, 42);
-        assert_eq!(c.kind, "review");
+        assert_eq!(c.kind, crate::model::ReviewKind::Review);
         assert_eq!(c.head_sha, "abc123");
         assert_eq!(c.head_ref, "feature");
         assert_eq!(c.author, "octocat");
@@ -2295,7 +2309,7 @@ mod tests {
         let ev = routable(&title_tagged, &routes);
         assert_eq!(ev.labels, vec!["needs-review".to_string()]);
         let c = dispatch_candidate(&title_tagged, &routes);
-        assert_eq!(c.kind, "review");
+        assert_eq!(c.kind, crate::model::ReviewKind::Review);
     }
 
     #[test]
@@ -2304,7 +2318,7 @@ mod tests {
         let ev = routable(&p, &single_route("needs-review", "needs-check"));
         assert_eq!(ev.project_id, "default");
         let c = dispatch_candidate(&p, &single_route("needs-review", "needs-check"));
-        assert_eq!(c.kind, "review");
+        assert_eq!(c.kind, crate::model::ReviewKind::Review);
     }
 
     #[test]
@@ -3160,7 +3174,10 @@ mod tests {
             ev.project_id, "proj-b",
             "routed to the matching project, not the first"
         );
-        assert_eq!(dispatch_candidate(&for_b, &routes).kind, "review");
+        assert_eq!(
+            dispatch_candidate(&for_b, &routes).kind,
+            crate::model::ReviewKind::Review
+        );
 
         // The SAME repo with project A's label still routes to proj-b. Label-to-action
         // matching is rule-engine work, not webhook routing work.
@@ -3318,7 +3335,7 @@ mod tests {
             repo: Some("owner/repo".to_string()),
             pr_number: Some(42),
             kind: Some("review".to_string()),
-            status: DeliveryStatus::Dispatched,
+            status: DeliveryStatus::ListUpdated,
             message: None,
         };
         let v = serde_json::to_value(&d).expect("WebhookDelivery serializes");
@@ -3340,7 +3357,7 @@ mod tests {
         // `message: string | null` stays a closed contract.
         assert_eq!(v["message"], serde_json::Value::Null);
         // The status discriminator serializes camelCase (see the dedicated lock below).
-        assert_eq!(v["status"], "dispatched");
+        assert_eq!(v["status"], "listUpdated");
     }
 
     // Every `Option` field of `WebhookDelivery` serializes to JSON `null` (NOT omitted)
@@ -3381,7 +3398,6 @@ mod tests {
             (DeliveryStatus::NoTriggerLabel, "noTriggerLabel"),
             (DeliveryStatus::NotOpen, "notOpen"),
             (DeliveryStatus::Gated, "gated"),
-            (DeliveryStatus::Dispatched, "dispatched"),
             (DeliveryStatus::ListUpdated, "listUpdated"),
             (DeliveryStatus::Refreshed, "refreshed"),
         ];

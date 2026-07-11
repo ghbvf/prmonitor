@@ -7,7 +7,8 @@
 use super::CodexManager;
 use crate::config::service::ResolvedCli;
 use crate::error::AppResult;
-use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
+use crate::model::ReviewKind;
+use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, StartReviewOutcome};
 use crate::review::session::{self, CommentUrlContext, SessionInfo, SessionRegistry};
 
 /// Per-request engine handle. Borrows the long-lived state from `AppState` plus
@@ -53,14 +54,19 @@ pub struct CodexEngine<'a, R: tauri::Runtime> {
     /// on the OUTBOX executor's start path ([`crate::review::commands::start_for_outbox`]), `None`
     /// on the manual / follow-up / auto-dispatch paths. When `Some`, `start` writes the claim's
     /// `thread_id` breadcrumb INSIDE `session::start_review` — right after `thread/start` yields a
-    /// stable `thread_id` and the `Starting` session is persisted, but BEFORE `start_turn` runs the
-    /// turn (so the breadcrumb lands before any `pm:` comment could be posted; see F1 in
-    /// `start_for_outbox`). `None` skips the write entirely (no outbox row to claim).
+    /// stable `thread_id`. The session row and claim breadcrumb commit atomically BEFORE registry
+    /// promotion / `start_turn`, so linkage failure leaves no false-live session and the retry owns
+    /// a clean reservation. `None` skips the claim write entirely (no outbox row to claim).
     pub outbox_claim_id: Option<i64>,
 }
 
 impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
-    async fn start(&self, pr_number: u64, kind: &str) -> AppResult<StartReviewOutcome> {
+    async fn start(
+        &self,
+        _capability: &ReviewStartCapability,
+        pr_number: u64,
+        kind: ReviewKind,
+    ) -> AppResult<StartReviewOutcome> {
         session::start_review(
             self.app,
             self.codex,
@@ -80,10 +86,6 @@ impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
             self.outbox_claim_id,
         )
         .await
-    }
-
-    async fn stop(&self, session: &SessionId) -> AppResult<()> {
-        session::stop_review(self.codex, self.registry, session).await
     }
 
     async fn send_message(

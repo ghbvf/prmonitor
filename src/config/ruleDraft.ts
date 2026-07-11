@@ -22,7 +22,6 @@ export function createRuleAction(kind: RuleActionKind): RuleActionConfig {
     target: { kind: "none" },
     dedupePolicy: "event",
     delaySecs: 0,
-    dependsOn: [],
     level: "action",
   };
 }

@@ -8,7 +8,7 @@
 //! PR3 uses the **read** path (`has_dispatched` / `last_dispatch_at`) to annotate
 //! the PR list with "already dispatched" / cooldown skip reasons. The **write**
 //! path (`record_many`) is invoked by the auto-trigger dispatcher
-//! ([`crate::dispatch`]) once review turns actually start; recording it here keeps
+//! once review turns actually start; recording it here keeps
 //! the dedup machinery complete. The write is batched (one transaction for the whole
 //! cycle's started candidates) so unbounded concurrent starts can't race the store.
 
@@ -20,7 +20,7 @@ use tauri::Manager;
 
 use crate::db::{map_err, Database};
 use crate::error::AppResult;
-use crate::model::Candidate;
+use crate::model::{Candidate, ReviewActionKey};
 
 /// Serializes EVERY load→stage→save of the dispatch ledger across projects (#35). Two
 /// parallel project cycles each doing a load→stage→save would interleave and one would
@@ -55,13 +55,6 @@ pub struct Ledger {
     pub(crate) events: Vec<DispatchEvent>,
 }
 
-/// `{number}@{head_sha}:{kind}` — the per-(pr, head, kind) dedup key
-/// (`router.py` `Candidate.key`). Re-dispatch is suppressed once this key is in
-/// the ledger, so a force-push (new head_sha) is a fresh key and *can* dispatch.
-pub fn dispatch_key(number: u64, head_sha: &str, kind: &str) -> String {
-    format!("{number}@{head_sha}:{kind}")
-}
-
 /// Wall-clock seconds since the Unix epoch (the cooldown / dispatch clock). A
 /// pre-epoch system clock degrades to 0 rather than panicking. `pub(crate)` so
 /// both the discovery gating and the dispatch landing ([`record_dispatched`])
@@ -76,7 +69,7 @@ pub(crate) fn now_epoch() -> u64 {
 
 /// Load the ledger, batch-record the started candidates at one epoch, and persist
 /// — the dispatch-time landing in ONE call, scoped to `project_id` (#35). Stamps the
-/// clock internally so callers (the dispatcher, [`crate::dispatch`]) pass only the
+/// clock internally so callers pass only the
 /// candidates that started; the load + stage + persist + clock all stay in the pr
 /// slice. The load→stage→save runs under [`LEDGER_WRITE_LOCK`] (in
 /// [`Ledger::record_many`]) so parallel project cycles can't clobber each other's
@@ -186,7 +179,7 @@ impl Ledger {
 
     /// Records a batch of dispatches (key + event per candidate) into `project_id`'s
     /// partition and persists **once**. Invoked by the auto-trigger dispatcher
-    /// ([`crate::dispatch`]) via [`record_dispatched`] after a poll cycle's reviews
+    /// via [`record_dispatched`] after a poll cycle's reviews
     /// have started; PR discovery itself never dispatches.
     ///
     /// The single-persist shape matters under unbounded concurrent starts: staging
@@ -268,13 +261,14 @@ impl Ledger {
     /// (the persistence itself goes through `save_db` → `db.with_tx`).
     fn stage_all(&mut self, cands: &[Candidate], epoch: u64) {
         for cand in cands {
-            let key = dispatch_key(cand.number, &cand.head_sha, &cand.kind);
-            self.dispatched.insert(key.clone());
+            let key = ReviewActionKey::for_candidate(cand)
+                .expect("gated candidate has a valid typed review action key");
+            self.dispatched.insert(key.as_str().to_string());
             self.events.push(DispatchEvent {
                 pr: cand.number,
-                kind: cand.kind.clone(),
+                kind: cand.kind.to_string(),
                 head_sha: cand.head_sha.clone(),
-                key,
+                key: key.into_inner(),
                 dispatched_at_epoch: epoch,
             });
         }
@@ -335,12 +329,18 @@ pub fn import_legacy_events(
 mod tests {
     use super::*;
 
+    fn action_key(pr: u64, head: &str, kind: &str) -> String {
+        ReviewActionKey::for_parts(pr, head, kind.parse().unwrap())
+            .unwrap()
+            .into_inner()
+    }
+
     fn event(pr: u64, kind: &str, epoch: u64) -> DispatchEvent {
         DispatchEvent {
             pr,
-            kind: kind.to_string(),
+            kind: kind.parse().unwrap(),
             head_sha: "sha".to_string(),
-            key: dispatch_key(pr, "sha", kind),
+            key: action_key(pr, "sha", kind),
             dispatched_at_epoch: epoch,
         }
     }
@@ -353,7 +353,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: kind.to_string(),
+            kind: kind.parse().unwrap(),
         }
     }
 
@@ -369,9 +369,9 @@ mod tests {
         ledger.stage_all(&cands, 1_700_000_000);
 
         // One dedup key per candidate (distinct (pr, head, kind) tuples).
-        assert!(ledger.has_dispatched(&dispatch_key(12, "sha", "review")));
-        assert!(ledger.has_dispatched(&dispatch_key(12, "sha", "check")));
-        assert!(ledger.has_dispatched(&dispatch_key(13, "sha", "review")));
+        assert!(ledger.has_dispatched(&action_key(12, "sha", "review")));
+        assert!(ledger.has_dispatched(&action_key(12, "sha", "check")));
+        assert!(ledger.has_dispatched(&action_key(13, "sha", "review")));
         assert_eq!(ledger.dispatched.len(), 3);
 
         // One cooldown event per candidate, all at the shared epoch.
@@ -407,8 +407,8 @@ mod tests {
 
     #[test]
     fn dispatch_key_format() {
-        assert_eq!(dispatch_key(42, "abc123", "review"), "42@abc123:review");
-        assert_eq!(dispatch_key(7, "deadbeef", "check"), "7@deadbeef:check");
+        assert_eq!(action_key(42, "abc123", "review"), "42@abc123:review");
+        assert_eq!(action_key(7, "deadbeef", "check"), "7@deadbeef:check");
     }
 
     // SQLite store round-trip (#70, Medium carrier): staging a batch, `save_db` then
@@ -424,8 +424,8 @@ mod tests {
         ledger.save_db(&db, "alpha").expect("save");
 
         let back = Ledger::load_db(&db, "alpha").expect("load");
-        assert!(back.has_dispatched(&dispatch_key(12, "sha", "review")));
-        assert!(back.has_dispatched(&dispatch_key(12, "sha", "check")));
+        assert!(back.has_dispatched(&action_key(12, "sha", "review")));
+        assert!(back.has_dispatched(&action_key(12, "sha", "check")));
         assert_eq!(back.events.len(), 2);
         assert_eq!(back.last_dispatch_at(12, "review"), Some(1_700_000_000));
 
@@ -451,8 +451,8 @@ mod tests {
 
         let back = Ledger::load_db(&db, "p").expect("load");
         assert_eq!(back.dispatched.len(), 1);
-        assert!(back.has_dispatched(&dispatch_key(1, "sha", "review")));
-        assert!(!back.has_dispatched(&dispatch_key(2, "sha", "review")));
+        assert!(back.has_dispatched(&action_key(1, "sha", "review")));
+        assert!(!back.has_dispatched(&action_key(2, "sha", "review")));
     }
 
     // One-time legacy import (#70): the old `ledger.json` shapes (a JSON array of dedup
@@ -493,7 +493,7 @@ mod tests {
     // under project B.
     #[test]
     fn dedup_does_not_collide_across_projects() {
-        let key = dispatch_key(1, "sha", "review");
+        let key = action_key(1, "sha", "review");
 
         // Project A staged the candidate; project B's partition is empty.
         let mut ledger_a = Ledger::default();

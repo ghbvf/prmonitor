@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
-use crate::model::{Candidate, Event, EventType, LabelSource, SourceKind};
+use crate::model::{
+    Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, LabelSource, ReviewKind,
+    SourceKind,
+};
 
 use super::labels;
 use super::source::{pr_dedupe_key, DiscoveredEvent, EventSourceProvider};
@@ -35,7 +38,7 @@ const GH_PR_LIST_LIMIT: u32 = 1000;
 /// `--json` field set requested from `gh pr list`. `router.py` only needs the
 /// gating fields; the prmonitor UI additionally needs `title,url,labels`.
 const PR_LIST_FIELDS: &str =
-    "number,title,url,headRefName,headRefOid,author,isCrossRepository,isDraft,labels";
+    "number,title,body,url,headRefName,headRefOid,author,isCrossRepository,isDraft,labels";
 
 /// A discovered PR: its gating [`Candidate`] plus the display fields the PR list
 /// shows. `conflict` marks a PR that carried BOTH trigger labels — `router.py`
@@ -44,6 +47,7 @@ const PR_LIST_FIELDS: &str =
 struct GhRow {
     candidate: Candidate,
     title: String,
+    body: String,
     url: String,
     labels: Vec<String>,
     conflict: bool,
@@ -70,6 +74,8 @@ struct RawPr {
     number: u64,
     #[serde(default)]
     title: String,
+    #[serde(default)]
+    body: String,
     #[serde(default)]
     url: String,
     #[serde(default)]
@@ -110,9 +116,10 @@ fn to_row(raw: RawPr) -> GhRow {
             author,
             is_cross_repository: raw.is_cross_repository,
             is_draft: raw.is_draft,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
         },
         title: raw.title,
+        body: raw.body,
         url: raw.url,
         labels,
         conflict: false,
@@ -153,9 +160,10 @@ fn to_row_classified(
             author,
             is_cross_repository: raw.is_cross_repository,
             is_draft: raw.is_draft,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
         },
         title: raw.title,
+        body: raw.body,
         url: raw.url,
         labels,
         conflict: false,
@@ -192,26 +200,29 @@ fn merge_rows(review: Vec<GhRow>, check: Vec<GhRow>) -> Vec<GhRow> {
 /// the matched project id or the receive time). Always a `PullRequest` event (the only class a
 /// PR source emits).
 fn row_into_event(row: GhRow, repo: &str) -> DiscoveredEvent {
-    let event = Event {
+    let event = EventEnvelope::observation(
         // Wire literal "github" matches `SourceKind::Github`'s serde string (format single-sourced).
-        dedupe_key: pr_dedupe_key(
+        InboxDedupeKey::new(pr_dedupe_key(
             "github",
             repo,
             row.candidate.number,
             &row.candidate.head_sha,
-        ),
-        source: SourceKind::Github,
-        event_type: EventType::PullRequest,
-        project_id: String::new(),
-        repo: repo.to_string(),
-        number: Some(row.candidate.number),
-        title: row.title.clone(),
-        // body 抓取留待 AB#1068（rule engine）
-        body: String::new(),
-        labels: row.labels.clone(),
-        url: row.url.clone(),
-        received_at_epoch: 0,
-    };
+        ))
+        .expect("discovery dedupe key is non-empty"),
+        SourceKind::Github,
+        "discovery",
+        repo,
+        EventType::PullRequest,
+        EventSubject {
+            number: Some(row.candidate.number),
+            title: row.title.clone(),
+            body: row.body.clone(),
+            labels: row.labels.clone(),
+            url: row.url.clone(),
+        },
+        0,
+    )
+    .expect("discovery event is valid");
     DiscoveredEvent {
         event,
         candidate: row.candidate,
@@ -449,7 +460,15 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].candidate.number, 41);
-        assert_eq!(events[0].event.title, "Configured gh");
+        assert_eq!(
+            events[0]
+                .event
+                .as_observation()
+                .expect("discovery event is an observation")
+                .subject
+                .title,
+            "Configured gh"
+        );
         let captured = fs::read_to_string(&invocation).unwrap();
         let mut lines = captured.lines();
         let path = lines.next().unwrap().strip_prefix("PATH=").unwrap();
@@ -507,6 +526,7 @@ mod tests {
             {
                 "number": 12,
                 "title": "Add widget",
+                "body": "Widget details",
                 "url": "https://github.com/o/r/pull/12",
                 "headRefName": "feature/widget",
                 "headRefOid": "abc123",
@@ -528,10 +548,11 @@ mod tests {
         assert_eq!(row.candidate.head_sha, "abc123");
         assert_eq!(row.candidate.head_ref, "feature/widget");
         assert_eq!(row.candidate.author, "octocat");
-        assert_eq!(row.candidate.kind, "review");
+        assert_eq!(row.candidate.kind, crate::model::ReviewKind::Review);
         assert!(!row.candidate.is_cross_repository);
         assert!(!row.candidate.is_draft);
         assert_eq!(row.title, "Add widget");
+        assert_eq!(row.body, "Widget details");
         assert_eq!(row.url, "https://github.com/o/r/pull/12");
         assert_eq!(row.labels, vec!["pr-status/needs-review-again", "area/ui"]);
         assert!(!row.conflict);
@@ -540,18 +561,22 @@ mod tests {
         // `DiscoveredEvent`, built from the SAME parsed locals, while the gating
         // `Candidate` rides along unchanged.
         let de = row_into_event(rows[0].clone(), "o/r");
-        assert_eq!(de.event.source, SourceKind::Github);
-        assert_eq!(de.event.event_type, EventType::PullRequest);
-        assert_eq!(de.event.number, Some(de.candidate.number));
-        assert_eq!(de.event.title, "Add widget");
-        assert_eq!(de.event.url, "https://github.com/o/r/pull/12");
+        let observation = de.event.as_observation().unwrap();
+        assert_eq!(de.event.source(), SourceKind::Github);
+        assert_eq!(observation.event_type, EventType::PullRequest);
+        assert_eq!(observation.subject.number, Some(de.candidate.number));
+        assert_eq!(observation.subject.title, "Add widget");
+        assert_eq!(observation.subject.url, "https://github.com/o/r/pull/12");
         assert_eq!(
-            de.event.labels,
+            observation.subject.labels,
             vec!["pr-status/needs-review-again", "area/ui"]
         );
-        assert_eq!(de.event.body, "");
+        assert_eq!(observation.subject.body, "Widget details");
         // dedupe_key is the exact inbox idempotency-key seed (format single-sourced).
-        assert_eq!(de.event.dedupe_key, "github:pullRequest:o/r#12@abc123");
+        assert_eq!(
+            de.event.dedupe_key().as_str(),
+            "github:pullRequest:o/r#12@abc123"
+        );
         assert!(!de.conflict);
     }
 
@@ -570,7 +595,7 @@ mod tests {
         assert_eq!(row.candidate.author, ""); // null author → empty login
         assert!(row.candidate.is_cross_repository);
         assert!(row.candidate.is_draft);
-        assert_eq!(row.candidate.kind, "review");
+        assert_eq!(row.candidate.kind, crate::model::ReviewKind::Review);
         assert_eq!(row.title, ""); // missing optional display fields default empty
         assert!(row.labels.is_empty());
     }
@@ -591,6 +616,7 @@ mod tests {
         let mut row = to_row(RawPr {
             number,
             title: format!("PR {number}"),
+            body: String::new(),
             url: format!("https://x/{number}"),
             head_ref_name: "ref".to_string(),
             head_ref_oid: "sha".to_string(),
@@ -601,7 +627,7 @@ mod tests {
             is_draft: false,
             labels: vec![],
         });
-        row.candidate.kind = kind.to_string();
+        row.candidate.kind = kind.parse().unwrap();
         row
     }
 
@@ -638,7 +664,7 @@ mod tests {
     fn merge_rows_check_only_keeps_check_kind() {
         let merged = merge_rows(vec![], vec![row(2, "check")]);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].candidate.kind, "check");
+        assert_eq!(merged[0].candidate.kind, crate::model::ReviewKind::Check);
         assert!(!merged[0].conflict);
     }
 
@@ -646,7 +672,7 @@ mod tests {
     fn merge_rows_review_only_keeps_review_kind() {
         let merged = merge_rows(vec![row(1, "review")], vec![]);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].candidate.kind, "review");
+        assert_eq!(merged[0].candidate.kind, crate::model::ReviewKind::Review);
         assert!(!merged[0].conflict);
     }
 
@@ -662,6 +688,7 @@ mod tests {
         let raw = RawPr {
             number: 7,
             title: format!("Fix login [{REVIEW}]"),
+            body: String::new(),
             url: "https://x/7".to_string(),
             head_ref_name: "fix".to_string(),
             head_ref_oid: "sha".to_string(),
@@ -676,7 +703,7 @@ mod tests {
             }],
         };
         let row = to_row_classified(raw, &trigger_labels, LabelSource::Title).expect("monitored");
-        assert_eq!(row.candidate.kind, "review");
+        assert_eq!(row.candidate.kind, crate::model::ReviewKind::Review);
         assert_eq!(row.labels, vec![REVIEW.to_string()]);
         assert!(!row.conflict);
 
@@ -684,6 +711,7 @@ mod tests {
         let raw_native_only = RawPr {
             number: 8,
             title: "No tags".to_string(),
+            body: String::new(),
             url: "https://x/8".to_string(),
             head_ref_name: "x".to_string(),
             head_ref_oid: "sha".to_string(),
@@ -700,6 +728,7 @@ mod tests {
         let raw_both = RawPr {
             number: 9,
             title: format!("[{REVIEW}][{CHECK}] both"),
+            body: String::new(),
             url: "https://x/9".to_string(),
             head_ref_name: "x".to_string(),
             head_ref_oid: "sha".to_string(),
@@ -711,7 +740,7 @@ mod tests {
         let row_both =
             to_row_classified(raw_both, &trigger_labels, LabelSource::Title).expect("kept");
         assert!(!row_both.conflict);
-        assert_eq!(row_both.candidate.kind, "review");
+        assert_eq!(row_both.candidate.kind, crate::model::ReviewKind::Review);
     }
 
     // Wire-shape lock for `GhStatus` — the `gh_status` command's front/back wire

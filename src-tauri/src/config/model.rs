@@ -390,7 +390,7 @@ pub enum RuleActionTarget {
 
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct RuleActionConfig {
     pub id: String,
     pub kind: RuleActionKind,
@@ -398,7 +398,6 @@ pub struct RuleActionConfig {
     pub target: RuleActionTarget,
     pub dedupe_policy: RuleActionDedupePolicy,
     pub delay_secs: u64,
-    pub depends_on: Vec<String>,
     pub level: String,
 }
 
@@ -411,7 +410,6 @@ impl RuleActionConfig {
             target: RuleActionTarget::None,
             dedupe_policy: RuleActionDedupePolicy::default(),
             delay_secs: 0,
-            depends_on: Vec::new(),
             level: "action".to_string(),
         }
     }
@@ -1589,7 +1587,6 @@ fn validate_rule(
             )));
         }
     }
-    validate_rule_action_dag(&rule.actions)?;
     Ok(())
 }
 
@@ -1618,7 +1615,6 @@ fn validate_rule_action(
     }
     validate_delay_secs("delaySecs", action.delay_secs)?;
     validate_rule_action_target(&action.target, notifications, messaging)?;
-    validate_id_list("dependsOn", &action.depends_on)?;
     Ok(())
 }
 
@@ -1712,66 +1708,6 @@ fn validate_id_list(field: &str, ids: &[String]) -> AppResult<()> {
         if !seen.insert(id.to_string()) {
             return Err(AppError::new(format!("{field} 不能包含重复值: {id}")));
         }
-    }
-    Ok(())
-}
-
-fn validate_rule_action_dag(actions: &[RuleActionConfig]) -> AppResult<()> {
-    let ids: std::collections::HashSet<&str> =
-        actions.iter().map(|action| action.id.as_str()).collect();
-    for action in actions {
-        for dep in &action.depends_on {
-            if dep == &action.id {
-                return Err(AppError::new(format!("actions DAG 自依赖: {}", action.id)));
-            }
-            if !ids.contains(dep.as_str()) {
-                return Err(AppError::new(format!(
-                    "actions DAG 依赖未知动作: {} -> {}",
-                    action.id, dep
-                )));
-            }
-        }
-    }
-
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Mark {
-        New,
-        Visiting,
-        Done,
-    }
-    let mut marks: std::collections::HashMap<&str, Mark> = actions
-        .iter()
-        .map(|action| (action.id.as_str(), Mark::New))
-        .collect();
-    let by_id: std::collections::HashMap<&str, &RuleActionConfig> = actions
-        .iter()
-        .map(|action| (action.id.as_str(), action))
-        .collect();
-
-    fn visit<'a>(
-        id: &'a str,
-        marks: &mut std::collections::HashMap<&'a str, Mark>,
-        by_id: &std::collections::HashMap<&'a str, &'a RuleActionConfig>,
-    ) -> AppResult<()> {
-        match marks.get(id).copied().unwrap_or(Mark::New) {
-            Mark::Done => return Ok(()),
-            Mark::Visiting => {
-                return Err(AppError::new(format!("actions DAG 存在环路: {id}")));
-            }
-            Mark::New => {}
-        }
-        marks.insert(id, Mark::Visiting);
-        if let Some(action) = by_id.get(id) {
-            for dep in &action.depends_on {
-                visit(dep, marks, by_id)?;
-            }
-        }
-        marks.insert(id, Mark::Done);
-        Ok(())
-    }
-
-    for action in actions {
-        visit(action.id.as_str(), &mut marks, &by_id)?;
     }
     Ok(())
 }
@@ -2575,7 +2511,6 @@ mod tests {
                         "target": { "kind": "none" },
                         "dedupePolicy": "event",
                         "delaySecs": 0,
-                        "dependsOn": [],
                         "level": "action"
                     },
                     {
@@ -2585,7 +2520,6 @@ mod tests {
                         "target": { "kind": "none" },
                         "dedupePolicy": "event",
                         "delaySecs": 0,
-                        "dependsOn": [],
                         "level": "action"
                     },
                     {
@@ -2595,7 +2529,6 @@ mod tests {
                         "target": { "kind": "none" },
                         "dedupePolicy": "event",
                         "delaySecs": 0,
-                        "dependsOn": [],
                         "level": "action"
                     }
                 ],
@@ -3449,50 +3382,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_rule_action_dag_and_combination_policy_fail_fast() {
-        let mut config = valid_base();
-        let mut action = RuleActionConfig::new("review", RuleActionKind::Review);
-        action.depends_on = vec!["missing".to_string()];
-        config.rules.push(RuleConfig {
-            id: "r1".to_string(),
-            name: "Unknown dep".to_string(),
-            enabled: true,
-            actions: vec![action],
-            ..RuleConfig::default()
-        });
-        assert!(validate(&config)
-            .unwrap_err()
-            .message
-            .contains("依赖未知动作"));
-
-        let mut config = valid_base();
-        let mut action = RuleActionConfig::new("review", RuleActionKind::Review);
-        action.depends_on = vec!["review".to_string()];
-        config.rules.push(RuleConfig {
-            id: "r1".to_string(),
-            name: "Self dep".to_string(),
-            enabled: true,
-            actions: vec![action],
-            ..RuleConfig::default()
-        });
-        assert!(validate(&config).unwrap_err().message.contains("自依赖"));
-
-        let mut config = valid_base();
-        let mut a = RuleActionConfig::new("a", RuleActionKind::Notify);
-        a.depends_on = vec!["c".to_string()];
-        let mut b = RuleActionConfig::new("b", RuleActionKind::Notify);
-        b.depends_on = vec!["a".to_string()];
-        let mut c = RuleActionConfig::new("c", RuleActionKind::Notify);
-        c.depends_on = vec!["b".to_string()];
-        config.rules.push(RuleConfig {
-            id: "r1".to_string(),
-            name: "Cycle".to_string(),
-            enabled: true,
-            actions: vec![a, b, c],
-            ..RuleConfig::default()
-        });
-        assert!(validate(&config).unwrap_err().message.contains("存在环路"));
-
+    fn validate_rule_action_combination_policy_fail_fast() {
         let mut config = valid_base();
         config.rules.push(RuleConfig {
             id: "r1".to_string(),

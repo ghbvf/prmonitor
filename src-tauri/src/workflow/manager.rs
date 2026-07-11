@@ -15,17 +15,18 @@ use tokio::sync::Notify;
 use tokio::time::{interval, MissedTickBehavior};
 
 use crate::db::Database;
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::events::{StreamEvent, WorkflowEvent};
-use crate::model::SendNotificationResponse;
+use crate::model::{ReviewKind, ReviewReceiptId, ReviewReceiptStatus, SendNotificationResponse};
 use crate::stream;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewNotifyRequest {
+    pub receipt_id: ReviewReceiptId,
     pub reference: String,
     pub pr_number: u64,
-    pub kind: String,
+    pub kind: ReviewKind,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,28 +43,15 @@ pub struct ReviewNotifyState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StartedReview {
-    pub thread_id: String,
-    pub project_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewCompletion {
-    pub wire_status: String,
+    pub thread_id: Option<String>,
+    pub project_id: String,
+    pub status: ReviewReceiptStatus,
     pub comment_url: Option<String>,
 }
 
-pub type StartReviewFn = Arc<
-    dyn Fn(
-            ReviewNotifyRequest,
-            u64,
-        ) -> Pin<Box<dyn Future<Output = AppResult<StartedReview>> + Send>>
-        + Send
-        + Sync,
->;
-
-pub type WaitReviewFn = Arc<
-    dyn Fn(String) -> Pin<Box<dyn Future<Output = AppResult<ReviewCompletion>> + Send>>
+pub type WaitReceiptFn = Arc<
+    dyn Fn(ReviewReceiptId) -> Pin<Box<dyn Future<Output = AppResult<ReviewCompletion>> + Send>>
         + Send
         + Sync,
 >;
@@ -79,8 +67,7 @@ pub type SendNotificationFn = Arc<
 
 #[derive(Clone)]
 pub struct WorkflowActions {
-    pub start_review: StartReviewFn,
-    pub wait_review: WaitReviewFn,
+    pub wait_receipt: WaitReceiptFn,
     pub send_notification: SendNotificationFn,
 }
 
@@ -150,33 +137,22 @@ impl WorkflowManager {
         }
     }
 
-    pub fn start_review_notify(
+    pub fn start_receipt_notify(
         &self,
         app: tauri::AppHandle,
+        receipt_id: ReviewReceiptId,
         reference: String,
         pr_number: u64,
-        kind: String,
+        kind: ReviewKind,
     ) -> AppResult<()> {
         let request = ReviewNotifyRequest {
+            receipt_id,
             reference,
             pr_number,
             kind,
         };
-        let actions = self
-            .actions
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-            .ok_or_else(|| AppError::new("workflow actions 未初始化".to_string()))?;
-        let wake = Arc::clone(&self.wake);
-        spawn_tracked(&self.in_flight, async move {
-            if let Err(e) =
-                crate::workflow::service::start_review_notify(&app, &actions, request).await
-            {
-                emit_error(&app, "start_review_notify", e.message);
-            }
-            wake.notify_one();
-        });
+        crate::workflow::service::ensure_receipt_notify(&app, request)?;
+        self.wake.notify_one();
         Ok(())
     }
 }

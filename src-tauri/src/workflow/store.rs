@@ -4,7 +4,7 @@ use rusqlite::{types::Type, OptionalExtension};
 
 use crate::db::{map_err, Database};
 use crate::error::AppResult;
-use crate::model::{WorkflowInstance, WorkflowStatus, WorkflowStep, WorkflowType};
+use crate::model::{ReviewReceiptId, WorkflowInstance, WorkflowStatus, WorkflowStep, WorkflowType};
 
 const LIST_LIMIT: i64 = 500;
 const CLAIM_LIMIT: i64 = 20;
@@ -117,6 +117,51 @@ pub fn create_or_get(db: &Database, new: NewWorkflow<'_>) -> AppResult<WorkflowI
         )
         .map_err(map_err)?;
         select_active_by_dedupe_tx(tx, new.project_id, new.workflow_type, new.dedupe_key)
+    })
+}
+
+pub fn create_or_get_for_receipt(
+    db: &Database,
+    receipt_id: ReviewReceiptId,
+    new: NewWorkflow<'_>,
+) -> AppResult<WorkflowInstance> {
+    let input_json = serde_json::to_string(new.input)
+        .map_err(|e| crate::error::AppError::new(format!("workflow input 序列化失败：{e}")))?;
+    db.with_tx(|tx| {
+        let existing = tx
+            .query_row(
+                "SELECT workflow_id FROM review_receipt_workflow WHERE receipt_id=?1",
+                [receipt_id.get()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        if let Some(id) = existing {
+            return select_by_id_tx(tx, id);
+        }
+        tx.execute(
+            "INSERT INTO workflow_instance \
+             (project_id, workflow_type, status, current_step, input_json, state_json, \
+              attempt_count, next_wake_at, last_error, created_at, updated_at, dedupe_key) \
+             VALUES (?1, ?2, ?3, ?4, ?5, '{}', 0, ?6, NULL, ?6, ?6, ?7)",
+            rusqlite::params![
+                new.project_id,
+                type_wire(new.workflow_type),
+                status_wire(WorkflowStatus::Pending),
+                step_wire(WorkflowStep::StartReview),
+                input_json,
+                new.now as i64,
+                new.dedupe_key,
+            ],
+        )
+        .map_err(map_err)?;
+        let workflow_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO review_receipt_workflow (receipt_id, workflow_id) VALUES (?1, ?2)",
+            rusqlite::params![receipt_id.get(), workflow_id],
+        )
+        .map_err(map_err)?;
+        select_by_id_tx(tx, workflow_id)
     })
 }
 
@@ -352,6 +397,17 @@ fn select_active_by_dedupe_tx(
     .map_err(map_err)
 }
 
+fn select_by_id_tx(tx: &rusqlite::Transaction<'_>, id: i64) -> AppResult<WorkflowInstance> {
+    tx.query_row(
+        "SELECT id, project_id, workflow_type, status, current_step, input_json, \
+         state_json, attempt_count, next_wake_at, last_error, created_at, updated_at \
+         FROM workflow_instance WHERE id=?1",
+        [id],
+        row_to_instance,
+    )
+    .map_err(map_err)
+}
+
 fn row_to_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowInstance> {
     let workflow_type: String = row.get(2)?;
     let status: String = row.get(3)?;
@@ -534,6 +590,45 @@ mod tests {
             second.id, third.id,
             "active rows still dedupe repeated deeplink clicks"
         );
+    }
+
+    #[test]
+    fn receipt_identity_survives_terminal_workflow_and_prevents_duplicate_notification_saga() {
+        let db = Database::open_in_memory().expect("db");
+        let receipt_id = ReviewReceiptId::new(17).expect("receipt");
+        let input = serde_json::json!({
+            "receiptId": 17, "reference": "repo", "prNumber": 7, "kind": "review"
+        });
+        let create = |now| NewWorkflow {
+            project_id: "repo",
+            workflow_type: WorkflowType::ReviewNotify,
+            input: &input,
+            dedupe_key: "receipt:17",
+            now,
+        };
+        let first = create_or_get_for_receipt(&db, receipt_id, create(10)).expect("first");
+        assert!(update_progress(
+            &db,
+            ProgressUpdate {
+                id: first.id,
+                expected_step: WorkflowStep::StartReview,
+                project_id: None,
+                status: WorkflowStatus::Done,
+                step: WorkflowStep::Done,
+                state: &serde_json::json!({"notificationOutboxIds":[9]}),
+                next_wake_at: 0,
+            },
+        )
+        .expect("terminalize"));
+
+        let replay = create_or_get_for_receipt(&db, receipt_id, create(20)).expect("replay");
+        assert_eq!(replay.id, first.id);
+        let count: i64 = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM workflow_instance", [], |r| r.get(0))
+            })
+            .expect("count");
+        assert_eq!(count, 1);
     }
 
     #[test]

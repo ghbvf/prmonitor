@@ -29,12 +29,14 @@ use std::sync::Arc;
 
 use crate::db::Database;
 use crate::error::AppResult;
-use crate::model::{ActionExecutionResult, ActionKind};
+use crate::model::ActionExecutionResult;
 
 pub mod commands;
 pub mod manager;
 pub mod service;
 pub mod store;
+
+pub(crate) use store::OutboxAction;
 
 /// The side-effect executor the composition root injects (AB#1066). Given the
 /// [`tauri::AppHandle`] and one claimed [`OutboxAction`], it performs the action — today routing
@@ -63,27 +65,3 @@ pub type ActionExecutor = Arc<
 /// and idempotent. Table hygiene only — correctness does NOT depend on it (a terminal row is never
 /// re-claimed), so this never affects the dedup decision, only bounds `outbox_review_claim`.
 pub type ClaimReleaser = Arc<dyn Fn(&Database, i64) + Send + Sync>;
-
-/// One claimed outbox row, handed to the [`ActionExecutor`] (AB#1066). Carries the neutral
-/// [`ActionKind`] + the opaque `payload` (a `model::Notification` JSON today; the executor
-/// deserializes it) plus the routing `project_id` and the row `id` for diagnostics. `attempt_count`
-/// is the number of attempts BEFORE this run (the worker uses it to decide retry-vs-dead-letter; the
-/// executor ignores it). A plain struct (no serde): the store builds it from columns and the worker
-/// consumes it in-process — it never crosses a wire.
-#[derive(Debug, Clone)]
-pub struct OutboxAction {
-    /// The `action_outbox` row id.
-    pub id: i64,
-    /// Routing key (#35): which project this action belongs to.
-    pub project_id: String,
-    /// The side effect's kind (the executor routes on it).
-    pub kind: ActionKind,
-    /// The serialized action body (a `model::Notification` JSON today).
-    pub payload: String,
-    /// Attempts that have already run for this row (0 on the first claim).
-    pub attempt_count: u32,
-    /// When the action was enqueued (epoch seconds) (AB#1182). The worker compares this against
-    /// the kind's staleness TTL to dead-letter a row that has sat `pending` too long (e.g. a
-    /// notification persisted before a restart) instead of firing it as a ghost.
-    pub created_at: u64,
-}

@@ -9,11 +9,14 @@
 //! is the **Hard** carrier for the status ↔ column-string mapping (a new variant is a compile
 //! error here, like `pr::webhook::StatusOnlyKind`).
 
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, Transaction};
 
 use crate::db::{map_err, Database};
 use crate::error::AppResult;
-use crate::model::{Candidate, Event, InboxEntry, InboxStatus, SourceKind};
+use crate::model::{
+    Candidate, EventEnvelope, EventPayload, InboxEntry, InboxStatus, ReviewReceiptId,
+    ReviewReceiptSnapshot, ReviewReceiptStatus, SourceKind,
+};
 
 /// Bound on a single [`list_by_project`] page (AB#1065): the panel only ever needs a recent
 /// window, and the `idx_inbox_event_project` index makes the `ORDER BY id DESC LIMIT` a cheap
@@ -91,7 +94,7 @@ fn source_as_wire(source: SourceKind) -> String {
 /// row with a half-applied prune, and both commit/roll back atomically.
 pub fn insert_dedup(
     db: &Database,
-    event: &Event,
+    event: &EventEnvelope,
     raw: &str,
     webhook_event_json: Option<&str>,
     candidate: Option<&Candidate>,
@@ -110,20 +113,24 @@ pub fn insert_dedup(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) \
              ON CONFLICT(dedupe_key) DO NOTHING",
             rusqlite::params![
-                event.dedupe_key,
-                source_as_wire(event.source),
+                event.dedupe_key().as_str(),
+                source_as_wire(event.source()),
                 // The event-class column mirrors the normalized `Event`'s serde wire form, kept
                 // in lockstep with `event_json`'s `eventType` (both come from the same `Event`).
                 event_type_as_wire(event),
-                event.project_id,
-                event.repo,
-                event.number.map(|n| n as i64),
+                event.project_id(),
+                event.repo(),
+                event
+                    .as_observation()
+                    .and_then(|o| o.subject.number)
+                    .or_else(|| event.as_review_request().map(|r| r.pr_number))
+                    .map(|n| n as i64),
                 event_json,
                 raw,
                 webhook_event_json,
                 candidate_json.as_deref(),
                 status_as_wire(InboxStatus::Received),
-                event.received_at_epoch as i64,
+                event.received_at_epoch() as i64,
             ],
         )
         .map_err(map_err)?;
@@ -137,11 +144,49 @@ pub fn insert_dedup(
         // `LIMIT -1 OFFSET ?` no-ops cheaply when the table is under the cap).
         tx.execute(
             "DELETE FROM inbox_event WHERE id IN ( \
-                 SELECT id FROM inbox_event ORDER BY id DESC LIMIT -1 OFFSET ?1)",
+                 SELECT id FROM inbox_event \
+                 WHERE status IN ('processed','failed') \
+                   AND COALESCE(json_extract(event_json, '$.payload.kind'), 'observation') <> 'reviewRequest' \
+                 ORDER BY id ASC LIMIT max((SELECT COUNT(*) FROM inbox_event) - ?1, 0))",
             rusqlite::params![MAX_INBOX_EVENTS],
         )
         .map_err(map_err)?;
         Ok(Some(id))
+    })
+}
+
+/// Whether live rows forced the audit table above its history target. Live work is never pruned.
+pub fn retention_pressure(db: &Database) -> AppResult<bool> {
+    db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) > ?1 FROM inbox_event",
+            [MAX_INBOX_EVENTS],
+            |row| row.get(0),
+        )
+    })
+}
+
+/// Oldest durable work awaiting the single inbox consumer.
+pub fn received_ids(db: &Database) -> AppResult<Vec<i64>> {
+    db.with_conn(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT id FROM inbox_event WHERE status='received' ORDER BY id LIMIT 100")?;
+        let ids = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    })
+}
+
+/// Replay is the only legal transition back to live work.
+pub fn requeue_failed(db: &Database, id: i64) -> AppResult<bool> {
+    db.with_conn(|conn| {
+        conn.execute(
+            "UPDATE inbox_event SET status='received', processed_at_epoch=NULL, error=NULL \
+             WHERE id=?1 AND status='failed'",
+            [id],
+        )
+        .map(|changed| changed == 1)
     })
 }
 
@@ -192,7 +237,7 @@ pub fn list_by_project(db: &Database, project_id: Option<&str>) -> AppResult<Vec
         for row in raw_rows {
             // Best-effort hydrate: skip a row whose `event_json` no longer parses rather than
             // failing the whole list (a forward-incompatible / corrupt blob).
-            if let Ok(event) = serde_json::from_str::<Event>(&row.event_json) {
+            if let Ok(event) = serde_json::from_str::<EventEnvelope>(&row.event_json) {
                 out.push(InboxEntry {
                     id: row.id,
                     event,
@@ -230,7 +275,7 @@ pub fn get_entry(db: &Database, id: i64) -> AppResult<Option<InboxEntry>> {
     .and_then(|maybe| match maybe {
         None => Ok(None),
         Some(row) => {
-            let event: Event = serde_json::from_str(&row.event_json).map_err(|e| {
+            let event: EventEnvelope = serde_json::from_str(&row.event_json).map_err(|e| {
                 crate::error::AppError::new(format!("inbox 行 {id} 的事件反序列化失败: {e}"))
             })?;
             Ok(Some(InboxEntry {
@@ -257,22 +302,123 @@ pub fn get_raw(db: &Database, id: i64) -> AppResult<Option<String>> {
     })
 }
 
+pub fn id_by_dedupe_key(db: &Database, key: &str) -> AppResult<Option<i64>> {
+    db.with_conn(|conn| {
+        conn.query_row(
+            "SELECT id FROM inbox_event WHERE dedupe_key=?1",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()
+    })
+}
+
+pub fn get_review_receipt(
+    db: &Database,
+    receipt_id: ReviewReceiptId,
+) -> AppResult<ReviewReceiptSnapshot> {
+    let row = db
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT i.event_json, i.status, i.error, o.status, o.last_error, o.review_thread_id, \
+                    s.status, s.comment_url, s.terminal_outcome, s.terminal_error \
+             FROM inbox_event i \
+             LEFT JOIN rule_match rm ON rm.inbox_event_id=i.id \
+             LEFT JOIN rule_match_action rma ON rma.rule_match_id=rm.id \
+             LEFT JOIN action_outbox o ON o.id=rma.action_outbox_id AND o.kind IN ('review','check') \
+             LEFT JOIN review_session s ON s.thread_id=o.review_thread_id \
+             WHERE i.id=?1 ORDER BY o.id LIMIT 1",
+                [receipt_id.get()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                    ))
+                },
+            )
+            .optional()
+        })?
+        .ok_or_else(|| {
+            crate::error::AppError::new(format!("review receipt 不存在：{}", receipt_id.get()))
+        })?;
+
+    let (
+        event_json,
+        inbox_status,
+        inbox_error,
+        action_status,
+        action_error,
+        thread_id,
+        session_status,
+        comment_url,
+        terminal_outcome,
+        terminal_error,
+    ) = row;
+    let event: EventEnvelope = serde_json::from_str(&event_json).map_err(|error| {
+        crate::error::AppError::new(format!(
+            "review receipt {} 的事件损坏: {error}",
+            receipt_id.get()
+        ))
+    })?;
+    if event.as_review_request().is_none() {
+        return Err(crate::error::AppError::new(format!(
+            "review receipt 不存在：{}",
+            receipt_id.get()
+        )));
+    }
+    let status = if inbox_status == "failed" {
+        ReviewReceiptStatus::Failed
+    } else {
+        match action_status.as_deref() {
+            None => ReviewReceiptStatus::Received,
+            Some("pending") => ReviewReceiptStatus::Queued,
+            Some("blocked") => ReviewReceiptStatus::Blocked,
+            Some("dead") => ReviewReceiptStatus::Failed,
+            Some("done") => match session_status.as_deref() {
+                Some("starting") => ReviewReceiptStatus::Starting,
+                Some("running") => ReviewReceiptStatus::Running,
+                Some("interrupting") => ReviewReceiptStatus::Interrupting,
+                Some("failed") => ReviewReceiptStatus::Failed,
+                Some("done") | None => ReviewReceiptStatus::Done,
+                Some(_) => ReviewReceiptStatus::Failed,
+            },
+            Some(_) => ReviewReceiptStatus::Failed,
+        }
+    };
+    Ok(ReviewReceiptSnapshot {
+        receipt_id,
+        status,
+        thread_id,
+        comment_url,
+        outcome: terminal_outcome,
+        error: terminal_error.or(inbox_error).or(action_error),
+    })
+}
+
 /// The stored facts a replay needs for one inbox entry (AB#1065): the normalized [`Event`], the
 /// [`SourceKind`] (which decides the replay path — GitHub re-feed vs Azure refresh), the current
 /// [`InboxStatus`], and the parsed `WebhookEvent` JSON (`Some` for a GitHub entry, `None` for an
 /// Azure audit row). A named struct rather than a wide tuple (clippy::type_complexity).
 #[derive(Debug)]
-pub struct Replayable {
-    pub event: Event,
+pub struct ProcessableInboxRow {
+    pub event: EventEnvelope,
     pub source: SourceKind,
     pub status: InboxStatus,
     pub webhook_event_json: Option<String>,
     pub candidate: Option<Candidate>,
 }
 
-/// The [`Replayable`] facts of an inbox entry by id (AB#1065), or `None` when unknown. A corrupt
+/// The [`ProcessableInboxRow`] facts of an inbox entry by id (AB#1065), or `None` when unknown. A corrupt
 /// `event_json` is an error (the caller asked for THIS row).
-pub fn get_replayable(db: &Database, id: i64) -> AppResult<Option<Replayable>> {
+pub fn get_replayable(db: &Database, id: i64) -> AppResult<Option<ProcessableInboxRow>> {
     let row = db.with_conn(|conn| {
         conn.query_row(
             "SELECT event_json, source, status, webhook_event_json, candidate_json FROM inbox_event WHERE id = ?1",
@@ -292,7 +438,7 @@ pub fn get_replayable(db: &Database, id: i64) -> AppResult<Option<Replayable>> {
     match row {
         None => Ok(None),
         Some((event_json, source, status, webhook_event_json, candidate_json)) => {
-            let event: Event = serde_json::from_str(&event_json).map_err(|e| {
+            let event: EventEnvelope = serde_json::from_str(&event_json).map_err(|e| {
                 crate::error::AppError::new(format!("inbox 行 {id} 的事件反序列化失败: {e}"))
             })?;
             let candidate = candidate_json
@@ -304,7 +450,7 @@ pub fn get_replayable(db: &Database, id: i64) -> AppResult<Option<Replayable>> {
                     })
                 })
                 .transpose()?;
-            Ok(Some(Replayable {
+            Ok(Some(ProcessableInboxRow {
                 event,
                 source: source_from_wire(&source)?,
                 status: status_from_wire(&status),
@@ -327,6 +473,22 @@ pub fn mark_processed(db: &Database, id: i64) -> AppResult<()> {
         )
         .map(|_| ())
     })
+}
+
+pub(crate) fn mark_processed_in_tx(tx: &Transaction<'_>, id: i64, now: u64) -> AppResult<()> {
+    let changed = tx
+        .execute(
+            "UPDATE inbox_event SET status=?2, processed_at_epoch=?3, error=NULL \
+         WHERE id=?1 AND status='received'",
+            rusqlite::params![id, status_as_wire(InboxStatus::Processed), now as i64],
+        )
+        .map_err(map_err)?;
+    if changed != 1 {
+        return Err(crate::error::AppError::new(format!(
+            "inbox 行 {id} 非 Received，拒绝提交规则动作"
+        )));
+    }
+    Ok(())
 }
 
 /// Mark an inbox entry `Failed` (AB#1065) with an error message, stamping `processed_at_epoch`
@@ -368,8 +530,17 @@ fn source_from_wire(s: &str) -> AppResult<SourceKind> {
 /// The event-class column value for an [`Event`]: the same serde wire string the frontend
 /// mirrors (kept in lockstep with the `eventType` inside `event_json`). A unit enum, so
 /// serialization cannot fail — `expect` surfaces a serde regression loudly.
-fn event_type_as_wire(event: &Event) -> String {
-    serde_json::to_value(event.event_type)
+fn event_type_as_wire(event: &EventEnvelope) -> String {
+    let value = match event.payload() {
+        EventPayload::Observation { .. } => {
+            event
+                .as_observation()
+                .expect("observation payload")
+                .event_type
+        }
+        EventPayload::ReviewRequest { .. } => crate::model::EventType::PullRequest,
+    };
+    serde_json::to_value(value)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
         .expect("EventType serializes to a JSON string (unit enum, known variants)")
@@ -378,22 +549,25 @@ fn event_type_as_wire(event: &Event) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::EventType;
+    use crate::model::{EventSubject, EventType, InboxDedupeKey};
 
-    fn event(dedupe_key: &str, project_id: &str, number: Option<u64>) -> Event {
-        Event {
-            dedupe_key: dedupe_key.to_string(),
-            source: SourceKind::Github,
-            event_type: EventType::PullRequest,
-            project_id: project_id.to_string(),
-            repo: "owner/repo".to_string(),
-            number,
-            title: "Add feature".to_string(),
-            body: String::new(),
-            labels: vec!["pr-review".to_string()],
-            url: "https://example.com/pr/7".to_string(),
-            received_at_epoch: 1_700_000_000,
-        }
+    fn event(dedupe_key: &str, project_id: &str, number: Option<u64>) -> EventEnvelope {
+        EventEnvelope::observation(
+            InboxDedupeKey::new(dedupe_key).unwrap(),
+            SourceKind::Github,
+            project_id,
+            "owner/repo",
+            EventType::PullRequest,
+            EventSubject {
+                number,
+                title: "Add feature".to_string(),
+                body: String::new(),
+                labels: vec!["pr-review".to_string()],
+                url: "https://example.com/pr/7".to_string(),
+            },
+            1_700_000_000,
+        )
+        .unwrap()
     }
 
     fn candidate(number: u64, kind: &str) -> Candidate {
@@ -404,7 +578,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: kind.to_string(),
+            kind: kind.parse().unwrap(),
         }
     }
 
@@ -446,12 +620,18 @@ mod tests {
 
         // Scoped to p1: k3 (newest) then k1.
         let p1 = list_by_project(&db, Some("p1")).expect("list p1");
-        let p1_keys: Vec<String> = p1.iter().map(|e| e.event.dedupe_key.clone()).collect();
+        let p1_keys: Vec<String> = p1
+            .iter()
+            .map(|e| e.event.dedupe_key().to_string())
+            .collect();
         assert_eq!(p1_keys, vec!["k3".to_string(), "k1".to_string()]);
 
         // Across projects: k3, k2, k1 (id DESC).
         let all = list_by_project(&db, None).expect("list all");
-        let all_keys: Vec<String> = all.iter().map(|e| e.event.dedupe_key.clone()).collect();
+        let all_keys: Vec<String> = all
+            .iter()
+            .map(|e| e.event.dedupe_key().to_string())
+            .collect();
         assert_eq!(
             all_keys,
             vec!["k3".to_string(), "k2".to_string(), "k1".to_string()]
@@ -477,6 +657,67 @@ mod tests {
         assert!(get_raw(&db, 99_999).expect("unknown").is_none());
     }
 
+    #[test]
+    fn observation_inbox_id_is_not_a_review_receipt() {
+        let db = Database::open_in_memory().expect("open db");
+        let id = insert_dedup(&db, &event("observation", "p1", Some(7)), "raw", None, None)
+            .expect("insert")
+            .expect("new id");
+        let receipt = ReviewReceiptId::new(id).expect("positive id");
+        let error =
+            get_review_receipt(&db, receipt).expect_err("observation must not be enumerable");
+        assert!(error.message.contains("不存在"));
+    }
+
+    #[test]
+    fn review_receipt_projects_durable_terminal_outcome_and_engine_error() {
+        let db = Database::open_in_memory().expect("open db");
+        let request_id =
+            crate::model::ExternalRequestId::parse("0123456789abcdef0123456789abcdef").unwrap();
+        let event = EventEnvelope::review_request(
+            crate::model::InboxDedupeKey::new(format!("external:{request_id}")).unwrap(),
+            SourceKind::Github,
+            "p1",
+            "owner/repo",
+            7,
+            crate::model::ReviewKind::Review,
+            request_id,
+            crate::model::ExternalTriggerOrigin::Http,
+            false,
+            1,
+        )
+        .unwrap();
+        let inbox_id = insert_dedup(&db, &event, "external", None, None)
+            .expect("insert")
+            .expect("new");
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO review_session (thread_id, project_id, pr_number, turn_id, kind, status, created_at, updated_at, comment_url, engine_kind, terminal_outcome, terminal_error) VALUES ('th-1','p1',7,'turn-1','review','failed',1,2,NULL,'codex','interrupted','engine stopped')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO rule_match (rule_id, rule_name, inbox_event_id, project_id, action_count, created_at) VALUES ('system','external',?1,'p1',1,1)",
+                [inbox_id],
+            )?;
+            conn.execute(
+                "INSERT INTO action_outbox (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, created_at, updated_at, producer_key, review_thread_id) VALUES ('p1','review','review','{}','done',1,1,1,2,'receipt-test','th-1')",
+                [],
+            )?;
+            let action_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO rule_match_action (rule_match_id, action_outbox_id) VALUES ((SELECT id FROM rule_match WHERE inbox_event_id=?1), ?2)",
+                rusqlite::params![inbox_id, action_id],
+            )?;
+            Ok(())
+        })
+        .expect("session, action, and match");
+
+        let receipt =
+            get_review_receipt(&db, ReviewReceiptId::new(inbox_id).unwrap()).expect("receipt");
+        assert_eq!(receipt.outcome.as_deref(), Some("interrupted"));
+        assert_eq!(receipt.error.as_deref(), Some("engine stopped"));
+    }
+
     // Event round-trips through `event_json` (AB#1065): the hydrated `Event` matches what went
     // in, and an absent `number` (a generic event) round-trips as `None`.
     #[test]
@@ -488,9 +729,12 @@ mod tests {
             .expect("new id");
 
         let entry = get_entry(&db, id).expect("get").expect("exists");
-        assert_eq!(entry.event.dedupe_key, "k1");
-        assert_eq!(entry.event.number, None);
-        assert_eq!(entry.event.labels, vec!["pr-review".to_string()]);
+        assert_eq!(entry.event.dedupe_key().as_str(), "k1");
+        assert_eq!(entry.event.as_observation().unwrap().subject.number, None);
+        assert_eq!(
+            entry.event.as_observation().unwrap().subject.labels,
+            vec!["pr-review".to_string()]
+        );
         assert_eq!(entry.status, InboxStatus::Received);
         assert_eq!(entry.processed_at_epoch, None);
 
@@ -524,6 +768,33 @@ mod tests {
         assert!(processed.processed_at_epoch.is_some());
     }
 
+    #[test]
+    fn requeue_failed_is_the_only_transition_back_to_received() {
+        let db = Database::open_in_memory().expect("open db");
+
+        let failed_id = insert_dedup(&db, &event("failed", "p1", Some(1)), "raw", None, None)
+            .expect("insert failed row")
+            .expect("new id");
+        mark_failed(&db, failed_id, "boom").expect("mark failed");
+        assert!(requeue_failed(&db, failed_id).expect("requeue failed"));
+        let requeued = get_entry(&db, failed_id).expect("get").expect("exists");
+        assert_eq!(requeued.status, InboxStatus::Received);
+        assert_eq!(requeued.processed_at_epoch, None);
+        assert_eq!(requeued.error, None);
+
+        let received_id = insert_dedup(&db, &event("received", "p1", Some(2)), "raw", None, None)
+            .expect("insert received row")
+            .expect("new id");
+        assert!(!requeue_failed(&db, received_id).expect("reject received"));
+
+        let processed_id = insert_dedup(&db, &event("processed", "p1", Some(3)), "raw", None, None)
+            .expect("insert processed row")
+            .expect("new id");
+        mark_processed(&db, processed_id).expect("mark processed");
+        assert!(!requeue_failed(&db, processed_id).expect("reject processed"));
+        assert!(!requeue_failed(&db, i64::MAX).expect("reject unknown"));
+    }
+
     // `get_replayable` (AB#1065): returns the hydrated event, the source kind, the status, and
     // the stored `webhook_event_json`; an unknown id is `None`.
     #[test]
@@ -540,7 +811,7 @@ mod tests {
         .expect("new id");
 
         let r = get_replayable(&db, id).expect("get").expect("exists");
-        assert_eq!(r.event.dedupe_key, "k1");
+        assert_eq!(r.event.dedupe_key().as_str(), "k1");
         assert_eq!(r.source, SourceKind::Github);
         assert_eq!(r.status, InboxStatus::Received);
         assert_eq!(
@@ -628,10 +899,12 @@ mod tests {
             .expect("insert")
             .expect("new id");
         db.with_conn(|conn| {
+            conn.pragma_update(None, "ignore_check_constraints", true)?;
             conn.execute(
                 "UPDATE inbox_event SET source = 'bogus-source' WHERE id = ?1",
                 [id],
-            )
+            )?;
+            conn.pragma_update(None, "ignore_check_constraints", false)
         })
         .expect("corrupt source");
 
@@ -650,7 +923,7 @@ mod tests {
     // count by checking the cap value directly (MAX_INBOX_EVENTS is large, so seed cap+overflow
     // rows via raw inserts then one more through insert_dedup to trigger the prune).
     #[test]
-    fn insert_dedup_prunes_oldest_beyond_cap() {
+    fn insert_dedup_prunes_oldest_terminal_rows_beyond_cap() {
         let db = Database::open_in_memory().expect("open db");
         // Seed exactly MAX_INBOX_EVENTS rows directly (cheap raw inserts), oldest id first.
         db.with_conn(|conn| {
@@ -660,10 +933,20 @@ mod tests {
                      (dedupe_key, source, event_type, project_id, repo, event_json, raw_payload, \
                       status, received_at_epoch) \
                      VALUES (?1, 'github', 'pullRequest', 'p1', 'owner/repo', '{}', 'raw', \
-                             'received', 1)",
+                             'processed', 1)",
                     rusqlite::params![format!("seed-{i}")],
                 )?;
             }
+            conn.execute(
+                "INSERT INTO inbox_event \
+                 (dedupe_key, source, event_type, project_id, repo, event_json, raw_payload, \
+                  status, received_at_epoch, processed_at_epoch) \
+                 VALUES ('external:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'github', 'pullRequest', \
+                         'p1', 'owner/repo', \
+                         '{\"payload\":{\"kind\":\"reviewRequest\"}}', 'raw', \
+                         'processed', 1, 2)",
+                [],
+            )?;
             Ok(())
         })
         .expect("seed cap rows");
@@ -698,6 +981,41 @@ mod tests {
             })
             .expect("count newest");
         assert_eq!(newest_kept, 1, "newest row kept");
+        let receipt_kept: i64 = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM inbox_event WHERE dedupe_key LIKE 'external:%'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .expect("count durable receipt");
+        assert_eq!(
+            receipt_kept, 1,
+            "external receipts keep permanent idempotency identity"
+        );
+    }
+
+    #[test]
+    fn live_rows_are_never_pruned_and_report_retention_pressure() {
+        let db = Database::open_in_memory().expect("open db");
+        db.with_conn(|conn| {
+            for i in 0..=MAX_INBOX_EVENTS {
+                conn.execute(
+                    "INSERT INTO inbox_event \
+                     (dedupe_key, source, event_type, project_id, repo, event_json, raw_payload, status, received_at_epoch) \
+                     VALUES (?1, 'github', 'pullRequest', 'p1', 'owner/repo', '{}', 'raw', 'received', 1)",
+                    [format!("live-{i}")],
+                )?;
+            }
+            Ok(())
+        }).expect("seed live rows");
+        assert!(retention_pressure(&db).expect("pressure"));
+        assert_eq!(received_ids(&db).expect("live page").len(), 100);
+        let count: i64 = db
+            .with_conn(|conn| conn.query_row("SELECT COUNT(*) FROM inbox_event", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(count, MAX_INBOX_EVENTS + 1);
     }
 
     // Listing leniency (AB#1065 review fix): a row whose `event_json` is corrupt is SKIPPED by
@@ -708,6 +1026,7 @@ mod tests {
         let db = Database::open_in_memory().expect("open db");
         insert_dedup(&db, &event("good", "p1", Some(1)), "raw", None, None).expect("good");
         db.with_conn(|conn| {
+            conn.pragma_update(None, "ignore_check_constraints", true)?;
             conn.execute(
                 "INSERT INTO inbox_event \
                  (dedupe_key, source, event_type, project_id, repo, event_json, raw_payload, \
@@ -715,12 +1034,16 @@ mod tests {
                  VALUES ('bad', 'github', 'pullRequest', 'p1', 'owner/repo', 'NOT JSON', 'raw', \
                          'received', 2)",
                 [],
-            )
+            )?;
+            conn.pragma_update(None, "ignore_check_constraints", false)
         })
         .expect("insert corrupt row");
 
         let listed = list_by_project(&db, Some("p1")).expect("list does not error");
-        let keys: Vec<String> = listed.iter().map(|e| e.event.dedupe_key.clone()).collect();
+        let keys: Vec<String> = listed
+            .iter()
+            .map(|e| e.event.dedupe_key().to_string())
+            .collect();
         assert_eq!(keys, vec!["good".to_string()], "corrupt-json row skipped");
     }
 }

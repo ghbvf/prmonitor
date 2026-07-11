@@ -21,7 +21,9 @@
 //! horizontal [`crate::db::Database`] handle (not a cross-slice import). DDL lives in `db.rs`.
 
 use crate::db::Database;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
+use crate::model::ReviewKind;
+use crate::review::session::SessionInfo;
 
 /// Write-ahead claim for an outbox row that is about to start a review (AB#1204): insert a row
 /// keyed by `outbox_id` (`ON CONFLICT(outbox_id) DO NOTHING`, the **Hard** idempotency carrier —
@@ -41,7 +43,7 @@ pub fn begin_claim(
     outbox_id: i64,
     project_id: &str,
     pr_number: u64,
-    kind: &str,
+    kind: ReviewKind,
 ) -> AppResult<Option<String>> {
     let now = super::history_store::now_epoch() as i64;
     // **Hard-ized atomicity (AB#1204):** the INSERT and the read-back SELECT are wrapped in ONE
@@ -60,7 +62,7 @@ pub fn begin_claim(
              (outbox_id, project_id, pr_number, kind, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT(outbox_id) DO NOTHING",
-            rusqlite::params![outbox_id, project_id, pr_number as i64, kind, now],
+            rusqlite::params![outbox_id, project_id, pr_number as i64, kind.as_str(), now],
         )
         .map_err(crate::db::map_err)?;
         // The row always exists now (just inserted, or pre-existing). A NULL `thread_id` (fresh
@@ -74,17 +76,40 @@ pub fn begin_claim(
     })
 }
 
-/// Record the `thread_id` a claim's review started under (AB#1204), called right after
-/// `thread/start` succeeds and BEFORE the turn posts its `pm:` comment — so a later crash-replay
-/// finds the breadcrumb and resolves the prior review instead of duplicating it. Best-effort: a
-/// failure here only narrows the window back toward the pre-AB#1204 behavior, never a regression.
-pub fn attach_thread(db: &Database, outbox_id: i64, thread_id: &str) -> AppResult<()> {
+/// Test-only low-level breadcrumb writer. Production uses [`attach_started_session`] so the claim
+/// can never be attached independently of its durable session row.
+#[cfg(test)]
+fn attach_thread(db: &Database, outbox_id: i64, thread_id: &str) -> AppResult<()> {
     db.with_conn(|conn| {
         conn.execute(
             "UPDATE outbox_review_claim SET thread_id = ?2 WHERE outbox_id = ?1",
             rusqlite::params![outbox_id, thread_id],
         )
         .map(|_| ())
+    })
+}
+
+/// Persist the newly-created session and attach it to its owning outbox claim before the engine
+/// exposes the session as live in the in-memory registry.
+pub(super) fn attach_started_session(
+    db: &Database,
+    outbox_id: i64,
+    info: &SessionInfo,
+) -> AppResult<()> {
+    db.with_tx(|tx| {
+        super::history_store::upsert_session_in_tx(tx, info)?;
+        let changed = tx
+            .execute(
+                "UPDATE outbox_review_claim SET thread_id = ?2 WHERE outbox_id = ?1",
+                rusqlite::params![outbox_id, info.thread_id],
+            )
+            .map_err(crate::db::map_err)?;
+        if changed != 1 {
+            return Err(AppError::new(format!(
+                "outbox review claim 不存在（outbox_id={outbox_id}）"
+            )));
+        }
+        Ok(())
     })
 }
 
@@ -104,6 +129,20 @@ pub fn release_claim(db: &Database, outbox_id: i64) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn starting_session(thread_id: &str) -> SessionInfo {
+        SessionInfo {
+            project_id: "p1".to_string(),
+            thread_id: thread_id.to_string(),
+            turn_id: String::new(),
+            pr_number: 7,
+            kind: ReviewKind::Review,
+            engine_kind: crate::model::EngineKind::Codex,
+            status: crate::review::session::SessionStatus::Starting,
+            created_at_epoch: 1,
+            comment_url: None,
+        }
+    }
 
     /// Raw read of a claim's stored `thread_id` (test-only): `Some(None)` = row present with NULL
     /// thread, `Some(Some(_))` = attached, `None` = no row (released / never claimed).
@@ -144,9 +183,9 @@ mod tests {
             for id in ids {
                 conn.execute(
                     "INSERT INTO action_outbox \
-                     (id, project_id, kind, summary, payload, status, next_attempt_at, created_at, updated_at) \
-                     VALUES (?1, 'p1', 'review', 's', '{}', 'pending', 0, 0, 0)",
-                    rusqlite::params![id],
+                     (id, project_id, kind, summary, payload, status, next_attempt_at, created_at, updated_at, producer_key) \
+                     VALUES (?1, 'p1', 'review', 's', '{}', 'pending', 0, 0, 0, ?2)",
+                    rusqlite::params![id, format!("claim-test:{id}")],
                 )?;
             }
             Ok(())
@@ -164,7 +203,7 @@ mod tests {
 
         // Fresh claim: row inserted, thread_id NULL → None (caller starts the review).
         assert_eq!(
-            begin_claim(&db, 42, "p1", 7, "review").expect("begin"),
+            begin_claim(&db, 42, "p1", 7, ReviewKind::Review).expect("begin"),
             None,
             "a fresh claim has no thread yet"
         );
@@ -173,7 +212,7 @@ mod tests {
 
         // Replay: the SAME outbox_id is a PK conflict (no dup row) and surfaces the attached thread.
         assert_eq!(
-            begin_claim(&db, 42, "p1", 7, "review").expect("re-begin"),
+            begin_claim(&db, 42, "p1", 7, ReviewKind::Review).expect("re-begin"),
             Some("thread-abc".to_string()),
             "a replayed claim returns its attached thread_id"
         );
@@ -186,16 +225,22 @@ mod tests {
     #[test]
     fn claims_are_per_outbox_row() {
         let db = db_with_outbox_rows(&[1, 2]);
-        assert_eq!(begin_claim(&db, 1, "p1", 7, "review").expect("c1"), None);
+        assert_eq!(
+            begin_claim(&db, 1, "p1", 7, ReviewKind::Review).expect("c1"),
+            None
+        );
         // Same (project,pr,kind) but a DIFFERENT outbox row → a fresh, independent claim.
-        assert_eq!(begin_claim(&db, 2, "p1", 7, "review").expect("c2"), None);
+        assert_eq!(
+            begin_claim(&db, 2, "p1", 7, ReviewKind::Review).expect("c2"),
+            None
+        );
     }
 
     /// `release_claim` deletes the row (table hygiene) and is idempotent on a missing row.
     #[test]
     fn release_claim_deletes_and_is_idempotent() {
         let db = db_with_outbox_rows(&[9]);
-        begin_claim(&db, 9, "p1", 3, "check").expect("begin");
+        begin_claim(&db, 9, "p1", 3, ReviewKind::Check).expect("begin");
         assert!(peek(&db, 9).is_some(), "claimed");
 
         release_claim(&db, 9).expect("release");
@@ -216,7 +261,10 @@ mod tests {
         let db = db_with_outbox_rows(&[7]);
 
         // First attempt: fresh claim → None (caller would start the review).
-        assert_eq!(begin_claim(&db, 7, "p1", 3, "review").expect("begin"), None);
+        assert_eq!(
+            begin_claim(&db, 7, "p1", 3, ReviewKind::Review).expect("begin"),
+            None
+        );
         // Simulate `engine.start` FAILING: `attach_thread` is NOT called, so the breadcrumb stays
         // NULL. (The real path returns the start error to the outbox worker, which retries the row.)
         assert_eq!(peek(&db, 7), Some(None), "claim retained with NULL thread");
@@ -224,7 +272,7 @@ mod tests {
 
         // Replay of the SAME outbox row: still None (NULL thread ⇒ no review ran yet) → restartable.
         assert_eq!(
-            begin_claim(&db, 7, "p1", 3, "review").expect("re-begin"),
+            begin_claim(&db, 7, "p1", 3, ReviewKind::Review).expect("re-begin"),
             None,
             "a claim that never attached a thread (engine failed) is restartable on replay"
         );
@@ -246,7 +294,7 @@ mod tests {
     #[test]
     fn attach_thread_is_idempotent_on_repeat() {
         let db = db_with_outbox_rows(&[11]);
-        begin_claim(&db, 11, "p1", 5, "check").expect("begin");
+        begin_claim(&db, 11, "p1", 5, ReviewKind::Check).expect("begin");
 
         attach_thread(&db, 11, "t-1").expect("attach");
         attach_thread(&db, 11, "t-1").expect("attach-again");
@@ -263,25 +311,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_claim_linkage_rolls_back_the_starting_session() {
+        let db = Database::open_in_memory().expect("open");
+        let info = starting_session("thread-rollback");
+
+        let error = attach_started_session(&db, 404, &info).expect_err("missing claim must fail");
+
+        assert!(error.message.contains("claim 不存在"));
+        assert!(
+            super::super::history_store::get_session(&db, &info.thread_id)
+                .expect("read session")
+                .is_none(),
+            "a failed claim attach must not leave a durable Starting session"
+        );
+    }
+
+    #[test]
+    fn starting_session_and_claim_breadcrumb_commit_together() {
+        let db = db_with_outbox_rows(&[41]);
+        begin_claim(&db, 41, "p1", 7, ReviewKind::Review).expect("begin");
+        let info = starting_session("thread-atomic");
+
+        attach_started_session(&db, 41, &info).expect("atomic linkage");
+
+        assert_eq!(peek(&db, 41), Some(Some(info.thread_id.clone())));
+        assert_eq!(
+            super::super::history_store::get_session(&db, &info.thread_id)
+                .expect("read session")
+                .expect("session committed")
+                .status,
+            crate::review::session::SessionStatus::Starting
+        );
+    }
+
     /// F1 (AB#1204) claim-layer coverage of the BREADCRUMB-AT-THREAD-START forward placement. The
-    /// engine now calls `attach_thread` INSIDE `start` — right after `thread/start` yields a stable
-    /// thread id and the `Starting` session is persisted, but BEFORE `start_turn` runs the turn /
-    /// posts a `pm:` comment. So the durable claim already carries the thread BEFORE the turn could
-    /// have posted: a crash anywhere in the turn window then finds the breadcrumb on replay (rather
-    /// than NULL → "never started" → duplicate). The full async engine flow needs a live codex
+    /// engine now calls `attach_started_session` INSIDE `start` — right after `thread/start` yields
+    /// a stable thread id, but BEFORE registry promotion / `start_turn` lets the turn post a `pm:`
+    /// comment. So the durable claim already carries the thread BEFORE the turn could have posted:
+    /// a crash anywhere in the turn window then finds the breadcrumb on replay (rather than NULL →
+    /// "never started" → duplicate). The full async engine flow needs a live codex
     /// app-server / `claude` subprocess (not constructible in a unit test), so this pins the
-    /// claim-layer invariant the forward placement relies on: the SAME `attach_thread` the engine
-    /// now invokes pre-turn makes the breadcrumb visible to a subsequent `begin_claim` (the replay
-    /// path). Asserting the attach is visible before any "turn ran" step is the unit-testable core of
-    /// the window closure; the engine-level ordering (attach BEFORE `start_turn`/`set_running`) is
-    /// pinned by the placement + comments in `session.rs` / `engines/claude/engine.rs`.
+    /// claim-layer invariant the forward placement relies on: the breadcrumb is visible to a
+    /// subsequent `begin_claim` (the replay path) before any "turn ran" step. The engine-level
+    /// ordering is pinned by `commit_starting_session` owning persistence plus promotion.
     #[test]
     fn breadcrumb_attached_pre_turn_is_visible_to_replay() {
         let db = db_with_outbox_rows(&[31]);
-        // Engine `start` sequence on the outbox path: begin_claim (fresh → None) THEN attach_thread,
-        // both BEFORE the turn runs.
+        // Claim-layer equivalent of the engine sequence: begin_claim (fresh → None), then attach
+        // the stable thread before the turn runs.
         assert_eq!(
-            begin_claim(&db, 31, "p1", 7, "review").expect("begin"),
+            begin_claim(&db, 31, "p1", 7, ReviewKind::Review).expect("begin"),
             None,
             "fresh claim has no thread yet (engine is about to start the turn)"
         );
@@ -296,7 +376,7 @@ mod tests {
         // A crash-replay re-enters `begin_claim` for the SAME outbox row and now SEES the thread,
         // so the caller resolves the prior review instead of starting a duplicate.
         assert_eq!(
-            begin_claim(&db, 31, "p1", 7, "review").expect("re-begin"),
+            begin_claim(&db, 31, "p1", 7, ReviewKind::Review).expect("re-begin"),
             Some("thread-pre-turn".to_string()),
             "replay resolves the prior review via the pre-turn breadcrumb (no duplicate)"
         );
@@ -315,7 +395,7 @@ mod tests {
     fn dead_terminal_retains_claim_breadcrumb_for_manual_retry() {
         let db = db_with_outbox_rows(&[51]);
         // Review started: claim attached a thread (the engine's pre-turn breadcrumb, F1).
-        begin_claim(&db, 51, "p1", 7, "review").expect("begin");
+        begin_claim(&db, 51, "p1", 7, ReviewKind::Review).expect("begin");
         attach_thread(&db, 51, "thread-dead").expect("attach");
 
         // The row dead-letters. Per F2 the service does NOT release the claim on `Dead`, so it
@@ -330,7 +410,7 @@ mod tests {
         // `begin_claim` now returns the retained thread so the caller resolves-and-suppresses
         // instead of duplicating the review.
         assert_eq!(
-            begin_claim(&db, 51, "p1", 7, "review").expect("re-begin after manual retry"),
+            begin_claim(&db, 51, "p1", 7, ReviewKind::Review).expect("re-begin after manual retry"),
             Some("thread-dead".to_string()),
             "manual retry of a dead row resolves the prior review via the retained breadcrumb"
         );
@@ -346,7 +426,7 @@ mod tests {
     fn release_claim_cleans_up_null_thread_claim() {
         let db = db_with_outbox_rows(&[21]);
         // A Deduped path leaves the claim with thread_id NULL (no `attach_thread`).
-        begin_claim(&db, 21, "p1", 9, "review").expect("begin");
+        begin_claim(&db, 21, "p1", 9, ReviewKind::Review).expect("begin");
         assert_eq!(peek(&db, 21), Some(None), "Deduped claim has NULL thread");
 
         release_claim(&db, 21).expect("release");

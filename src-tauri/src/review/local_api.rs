@@ -1,13 +1,13 @@
-//! Local REST API trigger source (AB#1043): a `127.0.0.1`-only axum listener that lets a
-//! third party (curl / a CLI / a deeplink helper) trigger a PR review and poll for its
+//! Local REST API review-request source (AB#1043): an axum listener that lets a
+//! third party (curl / a CLI / a remote browser client) request a PR review and poll for its
 //! completion + comment URL. The first transport that can independently satisfy the whole
 //! need — HTTP's request/response is the only channel that cleanly hands back both
 //! "done" AND the comment link.
 //!
 //! **Separate from the webhook, never tunneled.** [`crate::pr::webhook`] binds `127.0.0.1`
 //! too, but it is reached from the public internet via a Cloudflare/custom tunnel. THIS
-//! listener is loopback-only and MUST never be exposed — it is the inbound trigger control
-//! plane, not a public push receiver. They share no port and no tunnel.
+//! local listener is loopback-only; a Remote Access entrypoint may mount this same typed router
+//! behind its own gate. It is the inbound review-request control plane, not a public push receiver.
 //!
 //! **Resident.** Unlike the user-toggled webhook, this listener is started once in
 //! `lib.rs` `setup()` and lives for the app's lifetime. The bound PORT is read once at
@@ -29,12 +29,11 @@
 //!     Azure path uses); an empty configured token fail-closes EVERY request to 401 (a blank
 //!     token is the "disabled" sentinel).
 //!
-//! The endpoints copy `gh`'s two-layer model (trigger-and-return + poll):
-//!  - `POST /reviews` `{projectId|repo, pr, kind}` → `202 {id, statusUrl}` (wraps the
-//!    [`crate::review::commands::trigger_review`] funnel — inheriting its kind validation,
-//!    id-or-repo project resolution, and dedup).
-//!  - `GET /reviews/{id}` → `200 {status, commentUrl?}` (the in-memory registry, falling
-//!    through to the durable by-id read for a finished / post-restart session).
+//! The endpoints copy `gh`'s two-layer model (submit-and-return + poll):
+//!  - `POST /reviews` `{projectId|repo, pr, kind, requestId}` →
+//!    `202 {receiptId, statusUrl}` (durably inserts one external review intent).
+//!  - `GET /reviews/{receiptId}` → the durable queue/session aggregate, including states before
+//!    a thread exists and after an app restart.
 
 use std::sync::Arc;
 
@@ -50,17 +49,23 @@ use serde::{Deserialize, Serialize};
 use tauri::Manager;
 use tokio_stream::wrappers::BroadcastStream;
 
+#[cfg(test)]
 use super::session::{SessionInfo, SessionStatus};
 use crate::config::service as config_service;
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, StreamEvent};
-use crate::model::SendNotificationRequest;
+use crate::model::{
+    ExternalRequestId, ExternalTriggerOrigin, ReviewKind, ReviewReceiptId, ReviewReceiptSnapshot,
+    ReviewReceiptStatus, SendNotificationRequest,
+};
 use crate::state::AppState;
 
-/// Trigger bodies are tiny (`{projectId, pr, kind}`). Cap what an unauthenticated POST can
+const RECEIPT_QUERY_FAILED_MESSAGE: &str = "查询 review receipt 失败";
+
+/// Review-request bodies are tiny (`{projectId, pr, kind, requestId}`). Cap what an unauthenticated POST can
 /// make us buffer before the auth check rejects it (the same body-cap defense the webhook
-/// receiver uses, with a smaller cap — a trigger body is far smaller than a webhook payload).
+/// receiver uses, with a smaller cap — this body is far smaller than a webhook payload).
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
 // ===========================================================================================
@@ -70,7 +75,7 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 // ===========================================================================================
 
 /// `POST /reviews` request body. Exactly one of `projectId` / `repo` identifies the project;
-/// both map to the trigger funnel's free-form `reference` (id-or-repo). Not
+/// both map to the request funnel's free-form `reference` (id-or-repo). Not
 /// `deny_unknown_fields`, so an extra key is ignored — but a snake_case `project_id` is NOT
 /// the camelCase `projectId` field, so it stays `None` (the wire-shape test locks this).
 // `pub(crate)` + both `Serialize` and `Deserialize` so the AB#1044 CLI client builds + SENDS the
@@ -78,40 +83,31 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 // drift; the round-trip goldens below lock both directions). `skip_serializing_if` on the
 // optional project refs keeps the client's outbound body to the one ref it set.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct TriggerRequest {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ReviewRequestBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) project_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) repo: Option<String>,
     pub(crate) pr: u64,
-    pub(crate) kind: String,
+    pub(crate) kind: ReviewKind,
+    pub(crate) request_id: ExternalRequestId,
 }
 
-/// `POST /reviews` success body → `202`. `statusUrl` is the absolute loopback URL the caller
-/// polls (`gh run watch` analogue).
+/// `POST /reviews` success body → `202`. `statusUrl` is absolute loopback for a local client and
+/// relative to the mounted LocalApi base path for a remote browser client.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct TriggerResponse {
-    pub(crate) id: String,
+pub(crate) struct ReviewReceiptAccepted {
+    pub(crate) receipt_id: ReviewReceiptId,
     pub(crate) status_url: String,
 }
 
-/// `GET /reviews/{id}` success body → `200`. `status` is the session state machine value
-/// (camelCase `starting`/`running`/`interrupting`/`done`/`failed`); `commentUrl` is the
-/// resolved pr-review comment link, present only at a `completed` terminal (omitted otherwise,
-/// matching `SessionInfo`'s `skip_serializing_if`). A poller waits for `status == "done"` with
-/// a non-empty `commentUrl`.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct StatusResponse {
-    pub(crate) status: SessionStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) comment_url: Option<String>,
-}
+/// Shared durable receipt snapshot used by HTTP and the CLI client.
+pub(crate) type StatusResponse = ReviewReceiptSnapshot;
 
 /// Uniform error envelope `{message}` (the same shape `AppError` serializes to, so the wire is
-/// consistent whether the message came from a gate or from the trigger funnel).
+/// consistent whether the message came from a gate or from the request funnel).
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ErrorBody {
     pub(crate) message: String,
@@ -187,11 +183,10 @@ mod security {
     }
 }
 
-/// Resolve the trigger funnel's free-form `reference` from the request: exactly one of
+/// Resolve the request funnel's free-form `reference` from the request: exactly one of
 /// `projectId` / `repo` must be present and non-blank. Pure (unit-tested). Both / neither is a
-/// client error (`400`); the resolved string flows into [`config_service`]'s id-or-repo lookup
-/// (via `trigger_review`), which rejects an unknown / ambiguous reference itself.
-fn resolve_reference(req: &TriggerRequest) -> AppResult<String> {
+/// client error (`400`); the resolved string flows into the external ingress's id-or-repo lookup.
+fn resolve_reference(req: &ReviewRequestBody) -> AppResult<String> {
     let project_id = req
         .project_id
         .as_deref()
@@ -260,7 +255,7 @@ fn check_request<R: tauri::Runtime>(ctx: &Ctx<R>, headers: &HeaderMap) -> Option
     }
     // 3. Bearer token, read LIVE from config (rotate without restart). A blank token disables
     //    the endpoint (verify_bearer fail-closes); a config load error also fail-closes to 401 —
-    //    a broken config must never silently open the trigger endpoint.
+    //    a broken config must never silently open the review-request endpoint.
     let token = match config_service::load(&ctx.app) {
         Ok(cfg) => cfg.local_api_token,
         Err(_) => {
@@ -288,7 +283,7 @@ async fn handle_create<R: tauri::Runtime>(
     if let Some(resp) = check_request(&ctx, &headers) {
         return resp;
     }
-    let req: TriggerRequest = match serde_json::from_slice(body.as_ref()) {
+    let req: ReviewRequestBody = match serde_json::from_slice(body.as_ref()) {
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, format!("请求体解析失败: {e}")),
     };
@@ -296,21 +291,48 @@ async fn handle_create<R: tauri::Runtime>(
         Ok(r) => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, e.message),
     };
-    // Reuse the transport-agnostic funnel directly (it is `pub` + generic over the runtime).
-    // `State` is obtained from the owned app handle and lives across the await (same lifetime
-    // shape `trigger_review` itself uses). A `Deduped` / bad-kind / unknown-project surfaces as
-    // an `Err` → 400, per the work item.
+    let origin = if ctx.remote_entrypoint_id.is_some() {
+        ExternalTriggerOrigin::RemoteWeb
+    } else if header_str(&headers, "x-prmonitor-client") == Some("cli") {
+        ExternalTriggerOrigin::Cli
+    } else {
+        ExternalTriggerOrigin::Http
+    };
     let state = ctx.app.state::<AppState>();
-    match super::commands::trigger_review(ctx.app.clone(), state, reference, req.pr, req.kind).await
+    match state
+        .external_review
+        .submit(reference, req.pr, req.kind, req.request_id, origin, false)
     {
-        Ok(id) => {
-            let status_url = format!(
-                "http://127.0.0.1:{}{}/reviews/{}",
-                ctx.port, ctx.base_path, id
+        Ok(receipt_id) => {
+            let status_url = receipt_status_url(
+                ctx.port,
+                &ctx.base_path,
+                ctx.remote_entrypoint_id.is_some(),
+                receipt_id,
             );
-            json_response(StatusCode::ACCEPTED, &TriggerResponse { id, status_url })
+            json_response(
+                StatusCode::ACCEPTED,
+                &ReviewReceiptAccepted {
+                    receipt_id,
+                    status_url,
+                },
+            )
         }
         Err(e) => error_response(StatusCode::BAD_REQUEST, e.message),
+    }
+}
+
+fn receipt_status_url(
+    port: u16,
+    base_path: &str,
+    remote: bool,
+    receipt_id: ReviewReceiptId,
+) -> String {
+    let path = format!("{base_path}/reviews/{}", receipt_id.get());
+    if remote {
+        path
+    } else {
+        format!("http://127.0.0.1:{port}{path}")
     }
 }
 
@@ -338,6 +360,7 @@ async fn handle_notify<R: tauri::Runtime>(
 /// persistence `Err` (DB locked / IO / schema) must reach the caller as a `500`, NEVER be
 /// folded into a not-found `404` — a poller must not read "status service unavailable" as
 /// "this id does not exist". Pure; unit-tested (the prior `.ok().flatten()` swallowed the Err).
+#[cfg(test)]
 fn resolve_session(
     in_memory: Option<SessionInfo>,
     durable: impl FnOnce() -> AppResult<Option<SessionInfo>>,
@@ -351,31 +374,28 @@ fn resolve_session(
 async fn handle_status<R: tauri::Runtime>(
     State(ctx): State<Arc<Ctx<R>>>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    Path(id): Path<i64>,
 ) -> Response {
     if let Some(resp) = check_request(&ctx, &headers) {
         return resp;
     }
-    // In-memory first (live / just-finished), then the durable by-id read (finished long ago /
-    // after a restart). The POST's `id` is the codex thread id, so this key matches exactly.
-    let lookup = resolve_session(ctx.app.state::<AppState>().sessions.get(&id), || {
-        super::history_store::get_session(ctx.app.state::<Database>().inner(), &id)
-    });
-    match lookup {
-        Ok(Some(info)) => json_response(
-            StatusCode::OK,
-            &StatusResponse {
-                status: info.status,
-                comment_url: info.comment_url,
-            },
+    let receipt_id = match ReviewReceiptId::new(id) {
+        Ok(id) => id,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "receiptId 必须为正整数"),
+    };
+    let state = ctx.app.state::<AppState>();
+    match state
+        .external_review
+        .get(ctx.app.state::<Database>().inner(), receipt_id)
+    {
+        Ok(snapshot) => json_response(StatusCode::OK, &snapshot),
+        Err(e) if e.message.contains("不存在") || e.message.contains("not found") => {
+            error_response(StatusCode::NOT_FOUND, "未找到指定的 review receipt")
+        }
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            RECEIPT_QUERY_FAILED_MESSAGE,
         ),
-        // Do not echo the caller-supplied `id` back into the message (avoid reflecting
-        // untrusted path input into a body a downstream tool might log/render); the caller
-        // already knows which id it polled from the request line.
-        Ok(None) => error_response(StatusCode::NOT_FOUND, "未找到指定的 review 会话"),
-        // A durable-lookup failure is "service unavailable", not "id absent" — surface 500
-        // (without echoing the internal error detail) so the poller doesn't misread it as 404.
-        Err(_) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "查询 review 会话失败"),
     }
 }
 
@@ -401,6 +421,7 @@ fn review_thread_id(event: &ReviewEvent) -> Option<&str> {
 
 /// Whether `event` is THIS id's terminal `turnCompleted` — the cue to close the SSE stream after
 /// yielding it.
+#[cfg(test)]
 fn is_terminal_review(event: &ReviewEvent, id: &str) -> bool {
     matches!(event, ReviewEvent::TurnCompleted { thread_id, .. } if thread_id == id)
 }
@@ -412,6 +433,7 @@ fn is_terminal_review(event: &ReviewEvent, id: &str) -> bool {
 /// `interrupted` wire string (only the live `CompletionOutcome` does), so `Done` maps to
 /// `completed`; the precise wire status is a live-stream detail while the `commentUrl` is the
 /// payload that matters on reconnect.
+#[cfg(test)]
 fn terminal_stream_event(info: &SessionInfo) -> StreamEvent {
     let status = match info.status {
         SessionStatus::Done => "completed",
@@ -432,7 +454,7 @@ fn terminal_stream_event(info: &SessionInfo) -> StreamEvent {
 /// a dep) and set the `data:` field directly: compact JSON is single-line, valid for an SSE frame.
 /// Serialization never fails for `StreamEvent`, but degrade to a tiny error frame rather than panic
 /// the stream task — the `Infallible` item error keeps the axum `Sse` response from short-circuiting.
-fn sse_data(event: &StreamEvent) -> Result<SseEvent, std::convert::Infallible> {
+fn sse_data<T: Serialize>(event: &T) -> Result<SseEvent, std::convert::Infallible> {
     let payload = serde_json::to_string(event).unwrap_or_else(|_| {
         r#"{"domain":"review","kind":"dispatchError","projectId":"","message":"stream serialize error"}"#
             .to_string()
@@ -453,6 +475,7 @@ fn sse_data(event: &StreamEvent) -> Result<SseEvent, std::convert::Infallible> {
 /// durable status: a terminal session yields ONE synthetic terminal event and the stream closes; a
 /// still-running one returns `None` and streaming continues (best-effort — the next live terminal
 /// still closes it). The lag is also logged (parity with the session pump's lag breadcrumb).
+#[cfg(test)]
 fn review_event_stream<F>(
     rx: tokio::sync::broadcast::Receiver<StreamEvent>,
     id: String,
@@ -492,62 +515,130 @@ where
     )
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum ReceiptStreamEvent {
+    Receipt {
+        receipt: ReviewReceiptSnapshot,
+    },
+    Review {
+        #[serde(rename = "receiptId")]
+        receipt_id: ReviewReceiptId,
+        event: ReviewEvent,
+    },
+    Error {
+        #[serde(rename = "receiptId")]
+        receipt_id: ReviewReceiptId,
+        message: String,
+    },
+}
+
+fn receipt_event_stream<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    rx: tokio::sync::broadcast::Receiver<StreamEvent>,
+    receipt_id: ReviewReceiptId,
+) -> impl futures::Stream<Item = ReceiptStreamEvent> {
+    stream::unfold(
+        (
+            app,
+            BroadcastStream::new(rx),
+            receipt_id,
+            None::<ReviewReceiptSnapshot>,
+            false,
+        ),
+        |(app, mut rx, receipt_id, last, done)| async move {
+            if done {
+                return None;
+            }
+            loop {
+                let state = app.state::<AppState>();
+                let current = match state
+                    .external_review
+                    .get(app.state::<Database>().inner(), receipt_id)
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(_) => {
+                        return Some((
+                            ReceiptStreamEvent::Error {
+                                receipt_id,
+                                message: RECEIPT_QUERY_FAILED_MESSAGE.to_string(),
+                            },
+                            (app, rx, receipt_id, last, true),
+                        ))
+                    }
+                };
+                if last.as_ref() != Some(&current) {
+                    let terminal = matches!(
+                        current.status,
+                        ReviewReceiptStatus::Done | ReviewReceiptStatus::Failed
+                    );
+                    return Some((
+                        ReceiptStreamEvent::Receipt {
+                            receipt: current.clone(),
+                        },
+                        (app, rx, receipt_id, Some(current), terminal),
+                    ));
+                }
+
+                let Some(thread_id) = current.thread_id.as_deref() else {
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    continue;
+                };
+                match tokio::time::timeout(std::time::Duration::from_millis(500), rx.next()).await {
+                    Ok(Some(Ok(StreamEvent::Review(event))))
+                        if review_thread_id(&event) == Some(thread_id) =>
+                    {
+                        return Some((
+                            ReceiptStreamEvent::Review { receipt_id, event },
+                            (app, rx, receipt_id, last, false),
+                        ));
+                    }
+                    Ok(Some(_)) | Err(_) => continue,
+                    Ok(None) => {
+                        return Some((
+                            ReceiptStreamEvent::Error {
+                                receipt_id,
+                                message: "review event stream 已关闭".to_string(),
+                            },
+                            (app, rx, receipt_id, last, true),
+                        ));
+                    }
+                }
+            }
+        },
+    )
+}
+
 async fn handle_stream<R: tauri::Runtime>(
     State(ctx): State<Arc<Ctx<R>>>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    Path(id): Path<i64>,
 ) -> Response {
     if let Some(resp) = check_request(&ctx, &headers) {
         return resp;
     }
+    let receipt_id = match ReviewReceiptId::new(id) {
+        Ok(id) => id,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "receiptId 必须为正整数"),
+    };
     let state = ctx.app.state::<AppState>();
-    // Subscribe BEFORE the existence check so no event for `id` slips between the status read and
-    // the subscription (race-free, mirroring `SessionRegistry::subscribe_completion`'s ordering).
     let rx = state.stream.subscribe();
-    let lookup = resolve_session(state.sessions.get(&id), || {
-        super::history_store::get_session(ctx.app.state::<Database>().inner(), &id)
-    });
-    let info = match lookup {
-        Ok(Some(info)) => info,
-        Ok(None) => return error_response(StatusCode::NOT_FOUND, "未找到指定的 review 会话"),
-        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "查询 review 会话失败"),
-    };
-
-    // Already finished before connect: the bus won't replay, so emit ONE synthetic terminal event
-    // from the durable status and close. The `once` stream exhausts after that single frame, so
-    // axum closes the connection immediately — `KeepAlive` never fires (there is no idle gap), so
-    // the client is not left hanging on a finished review.
-    if matches!(info.status, SessionStatus::Done | SessionStatus::Failed) {
-        let ev = terminal_stream_event(&info);
-        let once = stream::once(async move { sse_data(&ev) });
-        return Sse::new(once)
-            .keep_alive(KeepAlive::default())
-            .into_response();
-    }
-
-    // Live: stream this id's review events until its terminal `turnCompleted` closes it. The
-    // `on_lag` fail-safe re-reads the durable status if the bus ring overflows (the dropped batch
-    // may have held the terminal), so a slow client still gets a close instead of hanging.
-    let app_for_lag = ctx.app.clone();
-    let id_for_lag = id.clone();
-    let on_lag = move || -> Option<StreamEvent> {
-        let st = app_for_lag.state::<AppState>();
-        let lookup = resolve_session(st.sessions.get(&id_for_lag), || {
-            super::history_store::get_session(app_for_lag.state::<Database>().inner(), &id_for_lag)
-        });
-        match lookup {
-            // Terminal now → synthesize the close event. Still running / gone / lookup error →
-            // `None` (keep streaming; the next live terminal still closes the stream).
-            Ok(Some(info))
-                if matches!(info.status, SessionStatus::Done | SessionStatus::Failed) =>
-            {
-                Some(terminal_stream_event(&info))
-            }
-            _ => None,
+    match state
+        .external_review
+        .get(ctx.app.state::<Database>().inner(), receipt_id)
+    {
+        Ok(_) => {}
+        Err(e) if e.message.contains("不存在") || e.message.contains("not found") => {
+            return error_response(StatusCode::NOT_FOUND, "未找到指定的 review receipt")
         }
-    };
-    let live = review_event_stream(rx, id, on_lag).map(|ev| sse_data(&ev));
-
+        Err(_) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                RECEIPT_QUERY_FAILED_MESSAGE,
+            )
+        }
+    }
+    let live = receipt_event_stream(ctx.app.clone(), rx, receipt_id).map(|ev| sse_data(&ev));
     Sse::new(live)
         .keep_alive(KeepAlive::default())
         .into_response()
@@ -557,8 +648,8 @@ async fn handle_stream<R: tauri::Runtime>(
 // Router builder — the local-api router, mounted by the listener supervisor (AB#1225).
 // ===========================================================================================
 
-/// Shared handler state. Holds the app handle (to reach `trigger_review` / the registry / the
-/// live config) + the bound port (for `statusUrl`). It does NOT snapshot the token — that is
+/// Shared handler state. Holds the app handle (to reach external ingress / live config) + the
+/// bound port (for `statusUrl`). It does NOT snapshot the token — that is
 /// read live per request. `pub(crate)` so [`crate::remote::supervisor`] constructs it when it
 /// binds the local-api port from a `config.listeners[]` entry.
 pub(crate) struct Ctx<R: tauri::Runtime> {
@@ -680,12 +771,14 @@ mod tests {
 
     // --- resolve_reference ------------------------------------------------------------------
 
-    fn req(project_id: Option<&str>, repo: Option<&str>) -> TriggerRequest {
-        TriggerRequest {
+    fn req(project_id: Option<&str>, repo: Option<&str>) -> ReviewRequestBody {
+        ReviewRequestBody {
             project_id: project_id.map(str::to_string),
             repo: repo.map(str::to_string),
             pr: 7,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
+            request_id: ExternalRequestId::parse("0123456789abcdef0123456789abcdef")
+                .expect("request id"),
         }
     }
 
@@ -711,56 +804,105 @@ mod tests {
     // --- wire-shape goldens (serde camelCase contract; Medium) ------------------------------
 
     #[test]
-    fn trigger_request_deserializes_camel_case_only() {
-        let req: TriggerRequest = serde_json::from_value(
-            serde_json::json!({"projectId": "p1", "pr": 9, "kind": "check"}),
-        )
+    fn review_request_body_deserializes_camel_case_only() {
+        let req: ReviewRequestBody = serde_json::from_value(serde_json::json!({
+            "projectId": "p1",
+            "pr": 9,
+            "kind": "check",
+            "requestId": "0123456789abcdef0123456789abcdef"
+        }))
         .expect("camelCase body deserializes");
         assert_eq!(req.project_id.as_deref(), Some("p1"));
         assert_eq!(req.pr, 9);
-        assert_eq!(req.kind, "check");
+        assert_eq!(req.kind, ReviewKind::Check);
+        assert_eq!(req.request_id.as_str(), "0123456789abcdef0123456789abcdef");
 
-        // A snake_case `project_id` is NOT the camelCase field — it is ignored, leaving None.
-        // This locks the wire contract (a rename to snake_case would surface here).
-        let snake: TriggerRequest = serde_json::from_value(
-            serde_json::json!({"project_id": "p1", "pr": 9, "kind": "check"}),
+        let missing = serde_json::from_value::<ReviewRequestBody>(
+            serde_json::json!({"projectId": "p1", "pr": 9, "kind": "check"}),
         )
-        .expect("unknown key ignored");
-        assert_eq!(snake.project_id, None);
+        .expect_err("requestId is mandatory");
+        assert!(missing.to_string().contains("requestId"));
+
+        let legacy = serde_json::from_value::<ReviewRequestBody>(serde_json::json!({
+            "projectId": "p1",
+            "pr": 9,
+            "kind": "check",
+            "requestId": "0123456789abcdef0123456789abcdef",
+            "id": "legacy-thread"
+        }))
+        .expect_err("legacy fields fail closed");
+        assert!(legacy.to_string().contains("unknown field"));
+
+        for invalid in [
+            "0123456789abcdef0123456789abcde",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcdeg",
+        ] {
+            let error = serde_json::from_value::<ReviewRequestBody>(serde_json::json!({
+                "repo": "owner/name", "pr": 9, "kind": "review", "requestId": invalid
+            }))
+            .expect_err("invalid requestId must fail closed");
+            assert!(error.to_string().contains("requestId"), "{error}");
+        }
     }
 
     #[test]
-    fn trigger_response_wire_shape_is_camel_case() {
-        let v = serde_json::to_value(&TriggerResponse {
-            id: "th-1".to_string(),
-            status_url: "http://127.0.0.1:8788/reviews/th-1".to_string(),
+    fn review_receipt_accepted_wire_shape_is_camel_case() {
+        let v = serde_json::to_value(&ReviewReceiptAccepted {
+            receipt_id: ReviewReceiptId::new(42).expect("receipt"),
+            status_url: "http://127.0.0.1:8788/reviews/42".to_string(),
         })
         .expect("serializes");
-        assert!(v.get("id").is_some());
+        assert_eq!(v["receiptId"], 42);
         assert!(v.get("statusUrl").is_some());
+        assert!(v.get("id").is_none());
         assert!(v.get("status_url").is_none());
+    }
+
+    #[test]
+    fn receipt_status_url_is_loopback_for_cli_and_relative_for_remote() {
+        let receipt = ReviewReceiptId::new(42).expect("receipt");
+        assert_eq!(
+            receipt_status_url(8788, "/api", false, receipt),
+            "http://127.0.0.1:8788/api/reviews/42"
+        );
+        assert_eq!(
+            receipt_status_url(8788, "/api", true, receipt),
+            "/api/reviews/42"
+        );
     }
 
     #[test]
     fn status_response_wire_shape_and_optional_comment_url() {
         // Terminal with a URL: camelCase `commentUrl` present, `status` is the camelCase enum.
         let done = serde_json::to_value(&StatusResponse {
-            status: SessionStatus::Done,
+            receipt_id: ReviewReceiptId::new(42).expect("receipt"),
+            status: ReviewReceiptStatus::Done,
+            thread_id: Some("th-1".to_string()),
             comment_url: Some("https://x/c".to_string()),
+            outcome: Some("completed".to_string()),
+            error: None,
         })
         .expect("serializes");
+        assert_eq!(done["receiptId"], 42);
         assert_eq!(done["status"], "done");
+        assert_eq!(done["threadId"], "th-1");
         assert_eq!(done["commentUrl"], "https://x/c");
         assert!(done.get("comment_url").is_none());
 
         // Non-terminal with no URL: `commentUrl` is OMITTED (skip_serializing_if), not null.
         let running = serde_json::to_value(&StatusResponse {
-            status: SessionStatus::Running,
+            receipt_id: ReviewReceiptId::new(42).expect("receipt"),
+            status: ReviewReceiptStatus::Received,
+            thread_id: None,
             comment_url: None,
+            outcome: None,
+            error: None,
         })
         .expect("serializes");
-        assert_eq!(running["status"], "running");
-        assert!(running.get("commentUrl").is_none());
+        assert_eq!(running["status"], "received");
+        assert!(running["threadId"].is_null());
+        assert!(running["commentUrl"].is_null());
     }
 
     #[test]
@@ -806,50 +948,87 @@ mod tests {
     //     in the OPPOSITE direction; lock both sides so the one definition cannot drift) -------
 
     #[test]
-    fn trigger_request_serializes_camel_case_and_omits_none() {
+    fn review_request_body_serializes_camel_case_and_omits_none() {
         // The CLI client BUILDS + serializes this struct as the POST body. Lock its outbound
         // shape: camelCase keys, the unset project ref omitted (not sent as `null`).
-        let v = serde_json::to_value(&TriggerRequest {
+        let v = serde_json::to_value(&ReviewRequestBody {
             project_id: Some("p1".to_string()),
             repo: None,
             pr: 9,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
+            request_id: ExternalRequestId::parse("0123456789abcdef0123456789abcdef")
+                .expect("request id"),
         })
         .expect("serializes");
         assert_eq!(v["projectId"], "p1");
         assert_eq!(v["pr"], 9);
         assert_eq!(v["kind"], "review");
+        assert_eq!(v["requestId"], "0123456789abcdef0123456789abcdef");
         assert!(v.get("repo").is_none(), "unset repo is omitted");
         assert!(v.get("project_id").is_none(), "snake_case absent");
     }
 
     #[test]
-    fn trigger_response_round_trips_from_camel_case() {
+    fn review_receipt_accepted_round_trips_from_camel_case() {
         // The CLI client DESERIALIZES the 202 body. Lock its inbound parse.
-        let r: TriggerResponse = serde_json::from_value(
-            serde_json::json!({"id": "th-1", "statusUrl": "http://127.0.0.1:8788/reviews/th-1"}),
+        let r: ReviewReceiptAccepted = serde_json::from_value(
+            serde_json::json!({"receiptId": 42, "statusUrl": "http://127.0.0.1:8788/reviews/42"}),
         )
         .expect("deserializes camelCase");
-        assert_eq!(r.id, "th-1");
-        assert_eq!(r.status_url, "http://127.0.0.1:8788/reviews/th-1");
+        assert_eq!(r.receipt_id.get(), 42);
+        assert_eq!(r.status_url, "http://127.0.0.1:8788/reviews/42");
     }
 
     #[test]
     fn status_response_round_trips_from_camel_case() {
         // Terminal-with-URL: the CLI client reads `commentUrl` (the `gh run watch` analogue).
         let done: StatusResponse = serde_json::from_value(
-            serde_json::json!({"status": "done", "commentUrl": "https://x/c"}),
+            serde_json::json!({"receiptId": 42, "status": "done", "threadId": "th-1", "commentUrl": "https://x/c"}),
         )
         .expect("deserializes done+url");
-        assert_eq!(done.status, SessionStatus::Done);
+        assert_eq!(done.status, ReviewReceiptStatus::Done);
+        assert_eq!(done.thread_id.as_deref(), Some("th-1"));
         assert_eq!(done.comment_url.as_deref(), Some("https://x/c"));
 
         // `commentUrl` absent (the omitted-on-non-completed wire) → None via `serde(default)`.
         let running: StatusResponse =
-            serde_json::from_value(serde_json::json!({"status": "running"}))
+            serde_json::from_value(serde_json::json!({"receiptId": 42, "status": "queued"}))
                 .expect("deserializes without commentUrl");
-        assert_eq!(running.status, SessionStatus::Running);
+        assert_eq!(running.status, ReviewReceiptStatus::Queued);
         assert!(running.comment_url.is_none());
+    }
+
+    #[test]
+    fn receipt_stream_frames_are_tagged_and_keep_receipt_identity() {
+        let receipt_id = ReviewReceiptId::new(42).expect("receipt");
+        let queued = ReceiptStreamEvent::Receipt {
+            receipt: ReviewReceiptSnapshot {
+                receipt_id,
+                status: ReviewReceiptStatus::Queued,
+                thread_id: None,
+                comment_url: None,
+                outcome: None,
+                error: None,
+            },
+        };
+        let queued = serde_json::to_value(queued).expect("serialize queued receipt");
+        assert_eq!(queued["type"], "receipt");
+        assert_eq!(queued["receipt"]["receiptId"], 42);
+        assert_eq!(queued["receipt"]["status"], "queued");
+
+        let review = ReceiptStreamEvent::Review {
+            receipt_id,
+            event: ReviewEvent::MessageDelta {
+                project_id: "p1".to_string(),
+                thread_id: "th-1".to_string(),
+                item_id: "i1".to_string(),
+                text: "delta".to_string(),
+            },
+        };
+        let review = serde_json::to_value(review).expect("serialize linked review event");
+        assert_eq!(review["type"], "review");
+        assert_eq!(review["receiptId"], 42);
+        assert_eq!(review["event"]["threadId"], "th-1");
     }
 
     // --- resolve_session (codex F1: durable Err must not fold into 404) ----------------------
@@ -860,7 +1039,7 @@ mod tests {
             thread_id: thread.to_string(),
             turn_id: String::new(),
             pr_number: 7,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
             engine_kind: crate::model::EngineKind::Codex,
             status: SessionStatus::Done,
             created_at_epoch: 0,
@@ -1095,7 +1274,7 @@ mod tests {
                 let _ = axum::serve(listener, build_router(ctx).into_make_service()).await;
             });
 
-            let url = format!("http://127.0.0.1:{port}/reviews/abc/stream");
+            let url = format!("http://127.0.0.1:{port}/reviews/42/stream");
             let notify_url = format!("http://127.0.0.1:{port}/notifications");
             let client = reqwest::Client::new();
 
@@ -1137,5 +1316,57 @@ mod tests {
 
             server.abort();
         });
+    }
+
+    #[test]
+    fn remote_review_route_is_reachable_at_its_mounted_base_path() {
+        let app = tauri::test::mock_app();
+        let db = crate::db::Database::open_in_memory().expect("open db");
+        app.handle().manage(db);
+        let mut config = crate::config::service::load(app.handle()).expect("load default config");
+        config.local_api_token = "remote-review-token-0123456789".to_string();
+        crate::config::service::save(app.handle(), config).expect("persist token through service");
+
+        tauri::async_runtime::block_on(async move {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .expect("bind loopback");
+            let port = listener.local_addr().expect("addr").port();
+            let ctx = Arc::new(Ctx {
+                app: app.handle().clone(),
+                port,
+                base_path: "/api".to_string(),
+                remote_entrypoint_id: Some("remote-web".to_string()),
+            });
+            // Match the real Remote Access composition: LocalApi is nested at its configured
+            // route, independent from the Terminal/UI route that serves the browser shell.
+            let router = Router::new().nest("/api", build_router(ctx));
+            let server = tauri::async_runtime::spawn(async move {
+                let _ = axum::serve(listener, router.into_make_service()).await;
+            });
+
+            let response = reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/api/reviews"))
+                .bearer_auth("remote-review-token-0123456789")
+                .header(header::CONTENT_TYPE.as_str(), "application/json")
+                // Authenticated + reachable, then deliberately fail at the typed body boundary.
+                .body(r#"{"projectId":"p1"}"#)
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            let body = response.text().await.expect("body");
+            assert!(body.contains("请求体解析失败"), "{body}");
+
+            server.abort();
+        });
+    }
+
+    #[test]
+    fn receipt_query_failure_diagnostic_has_one_source() {
+        let source = include_str!("local_api.rs");
+        let diagnostic = ["查询 review receipt", " 失败"].concat();
+        assert!(source.contains("const RECEIPT_QUERY_FAILED_MESSAGE"));
+        assert_eq!(source.matches(&diagnostic).count(), 1);
     }
 }

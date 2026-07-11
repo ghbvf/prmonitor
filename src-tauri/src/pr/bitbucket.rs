@@ -16,7 +16,10 @@
 use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
-use crate::model::{Candidate, Event, EventType, LabelSource, SourceKind};
+use crate::model::{
+    Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, LabelSource, ReviewKind,
+    SourceKind,
+};
 
 use super::labels;
 use super::source::{pr_dedupe_key, DiscoveredEvent, EventSourceProvider};
@@ -105,6 +108,8 @@ struct BbPr {
     id: u64,
     #[serde(default)]
     title: String,
+    #[serde(default)]
+    description: String,
     /// Draft flag (Bitbucket DC ≥ 8.x). Absent / older versions → false.
     #[serde(default)]
     draft: bool,
@@ -139,6 +144,7 @@ struct BbPage {
 struct BbRow {
     candidate: Candidate,
     title: String,
+    body: String,
     labels: Vec<String>,
     url: String,
     conflict: bool,
@@ -269,9 +275,10 @@ fn map_rows(
                 author,
                 is_cross_repository,
                 is_draft: pr.draft,
-                kind: "review".to_string(),
+                kind: ReviewKind::Review,
             },
             title: pr.title,
+            body: pr.description,
             labels,
             url,
             conflict: false,
@@ -475,26 +482,29 @@ impl BitbucketServer {
 /// context (it can't be known here). Always a `PullRequest` event (the only class a PR source
 /// emits).
 fn row_into_event(row: BbRow, repo: &str) -> DiscoveredEvent {
-    let event = Event {
+    let event = EventEnvelope::observation(
         // Wire literal "bitbucket" matches `SourceKind::Bitbucket`'s serde string (format single-sourced).
-        dedupe_key: pr_dedupe_key(
+        InboxDedupeKey::new(pr_dedupe_key(
             "bitbucket",
             repo,
             row.candidate.number,
             &row.candidate.head_sha,
-        ),
-        source: SourceKind::Bitbucket,
-        event_type: EventType::PullRequest,
-        project_id: String::new(),
-        repo: repo.to_string(),
-        number: Some(row.candidate.number),
-        title: row.title.clone(),
-        // body 抓取留待 AB#1068（rule engine）
-        body: String::new(),
-        labels: row.labels.clone(),
-        url: row.url.clone(),
-        received_at_epoch: 0,
-    };
+        ))
+        .expect("discovery dedupe key is non-empty"),
+        SourceKind::Bitbucket,
+        "discovery",
+        repo,
+        EventType::PullRequest,
+        EventSubject {
+            number: Some(row.candidate.number),
+            title: row.title.clone(),
+            body: row.body.clone(),
+            labels: row.labels.clone(),
+            url: row.url.clone(),
+        },
+        0,
+    )
+    .expect("discovery event is valid");
     DiscoveredEvent {
         event,
         candidate: row.candidate,
@@ -555,6 +565,7 @@ mod tests {
                     {{
                         "id": 12,
                         "title": "Add widget [{REVIEW}]",
+                        "description": "Widget details",
                         "draft": false,
                         "fromRef": {{
                             "displayId": "feature/widget",
@@ -577,7 +588,8 @@ mod tests {
         assert_eq!(row.candidate.head_sha, "abc123");
         assert_eq!(row.candidate.head_ref, "feature/widget"); // no refs/heads/ on Bitbucket
         assert_eq!(row.candidate.author, "tom"); // name preferred over displayName
-        assert_eq!(row.candidate.kind, "review");
+        assert_eq!(row.candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(row.body, "Widget details");
         assert!(!row.candidate.is_cross_repository);
         assert!(!row.candidate.is_draft);
         // Effective labels come from the title.
@@ -593,16 +605,17 @@ mod tests {
         // `DiscoveredEvent`, built from the SAME parsed locals, while the gating
         // `Candidate` rides along unchanged.
         let de = row_into_event(r[0].clone(), REPO);
-        assert_eq!(de.event.source, SourceKind::Bitbucket);
-        assert_eq!(de.event.event_type, EventType::PullRequest);
-        assert_eq!(de.event.number, Some(de.candidate.number));
-        assert_eq!(de.event.title, row.title);
-        assert_eq!(de.event.url, row.url);
-        assert_eq!(de.event.labels, row.labels);
-        assert_eq!(de.event.body, "");
+        let observation = de.event.as_observation().unwrap();
+        assert_eq!(de.event.source(), SourceKind::Bitbucket);
+        assert_eq!(observation.event_type, EventType::PullRequest);
+        assert_eq!(observation.subject.number, Some(de.candidate.number));
+        assert_eq!(observation.subject.title, row.title);
+        assert_eq!(observation.subject.url, row.url);
+        assert_eq!(observation.subject.labels, row.labels);
+        assert_eq!(observation.subject.body, "Widget details");
         // dedupe_key is the exact inbox idempotency-key seed (format single-sourced).
         assert_eq!(
-            de.event.dedupe_key,
+            de.event.dedupe_key().as_str(),
             "bitbucket:pullRequest:myrepo#12@abc123"
         );
         assert!(!de.conflict);
@@ -617,7 +630,7 @@ mod tests {
         );
         let r = rows(&json).expect("parses");
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].candidate.kind, "review");
+        assert_eq!(r[0].candidate.kind, crate::model::ReviewKind::Review);
         assert_eq!(
             r[0].url,
             "https://bitbucket.example.com/projects/GOCELL/repos/myrepo/pull-requests/7"
@@ -655,7 +668,7 @@ mod tests {
         let r = rows(&json).expect("parses");
         assert_eq!(r.len(), 1);
         assert!(!r[0].conflict);
-        assert_eq!(r[0].candidate.kind, "review");
+        assert_eq!(r[0].candidate.kind, crate::model::ReviewKind::Review);
         assert_eq!(r[0].labels, vec![REVIEW.to_string(), CHECK.to_string()]);
         assert_eq!(candidates(&json).expect("parses").len(), 1);
     }

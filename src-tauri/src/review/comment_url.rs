@@ -3,8 +3,8 @@
 //! The trigger funnel ([`super::session::finalize_turn`]) needs the URL of the pr-review
 //! comment the review subprocess posted, to hand back to a third-party trigger
 //! (CLI/deeplink, future). The app itself NEVER writes comments — the governance backstop
-//! (`crate::dispatch`'s `app_code_uses_no_gh_write_subcommands`) scans all of `src` for
-//! gh write subcommands. Reading is allowed, so this resolves the URL source-kind-aware:
+//! (`slice_boundary_test::app_code_uses_no_gh_write_subcommands`) scans all of `src` for gh write
+//! subcommands. Reading is allowed, so this resolves the URL source-kind-aware:
 //!
 //! - [`SourceKind::Github`]: shell out to read-only `gh pr view <pr> --repo <repo> --json
 //!   comments` (mirroring `pr::gh`'s subprocess discipline — `Command::new` + a wall-clock

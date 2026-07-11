@@ -3,13 +3,18 @@
 //! Slices attach their long-lived handles here as they are implemented
 //! (e.g. the scheduler handle in PR4, the review session manager in PR6).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use crate::config::model::AppConfig;
 use crate::config::service::CliResolver;
+use crate::db::Database;
 use crate::error::{AppError, AppResult};
-use crate::model::{ReviewLifecycleDispatch, SendNotificationRequest, SendNotificationResponse};
+use crate::model::{
+    ExternalRequestId, ExternalTriggerOrigin, ReviewKind, ReviewLifecycleDispatch, ReviewReceiptId,
+    ReviewReceiptSnapshot, SendNotificationRequest, SendNotificationResponse,
+};
 
 /// The composition-root-injected post-save reconcile closure. Given the just-saved config, it
 /// drives Remote Access listener and tunnel reconcile. OPAQUE on purpose (an `Arc<dyn Fn>`
@@ -21,9 +26,96 @@ pub type NotificationSendSink = Arc<
         + Send
         + Sync,
 >;
-pub type ReviewWorkflowTriggerSink =
-    Arc<dyn Fn(tauri::AppHandle, String, u64, String) -> AppResult<()> + Send + Sync>;
 pub type ReviewLifecycleSink = Arc<dyn Fn(ReviewLifecycleDispatch) -> AppResult<()> + Send + Sync>;
+pub type ExternalReviewSubmitSink = Arc<
+    dyn Fn(
+            String,
+            u64,
+            ReviewKind,
+            ExternalRequestId,
+            ExternalTriggerOrigin,
+            bool,
+        ) -> AppResult<ReviewReceiptId>
+        + Send
+        + Sync,
+>;
+pub type ExternalReviewGetSink =
+    Arc<dyn Fn(&Database, ReviewReceiptId) -> AppResult<ReviewReceiptSnapshot> + Send + Sync>;
+pub type ReviewResumeSink = Arc<dyn Fn() -> AppResult<()> + Send + Sync>;
+
+#[derive(Default)]
+pub struct ReviewResumeHook {
+    sink: StdMutex<Option<ReviewResumeSink>>,
+    generation: AtomicU64,
+}
+
+impl ReviewResumeHook {
+    pub fn set_sink(&self, sink: ReviewResumeSink) {
+        *self.sink.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+    }
+
+    pub fn fire(&self) -> AppResult<()> {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.sink
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or_else(|| AppError::new("review resume hook 未初始化"))?()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Default)]
+pub struct ExternalReviewIngress {
+    submit: StdMutex<Option<ExternalReviewSubmitSink>>,
+    get: StdMutex<Option<ExternalReviewGetSink>>,
+}
+
+impl ExternalReviewIngress {
+    pub fn set_sinks(&self, submit: ExternalReviewSubmitSink, get: ExternalReviewGetSink) {
+        *self.submit.lock().unwrap_or_else(|p| p.into_inner()) = Some(submit);
+        *self.get.lock().unwrap_or_else(|p| p.into_inner()) = Some(get);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit(
+        &self,
+        reference: String,
+        pr_number: u64,
+        kind: ReviewKind,
+        request_id: ExternalRequestId,
+        origin: ExternalTriggerOrigin,
+        notify_on_completion: bool,
+    ) -> AppResult<ReviewReceiptId> {
+        let sink = self
+            .submit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or_else(|| AppError::new("external review ingress 未初始化"))?;
+        sink(
+            reference,
+            pr_number,
+            kind,
+            request_id,
+            origin,
+            notify_on_completion,
+        )
+    }
+
+    pub fn get(&self, db: &Database, receipt: ReviewReceiptId) -> AppResult<ReviewReceiptSnapshot> {
+        let sink = self
+            .get
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or_else(|| AppError::new("external review ingress 未初始化"))?;
+        sink(db, receipt)
+    }
+}
 
 /// The post-`set_config`-save hook seam (AB#1225 F4): a composition-root-injected closure the
 /// `config` slice fires AFTER a successful save, so config never names a sibling horizontal
@@ -82,35 +174,6 @@ impl NotificationSender {
     }
 }
 
-/// Composition-root-injected review workflow trigger (#1370). Deeplink remains a review transport,
-/// but the workflow slice is named only by the composition root.
-#[derive(Default)]
-pub struct ReviewWorkflowTrigger {
-    sink: StdMutex<Option<ReviewWorkflowTriggerSink>>,
-}
-
-impl ReviewWorkflowTrigger {
-    pub fn set_sink(&self, sink: ReviewWorkflowTriggerSink) {
-        *self.sink.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink);
-    }
-
-    pub fn start(
-        &self,
-        app: tauri::AppHandle,
-        reference: String,
-        pr_number: u64,
-        kind: String,
-    ) -> AppResult<()> {
-        let sink = self.sink.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let Some(sink) = sink else {
-            return Err(AppError::new(
-                "review workflow trigger 未初始化".to_string(),
-            ));
-        };
-        sink(app, reference, pr_number, kind)
-    }
-}
-
 #[derive(Default)]
 pub struct ReviewLifecycleNotifier {
     sink: StdMutex<Option<ReviewLifecycleSink>>,
@@ -134,6 +197,8 @@ impl ReviewLifecycleNotifier {
 
 #[derive(Default)]
 pub struct AppState {
+    pub external_review: ExternalReviewIngress,
+    pub review_resume: ReviewResumeHook,
     /// Process-lifetime cache + typed resolution funnel for managed third-party CLIs. The resolver's
     /// construction API is private to `config`; sibling slices can only call `config::service` and
     /// receive an opaque `ResolvedCli` launch capability.
@@ -164,9 +229,8 @@ pub struct AppState {
     /// `LocalApiManager` was removed; `listeners[]` is now the single source of truth). Reconciled
     /// in `lib.rs` `setup()` + after each `set_config`; killed on app shutdown. Methods take `&self`.
     pub remote: crate::remote::supervisor::ListenerSupervisor,
-    /// The event inbox's replay-time hooks (AB#1065): the dispatcher + Azure refresh the
-    /// `inbox_replay` command re-uses (installed once by the composition root in `setup()`,
-    /// like the webhook ingestor/refresher). Methods take `&self`.
+    /// The event inbox's sole consumer worker and its provider/rule hooks (AB#1065). Live ingress
+    /// only persists + wakes it; failed replay is a state transition back to its queue.
     pub inbox: crate::inbox::manager::InboxManager,
     /// The action outbox (AB#1066): the durable side-effect queue + its background worker. Holds
     /// the composition-root-injected executor closure, the worker's wake/stop signals, and the
@@ -183,7 +247,6 @@ pub struct AppState {
     pub notify_outbox: crate::review::notify::NotificationOutbox,
     /// Review transport → workflow trigger seam (#1370). This opaque hook is installed in `lib.rs`;
     /// review transports do not name the workflow slice directly.
-    pub review_workflow: ReviewWorkflowTrigger,
     /// Review start/finalize → lifecycle notification seam. The review slice emits normalized
     /// lifecycle facts; the composition root routes them to notification/messaging outbox rows.
     pub review_lifecycle: ReviewLifecycleNotifier,
@@ -209,4 +272,12 @@ pub struct AppState {
     /// the `crate::stream::emit` funnel. `Default` (empty until the first `create`); killed on app
     /// shutdown. Methods take `&self`.
     pub web_pty: crate::terminal::webpty_manager::WebPtyManager,
+}
+
+impl AppState {
+    /// Opaque generation read for the generic action worker. The outbox does not name the review
+    /// hook field; the composition state exposes only the monotonic concurrency fact it needs.
+    pub fn action_resume_generation(&self) -> u64 {
+        self.review_resume.generation()
+    }
 }

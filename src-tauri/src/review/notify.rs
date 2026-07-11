@@ -102,7 +102,7 @@ impl<R: Runtime> NotificationProvider for DesktopNotifier<'_, R> {
             .body(desktop_body(note))
             .show()
             .map_err(|e| AppError::new(format!("发送桌面通知失败: {e}")))?;
-        Ok(ActionExecutionResult::Done)
+        Ok(ActionExecutionResult::done())
     }
 }
 
@@ -227,7 +227,7 @@ impl NotificationProvider for EmailNotifier<'_> {
             ));
         }
         match relay.build().send(email).await {
-            Ok(_) => Ok(ActionExecutionResult::Done),
+            Ok(_) => Ok(ActionExecutionResult::done()),
             Err(e) => Ok(classify_smtp_error(self.channel, &e)),
         }
     }
@@ -359,7 +359,7 @@ fn classify_http_status(
     retry_after_secs: Option<u64>,
 ) -> ActionExecutionResult {
     if status.is_success() {
-        return ActionExecutionResult::Done;
+        return ActionExecutionResult::done();
     }
     let message = format!(
         "通知渠道「{}」HTTP 投递失败（status={}，已脱敏）",
@@ -385,7 +385,7 @@ fn classify_provider_success_body(
     match channel.kind {
         NotificationKind::Slack => {
             if body.trim().is_empty() || body.trim().eq_ignore_ascii_case("ok") {
-                ActionExecutionResult::Done
+                ActionExecutionResult::done()
             } else {
                 provider_business_dead(channel, "slack")
             }
@@ -395,7 +395,7 @@ fn classify_provider_success_body(
                 return provider_business_dead(channel, "telegram-invalid-json");
             };
             if v.get("ok").and_then(|v| v.as_bool()) == Some(true) {
-                ActionExecutionResult::Done
+                ActionExecutionResult::done()
             } else {
                 provider_business_dead(channel, "telegram")
             }
@@ -405,7 +405,7 @@ fn classify_provider_success_body(
                 return provider_business_dead(channel, "webhook-invalid-json");
             };
             if v.get("errcode").and_then(|v| v.as_i64()) == Some(0) {
-                ActionExecutionResult::Done
+                ActionExecutionResult::done()
             } else {
                 provider_business_dead(channel, "webhook")
             }
@@ -417,12 +417,12 @@ fn classify_provider_success_body(
             let ok_status = v.get("StatusCode").and_then(|v| v.as_i64()) == Some(0);
             let ok_code = v.get("code").and_then(|v| v.as_i64()) == Some(0);
             if ok_status || ok_code {
-                ActionExecutionResult::Done
+                ActionExecutionResult::done()
             } else {
                 provider_business_dead(channel, "feishu")
             }
         }
-        NotificationKind::Desktop | NotificationKind::Email => ActionExecutionResult::Done,
+        NotificationKind::Desktop | NotificationKind::Email => ActionExecutionResult::done(),
     }
 }
 
@@ -628,7 +628,7 @@ mod tests {
         let channel = delivery_channel(NotificationKind::Slack);
         assert_eq!(
             classify_http_status(&channel, StatusCode::OK, None),
-            ActionExecutionResult::Done
+            ActionExecutionResult::done()
         );
         assert_eq!(
             classify_http_status(&channel, StatusCode::TOO_MANY_REQUESTS, Some(42)),
@@ -701,7 +701,7 @@ mod tests {
                 &delivery_channel(NotificationKind::Telegram),
                 r#"{"ok":true}"#
             ),
-            ActionExecutionResult::Done
+            ActionExecutionResult::done()
         );
         assert_eq!(
             classify_provider_success_body(
@@ -717,7 +717,7 @@ mod tests {
                 &delivery_channel(NotificationKind::WeChatWork),
                 r#"{"errcode":0,"errmsg":"ok"}"#
             ),
-            ActionExecutionResult::Done
+            ActionExecutionResult::done()
         );
         assert_eq!(
             classify_provider_success_body(
@@ -733,14 +733,14 @@ mod tests {
                 &delivery_channel(NotificationKind::Feishu),
                 r#"{"StatusCode":0,"StatusMessage":"success"}"#
             ),
-            ActionExecutionResult::Done
+            ActionExecutionResult::done()
         );
         assert_eq!(
             classify_provider_success_body(
                 &delivery_channel(NotificationKind::Feishu),
                 r#"{"code":0,"msg":"success"}"#
             ),
-            ActionExecutionResult::Done
+            ActionExecutionResult::done()
         );
         assert_eq!(
             classify_provider_success_body(

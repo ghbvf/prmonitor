@@ -21,6 +21,63 @@ export const UPDATE_MODES = ["webhook-only","pull-only","hybrid","manual"] as co
 export type EventType = "pullRequest" | "issue" | "comment" | "label" | "generic";
 export const EVENT_TYPES = ["pullRequest","issue","comment","label","generic"] as const;
 
+export type ReviewKind = "review" | "check";
+export const REVIEW_KINDS = ["review","check"] as const;
+
+export type PullRequestView = { number: number, title: string, labels: Array<string>, url: string,
+/**
+ * The trigger-label mode this PR maps to. Typed at the Rust source so the
+ * generated TypeScript projection cannot claim a narrower value domain.
+ */
+kind: ReviewKind,
+/**
+ * Why this PR would be skipped (not dispatched), or `None` when it would
+ * dispatch. Serializes to `null` / a string for the frontend.
+ */
+skipReason: string | null, };
+
+export type ExternalTriggerOrigin = "http" | "cli" | "remoteWeb" | "deepLink" | "messagingBot";
+export const EXTERNAL_TRIGGER_ORIGINS = ["http","cli","remoteWeb","deepLink","messagingBot"] as const;
+
+declare const __brand: unique symbol;
+export type Brand<T, Name extends string> = T & { readonly [__brand]: Name };
+export type ExternalRequestId = Brand<string, "ExternalRequestId">;
+export function externalRequestId(value: string): ExternalRequestId {
+  if (!/^[0-9a-f]{32}$/.test(value)) throw new Error("requestId must be exactly 32 lowercase hexadecimal characters");
+  return value as ExternalRequestId;
+}
+export type InboxDedupeKey = Brand<string, "InboxDedupeKey">;
+export function inboxDedupeKey(value: string): InboxDedupeKey {
+  if (value.trim().length === 0) throw new Error("inbox dedupe key must not be empty");
+  return value as InboxDedupeKey;
+}
+export type ReviewActionKey = Brand<string, "ReviewActionKey">;
+export function reviewActionKey(value: string): ReviewActionKey {
+  if (value.trim().length === 0) throw new Error("review action key must not be empty");
+  return value as ReviewActionKey;
+}
+export type OutboxProducerKey = Brand<string, "OutboxProducerKey">;
+export function outboxProducerKey(value: string): OutboxProducerKey {
+  if (value.trim().length === 0) throw new Error("outbox producer key must not be empty");
+  return value as OutboxProducerKey;
+}
+export type InboxEventId = Brand<number, "InboxEventId">;
+export function inboxEventId(value: number): InboxEventId {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error("inbox event id must be a positive safe integer");
+  return value as InboxEventId;
+}
+export type ReviewReceiptId = Brand<number, "ReviewReceiptId">;
+export function reviewReceiptId(value: number): ReviewReceiptId {
+  if (!Number.isSafeInteger(value) || value <= 0) throw new Error("review receipt id must be a positive safe integer");
+  return value as ReviewReceiptId;
+}
+export type ReviewReceiptStatus = "received" | "queued" | "blocked" | "starting" | "running" | "interrupting" | "done" | "failed";
+export const REVIEW_RECEIPT_STATUSES = ["received","queued","blocked","starting","running","interrupting","done","failed"] as const;
+export type ReviewReceiptSnapshot = { receiptId: ReviewReceiptId, status: ReviewReceiptStatus, threadId: string | null, commentUrl: string | null, outcome: string | null, error: string | null, };
+export type EventSubject = { number: number | null, title: string, body: string, labels: Array<string>, url: string, };
+export type EventPayload = { "kind": "observation", eventType: EventType, subject: EventSubject, } | { "kind": "reviewRequest", prNumber: number, reviewKind: ReviewKind, requestId: ExternalRequestId, origin: ExternalTriggerOrigin, notifyOnCompletion: boolean, };
+export type EventEnvelope = { dedupeKey: InboxDedupeKey, source: SourceKind, projectId: string, repo: string, payload: EventPayload, receivedAtEpoch: number, };
+
 export type NotificationKind = "desktop" | "email" | "slack" | "telegram" | "weChatWork" | "feishu" | "dingTalk";
 export const NOTIFICATION_KINDS = ["desktop","email","slack","telegram","weChatWork","feishu","dingTalk"] as const;
 
@@ -30,8 +87,8 @@ export const MESSAGING_PROVIDER_KINDS = ["feishu","weChatWork","dingTalk"] as co
 export type MessagingEventStatus = "received" | "processed" | "failed";
 export const MESSAGING_EVENT_STATUSES = ["received","processed","failed"] as const;
 
-export type ActionStatus = "pending" | "done" | "dead";
-export const ACTION_STATUSES = ["pending","done","dead"] as const;
+export type ActionStatus = "pending" | "blocked" | "done" | "dead";
+export const ACTION_STATUSES = ["pending","blocked","done","dead"] as const;
 
 export type MessagingProviderCapability = { provider: MessagingProviderKind, supportsReply: boolean, supportsSend: boolean, requiresAllowedConversations: boolean, };
 

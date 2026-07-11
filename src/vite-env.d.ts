@@ -8,4 +8,5 @@ declare module "*.vue" {
 
 interface Window {
   __PRMONITOR_REMOTE_BASE_PATH__?: string;
+  __PRMONITOR_API_BASE_PATH__?: string;
 }

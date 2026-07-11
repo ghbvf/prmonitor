@@ -175,12 +175,12 @@ fn dedupe_prefix(event: &ReviewLifecycleDispatch, target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::future::Future;
-    use std::pin::Pin;
     use std::sync::Mutex;
 
     use crate::db::Database;
-    use crate::model::{ActionKind, ActionStatus, OutboxEntry};
+    use crate::model::{
+        ActionKind, ActionStatus, ExternalRequestId, OutboxEntry, ReviewKind, ReviewReceiptId,
+    };
     use crate::state::AppState;
     use tauri::Manager;
 
@@ -188,7 +188,7 @@ mod tests {
         ReviewLifecycleDispatch {
             project_id: "p1".to_string(),
             pr_number: 7,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
             thread_id: "thread-1".to_string(),
             event,
             comment_url: Some("https://example.com/pr/7#discussion".to_string()),
@@ -287,14 +287,15 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn trigger_review<'a>(
-            &'a self,
-            _app: &'a tauri::AppHandle<R>,
+        fn submit_review(
+            &self,
+            _app: &tauri::AppHandle<R>,
             _reference: String,
             _pr_number: u64,
-            _kind: String,
-        ) -> Pin<Box<dyn Future<Output = AppResult<String>> + Send + 'a>> {
-            Box::pin(async { Ok("thread".to_string()) })
+            _kind: ReviewKind,
+            _request_id: ExternalRequestId,
+        ) -> AppResult<ReviewReceiptId> {
+            ReviewReceiptId::new(1).map_err(AppError::new)
         }
     }
 

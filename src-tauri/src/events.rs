@@ -82,8 +82,20 @@ pub enum InboxEvent {
     #[serde(rename_all = "camelCase")]
     Updated {
         project_id: String,
-        entry: InboxEntry,
+        entry: Box<InboxEntry>,
     },
+    #[serde(rename_all = "camelCase")]
+    Error {
+        operation: InboxErrorOperation,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum InboxErrorOperation {
+    Retention,
+    Worker,
 }
 
 /// Payload emitted on [`OUTBOX_UPDATED_EVENT`] (AB#1066) when an outbox row is enqueued or
@@ -178,7 +190,7 @@ pub enum ReviewEvent {
     },
     /// An app-level background-write notice NOT tied to any one session — config
     /// invalid, one/more `start_review` failures, or a ledger-write failure during
-    /// `crate::dispatch::auto_dispatch`; ALSO the one-time review-session persistence
+    /// the durable inbox producer; ALSO the one-time review-session persistence
     /// failure notice (review F9), the same class of silent background-write failure the
     /// user should see. Carries no `threadId` (session-less), but
     /// DOES carry `project_id` (#35) so the frontend can scope the app-level "auto
@@ -309,9 +321,9 @@ pub enum StreamEvent {
 mod tests {
     use super::*;
     use crate::model::{
-        ActionKind, ActionStatus, Event, EventType, InboxStatus, OutboxEntry, PrPresence,
-        PullRequestView, SourceKind, TrackedPrView, WorkflowInstance, WorkflowStatus, WorkflowStep,
-        WorkflowType,
+        ActionKind, ActionStatus, EventEnvelope, EventSubject, EventType, InboxDedupeKey,
+        InboxStatus, OutboxEntry, PrPresence, PullRequestView, SourceKind, TrackedPrView,
+        WorkflowInstance, WorkflowStatus, WorkflowStep, WorkflowType,
     };
 
     fn sample_view() -> TrackedPrView {
@@ -321,7 +333,7 @@ mod tests {
                 title: "Add feature".to_string(),
                 labels: vec!["review".to_string()],
                 url: "https://example.com/pr/1".to_string(),
-                kind: "review".to_string(),
+                kind: crate::model::ReviewKind::Review,
                 skip_reason: None,
             },
             presence: PrPresence::Current,
@@ -394,25 +406,28 @@ mod tests {
     fn inbox_updated_wire_shape_is_camel_case() {
         let event = InboxEvent::Updated {
             project_id: "p1".to_string(),
-            entry: InboxEntry {
+            entry: Box::new(InboxEntry {
                 id: 7,
-                event: Event {
-                    dedupe_key: "github:abc-123".to_string(),
-                    source: SourceKind::Github,
-                    event_type: EventType::PullRequest,
-                    project_id: "p1".to_string(),
-                    repo: "owner/repo".to_string(),
-                    number: Some(7),
-                    title: "Add feature".to_string(),
-                    body: String::new(),
-                    labels: vec!["pr-review".to_string()],
-                    url: "https://example.com/pr/7".to_string(),
-                    received_at_epoch: 1_700_000_000,
-                },
+                event: EventEnvelope::observation(
+                    InboxDedupeKey::new("github:abc-123").unwrap(),
+                    SourceKind::Github,
+                    "p1",
+                    "owner/repo",
+                    EventType::PullRequest,
+                    EventSubject {
+                        number: Some(7),
+                        title: "Add feature".to_string(),
+                        body: String::new(),
+                        labels: vec!["pr-review".to_string()],
+                        url: "https://example.com/pr/7".to_string(),
+                    },
+                    1_700_000_000,
+                )
+                .unwrap(),
                 status: InboxStatus::Received,
                 processed_at_epoch: None,
                 error: None,
-            },
+            }),
         };
 
         let v = serde_json::to_value(&event).expect("InboxEvent serializes");

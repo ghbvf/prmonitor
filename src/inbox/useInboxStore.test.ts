@@ -4,7 +4,7 @@
 // event bus. Mirrors src/pr/usePrStore.test.ts (createPinia/setActivePinia + captured cb).
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
-import type { Event, InboxEntry, InboxEvent } from "../types";
+import { inboxDedupeKey, type Event, type InboxEntry, type InboxEvent } from "../types";
 
 // Captured callback handed to `onInboxUpdated`, so a test can push an `InboxEvent` through
 // the same path `subscribe()` wires up.
@@ -27,16 +27,21 @@ import { useInboxStore } from "./useInboxStore";
 
 // A normalized Event for a given project; only the fields these tests assert on vary.
 const event = (projectId: string): Event => ({
-  dedupeKey: `${projectId}-key`,
+  dedupeKey: inboxDedupeKey(`${projectId}-key`),
   source: "github",
-  eventType: "pullRequest",
   projectId,
   repo: "owner/repo",
-  number: 1,
-  title: "an event",
-  body: "",
-  labels: [],
-  url: "https://example.test/1",
+  payload: {
+    kind: "observation",
+    eventType: "pullRequest",
+    subject: {
+      number: 1,
+      title: "an event",
+      body: "",
+      labels: [],
+      url: "https://example.test/1",
+    },
+  },
   receivedAtEpoch: 0,
 });
 
@@ -108,6 +113,16 @@ describe("useInboxStore subscribe()", () => {
     inboxCb?.({ kind: "updated", projectId: "p2", entry: entry(2, "p2") });
 
     expect(store.entries.map((e) => e.id)).toEqual([1]);
+  });
+
+  it("surfaces a typed worker error without inventing an inbox row", () => {
+    const store = useInboxStore();
+    store.subscribe();
+
+    inboxCb?.({ kind: "error", operation: "retention", message: "active limit exceeded" });
+
+    expect(store.error).toBe("retention: active limit exceeded");
+    expect(store.entries).toEqual([]);
   });
 });
 

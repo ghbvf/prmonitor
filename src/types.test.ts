@@ -4,7 +4,16 @@
 // would show disabled projects as monitored / actionable.
 import { describe, it, expect } from "vitest";
 import {
+  externalRequestId,
+  inboxDedupeKey,
+  inboxEventId,
   periodicPollEligible,
+  OUTBOX_STATUSES,
+  outboxStatusLabel,
+  presentEvent,
+  outboxProducerKey,
+  reviewActionKey,
+  reviewReceiptId,
   manualPullEligible,
   TERMINAL_BACKENDS,
   terminalBackendLabel,
@@ -13,6 +22,11 @@ import {
   WORKFLOW_TYPES,
   workflowStatusLabel,
   workflowStepLabel,
+  type ExternalRequestId,
+  type InboxEventId,
+  type OutboxProducerKey,
+  type ReviewActionKey,
+  type ReviewReceiptId,
   type WorkflowInstance,
 } from "./types";
 
@@ -29,6 +43,63 @@ describe("periodicPollEligible", () => {
     expect(periodicPollEligible(false, "hybrid")).toBe(false);
     expect(periodicPollEligible(false, "webhook-only")).toBe(false);
     expect(periodicPollEligible(false, "manual")).toBe(false);
+  });
+});
+
+describe("typed dispatch contracts", () => {
+  it("constructs and validates semantic boundary ids", () => {
+    expect(externalRequestId("00112233445566778899aabbccddeeff")).toHaveLength(32);
+    expect(() => externalRequestId("not-hex")).toThrow(/32 lowercase hexadecimal/);
+    expect(inboxEventId(7)).toBe(7);
+    expect(reviewReceiptId(9)).toBe(9);
+    expect(() => inboxEventId(0)).toThrow(/positive safe integer/);
+    expect(() => reviewReceiptId(Number.MAX_SAFE_INTEGER + 1)).toThrow(/positive safe integer/);
+    expect(inboxDedupeKey("event:7")).toBe("event:7");
+    expect(reviewActionKey("7@abc:review")).toBe("7@abc:review");
+    expect(outboxProducerKey("inbox:7:action:review")).toBe("inbox:7:action:review");
+  });
+
+  it("keeps equal primitive representations nominally distinct at compile time", () => {
+    const request: ExternalRequestId = externalRequestId("00112233445566778899aabbccddeeff");
+    const inbox: InboxEventId = inboxEventId(7);
+    const receipt: ReviewReceiptId = reviewReceiptId(7);
+    const action: ReviewActionKey = reviewActionKey("action");
+    const producer: OutboxProducerKey = outboxProducerKey("producer");
+
+    // @ts-expect-error raw strings cannot enter a typed external-request boundary.
+    const rawRequest: ExternalRequestId = "00112233445566778899aabbccddeeff";
+    // @ts-expect-error inbox ids and receipt ids remain distinct despite both being numbers.
+    const wrongReceipt: ReviewReceiptId = inbox;
+    // @ts-expect-error producer keys cannot substitute for review-action keys.
+    const wrongAction: ReviewActionKey = producer;
+
+    expect([request, receipt, action, rawRequest, wrongReceipt, wrongAction]).toHaveLength(6);
+  });
+
+  it("renders every generated action status including blocked", () => {
+    expect([...OUTBOX_STATUSES]).toEqual(["pending", "blocked", "done", "dead"]);
+    for (const status of OUTBOX_STATUSES) {
+      expect(outboxStatusLabel(status).length).toBeGreaterThan(0);
+    }
+  });
+
+  it("presents explicit review requests without flattening them into observations", () => {
+    const presented = presentEvent({
+      dedupeKey: inboxDedupeKey("review-request:00112233445566778899aabbccddeeff"),
+      source: "github",
+      projectId: "p1",
+      repo: "octocat/hello",
+      payload: {
+        kind: "reviewRequest",
+        prNumber: 7,
+        reviewKind: "check",
+        requestId: externalRequestId("00112233445566778899aabbccddeeff"),
+        origin: "remoteWeb",
+        notifyOnCompletion: false,
+      },
+      receivedAtEpoch: 42,
+    });
+    expect(presented).toEqual({ eventType: "pullRequest", number: 7, title: "Check request" });
   });
 });
 

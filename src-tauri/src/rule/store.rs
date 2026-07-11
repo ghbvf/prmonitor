@@ -165,8 +165,8 @@ mod tests {
             let inbox_id = conn.last_insert_rowid();
             conn.execute(
                 "INSERT INTO action_outbox \
-                 (project_id, kind, summary, payload, status, next_attempt_at, created_at, updated_at) \
-                 VALUES ('p1', 'review', 'summary', '{}', 'pending', 10, 10, 10)",
+                 (project_id, kind, summary, payload, status, next_attempt_at, created_at, updated_at, producer_key) \
+                 VALUES ('p1', 'review', 'summary', '{}', 'pending', 10, 10, 10, 'rule-store-test')",
                 [],
             )?;
             let outbox_id = conn.last_insert_rowid();

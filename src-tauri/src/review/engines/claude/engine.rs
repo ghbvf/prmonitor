@@ -16,10 +16,12 @@ use super::process::{self, ParsedEvent, ParserState};
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, StreamEvent};
-use crate::model::EngineKind;
-use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
+use crate::model::{EngineKind, ReviewKind};
+use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, StartReviewOutcome};
 use crate::review::history_store::{self, HistoryItemKind};
-use crate::review::session::{CommentUrlContext, SessionInfo, SessionRegistry, SessionStatus};
+use crate::review::session::{
+    commit_starting_session, CommentUrlContext, SessionInfo, SessionRegistry, SessionStatus,
+};
 
 /// Per-request engine handle. Borrows the long-lived state from `AppState` plus the
 /// request's `AppHandle`; constructed fresh by each command/dispatch (cheap — all
@@ -60,13 +62,19 @@ pub struct ClaudeEngine<'a, R: tauri::Runtime> {
     /// on the OUTBOX executor's start path ([`crate::review::commands::start_for_outbox`]), `None`
     /// on the manual / follow-up / auto-dispatch paths. When `Some`, `start` writes the claim's
     /// `thread_id` (== claude `session_id`) breadcrumb INSIDE `start_review` — right after the
-    /// `system/init` line yields a stable `session_id` and the `Starting` session is persisted, but
-    /// BEFORE the turn streams / posts a `pm:` comment (mirrors the codex path's F1 placement).
+    /// `system/init` line yields a stable `session_id`. The session row and claim breadcrumb commit
+    /// atomically BEFORE registry promotion; linkage failure drops the kill-on-drop child and keeps
+    /// the pair retryable (mirrors the codex path's F1 placement).
     pub outbox_claim_id: Option<i64>,
 }
 
 impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
-    async fn start(&self, pr_number: u64, kind: &str) -> AppResult<StartReviewOutcome> {
+    async fn start(
+        &self,
+        _capability: &ReviewStartCapability,
+        pr_number: u64,
+        kind: ReviewKind,
+    ) -> AppResult<StartReviewOutcome> {
         start_review(
             self.app,
             self.claude,
@@ -84,16 +92,6 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
             self.outbox_claim_id,
         )
         .await
-    }
-
-    async fn stop(&self, session: &SessionId) -> AppResult<()> {
-        // The manager owns the in-flight session's cancel channel. `stop` SIGNALS cancel;
-        // the pump observes it, kills its child, and emits the terminal event via `finish`
-        // (so the session is never left `Running`). A `false` (unknown id) is benign here —
-        // the command-level `stop_review` is the funnel that decides claude-vs-codex; an
-        // engine-level stop against a gone session is a no-op.
-        self.claude.stop(session);
-        Ok(())
     }
 
     async fn send_message(
@@ -145,7 +143,7 @@ async fn start_review<R: tauri::Runtime>(
     repo_root: &str,
     claude_model: &str,
     pr_number: u64,
-    kind: &str,
+    kind: ReviewKind,
     // IMMUTABLE comment-URL source context (AB#1042); handed to the `Starting` session in
     // `promote_reservation` so the terminal `finalize_turn` resolves the URL against the
     // project this review ran against (mirrors the codex path).
@@ -167,7 +165,7 @@ async fn start_review<R: tauri::Runtime>(
         registry,
         project_id: project_id.to_string(),
         pr_number,
-        kind: kind.to_string(),
+        kind,
         armed: true,
     };
 
@@ -210,38 +208,22 @@ async fn start_review<R: tauri::Runtime>(
         thread_id: session_id.clone(),
         turn_id: session_id.clone(),
         pr_number,
-        kind: kind.to_string(),
+        kind,
         engine_kind: EngineKind::Claude,
         status: SessionStatus::Starting,
         created_at_epoch,
         // No comment yet — filled by `session::finalize_turn` at a `completed` terminal (AB#1042).
         comment_url: None,
     };
-    registry.promote_reservation(starting.clone(), url_ctx);
-    persist_session(app, &starting);
+    // The subprocess is configured with `kill_on_drop`; if durable linkage fails here, returning
+    // drops `child` before it is handed to the pump, while the still-armed reservation guard makes
+    // the pair retryable. A successful transaction is promoted atomically into the registry.
+    commit_starting_session(app, registry, starting.clone(), url_ctx, outbox_claim_id)?;
     reservation.disarm();
-
-    // F1 (AB#1204): write the outbox claim's thread_id (== claude `session_id`) breadcrumb HERE —
-    // right after the `system/init` line yields a stable session id and the Starting session is
-    // persisted, but BEFORE `set_running` / the pump lets the turn stream / post a `pm:` comment.
-    // This closes the window where a crash between the turn starting and the (former) post-return
-    // attach left the claim NULL → replay duplicated. Best-effort: a failure only narrows back
-    // toward the pre-AB#1204 window (no regression) and must NOT fail the started review.
-    if let Some(outbox_id) = outbox_claim_id {
-        let db = app.state::<crate::db::Database>();
-        if let Err(e) =
-            crate::review::claim_store::attach_thread(db.inner(), outbox_id, &session_id)
-        {
-            eprintln!(
-                "outbox review claim：记录 thread_id 失败（outbox_id={outbox_id}）：{}",
-                e.message
-            );
-        }
-    }
 
     // Flip to Running (the child is live and streaming). turn_id stays the session id.
     registry.set_running(&session_id, session_id.clone());
-    persist_session(
+    let _ = persist_session(
         app,
         &SessionInfo {
             status: SessionStatus::Running,
@@ -502,13 +484,13 @@ fn persist_session_status<R: tauri::Runtime>(
             thread_id: thread_id.to_string(),
             turn_id: thread_id.to_string(),
             pr_number,
-            kind: durable_info.kind.clone(),
+            kind: durable_info.kind,
             engine_kind: durable_info.engine_kind,
             status,
             created_at_epoch: durable_info.created_at_epoch,
             comment_url: durable_info.comment_url.clone(),
         });
-    persist_session(app, &info);
+    let _ = persist_session(app, &info);
 }
 
 /// Read stdout until the first `system/init` line, returning its session id (or `None`
@@ -780,7 +762,10 @@ async fn finish<R: tauri::Runtime>(
 /// Best-effort mirror of an in-memory [`SessionInfo`] into the durable `review_session`
 /// table. Logs + swallows errors so a persistence hiccup never breaks the live session —
 /// the in-memory registry stays the authority for dedup / status (same contract as codex).
-fn persist_session<R: tauri::Runtime>(app: &tauri::AppHandle<R>, info: &SessionInfo) {
+fn persist_session<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    info: &SessionInfo,
+) -> AppResult<()> {
     let db = app.state::<crate::db::Database>();
     if let Err(e) = history_store::upsert_session(db.inner(), info) {
         eprintln!(
@@ -790,7 +775,9 @@ fn persist_session<R: tauri::Runtime>(app: &tauri::AppHandle<R>, info: &SessionI
         // Symmetry with codex (review F9): the first silent persist failure raises one
         // app-level notice; later failures only log (the shared process-global guard).
         crate::review::session::notify_persist_failure_once(app, &info.project_id);
+        return Err(e);
     }
+    Ok(())
 }
 
 /// RAII release of a `(pr, kind)` reservation taken by `try_reserve_pair`. An undisarmed
@@ -801,7 +788,7 @@ struct ReservationGuard<'a> {
     registry: &'a SessionRegistry,
     project_id: String,
     pr_number: u64,
-    kind: String,
+    kind: ReviewKind,
     armed: bool,
 }
 
@@ -816,7 +803,7 @@ impl Drop for ReservationGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.registry
-                .release_pair(&self.project_id, self.pr_number, &self.kind);
+                .release_pair(&self.project_id, self.pr_number, self.kind);
         }
     }
 }

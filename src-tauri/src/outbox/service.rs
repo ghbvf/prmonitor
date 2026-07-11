@@ -18,7 +18,7 @@ use tauri::{Manager, Runtime};
 use crate::db::Database;
 use crate::error::AppResult;
 use crate::events::{OutboxEvent, StreamEvent};
-use crate::model::{ActionExecutionResult, ActionKind};
+use crate::model::{ActionExecutionOutput, ActionExecutionResult, ActionKind};
 use crate::outbox::{store, ActionExecutor, ClaimReleaser};
 use crate::state::AppState;
 
@@ -80,7 +80,9 @@ fn next_backoff(attempt: u32, seed: u64) -> u64 {
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     /// The executor succeeded — mark the row `done`.
-    Done,
+    Done { output: ActionExecutionOutput },
+    /// Executor is intentionally paused; keep attempts unchanged until an explicit resume.
+    Blocked { observed_resume_generation: u64 },
     /// A transient failure under the attempt budget — reschedule (still `pending`) at this epoch.
     Retry { next_attempt_at: u64 },
     /// The attempt budget is exhausted — dead-letter the row.
@@ -94,7 +96,9 @@ enum Outcome {
 /// keys the backoff jitter so rows that fail together don't retry in lockstep.
 fn decide_outcome(new_attempt_count: u32, now: u64, is_err: bool, seed: u64) -> Outcome {
     if !is_err {
-        return Outcome::Done;
+        return Outcome::Done {
+            output: ActionExecutionOutput::None,
+        };
     }
     if new_attempt_count >= MAX_ATTEMPTS {
         Outcome::Dead
@@ -158,9 +162,8 @@ pub fn enqueue<R: Runtime>(
     Ok(id)
 }
 
-/// Enqueue a produced action with a live-pending dedupe key (#1379). Used by default rule
-/// production for review/check actions so repeated poll/webhook processing of the same candidate
-/// reuses one pending outbox row.
+/// Enqueue a produced action with a permanent producer key (#1379/#1374). Repeated production of
+/// the same semantic action reuses its original row in every status, closing terminal replay.
 pub fn enqueue_deduped<R: Runtime>(
     app: &tauri::AppHandle<R>,
     project_id: &str,
@@ -227,7 +230,21 @@ fn record_action_result(
 ) -> AppResult<Outcome> {
     let new_attempt_count = prev_attempt_count.saturating_add(1);
     let (outcome, error) = match result {
-        Ok(ActionExecutionResult::Done) => (Outcome::Done, String::new()),
+        Ok(ActionExecutionResult::Done { output }) => (
+            Outcome::Done {
+                output: output.clone(),
+            },
+            String::new(),
+        ),
+        Ok(ActionExecutionResult::Blocked {
+            message,
+            observed_resume_generation,
+        }) => (
+            Outcome::Blocked {
+                observed_resume_generation: *observed_resume_generation,
+            },
+            message.clone(),
+        ),
         Ok(ActionExecutionResult::Dead { message }) => (Outcome::Dead, message.clone()),
         Ok(ActionExecutionResult::Retry {
             message,
@@ -256,13 +273,35 @@ fn record_action_result(
         }
     };
     match &outcome {
-        Outcome::Done => store::mark_done(db, id, new_attempt_count, now)?,
+        Outcome::Done { output } => {
+            store::mark_done_with_output(db, id, new_attempt_count, output, now)?
+        }
+        Outcome::Blocked { .. } => store::mark_blocked(db, id, &error, now)?,
         Outcome::Retry { next_attempt_at } => {
             store::mark_retry(db, id, new_attempt_count, *next_attempt_at, &error, now)?
         }
         Outcome::Dead => store::mark_dead(db, id, new_attempt_count, &error, now)?,
     }
     Ok(outcome)
+}
+
+fn reconcile_blocked_resume(
+    db: &Database,
+    outcome: &Outcome,
+    current_resume_generation: u64,
+    now: u64,
+) -> AppResult<bool> {
+    let Outcome::Blocked {
+        observed_resume_generation,
+    } = outcome
+    else {
+        return Ok(false);
+    };
+    if *observed_resume_generation == current_resume_generation {
+        return Ok(false);
+    }
+    store::unblock_reviews(db, now)?;
+    Ok(true)
 }
 
 /// Fold a worker cycle's per-row failures of ONE operation into the single representative
@@ -336,12 +375,17 @@ pub async fn run_due_once(
         }
     }
     for action in due {
-        let id = action.id;
-        let prev_attempt_count = action.attempt_count;
+        let id = action.id();
+        let prev_attempt_count = action.attempt_count();
 
         // Staleness sweep (AB#1182): dead-letter a too-old row INSTEAD of executing it. `kind`
         // (Copy) and `created_at` are read before `action` moves into the executor below.
-        if is_expired(action.kind, action.created_at, now0, notification_ttl_secs) {
+        if is_expired(
+            action.kind(),
+            action.created_at(),
+            now0,
+            notification_ttl_secs,
+        ) {
             // A static, user-readable reason (AB#1182 review F3): no raw epochs — the panel already
             // renders this row's `created` / `updated` timestamps next to the error.
             let reason =
@@ -369,13 +413,28 @@ pub async fn run_due_once(
             // `pending` → it re-enters `start_for_outbox`, where the RETAINED claim is the breadcrumb
             // that SUPPRESSES a duplicate review (if the dead row's review already started/posted).
             // Releasing on `Dead` would drop that breadcrumb and re-open the dup window on manual
-            // retry. The dead/leaked claim is instead cleaned up by the F4 FK `ON DELETE CASCADE`
-            // when the owning `action_outbox` row is retention-pruned (so the table stays bounded
-            // without the outbox slice ever needing to know about the claim — review-blind). A
-            // still-`pending` Retry ALSO keeps the claim (a later sweep re-resolves it).
+            // retry. The dead claim remains paired with its permanent producer row; the FK still
+            // guarantees cleanup if maintenance explicitly deletes that row. A still-`pending`
+            // Retry ALSO keeps the claim (a later sweep re-resolves it).
             Ok(outcome) => {
-                if matches!(outcome, Outcome::Done) {
+                if matches!(outcome, Outcome::Done { .. }) {
                     release_terminal(db, id);
+                }
+                if matches!(outcome, Outcome::Blocked { .. }) {
+                    let state = app.state::<AppState>();
+                    match reconcile_blocked_resume(
+                        db,
+                        &outcome,
+                        state.action_resume_generation(),
+                        store::now_epoch(),
+                    ) {
+                        Ok(true) => state.outbox.wake(),
+                        Ok(false) => {}
+                        Err(error) => {
+                            record_failures += 1;
+                            first_record_error.get_or_insert(error.message);
+                        }
+                    }
                 }
             }
             // AB#1182 cycle-error aggregation: a record-write failure is counted (one representative
@@ -594,12 +653,12 @@ mod tests {
         let now = TTL + 1;
 
         let (due, _q) = store::claim_due(&db, now).expect("claim");
-        let action = due.into_iter().find(|a| a.id == id).expect("claimed");
+        let action = due.into_iter().find(|a| a.id() == id).expect("claimed");
         assert!(
-            is_expired(action.kind, action.created_at, now, TTL),
+            is_expired(action.kind(), action.created_at(), now, TTL),
             "an old pending row is stale"
         );
-        store::mark_dead(&db, id, action.attempt_count, "expired", now).expect("dead");
+        store::mark_dead(&db, id, action.attempt_count(), "expired", now).expect("dead");
 
         let entry = store::get_entry(&db, id).expect("get").expect("exists");
         assert_eq!(
@@ -609,7 +668,10 @@ mod tests {
         );
         // A swept row is terminal → never re-claimed (no ghost fire on a later tick).
         let (again, _q) = store::claim_due(&db, now + 1_000_000).expect("claim again");
-        assert!(again.iter().all(|a| a.id != id), "dead row not re-claimed");
+        assert!(
+            again.iter().all(|a| a.id() != id),
+            "dead row not re-claimed"
+        );
     }
 
     // Per-cycle error folding (AB#1182 review F1/F2): N per-row failures of one operation collapse
@@ -645,10 +707,17 @@ mod tests {
         const SEED: u64 = 7;
 
         // Success is Done no matter the attempt count.
-        assert_eq!(decide_outcome(1, 1_000, false, SEED), Outcome::Done);
+        assert_eq!(
+            decide_outcome(1, 1_000, false, SEED),
+            Outcome::Done {
+                output: ActionExecutionOutput::None
+            }
+        );
         assert_eq!(
             decide_outcome(MAX_ATTEMPTS, 1_000, false, SEED),
-            Outcome::Done
+            Outcome::Done {
+                output: ActionExecutionOutput::None
+            }
         );
 
         // Error with attempts left → Retry at now + the SAME jittered backoff (same seed).
@@ -694,11 +763,15 @@ mod tests {
         // MAX_ATTEMPTS so a regression (never dead-lettering) fails loudly instead of looping.
         for _ in 0..(MAX_ATTEMPTS + 3) {
             let (due, _q) = store::claim_due(&db, now).expect("claim");
-            let Some(action) = due.into_iter().find(|a| a.id == id) else {
+            let Some(action) = due.into_iter().find(|a| a.id() == id) else {
                 break; // no longer claimable (dead) — stop
             };
-            match record_action_result(&db, id, action.attempt_count, now, &err).expect("record") {
-                Outcome::Done => unreachable!("the action always fails"),
+            match record_action_result(&db, id, action.attempt_count(), now, &err).expect("record")
+            {
+                Outcome::Done { .. } => unreachable!("the action always fails"),
+                Outcome::Blocked { .. } => {
+                    unreachable!("ordinary errors retry instead of blocking")
+                }
                 Outcome::Retry { next_attempt_at } => {
                     retries_seen += 1;
                     // The increment is exact each step, not just at the terminal state: after N
@@ -751,10 +824,12 @@ mod tests {
             store::enqueue(&db, "p1", ActionKind::Notification, "s", "{}", 0).expect("enqueue");
         let (mut due, _q) = store::claim_due(&db, 0).expect("claim");
         let action = due.remove(0);
-        let ok: AppResult<ActionExecutionResult> = Ok(ActionExecutionResult::Done);
+        let ok: AppResult<ActionExecutionResult> = Ok(ActionExecutionResult::done());
         assert_eq!(
-            record_action_result(&db, id, action.attempt_count, 0, &ok).expect("record"),
-            Outcome::Done
+            record_action_result(&db, id, action.attempt_count(), 0, &ok).expect("record"),
+            Outcome::Done {
+                output: ActionExecutionOutput::None
+            }
         );
 
         let entry = store::get_entry(&db, id).expect("get").expect("exists");
@@ -775,7 +850,7 @@ mod tests {
         let id =
             store::enqueue(&db, "p1", ActionKind::Notification, "s", "{}", 0).expect("enqueue");
         let err: AppResult<ActionExecutionResult> = Err(AppError::new("transient"));
-        let ok: AppResult<ActionExecutionResult> = Ok(ActionExecutionResult::Done);
+        let ok: AppResult<ActionExecutionResult> = Ok(ActionExecutionResult::done());
 
         // Two failures (attempt_count → 1 then 2), then a success on attempt 3.
         record_action_result(&db, id, 0, 0, &err).expect("fail 1");
@@ -849,6 +924,52 @@ mod tests {
             Outcome::Retry {
                 next_attempt_at: 10 + BACKOFF_CAP_SECS
             }
+        );
+    }
+
+    #[test]
+    fn blocked_review_preserves_attempt_and_unblock_returns_it_to_pending() {
+        let db = Database::open_in_memory().expect("open db");
+        let id = store::enqueue(&db, "p1", ActionKind::Review, "review", "{}", 0).expect("enqueue");
+        let blocked: AppResult<ActionExecutionResult> = Ok(ActionExecutionResult::Blocked {
+            message: "Codex is stopped".to_string(),
+            observed_resume_generation: 7,
+        });
+
+        assert_eq!(
+            record_action_result(&db, id, 0, 10, &blocked).expect("record blocked"),
+            Outcome::Blocked {
+                observed_resume_generation: 7
+            }
+        );
+        let entry = store::get_entry(&db, id).expect("get").expect("exists");
+        assert_eq!(entry.status, crate::model::ActionStatus::Blocked);
+        assert_eq!(
+            entry.attempt_count, 0,
+            "blocked is not an execution attempt"
+        );
+        assert_eq!(entry.last_error.as_deref(), Some("Codex is stopped"));
+
+        assert_eq!(store::unblock_reviews(&db, 10).expect("unblock"), 1);
+        let entry = store::get_entry(&db, id).expect("get").expect("exists");
+        assert_eq!(entry.status, crate::model::ActionStatus::Pending);
+        assert_eq!(entry.attempt_count, 0, "resume does not consume an attempt");
+        assert_eq!(entry.last_error, None);
+    }
+
+    #[test]
+    fn resume_between_executor_and_block_record_is_reconciled() {
+        let db = Database::open_in_memory().expect("open db");
+        let id = store::enqueue(&db, "p1", ActionKind::Review, "review", "{}", 0).expect("enqueue");
+        let blocked = Ok(ActionExecutionResult::Blocked {
+            message: "Codex is stopped".to_string(),
+            observed_resume_generation: 7,
+        });
+        let outcome = record_action_result(&db, id, 0, 10, &blocked).expect("record blocked");
+        assert!(reconcile_blocked_resume(&db, &outcome, 8, 11).expect("reconcile"));
+        assert_eq!(
+            store::get_entry(&db, id).unwrap().unwrap().status,
+            crate::model::ActionStatus::Pending
         );
     }
 }

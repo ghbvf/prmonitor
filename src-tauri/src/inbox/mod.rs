@@ -31,7 +31,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::error::AppResult;
-use crate::model::{Candidate, Event};
+use crate::model::{Candidate, EventEnvelope};
 
 pub mod commands;
 pub mod manager;
@@ -41,14 +41,14 @@ pub mod store;
 /// The GitHub re-feed hook the composition root injects (AB#1065). Given the [`tauri::AppHandle`]
 /// and the stored parsed-`WebhookEvent` JSON, it re-feeds that delivery through the vetted
 /// `pr::commands::ingest_webhook` dispatch path. OPAQUE on purpose: the inbox holds only this
-/// `dyn Fn` (the closure captures the `ProjectDispatcher` in `lib.rs`), so the inbox slice never
-/// names `pr::webhook::WebhookEvent` / `pr::scheduler::ProjectDispatcher`. The Azure analogue is
+/// `dyn Fn` (the closure captures the composition-root refeed), so the inbox slice never
+/// names `pr::webhook::WebhookEvent`. The Azure analogue is
 /// [`AzureRefresh`]; making GitHub symmetric is what fully decouples the inbox from `pr`.
 ///
 /// **Returns [`AppResult`] (AB#1065 F2):** a refeed FAILURE (e.g. the `lib.rs` closure can't
 /// deserialize the stored `WebhookEvent` JSON) propagates as `Err` so the inbox marks the row
 /// `Failed` rather than falsely `Processed`. This drives the inbox ROW STATUS, NOT the HTTP ACK
-/// (which F1 ties to durable persist only — the process runs post-ACK in a spawned task).
+/// (which ties acknowledgement to durable persist only; the single worker processes it later).
 pub type GithubRefeed = Arc<
     dyn Fn(
             tauri::AppHandle,
@@ -71,7 +71,7 @@ pub type RuleProcessor = Arc<
     dyn Fn(
             tauri::AppHandle,
             i64,
-            Event,
+            EventEnvelope,
             Option<Candidate>,
         ) -> Pin<Box<dyn Future<Output = AppResult<()>> + Send>>
         + Send

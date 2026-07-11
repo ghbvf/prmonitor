@@ -415,7 +415,7 @@ async fn classify_wechat_response(
         .await
         .map_err(|e| AppError::new(format!("{op} 响应解析失败: {e}")))?;
     if body.errcode == 0 {
-        Ok(ActionExecutionResult::Done)
+        Ok(ActionExecutionResult::done())
     } else if body.errcode == 45009 || body.errcode == 45047 {
         Ok(ActionExecutionResult::Retry {
             message: format!("{op} 暂时失败: {}", body.errmsg),

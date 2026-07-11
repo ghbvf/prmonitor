@@ -323,7 +323,7 @@ async fn classify_feishu_response(
         .await
         .map_err(|e| AppError::new(format!("{op} 响应解析失败: {e}")))?;
     if body.code == 0 {
-        Ok(ActionExecutionResult::Done)
+        Ok(ActionExecutionResult::done())
     } else if body.code == 99991663 || body.code == 99991664 {
         Ok(ActionExecutionResult::Retry {
             message: format!("{op} 暂时失败: {}", body.msg),

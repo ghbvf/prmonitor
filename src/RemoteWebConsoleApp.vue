@@ -2,22 +2,35 @@
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import ReviewStream from "./review/ReviewStream.vue";
 import type { ReviewEvent, TrackedPrView } from "./types";
+import type {
+  ReviewReceiptId,
+  ReviewReceiptSnapshot,
+  ReviewReceiptStatus,
+} from "./types.generated";
 import type { ReviewSession, StreamItem } from "./review/types";
 import type { UnlistenFn } from "./transport";
 import {
   getRemoteClaudeStatus,
   getRemoteCodexStatus,
+  getRemoteReviewReceipt,
   getRemotePrs,
   getRemotePrSessions,
   getRemoteSessionHistory,
   listRemoteReviewSessions,
+  createExternalRequestId,
   onRemotePrEvent,
   onRemoteReviewEvent,
   remoteConsoleSnapshot,
-  startRemoteReview,
+  requestRemoteReview,
   stopRemoteReview,
   type RemoteConsoleSnapshot,
 } from "./remoteConsole/api";
+import {
+  invalidateReceiptState,
+  mergeSessionsByThread,
+  pollReceiptOnce,
+  RequestIdLifecycle,
+} from "./remoteConsole/receiptLifecycle";
 
 const snapshot = ref<RemoteConsoleSnapshot | null>(null);
 const activeProjectId = ref("");
@@ -31,7 +44,24 @@ const busy = ref(false);
 const error = ref<string | null>(null);
 const codexStatus = ref("");
 const claudeStatus = ref("");
+const receipt = ref<ReviewReceiptSnapshot | null>(null);
+const activeReceiptId = ref<ReviewReceiptId | null>(null);
+const receiptPollingStopped = ref(false);
 const unlisteners: UnlistenFn[] = [];
+let receiptTimer: ReturnType<typeof setTimeout> | null = null;
+const MAX_RECEIPT_POLL_FAILURES = 5;
+const requestIds = new RequestIdLifecycle(createExternalRequestId);
+
+const receiptStatusLabels: Record<ReviewReceiptStatus, string> = {
+  received: "Received",
+  queued: "Queued",
+  blocked: "Blocked — resume Codex to continue",
+  starting: "Starting",
+  running: "Running",
+  interrupting: "Interrupting",
+  done: "Done",
+  failed: "Failed",
+};
 
 const projects = computed(() => snapshot.value?.projects ?? []);
 const activeProject = computed(
@@ -89,9 +119,20 @@ async function refreshProject(projectId: string) {
 
 async function loadPrSessions(projectId: string, prNumber: number) {
   const durable = await getRemotePrSessions(projectId, prNumber);
-  const liveById = new Map(sessions.value.map((s) => [s.threadId, s]));
-  for (const session of durable) liveById.set(session.threadId, session);
-  sessions.value = Array.from(liveById.values());
+  sessions.value = mergeSessionsByThread(sessions.value, durable);
+}
+
+function invalidateActiveReceipt() {
+  const state = {
+    receipt: receipt.value,
+    activeReceiptId: activeReceiptId.value,
+    receiptPollingStopped: receiptPollingStopped.value,
+  };
+  invalidateReceiptState(state, stopReceiptPolling);
+  receipt.value = state.receipt;
+  activeReceiptId.value = state.activeReceiptId;
+  receiptPollingStopped.value = state.receiptPollingStopped;
+  requestIds.selectionChanged();
 }
 
 async function hydrateFocusedHistory() {
@@ -152,6 +193,7 @@ async function selectProject(projectId: string) {
   busy.value = true;
   error.value = null;
   try {
+    invalidateActiveReceipt();
     activeProjectId.value = projectId;
     selectedPrNumber.value = null;
     focusedThreadId.value = null;
@@ -168,6 +210,7 @@ async function selectPr(number: number) {
   busy.value = true;
   error.value = null;
   try {
+    invalidateActiveReceipt();
     selectedPrNumber.value = number;
     focusedThreadId.value = null;
     if (!activeProject.value) return;
@@ -190,14 +233,97 @@ async function focusSession(threadId: string) {
   }
 }
 
+function stopReceiptPolling() {
+  if (receiptTimer !== null) clearTimeout(receiptTimer);
+  receiptTimer = null;
+}
+
+async function refreshReceipt(
+  receiptId: ReviewReceiptId,
+  failureCount = 0,
+): Promise<void> {
+  try {
+    const result = await pollReceiptOnce(
+      receiptId,
+      getRemoteReviewReceipt,
+      listRemoteReviewSessions,
+    );
+    const next = result.receipt;
+    if (activeReceiptId.value !== receiptId) return;
+    receipt.value = next;
+    receiptPollingStopped.value = false;
+    error.value = null;
+    if (next.threadId) {
+      const firstSeen = !sessions.value.some((session) => session.threadId === next.threadId);
+      if (firstSeen && activeProject.value && selectedPr.value) {
+        try {
+          await loadPrSessions(activeProject.value.id, selectedPr.value.number);
+        } catch (sessionError) {
+          error.value = `Session refresh failed: ${toMessage(sessionError)}`;
+        }
+      }
+      focusedThreadId.value = next.threadId;
+      await hydrateFocusedHistory();
+    }
+    if (next.status === "done" || next.status === "failed") {
+      stopReceiptPolling();
+      if (result.sessions) sessions.value = mergeSessionsByThread(sessions.value, result.sessions);
+      if (result.sessionRefreshError) {
+        error.value = `Session refresh failed: ${toMessage(result.sessionRefreshError)}`;
+      }
+      if (next.error) error.value = next.error;
+      return;
+    }
+    receiptTimer = setTimeout(() => void refreshReceipt(receiptId), 1000);
+  } catch (err) {
+    if (activeReceiptId.value !== receiptId) return;
+    stopReceiptPolling();
+    const nextFailure = failureCount + 1;
+    if (nextFailure < MAX_RECEIPT_POLL_FAILURES) {
+      const delayMs = Math.min(1000 * 2 ** (nextFailure - 1), 8000);
+      error.value = `Receipt #${receiptId} 查询暂时失败，${delayMs / 1000}s 后重试：${toMessage(err)}`;
+      receiptTimer = setTimeout(
+        () => void refreshReceipt(receiptId, nextFailure),
+        delayMs,
+      );
+      return;
+    }
+    receiptPollingStopped.value = true;
+    error.value = `Receipt #${receiptId} 查询失败：${toMessage(err)}`;
+  }
+}
+
+function retryReceiptPolling() {
+  if (activeReceiptId.value === null) return;
+  stopReceiptPolling();
+  receiptPollingStopped.value = false;
+  error.value = null;
+  void refreshReceipt(activeReceiptId.value);
+}
+
 async function run(kind: "review" | "check") {
   if (!activeProject.value || !selectedPr.value) return;
   busy.value = true;
   error.value = null;
+  stopReceiptPolling();
+  receipt.value = null;
+  activeReceiptId.value = null;
+  receiptPollingStopped.value = false;
   try {
-    const threadId = await startRemoteReview(activeProject.value.id, selectedPr.value.number, kind);
-    focusedThreadId.value = threadId;
-    sessions.value = await listRemoteReviewSessions();
+    const requestId = requestIds.forOperation(
+      activeProject.value.id,
+      selectedPr.value.number,
+      kind,
+    );
+    const accepted = await requestRemoteReview(
+      activeProject.value.id,
+      selectedPr.value.number,
+      kind,
+      requestId,
+    );
+    requestIds.accepted();
+    activeReceiptId.value = accepted.receiptId;
+    await refreshReceipt(accepted.receiptId);
   } catch (err) {
     error.value = toMessage(err);
   } finally {
@@ -254,6 +380,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  stopReceiptPolling();
   for (const unlisten of unlisteners.splice(0)) unlisten();
 });
 </script>
@@ -315,6 +442,17 @@ onUnmounted(() => {
           </div>
         </div>
         <p v-else class="empty">No PRs available for this project.</p>
+
+        <div v-if="activeReceiptId !== null" class="receipt" :data-status="receipt?.status ?? 'loading'">
+          <strong>Receipt #{{ activeReceiptId }}</strong>
+          <span>{{ receipt ? receiptStatusLabels[receipt.status] : "Waiting for status" }}</span>
+          <a v-if="receipt?.commentUrl" :href="receipt.commentUrl" target="_blank" rel="noreferrer">Comment</a>
+          <small v-if="receipt?.threadId">Thread {{ receipt.threadId }}</small>
+          <small v-if="receipt?.error" class="error">{{ receipt.error }}</small>
+          <button v-if="receiptPollingStopped" type="button" @click="retryReceiptPolling">
+            Retry receipt lookup
+          </button>
+        </div>
 
         <div class="sessions" v-if="activeSessions.length">
           <button
@@ -415,6 +553,20 @@ select {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
+}
+.receipt {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-4) 0;
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-bg-subtle);
+}
+.receipt small {
+  color: var(--color-text-muted);
 }
 .pr-list button,
 .sessions button {

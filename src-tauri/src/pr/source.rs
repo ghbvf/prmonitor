@@ -25,7 +25,7 @@ use crate::error::AppResult;
 /// (`Event` / `Candidate`) live in `crate::model`.
 #[derive(Clone)]
 pub struct DiscoveredEvent {
-    pub event: crate::model::Event,
+    pub event: crate::model::EventEnvelope,
     pub candidate: crate::model::Candidate,
     pub conflict: bool,
 }

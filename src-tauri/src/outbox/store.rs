@@ -13,8 +13,60 @@ use rusqlite::{OptionalExtension, Transaction};
 
 use crate::db::{map_err, Database};
 use crate::error::{AppError, AppResult};
-use crate::model::{ActionKind, ActionStatus, OutboxEntry};
-use crate::outbox::OutboxAction;
+use crate::model::{
+    ActionExecutionOutput, ActionKind, ActionStatus, OutboxEntry, OutboxProducerKey,
+};
+
+/// Opaque executable row. It lives in the store module so no sibling outbox module can fabricate
+/// one; only [`claim_due`] can invoke the private constructor after a successful database claim.
+#[derive(Debug, Clone)]
+pub struct OutboxAction {
+    id: i64,
+    project_id: String,
+    kind: ActionKind,
+    payload: String,
+    attempt_count: u32,
+    created_at: u64,
+}
+
+impl OutboxAction {
+    pub fn id(&self) -> i64 {
+        self.id
+    }
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+    pub fn kind(&self) -> ActionKind {
+        self.kind
+    }
+    pub fn payload(&self) -> &str {
+        &self.payload
+    }
+    pub fn attempt_count(&self) -> u32 {
+        self.attempt_count
+    }
+    pub fn created_at(&self) -> u64 {
+        self.created_at
+    }
+
+    fn from_claimed_row(
+        id: i64,
+        project_id: String,
+        kind: ActionKind,
+        payload: String,
+        attempt_count: u32,
+        created_at: u64,
+    ) -> Self {
+        Self {
+            id,
+            project_id,
+            kind,
+            payload,
+            attempt_count,
+            created_at,
+        }
+    }
+}
 
 /// Bound on a single [`list_by_project`] page (AB#1066): the panel only needs a recent window, and
 /// `idx_action_outbox_project` makes the `ORDER BY id DESC LIMIT` a cheap top-N read.
@@ -23,14 +75,6 @@ const LIST_LIMIT: i64 = 500;
 /// Bound on a single [`claim_due`] batch (AB#1066): the worker drains due rows a page at a time so
 /// one cycle can't hydrate an unbounded backlog into memory; the next tick/wake picks up the rest.
 const CLAIM_LIMIT: i64 = 100;
-
-/// Global retention cap on TERMINAL (`done` / `dead`) outbox rows (AB#1066). Every produced action
-/// inserts a row; nothing else deletes them, so without a cap the table grows unbounded. [`enqueue`]
-/// prunes the oldest terminal rows beyond this cap on each insert (mirroring `inbox::store`'s
-/// `MAX_INBOX_EVENTS`). Only terminal rows are pruned — a `pending` row is an un-run action and must
-/// never be dropped by the cap (the worker drains those), so the bound is a backstop on history, not
-/// on the live queue.
-const MAX_OUTBOX_TERMINAL: i64 = 5000;
 
 /// Cap on a stored `last_error` (AB#1066, security review): the error is persisted and surfaced to
 /// the frontend panel, so an unbounded message (a giant serde error, or a crafted value echoed
@@ -78,6 +122,7 @@ fn sqlite_epoch(field: &str, value: u64) -> AppResult<i64> {
 pub(crate) fn status_as_wire(status: ActionStatus) -> &'static str {
     match status {
         ActionStatus::Pending => "pending",
+        ActionStatus::Blocked => "blocked",
         ActionStatus::Done => "done",
         ActionStatus::Dead => "dead",
     }
@@ -89,6 +134,7 @@ pub(crate) fn status_as_wire(status: ActionStatus) -> &'static str {
 pub(crate) fn status_from_wire(s: &str) -> ActionStatus {
     match s {
         "pending" => ActionStatus::Pending,
+        "blocked" => ActionStatus::Blocked,
         "done" => ActionStatus::Done,
         _ => ActionStatus::Dead,
     }
@@ -114,9 +160,7 @@ fn kind_from_wire(s: &str) -> AppResult<ActionKind> {
 }
 
 /// Enqueue one produced action as a NEW `pending` row due now (AB#1066), returning its row id. The
-/// row starts at `attempt_count = 0`, `next_attempt_at = now`, `last_error = NULL`. Insert + prune
-/// run in ONE `with_tx` (mirroring `inbox::store::insert_dedup`) so a prune failure can't leave the
-/// new row half-pruned; both commit / roll back atomically.
+/// row starts at `attempt_count = 0`, `next_attempt_at = now`, `last_error = NULL`.
 pub fn enqueue(
     db: &Database,
     project_id: &str,
@@ -137,10 +181,9 @@ pub(crate) struct EnqueueInput<'a> {
     pub(crate) next_attempt_at: Option<u64>,
 }
 
-/// Enqueue one produced action with a live-pending dedupe key (#1379). If the same project already
-/// has a pending row for `dedupe_key`, return that row id instead of inserting another pending
-/// action. Once the row reaches `done`/`dead`, the partial unique index no longer applies and a new
-/// action for a new attempt can be queued intentionally.
+/// Enqueue one produced action with a permanent producer key (#1379/#1374). If the same semantic
+/// producer key already exists, return that row id regardless of its status. A terminal row never
+/// opens a duplicate side-effect window.
 pub fn enqueue_deduped(
     db: &Database,
     project_id: &str,
@@ -199,7 +242,29 @@ pub(crate) fn enqueue_in_tx(
     row: &EnqueueInput<'_>,
     now: u64,
 ) -> AppResult<i64> {
-    enqueue_inner_tx(tx, row, now)
+    let producer = default_producer_key(row, now)?;
+    enqueue_inner_tx(tx, row, &producer, now)
+}
+
+pub(crate) fn enqueue_in_tx_with_producer(
+    tx: &Transaction<'_>,
+    row: &EnqueueInput<'_>,
+    producer: &OutboxProducerKey,
+    now: u64,
+) -> AppResult<i64> {
+    enqueue_inner_tx(tx, row, producer, now)
+}
+
+fn default_producer_key(row: &EnqueueInput<'_>, _now: u64) -> AppResult<OutboxProducerKey> {
+    match row.dedupe_key {
+        Some(key) => OutboxProducerKey::for_dedupe(row.project_id, key).map_err(AppError::new),
+        None => {
+            let nonce =
+                crate::model::ExternalRequestId::parse(uuid::Uuid::new_v4().simple().to_string())
+                    .map_err(AppError::new)?;
+            OutboxProducerKey::for_manual(row.project_id, row.kind, &nonce).map_err(AppError::new)
+        }
+    }
 }
 
 fn enqueue_inner(
@@ -220,19 +285,25 @@ fn enqueue_inner(
             dedupe_key,
             next_attempt_at: Some(now),
         };
-        enqueue_inner_tx(tx, &row, now)
+        let producer = default_producer_key(&row, now)?;
+        enqueue_inner_tx(tx, &row, &producer, now)
     })
 }
 
-fn enqueue_inner_tx(tx: &Transaction<'_>, row: &EnqueueInput<'_>, now: u64) -> AppResult<i64> {
+fn enqueue_inner_tx(
+    tx: &Transaction<'_>,
+    row: &EnqueueInput<'_>,
+    producer: &OutboxProducerKey,
+    now: u64,
+) -> AppResult<i64> {
     let next_attempt_at = row.next_attempt_at.unwrap_or(now);
     let next_attempt_at = sqlite_epoch("next_attempt_at", next_attempt_at)?;
     let now = sqlite_epoch("now", now)?;
     tx.execute(
         "INSERT OR IGNORE INTO action_outbox \
          (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, \
-          last_error, created_at, updated_at, dedupe_key) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, ?7, ?7, ?8)",
+          last_error, created_at, updated_at, dedupe_key, producer_key) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, NULL, ?7, ?7, ?8, ?9)",
         rusqlite::params![
             row.project_id,
             kind_as_wire(row.kind),
@@ -242,31 +313,39 @@ fn enqueue_inner_tx(tx: &Transaction<'_>, row: &EnqueueInput<'_>, now: u64) -> A
             next_attempt_at,
             now,
             row.dedupe_key,
+            producer.as_str(),
         ],
     )
     .map_err(map_err)?;
     let id = if tx.changes() == 1 {
         tx.last_insert_rowid()
     } else {
-        tx.query_row(
-            "SELECT id FROM action_outbox \
-             WHERE project_id = ?1 AND dedupe_key = ?2 AND status = 'pending' \
-             ORDER BY id LIMIT 1",
-            rusqlite::params![row.project_id, row.dedupe_key],
-            |r| r.get::<_, i64>(0),
-        )
-        .map_err(map_err)?
+        let by_producer = tx
+            .query_row(
+                "SELECT id FROM action_outbox WHERE producer_key = ?1 ORDER BY id LIMIT 1",
+                [producer.as_str()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(map_err)?;
+        match (by_producer, row.dedupe_key) {
+            (Some(id), _) => id,
+            (None, Some(dedupe_key)) => tx
+                .query_row(
+                    "SELECT id FROM action_outbox \
+                     WHERE project_id=?1 AND dedupe_key=?2 AND status IN ('pending','blocked') \
+                     ORDER BY id LIMIT 1",
+                    rusqlite::params![row.project_id, dedupe_key],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(map_err)?,
+            (None, None) => {
+                return Err(AppError::new(
+                    "outbox insert 被约束拒绝但未找到 producer 或 semantic dedupe 行",
+                ));
+            }
+        }
     };
-    // Cap stored history: drop the oldest TERMINAL rows beyond MAX_OUTBOX_TERMINAL (never a
-    // `pending` row — that is an un-run action). The `LIMIT -1 OFFSET ?` no-ops cheaply when
-    // under the cap.
-    tx.execute(
-        "DELETE FROM action_outbox WHERE id IN ( \
-             SELECT id FROM action_outbox WHERE status IN ('done', 'dead') \
-             ORDER BY id DESC LIMIT -1 OFFSET ?1)",
-        rusqlite::params![MAX_OUTBOX_TERMINAL],
-    )
-    .map_err(map_err)?;
     Ok(id)
 }
 
@@ -320,14 +399,14 @@ pub fn claim_due(db: &Database, now: u64) -> AppResult<(Vec<OutboxAction>, Vec<i
     for (id, project_id, kind, payload, attempt_count, created_at) in rows {
         let attempt_count = attempt_count.max(0) as u32;
         match kind_from_wire(&kind) {
-            Ok(kind) => actions.push(OutboxAction {
+            Ok(kind) => actions.push(OutboxAction::from_claimed_row(
                 id,
                 project_id,
                 kind,
                 payload,
                 attempt_count,
-                created_at: created_at.max(0) as u64,
-            }),
+                created_at.max(0) as u64,
+            )),
             Err(e) => {
                 // Quarantine: dead-letter the corrupt row so it terminalizes (panel-visible) instead
                 // of being re-skipped + re-logged forever. Best-effort — a write failure here just
@@ -364,6 +443,40 @@ pub fn mark_done(db: &Database, id: i64, attempt_count: u32, now: u64) -> AppRes
         )
         .map(|_| ())
     })
+}
+
+pub fn mark_done_with_output(
+    db: &Database,
+    id: i64,
+    attempt_count: u32,
+    output: &ActionExecutionOutput,
+    now: u64,
+) -> AppResult<()> {
+    let thread_id = match output {
+        ActionExecutionOutput::None => None,
+        ActionExecutionOutput::Review { thread_id } => Some(thread_id.as_str()),
+    };
+    let now = sqlite_epoch("now", now)?;
+    db.with_conn(|conn| conn.execute(
+        "UPDATE action_outbox SET status=?2, attempt_count=?3, last_error=NULL, review_thread_id=?4, updated_at=?5 WHERE id=?1",
+        rusqlite::params![id, status_as_wire(ActionStatus::Done), attempt_count as i64, thread_id, now],
+    ).map(|_| ()))
+}
+
+pub fn mark_blocked(db: &Database, id: i64, message: &str, now: u64) -> AppResult<()> {
+    let now = sqlite_epoch("now", now)?;
+    db.with_conn(|conn| conn.execute(
+        "UPDATE action_outbox SET status=?2, last_error=?3, updated_at=?4 WHERE id=?1 AND status='pending'",
+        rusqlite::params![id, status_as_wire(ActionStatus::Blocked), clamp_error(message), now],
+    ).map(|_| ()))
+}
+
+pub fn unblock_reviews(db: &Database, now: u64) -> AppResult<u64> {
+    let now = sqlite_epoch("now", now)?;
+    db.with_conn(|conn| conn.execute(
+        "UPDATE action_outbox SET status='pending', next_attempt_at=?1, last_error=NULL, updated_at=?1 WHERE status='blocked' AND kind IN ('review','check')",
+        [now],
+    ).map(|n| n as u64))
 }
 
 /// Record a transient failure (AB#1066): bump `attempt_count`, reschedule `next_attempt_at`, store
@@ -594,16 +707,8 @@ pub fn get_raw(db: &Database, id: i64) -> AppResult<Option<String>> {
     })
 }
 
-/// Map one queried row to an [`OutboxEntry`]. The `kind` / `status` columns degrade leniently so a
-/// tampered row still LISTS rather than failing the whole page: `status_from_wire` defaults a
-/// corrupt value to `Dead`, and `kind` falls back to `ActionKind::default()` (`Notification`) — a
-/// diagnostic lie for an UNRECOGNIZED kind, but acceptable for a read-only list (the strict
-/// `kind_from_wire` on the side-effectful [`claim_due`] path instead DEAD-LETTERS such a row, so it
-/// surfaces as terminal `dead` and stops re-appearing). Every KNOWN kind
-/// (`notification`/`review`/`check`/`stopReview`, AB#1069) hydrates correctly — only a genuinely
-/// unrecognized string falls back to `Notification`, and the schema-version guard rules out a
-/// legitimate future kind reaching an older binary. (`hydrate_entry_round_trips_all_known_kinds`
-/// locks this so a new kind can't silently list as `Notification`.)
+/// Map one queried row to an [`OutboxEntry`]. Unknown kinds fail closed: the v15 CHECK constraint
+/// rejects them on write, and a tampered database must never be presented as a different action.
 fn hydrate_entry(r: &rusqlite::Row) -> rusqlite::Result<OutboxEntry> {
     let kind_wire: String = r.get(2)?;
     let status_wire: String = r.get(4)?;
@@ -614,7 +719,16 @@ fn hydrate_entry(r: &rusqlite::Row) -> rusqlite::Result<OutboxEntry> {
     Ok(OutboxEntry {
         id: r.get(0)?,
         project_id: r.get(1)?,
-        kind: kind_from_wire(&kind_wire).unwrap_or_default(),
+        kind: kind_from_wire(&kind_wire).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    e.message,
+                )),
+            )
+        })?,
         summary: r.get(3)?,
         status: status_from_wire(&status_wire),
         attempt_count: attempt_count.max(0) as u32,
@@ -658,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_deduped_reuses_live_pending_row_only() {
+    fn enqueue_deduped_reuses_producer_row_across_terminal_states() {
         let db = Database::open_in_memory().expect("open db");
         let first = enqueue_deduped(
             &db,
@@ -693,10 +807,57 @@ mod tests {
             201,
         )
         .expect("enqueue after done");
-        assert_ne!(
+        assert_eq!(
             after_done, first,
-            "terminal row no longer blocks a deliberate future enqueue"
+            "permanent producer identity prevents replay after terminalization"
         );
+    }
+
+    #[test]
+    fn semantic_dedupe_reuses_live_row_across_distinct_producers() {
+        let db = Database::open_in_memory().expect("open db");
+        let row = EnqueueInput {
+            project_id: "p1",
+            kind: ActionKind::Review,
+            summary: "PR #7 review",
+            payload: "{}",
+            dedupe_key: Some("7@sha:review"),
+            next_attempt_at: Some(100),
+        };
+        let first = db
+            .with_tx(|tx| {
+                enqueue_in_tx_with_producer(
+                    tx,
+                    &row,
+                    &OutboxProducerKey::new("inbox:1:rule:a").map_err(AppError::new)?,
+                    100,
+                )
+            })
+            .expect("first producer");
+        let second = db
+            .with_tx(|tx| {
+                enqueue_in_tx_with_producer(
+                    tx,
+                    &row,
+                    &OutboxProducerKey::new("inbox:2:rule:b").map_err(AppError::new)?,
+                    101,
+                )
+            })
+            .expect("second producer reuses semantic action");
+        assert_eq!(second, first);
+
+        mark_blocked(&db, first, "stopped", 102).expect("block");
+        let third = db
+            .with_tx(|tx| {
+                enqueue_in_tx_with_producer(
+                    tx,
+                    &row,
+                    &OutboxProducerKey::new("inbox:3:rule:c").map_err(AppError::new)?,
+                    103,
+                )
+            })
+            .expect("blocked action remains the live semantic action");
+        assert_eq!(third, first);
     }
 
     // `claim_due` returns ONLY pending rows whose next_attempt_at <= now, oldest first; it excludes
@@ -975,11 +1136,7 @@ mod tests {
         );
     }
 
-    // The read-only LIST path (`hydrate_entry`) must surface every KNOWN kind correctly — the lenient
-    // `kind_from_wire(...).unwrap_or_default()` fallback (→ Notification) is ONLY for an unrecognized
-    // string, never for a legitimate AB#1069 kind. This locks that a `review`/`check`/`stopReview` row
-    // does NOT silently list as `Notification` in the panel (the "diagnostic lie" must not bite a
-    // real kind).
+    // The read-only LIST path (`hydrate_entry`) must surface every KNOWN kind correctly.
     #[test]
     fn hydrate_entry_round_trips_all_known_kinds() {
         let db = Database::open_in_memory().expect("open db");
@@ -1014,14 +1171,17 @@ mod tests {
         let good = enqueue_notif(&db, "p1", "good", 100);
         let corrupt = db
             .with_conn(|conn| {
+                conn.execute_batch("PRAGMA ignore_check_constraints=ON")?;
                 conn.execute(
                     "INSERT INTO action_outbox \
                      (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, \
-                      created_at, updated_at) \
-                     VALUES ('p1', 'gitlab-bot', 's', '{}', 'pending', 0, 100, 100, 100)",
+                      created_at, updated_at, producer_key) \
+                     VALUES ('p1', 'gitlab-bot', 's', '{}', 'pending', 0, 100, 100, 100, 'corrupt-kind-test')",
                     [],
                 )?;
-                Ok(conn.last_insert_rowid())
+                let id = conn.last_insert_rowid();
+                conn.execute_batch("PRAGMA ignore_check_constraints=OFF")?;
+                Ok(id)
             })
             .expect("insert corrupt-kind row");
 
@@ -1041,16 +1201,21 @@ mod tests {
 
         // The corrupt row was dead-lettered (terminal), carrying the parse error, and is not
         // re-claimed on the next cycle.
-        let entry = get_entry(&db, corrupt).expect("get").expect("exists");
+        let (status, last_error): (String, Option<String>) = db
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT status, last_error FROM action_outbox WHERE id=?1",
+                    [corrupt],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .expect("read quarantined row without normalizing its corrupt kind");
         assert_eq!(
-            entry.status,
-            ActionStatus::Dead,
+            status,
+            status_as_wire(ActionStatus::Dead),
             "corrupt-kind row dead-lettered"
         );
-        assert!(
-            entry.last_error.is_some(),
-            "carries the unrecognized-kind error"
-        );
+        assert!(last_error.is_some(), "carries the unrecognized-kind error");
         let (reclaimed, requarantined) = claim_due(&db, 500).expect("re-claim");
         assert!(
             reclaimed.iter().all(|x| x.id != corrupt) && requarantined.is_empty(),
@@ -1093,46 +1258,36 @@ mod tests {
         assert!(stored.ends_with('…'), "truncation marker appended");
     }
 
-    // Retention cap prunes oldest TERMINAL rows but NEVER a pending one (AB#1066): a pending row is
-    // an un-run action. Seed cap+overflow terminal rows + one pending, enqueue one more to trigger
-    // the prune, assert the count holds and the pending row survives.
+    // Producer identity is permanent across terminalization and unrelated later history. Deleting
+    // terminal rows would delete the only UNIQUE producer tombstone and reopen duplicate effects.
     #[test]
-    fn enqueue_prunes_oldest_terminal_but_keeps_pending() {
+    fn terminal_producer_identity_survives_later_history() {
         let db = Database::open_in_memory().expect("open db");
-        // A pending row with the LOWEST id (oldest) — must survive the prune.
-        let pending_old = enqueue_notif(&db, "p1", "pending-old", 50);
-        // Seed exactly MAX_OUTBOX_TERMINAL terminal (done) rows directly (cheap raw inserts).
-        db.with_conn(|conn| {
-            for i in 0..MAX_OUTBOX_TERMINAL {
-                conn.execute(
-                    "INSERT INTO action_outbox \
-                     (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, \
-                      created_at, updated_at) \
-                     VALUES ('p1', 'notification', ?1, '{}', 'done', 0, 100, 100, 100)",
-                    rusqlite::params![format!("seed-{i}")],
-                )?;
-            }
-            Ok(())
-        })
-        .expect("seed terminal rows");
-
-        // One more enqueue triggers the terminal-row prune (cap + 1 → cap, among terminal rows).
-        enqueue_notif(&db, "p1", "newest", 100);
-
-        let terminal: i64 = db
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM action_outbox WHERE status IN ('done','dead')",
-                    [],
-                    |r| r.get(0),
-                )
-            })
-            .expect("count terminal");
-        assert_eq!(terminal, MAX_OUTBOX_TERMINAL, "terminal rows capped");
-        // The pending row (oldest id of all) was NOT pruned — only terminal rows are.
-        assert!(
-            get_entry(&db, pending_old).expect("get").is_some(),
-            "a pending row is never pruned by the cap"
-        );
+        let first = enqueue_deduped(
+            &db,
+            "p1",
+            ActionKind::Review,
+            "review",
+            "{}",
+            "7@sha:review",
+            1,
+        )
+        .expect("first");
+        mark_done(&db, first, 1, 2).expect("done");
+        for index in 0..100 {
+            let id = enqueue_notif(&db, "p1", &format!("later-{index}"), 3 + index);
+            mark_done(&db, id, 1, 3 + index).expect("later done");
+        }
+        let replay = enqueue_deduped(
+            &db,
+            "p1",
+            ActionKind::Review,
+            "review",
+            "{}",
+            "7@sha:review",
+            200,
+        )
+        .expect("permanent replay");
+        assert_eq!(replay, first);
     }
 }

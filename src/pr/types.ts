@@ -41,7 +41,6 @@ export type DeliveryStatus =
   | "noTriggerLabel"
   | "notOpen"
   | "gated"
-  | "dispatched"
   | "listUpdated"
   | "refreshed";
 

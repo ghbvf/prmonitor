@@ -160,16 +160,14 @@ const statusLabels: Record<DeliveryStatus, string> = {
   noTriggerLabel: "无触发标签",
   notOpen: "PR 非 open",
   gated: "被拦截",
-  dispatched: "已派发",
   listUpdated: "已更新列表",
   refreshed: "已触发刷新",
 };
 
-// Tone class per status, so dispatched/listUpdated read as success, the skip/gate
+// Tone class per status, so listUpdated/refreshed read as success, the skip/gate
 // outcomes as warn, and the hard failures as danger.
 function statusTone(s: DeliveryStatus): "ok" | "warn" | "danger" {
   switch (s) {
-    case "dispatched":
     case "listUpdated":
     case "refreshed":
       return "ok";

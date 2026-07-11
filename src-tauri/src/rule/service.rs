@@ -1,48 +1,52 @@
 use crate::config::service::{
     RuleActionConfig, RuleActionDedupePolicy, RuleActionKind, RuleActionTarget, RuleConfig,
 };
-use crate::dispatch;
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    ActionKind, Candidate, Event, NotificationLevel, ReviewActionPayload, SendMessagingRequest,
-    SendNotificationRequest,
+    ActionKind, Candidate, EventEnvelope, NotificationLevel, ReviewActionPayload, ReviewKind,
+    SendMessagingRequest, SendNotificationRequest,
 };
 
-pub fn matches(rule: &RuleConfig, event: &Event) -> bool {
+pub fn matches(rule: &RuleConfig, event: &EventEnvelope) -> bool {
+    let Some(observation) = event.as_observation() else {
+        return false;
+    };
+    let subject = observation.subject;
     if !rule.enabled {
         return false;
     }
-    if rule.source.is_some_and(|source| source != event.source) {
+    if rule.source.is_some_and(|source| source != event.source()) {
         return false;
     }
     if rule
         .event_type
-        .is_some_and(|event_type| event_type != event.event_type)
+        .is_some_and(|event_type| event_type != observation.event_type)
     {
         return false;
     }
-    if !rule.project_id.is_empty() && rule.project_id != event.project_id {
+    if !rule.project_id.is_empty() && rule.project_id != event.project_id() {
         return false;
     }
-    if !rule.repo.is_empty() && !rule.repo.eq_ignore_ascii_case(&event.repo) {
+    if !rule.repo.is_empty() && !rule.repo.eq_ignore_ascii_case(event.repo()) {
         return false;
     }
     if !rule.labels_any.is_empty()
         && !rule
             .labels_any
             .iter()
-            .any(|wanted| event.labels.iter().any(|label| label == wanted))
+            .any(|wanted| subject.labels.iter().any(|label| label == wanted))
     {
         return false;
     }
     if !rule
         .labels_all
         .iter()
-        .all(|wanted| event.labels.iter().any(|label| label == wanted))
+        .all(|wanted| subject.labels.iter().any(|label| label == wanted))
     {
         return false;
     }
-    contains_ci(&event.title, &rule.title_contains) && contains_ci(&event.body, &rule.body_contains)
+    contains_ci(&subject.title, &rule.title_contains)
+        && contains_ci(&subject.body, &rule.body_contains)
 }
 
 fn contains_ci(haystack: &str, needle: &str) -> bool {
@@ -79,28 +83,55 @@ pub enum RuleActionDispatch {
 
 pub fn plan_event(
     rules: &[RuleConfig],
-    event: &Event,
+    event: &EventEnvelope,
     candidate: Option<&Candidate>,
 ) -> Vec<RuleMatchPlan> {
+    if let Some(request) = event.as_review_request() {
+        let kind = match request.review_kind {
+            ReviewKind::Review => ActionKind::Review,
+            ReviewKind::Check => ActionKind::Check,
+        };
+        let payload = serde_json::to_string(&ReviewActionPayload::Explicit {
+            pr_number: request.pr_number,
+            request_id: request.request_id.clone(),
+            origin: request.origin,
+        })
+        .expect("typed review request serializes");
+        return vec![RuleMatchPlan {
+            rule_id: "system:external-review".to_string(),
+            rule_name: "External review request".to_string(),
+            project_id: event.project_id().to_string(),
+            actions: vec![RuleActionPlan {
+                kind,
+                summary: format!(
+                    "External {} request for PR #{}",
+                    request.review_kind, request.pr_number
+                ),
+                dispatch: RuleActionDispatch::Outbox { payload },
+                dedupe_key: format!("external:{}", request.request_id),
+                delay_secs: 0,
+                action_id: request.review_kind.to_string(),
+                level: "system".to_string(),
+            }],
+            errors: Vec::new(),
+        }];
+    }
     let mut plans = Vec::new();
     for rule in rules.iter().filter(|rule| matches(rule, event)) {
         let mut actions = Vec::new();
         let mut errors = Vec::new();
-        match ordered_enabled_actions(rule) {
-            Ok(ordered) => {
-                for action in ordered {
-                    match plan_action(rule, event, candidate, action) {
-                        Ok(plan) => actions.push(plan),
-                        Err(e) => errors.push(e.message),
-                    }
+        {
+            for action in rule.actions.iter().filter(|action| action.enabled) {
+                match plan_action(rule, event, candidate, action) {
+                    Ok(plan) => actions.push(plan),
+                    Err(e) => errors.push(e.message),
                 }
             }
-            Err(e) => errors.push(e.message),
         }
         plans.push(RuleMatchPlan {
             rule_id: rule.id.clone(),
             rule_name: rule.name.clone(),
-            project_id: event.project_id.clone(),
+            project_id: event.project_id().to_string(),
             actions,
             errors,
         });
@@ -108,64 +139,9 @@ pub fn plan_event(
     plans
 }
 
-fn ordered_enabled_actions(rule: &RuleConfig) -> AppResult<Vec<&RuleActionConfig>> {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Mark {
-        New,
-        Visiting,
-        Done,
-    }
-
-    let by_id: std::collections::HashMap<&str, &RuleActionConfig> = rule
-        .actions
-        .iter()
-        .map(|action| (action.id.as_str(), action))
-        .collect();
-    let mut marks: std::collections::HashMap<&str, Mark> = rule
-        .actions
-        .iter()
-        .map(|action| (action.id.as_str(), Mark::New))
-        .collect();
-    let mut ordered = Vec::new();
-
-    fn visit<'a>(
-        id: &'a str,
-        by_id: &std::collections::HashMap<&'a str, &'a RuleActionConfig>,
-        marks: &mut std::collections::HashMap<&'a str, Mark>,
-        ordered: &mut Vec<&'a RuleActionConfig>,
-    ) -> AppResult<()> {
-        match marks.get(id).copied().unwrap_or(Mark::New) {
-            Mark::Done => return Ok(()),
-            Mark::Visiting => {
-                return Err(AppError::new(format!("actions DAG 存在环路: {id}")));
-            }
-            Mark::New => {}
-        }
-        let Some(action) = by_id.get(id).copied() else {
-            return Err(AppError::new(format!("actions DAG 依赖未知动作: {id}")));
-        };
-        marks.insert(id, Mark::Visiting);
-        for dep in &action.depends_on {
-            visit(dep, by_id, marks, ordered)?;
-        }
-        marks.insert(id, Mark::Done);
-        if action.enabled {
-            ordered.push(action);
-        }
-        Ok(())
-    }
-
-    for action in &rule.actions {
-        if action.enabled {
-            visit(action.id.as_str(), &by_id, &mut marks, &mut ordered)?;
-        }
-    }
-    Ok(ordered)
-}
-
 fn plan_action(
     rule: &RuleConfig,
-    event: &Event,
+    event: &EventEnvelope,
     candidate: Option<&Candidate>,
     action: &RuleActionConfig,
 ) -> AppResult<RuleActionPlan> {
@@ -194,8 +170,8 @@ fn plan_review_like(
         )));
     };
     let mut candidate = candidate.clone();
-    candidate.kind = candidate_kind.to_string();
-    let payload = serde_json::to_string(&ReviewActionPayload {
+    candidate.kind = candidate_kind;
+    let payload = serde_json::to_string(&ReviewActionPayload::Automatic {
         candidate: candidate.clone(),
     })
     .map_err(|e| AppError::new(format!("rule action 序列化失败：{e}")))?;
@@ -205,7 +181,9 @@ fn plan_review_like(
         action_node_id(action_config),
         candidate.number
     );
-    let base_dedupe_key = dispatch::review_action_dedupe_key(&candidate);
+    let base_dedupe_key = crate::model::ReviewActionKey::for_candidate(&candidate)
+        .map_err(AppError::new)?
+        .into_inner();
     let dedupe_key = match action_config.dedupe_policy {
         RuleActionDedupePolicy::Event => base_dedupe_key,
         RuleActionDedupePolicy::Action => {
@@ -223,21 +201,25 @@ fn plan_review_like(
     })
 }
 
-fn review_like_kinds(action: RuleActionKind) -> (&'static str, ActionKind) {
+fn review_like_kinds(action: RuleActionKind) -> (ReviewKind, ActionKind) {
     match action {
-        RuleActionKind::Review => ("review", ActionKind::Review),
-        RuleActionKind::Check => ("check", ActionKind::Check),
+        RuleActionKind::Review => (ReviewKind::Review, ActionKind::Review),
+        RuleActionKind::Check => (ReviewKind::Check, ActionKind::Check),
         RuleActionKind::Notify => unreachable!("notify is not a review-like action"),
     }
 }
 
 fn plan_notification(
     rule: &RuleConfig,
-    event: &Event,
+    event: &EventEnvelope,
     action: &RuleActionConfig,
 ) -> AppResult<RuleActionPlan> {
     let node_id = action_node_id(action);
-    let title = if let Some(number) = event.number {
+    let subject = event
+        .as_observation()
+        .expect("configuration rules only consume observations")
+        .subject;
+    let title = if let Some(number) = subject.number {
         format!("Rule {} action {node_id} matched PR #{}", rule.name, number)
     } else {
         format!("Rule {} action {node_id} matched event", rule.name)
@@ -252,8 +234,8 @@ fn plan_notification(
                     level: Some(NotificationLevel::Info),
                     title: title.clone(),
                     body: Some(body),
-                    url: Some(event.url.clone()).filter(|url| !url.is_empty()),
-                    project_id: Some(event.project_id.clone()),
+                    url: Some(subject.url.clone()).filter(|url| !url.is_empty()),
+                    project_id: Some(event.project_id().to_string()),
                     channel_ids: Vec::new(),
                 },
             },
@@ -265,8 +247,8 @@ fn plan_notification(
                     level: Some(NotificationLevel::Info),
                     title: title.clone(),
                     body: Some(body),
-                    url: Some(event.url.clone()).filter(|url| !url.is_empty()),
-                    project_id: Some(event.project_id.clone()),
+                    url: Some(subject.url.clone()).filter(|url| !url.is_empty()),
+                    project_id: Some(event.project_id().to_string()),
                     channel_ids: channel_ids.clone(),
                 },
             },
@@ -275,10 +257,10 @@ fn plan_notification(
             integration_id,
             conversation_id,
         } => {
-            let text = if event.url.is_empty() {
+            let text = if subject.url.is_empty() {
                 format!("{title}\n{body}")
             } else {
-                format!("{title}\n{body}\n{}", event.url)
+                format!("{title}\n{body}\n{}", subject.url)
             };
             (
                 ActionKind::MessagingSend,
@@ -307,17 +289,19 @@ fn plan_notification(
 fn rule_action_dedupe_key(
     rule: &RuleConfig,
     action: &RuleActionConfig,
-    event: &Event,
+    event: &EventEnvelope,
     suffix: &str,
 ) -> String {
     match action.dedupe_policy {
         RuleActionDedupePolicy::Event => {
-            format!("rule:{}:{}:{suffix}", rule.id, event.dedupe_key)
+            format!("rule:{}:{}:{suffix}", rule.id, event.dedupe_key())
         }
         RuleActionDedupePolicy::Action => {
             format!(
                 "rule:{}:{}:{}:{suffix}",
-                rule.id, action.id, event.dedupe_key
+                rule.id,
+                action.id,
+                event.dedupe_key()
             )
         }
     }
@@ -330,22 +314,25 @@ fn action_node_id(action: &RuleActionConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{EventType, SourceKind};
+    use crate::model::{EventSubject, EventType, InboxDedupeKey, SourceKind};
 
-    fn event() -> Event {
-        Event {
-            dedupe_key: "k".to_string(),
-            source: SourceKind::Github,
-            event_type: EventType::PullRequest,
-            project_id: "p1".to_string(),
-            repo: "Owner/Repo".to_string(),
-            number: Some(7),
-            title: "Fix Login".to_string(),
-            body: "body text".to_string(),
-            labels: vec!["ready".to_string(), "urgent".to_string()],
-            url: "https://example.com".to_string(),
-            received_at_epoch: 1,
-        }
+    fn event() -> EventEnvelope {
+        EventEnvelope::observation(
+            InboxDedupeKey::new("k").unwrap(),
+            SourceKind::Github,
+            "p1",
+            "Owner/Repo",
+            EventType::PullRequest,
+            EventSubject {
+                number: Some(7),
+                title: "Fix Login".to_string(),
+                body: "body text".to_string(),
+                labels: vec!["ready".to_string(), "urgent".to_string()],
+                url: "https://example.com".to_string(),
+            },
+            1,
+        )
+        .unwrap()
     }
 
     fn rule() -> RuleConfig {
@@ -399,7 +386,7 @@ mod tests {
             author: "dev".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
         }
     }
 
@@ -459,10 +446,9 @@ mod tests {
     }
 
     #[test]
-    fn plan_event_orders_actions_by_dependencies() {
+    fn plan_event_preserves_configured_action_order() {
         let mut r = rule();
-        let mut notify = RuleActionConfig::new("notify", RuleActionKind::Notify);
-        notify.depends_on = vec!["review".to_string()];
+        let notify = RuleActionConfig::new("notify", RuleActionKind::Notify);
         r.actions = vec![
             notify,
             RuleActionConfig::new("review", RuleActionKind::Review),
@@ -476,7 +462,7 @@ mod tests {
                 .iter()
                 .map(|action| action.action_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["review", "notify"]
+            vec!["notify", "review"]
         );
     }
 

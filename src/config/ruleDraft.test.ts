@@ -6,6 +6,7 @@ import {
   NEW_PROJECT_DEFAULTS,
 } from "./defaults";
 import {
+  createRuleAction,
   createDefaultRule,
   nextRuleId,
   parseRuleCsv,
@@ -61,7 +62,6 @@ function rule(): RuleConfig {
       target: { kind: "none" },
       dedupePolicy: "event",
       delaySecs: 0,
-      dependsOn: [],
       level: "action",
     }],
     allowActionKinds: [],
@@ -70,6 +70,18 @@ function rule(): RuleConfig {
 }
 
 describe("rule draft helpers", () => {
+  it("creates the complete ordered-action contract", () => {
+    expect(Object.keys(createRuleAction("review"))).toEqual([
+      "id",
+      "kind",
+      "enabled",
+      "target",
+      "dedupePolicy",
+      "delaySecs",
+      "level",
+    ]);
+  });
+
   it("creates a default rule from the active project and repo", () => {
     const d = draft([project("p1", "owner/repo")], "p1");
     const created = createDefaultRule(d);
@@ -121,7 +133,6 @@ describe("rule draft helpers", () => {
       target: { kind: "notificationChannels" as const, channelIds: ["desktop"] },
       dedupePolicy: "action" as const,
       delaySecs: 30,
-      dependsOn: ["review"],
       level: "important",
     };
     const updated = toggleRuleAction(

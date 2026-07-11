@@ -1,14 +1,28 @@
 // Shared cross-slice contracts mirroring `src-tauri/src/model.rs` (the contract
 // boundary). Slices import from here; they do not import each other's internals.
-import type { EventType, SourceKind, UpdateMode } from "./types.generated";
+import { ACTION_STATUSES as GENERATED_ACTION_STATUSES } from "./types.generated";
+import type {
+  ActionStatus,
+  EventEnvelope,
+  EventType,
+  PullRequestView,
+  SourceKind,
+  UpdateMode,
+} from "./types.generated";
 
 export {
   CLI_RESOLUTION_SOURCES,
   CLI_TOOLS,
   ENGINE_KINDS,
   EVENT_TYPES,
+  externalRequestId,
+  inboxDedupeKey,
+  inboxEventId,
   LABEL_SOURCES,
   NOTIFICATION_LEVELS,
+  outboxProducerKey,
+  reviewActionKey,
+  reviewReceiptId,
   SOURCE_KINDS,
   UPDATE_MODES,
 } from "./types.generated";
@@ -24,6 +38,18 @@ export type {
   SendNotificationResponse,
   SourceKind,
   UpdateMode,
+  ActionStatus,
+  EventEnvelope,
+  EventPayload,
+  ExternalRequestId,
+  ExternalTriggerOrigin,
+  InboxDedupeKey,
+  InboxEventId,
+  OutboxProducerKey,
+  PullRequestView,
+  ReviewActionKey,
+  ReviewKind,
+  ReviewReceiptId,
 } from "./types.generated";
 
 // Exhaustiveness guard for discriminated unions / string-literal enums: in a
@@ -33,15 +59,6 @@ export type {
 // for values that bypass the type system (e.g. malformed wire data).
 export function assertNever(x: never): never {
   throw new Error(`Unexpected value: ${String(x)}`);
-}
-
-export interface PullRequestView {
-  number: number;
-  title: string;
-  labels: string[];
-  url: string;
-  kind: string; // "review" | "check" — the trigger-label mode
-  skipReason: string | null; // null = would dispatch; string = why it is skipped
 }
 
 // Tracking presence for a retained PR (#38): "current" = seen in the latest
@@ -199,22 +216,33 @@ export type PrEvent =
 // The normalized inbound-event envelope shared by the inbox (1065) / rule engine (1068) /
 // outbox (1066). Mirrors `model.rs::Event` + `EventType` (the event-pipeline keystone).
 
-// A normalized inbound event (AB#1079) — mirrors `model.rs::Event` (serde camelCase; locked
-// by the model.rs golden test). Generalizes the webhook event with a cross-source identity
-// (`source` / `eventType`) and the `dedupeKey` the inbox dedups on. `number` is null for an
-// event class with no PR/issue number (a generic webhook), mirroring the Rust `Option<u64>`.
-export interface Event {
-  dedupeKey: string;
-  source: SourceKind;
+// Rust's private-field `EventEnvelope` is the wire source. Its payload union keeps observations
+// and explicit review requests distinct, so configured observation rules cannot consume a command.
+export type Event = EventEnvelope;
+
+export interface EventPresentation {
   eventType: EventType;
-  projectId: string;
-  repo: string;
   number: number | null;
   title: string;
-  body: string;
-  labels: string[];
-  url: string;
-  receivedAtEpoch: number;
+}
+
+export function presentEvent(event: EventEnvelope): EventPresentation {
+  switch (event.payload.kind) {
+    case "observation":
+      return {
+        eventType: event.payload.eventType,
+        number: event.payload.subject.number,
+        title: event.payload.subject.title,
+      };
+    case "reviewRequest":
+      return {
+        eventType: "pullRequest",
+        number: event.payload.prNumber,
+        title: `${event.payload.reviewKind === "review" ? "Review" : "Check"} request`,
+      };
+    default:
+      return assertNever(event.payload);
+  }
 }
 
 // A human-readable label for an EventType, rendered as the inbox row's type tag (AB#1065).
@@ -287,11 +315,17 @@ export interface InboxEntry {
 // in `inbox/api.ts`). A single-arm tagged union (discriminant `kind`) mirroring the `PrEvent`
 // / `ReviewEvent` shape, so it can widen later without churning the call sites. `projectId`
 // (#35) routes each upsert to its monitored project.
-export type InboxEvent = {
-  kind: "updated";
-  projectId: string;
-  entry: InboxEntry;
-};
+export type InboxEvent =
+  | {
+      kind: "updated";
+      projectId: string;
+      entry: InboxEntry;
+    }
+  | {
+      kind: "error";
+      operation: "retention" | "worker";
+      message: string;
+    };
 
 // ── Action outbox contracts (AB#1066, epic AB#1078) ───────────────────────────────
 // The outbox is the symmetric counterpart to the inbox: it retains each outbound ACTION the
@@ -304,8 +338,8 @@ export type InboxEvent = {
 // array (mirrors INBOX_STATUSES / EVENT_TYPES): the type is DERIVED from the array, so the
 // literal set is Hard — a value outside `["pending","done","dead"]` is un-expressible. The
 // `outboxStatusLabel` switch below is the Medium `assertNever`穷尽 carrier on top of it.
-export const OUTBOX_STATUSES = ["pending", "done", "dead"] as const;
-export type OutboxStatus = (typeof OUTBOX_STATUSES)[number];
+export const OUTBOX_STATUSES = GENERATED_ACTION_STATUSES;
+export type OutboxStatus = ActionStatus;
 
 // A human-readable label for an OutboxStatus, rendered as the outbox row's status badge.
 // `default: assertNever(s)` (Medium — `assertNever`穷尽, same carrier class as
@@ -315,6 +349,8 @@ export function outboxStatusLabel(s: OutboxStatus): string {
   switch (s) {
     case "pending":
       return "待执行 / Pending";
+    case "blocked":
+      return "等待恢复 / Blocked";
     case "done":
       return "已完成 / Done";
     case "dead":

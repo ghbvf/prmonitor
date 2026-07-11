@@ -582,7 +582,6 @@ fn rule_action_json(kind: &str) -> Value {
         "target": { "kind": "none" },
         "dedupePolicy": "event",
         "delaySecs": 0,
-        "dependsOn": [],
         "level": "action"
     })
 }
@@ -601,6 +600,8 @@ fn migrate_rule_actions(obj: &mut Map<String, Value>) {
         for action in actions {
             if let Some(kind) = action.as_str() {
                 *action = rule_action_json(kind);
+            } else if let Some(action) = action.as_object_mut() {
+                action.remove("dependsOn");
             }
         }
     }
@@ -647,6 +648,22 @@ pub fn local_api_path(cfg: &AppConfig) -> String {
                 .and_then(|route| crate::config::model::normalize_route_path(&route.path).ok())
         })
         .unwrap_or_else(|| crate::config::model::RemoteRoute::local_api().path)
+}
+
+/// Resolve the LocalApi route mounted on one concrete remote entrypoint. The browser UI uses this
+/// at response time so a runtime route edit is injected into the served shell without rebuilding.
+pub fn local_api_path_for_entrypoint(cfg: &AppConfig, entrypoint_id: &str) -> Option<String> {
+    cfg.remote_access
+        .entrypoints
+        .iter()
+        .find(|entrypoint| entrypoint.enabled && entrypoint.id == entrypoint_id)
+        .and_then(|entrypoint| {
+            entrypoint.routes.iter().find(|route| {
+                route.enabled
+                    && route.capability == crate::config::model::RemoteCapability::LocalApi
+            })
+        })
+        .and_then(|route| crate::config::model::normalize_route_path(&route.path).ok())
 }
 
 pub fn notification_channel<R: tauri::Runtime>(
@@ -1180,9 +1197,33 @@ mod tests {
             json!({ "kind": "none" })
         );
         assert_eq!(migrated["rules"][0]["actions"][0]["dedupePolicy"], "event");
-        assert_eq!(migrated["rules"][0]["actions"][0]["dependsOn"], json!([]));
         assert_eq!(migrated["rules"][0]["actions"][1]["id"], "notify");
         serde_json::from_value::<AppConfig>(migrated).expect("migrated config deserializes");
+    }
+
+    #[test]
+    fn migrate_drops_removed_rule_action_dependencies_once() {
+        let raw = json!({
+            "rules": [{
+                "id": "r1",
+                "name": "ordered actions",
+                "actions": [{
+                    "id": "notify",
+                    "kind": "notify",
+                    "enabled": true,
+                    "target": { "kind": "none" },
+                    "dedupePolicy": "event",
+                    "delaySecs": 0,
+                    "level": "action",
+                    "dependsOn": ["review"]
+                }]
+            }]
+        });
+
+        let migrated = migrate_value(raw);
+        assert!(migrated["rules"][0]["actions"][0]
+            .get("dependsOn")
+            .is_none());
     }
 
     #[test]
@@ -1615,6 +1656,12 @@ mod tests {
         let mut custom = AppConfig::default();
         custom.remote_access.entrypoints[0].routes[0].path = "/local-api/".to_string();
         assert_eq!(local_api_path(&custom), "/local-api");
+        let entrypoint_id = custom.remote_access.entrypoints[0].id.clone();
+        assert_eq!(
+            local_api_path_for_entrypoint(&custom, &entrypoint_id).as_deref(),
+            Some("/local-api")
+        );
+        assert_eq!(local_api_path_for_entrypoint(&custom, "missing"), None);
     }
 
     /// A bare project with the given `id` / `repo` for the `match_project_ref` cases

@@ -15,17 +15,18 @@ pub mod commands;
 /// the funnel in [`session`] calls it, so it is reachable as `super::comment_url` from
 /// `session.rs` while staying off the review slice's public surface.
 mod comment_url;
-/// Deeplink trigger transport (AB#1045): parses + validates a `prmonitor://review?pr=N&repo=R`
-/// URL and routes it into the [`commands::trigger_review`] funnel (the third transport beside the
-/// local API and CLI), then surfaces fire-and-forget completion as a desktop notification +
-/// window focus. The parser is pure (table-unit-tested); a golden locks the registered scheme.
+/// Deeplink request transport (AB#1045): parses + validates a
+/// `prmonitor://review?pr=N&repo=R&requestId=<32-lower-hex>`
+/// URL and records it through the durable external-review ingress, then surfaces fire-and-forget
+/// completion through the receipt-driven workflow. The parser is pure (table-unit-tested); a
+/// golden locks the registered scheme.
 pub mod deeplink;
 pub mod engine;
 pub mod engines;
 pub mod history_store;
-/// Local REST API trigger transport (AB#1043): a resident `127.0.0.1`-only axum listener that
-/// wraps the [`commands::trigger_review`] funnel so a third party (curl/CLI) can trigger a
-/// review and poll for completion + comment URL. Token/Host/Origin fail-closed; never tunneled.
+/// Local REST API request transport (AB#1043): an axum router that
+/// lets a third party (curl/CLI) create a durable review receipt and poll for completion + comment
+/// URL. Token/Host/Origin fail-closed; never tunneled.
 pub mod local_api;
 /// Outbound notification seam (AB#1070): the [`notify::NotificationProvider`] trait + the
 /// reference desktop notifier, dispatched by channel via an exhaustive `match NotificationKind`

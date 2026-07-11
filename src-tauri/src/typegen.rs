@@ -19,10 +19,13 @@ use crate::{
         SourcePolicy, SourcePolicyMode,
     },
     model::{
-        ActionStatus, CliResolutionSource, CliTool, EngineKind, EventType, LabelSource,
-        MessagingEvent, MessagingEventEntry, MessagingEventStatus, MessagingIntegrationOption,
-        MessagingProviderCapability, MessagingProviderKind, MessagingReplyAudit, NotificationKind,
-        NotificationLevel, ReviewLifecycleEvent, SendMessagingRequest, SendMessagingResponse,
+        ActionStatus, CliResolutionSource, CliTool, EngineKind, EventEnvelope, EventPayload,
+        EventSubject, EventType, ExternalRequestId, ExternalTriggerOrigin, InboxDedupeKey,
+        InboxEventId, LabelSource, MessagingEvent, MessagingEventEntry, MessagingEventStatus,
+        MessagingIntegrationOption, MessagingProviderCapability, MessagingProviderKind,
+        MessagingReplyAudit, NotificationKind, NotificationLevel, OutboxProducerKey,
+        PullRequestView, ReviewActionKey, ReviewKind, ReviewLifecycleEvent, ReviewReceiptId,
+        ReviewReceiptSnapshot, ReviewReceiptStatus, SendMessagingRequest, SendMessagingResponse,
         SendNotificationRequest, SendNotificationResponse, SourceKind, UpdateMode,
         WebhookTunnelMode,
     },
@@ -47,6 +50,18 @@ fn declaration<T: TS>(cfg: &Config) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("export {decl}\n")
+}
+
+fn branded_declaration<T: TS>(
+    cfg: &Config,
+    primitive: &str,
+    constructor: &str,
+    validation: &str,
+) -> String {
+    let name = T::name(cfg);
+    format!(
+        "export type {name} = Brand<{primitive}, \"{name}\">;\nexport function {constructor}(value: {primitive}): {name} {{\n  {validation}\n  return value as {name};\n}}\n"
+    )
 }
 
 fn enum_values<T>() -> String
@@ -118,6 +133,73 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push('\n');
     shared.push_str(&declaration::<EventType>(&cfg));
     shared.push_str(&option_array::<EventType>("EVENT_TYPES"));
+    shared.push('\n');
+    shared.push_str(&declaration::<ReviewKind>(&cfg));
+    shared.push_str(&option_array::<ReviewKind>("REVIEW_KINDS"));
+    shared.push('\n');
+    shared.push_str(&declaration::<PullRequestView>(&cfg));
+    shared.push('\n');
+    shared.push_str(&declaration::<ExternalTriggerOrigin>(&cfg));
+    shared.push_str(&option_array::<ExternalTriggerOrigin>(
+        "EXTERNAL_TRIGGER_ORIGINS",
+    ));
+    shared.push('\n');
+    shared.push_str("declare const __brand: unique symbol;\n");
+    shared.push_str(
+        "export type Brand<T, Name extends string> = T & { readonly [__brand]: Name };\n",
+    );
+    shared.push_str(&branded_declaration::<ExternalRequestId>(
+        &cfg,
+        "string",
+        "externalRequestId",
+        &format!(
+            "if (!/^[0-9a-f]{{{}}}$/.test(value)) throw new Error(\"requestId must be exactly {} lowercase hexadecimal characters\");",
+            ExternalRequestId::LENGTH,
+            ExternalRequestId::LENGTH
+        ),
+    ));
+    for declaration in [
+        branded_declaration::<InboxDedupeKey>(
+            &cfg,
+            "string",
+            "inboxDedupeKey",
+            "if (value.trim().length === 0) throw new Error(\"inbox dedupe key must not be empty\");",
+        ),
+        branded_declaration::<ReviewActionKey>(
+            &cfg,
+            "string",
+            "reviewActionKey",
+            "if (value.trim().length === 0) throw new Error(\"review action key must not be empty\");",
+        ),
+        branded_declaration::<OutboxProducerKey>(
+            &cfg,
+            "string",
+            "outboxProducerKey",
+            "if (value.trim().length === 0) throw new Error(\"outbox producer key must not be empty\");",
+        ),
+        branded_declaration::<InboxEventId>(
+            &cfg,
+            "number",
+            "inboxEventId",
+            "if (!Number.isSafeInteger(value) || value <= 0) throw new Error(\"inbox event id must be a positive safe integer\");",
+        ),
+        branded_declaration::<ReviewReceiptId>(
+            &cfg,
+            "number",
+            "reviewReceiptId",
+            "if (!Number.isSafeInteger(value) || value <= 0) throw new Error(\"review receipt id must be a positive safe integer\");",
+        ),
+    ] {
+        shared.push_str(&declaration);
+    }
+    shared.push_str(&declaration::<ReviewReceiptStatus>(&cfg));
+    shared.push_str(&option_array::<ReviewReceiptStatus>(
+        "REVIEW_RECEIPT_STATUSES",
+    ));
+    shared.push_str(&declaration::<ReviewReceiptSnapshot>(&cfg));
+    shared.push_str(&declaration::<EventSubject>(&cfg));
+    shared.push_str(&declaration::<EventPayload>(&cfg));
+    shared.push_str(&declaration::<EventEnvelope>(&cfg));
     shared.push('\n');
     shared.push_str(&declaration::<NotificationKind>(&cfg));
     shared.push_str(&option_array::<NotificationKind>("NOTIFICATION_KINDS"));
@@ -287,6 +369,49 @@ fn generated_config_types_are_current() {
             relative_path
         );
     }
+}
+
+#[test]
+fn semantic_newtypes_generate_branded_typescript_contracts() {
+    let shared = generated_outputs()
+        .into_iter()
+        .find_map(|(path, contents)| (path == "src/types.generated.ts").then_some(contents))
+        .expect("shared TypeScript output exists");
+
+    for (name, primitive) in [
+        ("ExternalRequestId", "string"),
+        ("InboxDedupeKey", "string"),
+        ("ReviewActionKey", "string"),
+        ("OutboxProducerKey", "string"),
+        ("InboxEventId", "number"),
+        ("ReviewReceiptId", "number"),
+    ] {
+        assert!(
+            shared.contains(&format!(
+                "export type {name} = Brand<{primitive}, \"{name}\">;"
+            )),
+            "{name} must remain a distinct branded TypeScript type"
+        );
+        assert!(
+            !shared.contains(&format!("export type {name} = {primitive};")),
+            "{name} must not collapse to its primitive TypeScript representation"
+        );
+    }
+
+    assert!(shared.contains("export function externalRequestId("));
+    assert!(shared.contains("export function inboxEventId("));
+    assert!(shared.contains("export function reviewReceiptId("));
+}
+
+#[test]
+fn pull_request_view_is_generated_from_the_rust_wire_type() {
+    let shared = generated_outputs()
+        .into_iter()
+        .find_map(|(path, contents)| (path == "src/types.generated.ts").then_some(contents))
+        .expect("shared TypeScript output exists");
+    assert!(shared.contains("export type PullRequestView = {"));
+    assert!(shared.contains("kind: ReviewKind,"));
+    assert!(shared.contains("skipReason: string | null,"));
 }
 
 #[test]

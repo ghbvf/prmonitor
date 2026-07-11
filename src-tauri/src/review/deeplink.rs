@@ -1,12 +1,10 @@
-//! Deeplink trigger transport (AB#1045): the third entry into the [`commands::trigger_review`]
-//! funnel, beside the Tauri command (`start_review`/`trigger_review`), the local REST API
-//! ([`super::local_api`]), and the CLI ([`crate::cli`]).
+//! Deeplink external-review transport (AB#1045), alongside the local REST API and CLI.
 //!
-//! A human / browser opens `prmonitor://review?pr=N&repo=R&kind=review` (Slack/Zoom-style
+//! A human / browser opens `prmonitor://review?pr=N&repo=R&kind=review&requestId=<32-lower-hex>` (Slack/Zoom-style
 //! `app://<action>?key=value`). `tauri-plugin-deep-link` surfaces it through `on_open_url`
 //! (wired in `lib.rs`); this module parses + validates the URL and hands `(reference, pr, kind)`
 //! to the SAME funnel the other transports use — so engine selection + dedup stay single-source
-//! ([`commands::dispatch_engine`]'s `Hard` carriers, never re-implemented here).
+//! (the durable receipt path's `Hard` carriers, never re-implemented here).
 //!
 //! Fire-and-forget: the OS returns no result/exit code to the opener, so completion is surfaced
 //! out-of-band — a desktop notification carrying the pr-review comment URL + the window pulled to
@@ -35,10 +33,9 @@ use url::Url;
 use crate::config::service as config_service;
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    Notification, NotificationKind, NotificationLevel, RedactedNotificationBody,
-    SendNotificationRequest,
+    ExternalRequestId, ExternalTriggerOrigin, Notification, NotificationKind, NotificationLevel,
+    RedactedNotificationBody, ReviewKind, SendNotificationRequest,
 };
-use crate::review::commands::{validate_kind, validate_pr_number};
 use crate::review::notify;
 use crate::state::AppState;
 
@@ -57,14 +54,14 @@ const MAX_REVIEW_REFERENCE_CHARS: usize = 256;
 /// today, but the URL action and the review-turn kind are separate concepts.
 const DEFAULT_KIND: &str = "review";
 
-/// A validated deeplink trigger: the funnel inputs ([`commands::trigger_review`] takes the same
-/// `(reference, pr_number, kind)`). `reference` is a project `id` OR a `repo` (resolved downstream
-/// by `project_by_ref_validated`); exactly one of `repo` / `projectId` produced it.
+/// A validated deeplink request. `reference` is a project `id` OR a `repo`; exactly one of
+/// `repo` / `projectId` produced it, and `request_id` is the mandatory durable idempotency key.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ParsedTrigger {
+pub(crate) struct ParsedReviewRequest {
     pub(crate) reference: String,
     pub(crate) pr_number: u64,
-    pub(crate) kind: String,
+    pub(crate) kind: ReviewKind,
+    pub(crate) request_id: ExternalRequestId,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -77,15 +74,17 @@ type HmacSha256 = Hmac<Sha256>;
 const NOTIFY_DEEPLINK_DEDUPE_CAP: usize = 256;
 static SEEN_NOTIFY_DEEPLINK_KEYS: OnceLock<StdMutex<VecDeque<String>>> = OnceLock::new();
 
-/// Parse + validate a `prmonitor://review?pr=N&repo=R&kind=review` deeplink into the funnel inputs.
+/// Parse + validate a
+/// `prmonitor://review?pr=N&repo=R&kind=review&requestId=<32-lower-hex>` deeplink into the
+/// durable receipt-request inputs.
 ///
-/// Rejects (never panics) anything that isn't a well-formed review trigger: wrong scheme, wrong
+/// Rejects (never panics) anything that isn't a well-formed review request: wrong scheme, wrong
 /// action, missing/non-numeric/zero `pr`, an unknown `kind`, or a reference that isn't EXACTLY one
 /// of `repo` / `projectId` (the same "exactly one" rule `local_api::resolve_reference` enforces).
 /// `kind` defaults to `"review"` when absent (parity with the CLI, where the absence of `--check`
 /// means a review). Unknown query keys are ignored (forward-compat) — only the validated fields
 /// are the contract.
-pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedTrigger> {
+pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedReviewRequest> {
     // `Url` ASCII-lowercases the scheme (WHATWG URL), so an OS that hands us `PRMONITOR://…`
     // still matches the lowercase `SCHEME` (locked by `tests::accepts_uppercase_scheme_*`).
     if url.scheme() != SCHEME {
@@ -106,12 +105,14 @@ pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedTrigger> {
     let mut repo: Option<String> = None;
     let mut project_id: Option<String> = None;
     let mut kind: Option<String> = None;
+    let mut request_id: Option<String> = None;
     for (key, value) in url.query_pairs() {
         let slot = match key.as_ref() {
             "pr" => &mut pr_raw,
             "repo" => &mut repo,
             "projectId" => &mut project_id,
             "kind" => &mut kind,
+            "requestId" => &mut request_id,
             // Ignore unknown params: the validated fields below are the contract, and tolerating
             // extras keeps a future `?foo=` from hard-failing existing links.
             _ => continue,
@@ -130,7 +131,9 @@ pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedTrigger> {
     let pr_number: u64 = pr_str
         .parse()
         .map_err(|_| AppError::new(format!("deeplink pr 参数非法（需正整数）: {pr_str:?}")))?;
-    validate_pr_number(pr_number)?;
+    if pr_number == 0 {
+        return Err(AppError::new("deeplink pr 参数非法（需正整数）"));
+    }
 
     // `reference`: EXACTLY one of `projectId` / `repo` (mirrors `local_api::resolve_reference`).
     let reference = match (project_id, repo) {
@@ -157,13 +160,19 @@ pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedTrigger> {
     }
 
     // `kind`: default "review"; otherwise the SAME whitelist the funnel enforces.
-    let kind = kind.unwrap_or_else(|| DEFAULT_KIND.to_string());
-    validate_kind(&kind)?;
+    let kind = kind
+        .unwrap_or_else(|| DEFAULT_KIND.to_string())
+        .parse::<ReviewKind>()
+        .map_err(AppError::new)?;
+    let request_id = request_id
+        .ok_or_else(|| AppError::new("deeplink 缺少 requestId 参数"))
+        .and_then(|value| ExternalRequestId::parse(value).map_err(AppError::new))?;
 
-    Ok(ParsedTrigger {
+    Ok(ParsedReviewRequest {
         reference,
         pr_number,
         kind,
+        request_id,
     })
 }
 
@@ -274,8 +283,8 @@ pub(crate) fn parse_notify_deeplink(url: &Url) -> AppResult<ParsedNotify> {
 }
 
 /// Handle a batch of opened deeplink URLs (the `on_open_url` payload). Pulls the window forward
-/// immediately (GitButler's show/focus on open), then triggers each URL on its OWN task so a
-/// long-running review for `urls[0]` never blocks triggering `urls[1]` (multiple URLs in one
+/// immediately (GitButler's show/focus on open), then processes each URL on its OWN task so a
+/// long-running review for `urls[0]` never blocks submitting `urls[1]` (multiple URLs in one
 /// event is rare, but serial `.await` would stall behind a full review). Synchronous: it only
 /// fans out spawns and returns, so the `on_open_url` callback calls it directly (no outer spawn).
 pub(crate) fn handle_review_deeplink(app: AppHandle, urls: Vec<Url>) {
@@ -285,7 +294,7 @@ pub(crate) fn handle_review_deeplink(app: AppHandle, urls: Vec<Url>) {
     }
 }
 
-/// Trigger one deeplink URL through the funnel, then await its terminal completion and notify.
+/// Submit one deeplink URL through the receipt funnel, then await terminal completion and notify.
 async fn handle_one(app: AppHandle, url: Url) {
     match url.host_str() {
         Some(ACTION_REVIEW) => handle_review_one(app, url).await,
@@ -335,7 +344,19 @@ async fn handle_notify_one<R: Runtime>(app: AppHandle<R>, url: Url) {
         .await;
         return;
     }
-    let dedupe_prefix = notify_deeplink_dedupe_prefix(&parsed.request);
+    let dedupe_prefix = match notify_deeplink_dedupe_prefix(&parsed.request) {
+        Ok(prefix) => prefix,
+        Err(e) => {
+            eprintln!("deeplink notify 去重键生成失败: {}", e.message);
+            notify_failure(
+                &app,
+                "prmonitor notification 未入队",
+                RedactedNotificationBody::fixed("通知内容无效，未入队通知"),
+            )
+            .await;
+            return;
+        }
+    };
     if notify_deeplink_key_seen(&dedupe_prefix) {
         eprintln!("deeplink notify 重复打开，已忽略");
         return;
@@ -396,10 +417,11 @@ fn verify_notify_deeplink_signature<R: Runtime>(
         .map_err(|_| AppError::new("deeplink notify sig 无效".to_string()))
 }
 
-fn notify_deeplink_dedupe_prefix(request: &SendNotificationRequest) -> String {
-    let bytes = serde_json::to_vec(request).unwrap_or_default();
+fn notify_deeplink_dedupe_prefix(request: &SendNotificationRequest) -> AppResult<String> {
+    let bytes = serde_json::to_vec(request)
+        .map_err(|e| AppError::new(format!("deeplink notify 序列化失败: {e}")))?;
     let digest = Sha256::digest(bytes);
-    format!("deeplink-notify:{}", hex::encode(digest))
+    Ok(format!("deeplink-notify:{}", hex::encode(digest)))
 }
 
 fn remember_notify_deeplink_key(key: &str) -> bool {
@@ -422,9 +444,9 @@ fn notify_deeplink_key_seen(key: &str) -> bool {
 }
 
 async fn handle_review_one(app: AppHandle, url: Url) {
-    let trigger = match parse_review_deeplink(&url) {
+    let request = match parse_review_deeplink(&url) {
         Ok(t) => t,
-        // Malformed / forged URL: reject — no trigger, no panic (acceptance ③). Fire-and-forget
+        // Malformed / forged URL: reject — no request, no panic (acceptance ③). Fire-and-forget
         // has no return channel, so a stderr line is the only surface. Log structured fields only
         // (scheme + action), NOT the full URL: its `repo`/`projectId` query values are
         // percent-decoded and may name private projects — kept symmetric with the trigger-failure
@@ -448,19 +470,24 @@ async fn handle_review_one(app: AppHandle, url: Url) {
             return;
         }
     };
-    let ParsedTrigger {
+    let ParsedReviewRequest {
         reference,
         pr_number,
         kind,
-    } = trigger;
+        request_id,
+    } = request;
 
     let state = app.state::<AppState>();
-    if let Err(e) = state
-        .review_workflow
-        .start(app.clone(), reference, pr_number, kind.clone())
-    {
+    if let Err(e) = state.external_review.submit(
+        reference,
+        pr_number,
+        kind,
+        request_id,
+        ExternalTriggerOrigin::DeepLink,
+        true,
+    ) {
         eprintln!(
-            "deeplink workflow 触发失败（pr={pr_number} kind={kind}）: {}",
+            "deeplink receipt 入队失败（pr={pr_number} kind={kind}）: {}",
             e.message
         );
         notify_failure(
@@ -520,8 +547,15 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    fn parse(s: &str) -> AppResult<ParsedTrigger> {
-        let url = Url::parse(s).unwrap_or_else(|e| panic!("test url {s:?} is malformed: {e}"));
+    const REQUEST_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    fn parse(s: &str) -> AppResult<ParsedReviewRequest> {
+        let mut url = Url::parse(s).unwrap_or_else(|e| panic!("test url {s:?} is malformed: {e}"));
+        if url.host_str() == Some(ACTION_REVIEW)
+            && !url.query_pairs().any(|(key, _)| key == "requestId")
+        {
+            url.query_pairs_mut().append_pair("requestId", REQUEST_ID);
+        }
         parse_review_deeplink(&url)
     }
 
@@ -563,18 +597,41 @@ mod tests {
         let p = parse("prmonitor://review?pr=42&repo=octo/app&kind=check").expect("ok");
         assert_eq!(
             p,
-            ParsedTrigger {
+            ParsedReviewRequest {
                 reference: "octo/app".to_string(),
                 pr_number: 42,
-                kind: "check".to_string(),
+                kind: ReviewKind::Check,
+                request_id: ExternalRequestId::parse(REQUEST_ID).expect("request id"),
             }
         );
     }
 
     #[test]
+    fn complete_documented_review_url_parses_without_test_helper() {
+        let url = Url::parse(&format!(
+            "prmonitor://review?pr=42&repo=octo/app&kind=review&requestId={REQUEST_ID}"
+        ))
+        .expect("url");
+        let parsed = parse_review_deeplink(&url).expect("documented url");
+        assert_eq!(parsed.pr_number, 42);
+        assert_eq!(parsed.request_id.as_str(), REQUEST_ID);
+    }
+
+    #[test]
     fn kind_defaults_to_review_when_absent() {
         let p = parse("prmonitor://review?pr=7&repo=octo/app").expect("ok");
-        assert_eq!(p.kind, "review");
+        assert_eq!(p.kind, ReviewKind::Review);
+    }
+
+    #[test]
+    fn request_id_is_required_and_fail_closed() {
+        let missing = Url::parse("prmonitor://review?pr=7&repo=octo/app").expect("url");
+        assert!(parse_review_deeplink(&missing).is_err());
+        assert!(parse("prmonitor://review?pr=7&repo=octo/app&requestId=ABC").is_err());
+        assert!(parse(&format!(
+            "prmonitor://review?pr=7&repo=octo/app&requestId={REQUEST_ID}&requestId={REQUEST_ID}"
+        ))
+        .is_err());
     }
 
     #[test]

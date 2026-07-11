@@ -7,7 +7,6 @@ export function cloneRuleAction(action: RuleActionConfig): RuleActionConfig {
       action.target.kind === "notificationChannels"
         ? { ...action.target, channelIds: [...action.target.channelIds] }
         : { ...action.target },
-    dependsOn: [...action.dependsOn],
   };
 }
 

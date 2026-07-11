@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use super::session::{SessionInfo, SessionStatus};
 use crate::db::Database;
 use crate::error::AppResult;
-use crate::model::EngineKind;
+use crate::model::{EngineKind, ReviewKind};
 
 /// The kind of a persisted history block (pr-review F7). The Rust write side can now ONLY
 /// express the two legal kinds, closing the gap where `kind: String` let `append_item`
@@ -118,6 +118,21 @@ fn engine_kind_from_wire(s: &str) -> EngineKind {
     serde_json::from_value(serde_json::Value::String(s.to_string())).unwrap_or(EngineKind::Codex)
 }
 
+/// DB wire string → [`ReviewKind`]. Unlike historical lenient fallbacks, a corrupt kind fails the
+/// read: silently turning an unknown value into `review` would split session identity and dedupe.
+fn review_kind_from_wire(column: usize, value: String) -> rusqlite::Result<ReviewKind> {
+    value.parse().map_err(|message: String| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                message,
+            )),
+        )
+    })
+}
+
 /// Per-PR cap on persisted review sessions (review F7). Beyond this, [`prune_pr_sessions`]
 /// drops the oldest on each upsert so `review_session` / `review_history_item` stay bounded
 /// (every dispatch adds a session; nothing else deleted them before this).
@@ -155,14 +170,24 @@ fn prune_pr_sessions(
 /// `updated_at`, preserving `created_at`. Persistence is best-effort — callers log +
 /// swallow errors so a DB hiccup never breaks the live session.
 pub fn upsert_session(db: &Database, info: &SessionInfo) -> AppResult<()> {
-    let now = now_epoch() as i64;
-    let status = status_wire(info.status);
-    let engine_kind = engine_kind_wire(info.engine_kind);
     // upsert + prune are ONE lifecycle write: run them in a transaction so a prune failure
     // can't leave the new row with a half-applied prune, and the multi-statement prune
     // commits/rolls back atomically (pr-review F5).
-    db.with_tx(|tx| {
-        tx.execute(
+    db.with_tx(|tx| upsert_session_in_tx(tx, info))
+}
+
+/// Transaction-composable form of [`upsert_session`]. The outbox start boundary uses this to
+/// commit the `review_session` row and its `outbox_review_claim.thread_id` breadcrumb together;
+/// exposing only the transaction-scoped helper keeps callers from accidentally nesting
+/// [`Database::with_tx`].
+pub(super) fn upsert_session_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    info: &SessionInfo,
+) -> AppResult<()> {
+    let now = now_epoch() as i64;
+    let status = status_wire(info.status);
+    let engine_kind = engine_kind_wire(info.engine_kind);
+    tx.execute(
             "INSERT INTO review_session \
              (thread_id, project_id, pr_number, turn_id, kind, status, created_at, updated_at, comment_url, engine_kind) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9) \
@@ -180,7 +205,7 @@ pub fn upsert_session(db: &Database, info: &SessionInfo) -> AppResult<()> {
                 info.project_id,
                 info.pr_number as i64,
                 info.turn_id,
-                info.kind,
+                info.kind.as_str(),
                 status,
                 now,
                 // AB#1042: `comment_url` is None during start (Starting/Running upserts); the
@@ -191,12 +216,10 @@ pub fn upsert_session(db: &Database, info: &SessionInfo) -> AppResult<()> {
             ],
         )
         .map_err(crate::db::map_err)?;
-        // Cap this PR's persisted sessions after the insert so `review_session` /
-        // `review_history_item` don't grow unbounded (review F7).
-        prune_pr_sessions(tx, &info.project_id, info.pr_number as i64)
-            .map_err(crate::db::map_err)?;
-        Ok(())
-    })
+    // Cap this PR's persisted sessions after the insert so `review_session` /
+    // `review_history_item` don't grow unbounded (review F7).
+    prune_pr_sessions(tx, &info.project_id, info.pr_number as i64).map_err(crate::db::map_err)?;
+    Ok(())
 }
 
 /// Updates a session's status (#70) without the full [`SessionInfo`] — the pump's
@@ -225,14 +248,24 @@ pub fn set_status_and_comment_url(
     thread_id: &str,
     status: SessionStatus,
     comment_url: Option<&str>,
+    terminal_outcome: &str,
+    terminal_error: Option<&str>,
 ) -> AppResult<()> {
     let now = now_epoch() as i64;
     let status = status_wire(status);
     db.with_conn(|conn| {
         conn.execute(
-            "UPDATE review_session SET status = ?2, comment_url = ?3, updated_at = ?4 \
+            "UPDATE review_session SET status = ?2, comment_url = ?3, terminal_outcome = ?4, \
+             terminal_error = ?5, updated_at = ?6 \
              WHERE thread_id = ?1",
-            rusqlite::params![thread_id, status, comment_url, now],
+            rusqlite::params![
+                thread_id,
+                status,
+                comment_url,
+                terminal_outcome,
+                terminal_error,
+                now
+            ],
         )
         .map(|_| ())
     })
@@ -309,6 +342,7 @@ pub fn get_pr_sessions(
              WHERE project_id = ?1 AND pr_number = ?2 ORDER BY created_at DESC, thread_id",
         )?;
         let rows = stmt.query_map(rusqlite::params![project_id, pr_number as i64], |r| {
+            let kind = review_kind_from_wire(4, r.get(4)?)?;
             let status: String = r.get(5)?;
             let engine_kind: String = r.get(8)?;
             Ok(SessionInfo {
@@ -316,7 +350,7 @@ pub fn get_pr_sessions(
                 project_id: r.get(1)?,
                 pr_number: r.get::<_, i64>(2)? as u64,
                 turn_id: r.get(3)?,
-                kind: r.get(4)?,
+                kind,
                 status: status_from_wire(&status),
                 created_at_epoch: r.get::<_, i64>(6)? as u64,
                 // AB#1042: NULL (no comment) → None; a resolved terminal URL → Some.
@@ -341,6 +375,7 @@ pub fn get_session(db: &Database, thread_id: &str) -> AppResult<Option<SessionIn
              WHERE thread_id = ?1",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![thread_id], |r| {
+            let kind = review_kind_from_wire(4, r.get(4)?)?;
             let status: String = r.get(5)?;
             let engine_kind: String = r.get(8)?;
             Ok(SessionInfo {
@@ -348,7 +383,7 @@ pub fn get_session(db: &Database, thread_id: &str) -> AppResult<Option<SessionIn
                 project_id: r.get(1)?,
                 pr_number: r.get::<_, i64>(2)? as u64,
                 turn_id: r.get(3)?,
-                kind: r.get(4)?,
+                kind,
                 status: status_from_wire(&status),
                 created_at_epoch: r.get::<_, i64>(6)? as u64,
                 // AB#1042: NULL (no comment) → None; a resolved terminal URL → Some.
@@ -384,7 +419,7 @@ mod tests {
             thread_id: thread.to_string(),
             turn_id: "t1".to_string(),
             pr_number: pr,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
             status,
             created_at_epoch: 0,
             comment_url: None,
@@ -408,6 +443,19 @@ mod tests {
 
         // Scoped per (project, PR): a different PR sees nothing.
         assert!(get_pr_sessions(&db, "alpha", 99).expect("list").is_empty());
+    }
+
+    #[test]
+    fn review_kind_db_boundary_rejects_unknown_values() {
+        assert_eq!(
+            review_kind_from_wire(4, "review".to_string()).expect("review"),
+            ReviewKind::Review
+        );
+        assert_eq!(
+            review_kind_from_wire(4, "check".to_string()).expect("check"),
+            ReviewKind::Check
+        );
+        assert!(review_kind_from_wire(4, "other".to_string()).is_err());
     }
 
     // AB#1043: the local REST API's GET /reviews/{id} durable lookup. By-thread_id read
@@ -443,8 +491,15 @@ mod tests {
         upsert_session(&db, &info("th-1", 12, SessionStatus::Running)).expect("running");
 
         // Terminal: write Done + the resolved URL atomically.
-        set_status_and_comment_url(&db, "th-1", SessionStatus::Done, Some("https://x/c"))
-            .expect("terminal write");
+        set_status_and_comment_url(
+            &db,
+            "th-1",
+            SessionStatus::Done,
+            Some("https://x/c"),
+            "completed",
+            None,
+        )
+        .expect("terminal write");
 
         let sessions = get_pr_sessions(&db, "alpha", 12).expect("list");
         assert_eq!(sessions.len(), 1);
@@ -454,14 +509,29 @@ mod tests {
         // A later Some terminal write OVERWRITES the earlier URL (Some→Some): the dedicated
         // terminal write is an explicit set, NOT a COALESCE — a re-review's new comment URL
         // replaces the prior one rather than being preserved.
-        set_status_and_comment_url(&db, "th-1", SessionStatus::Done, Some("https://x/c2"))
-            .expect("overwrite write");
+        set_status_and_comment_url(
+            &db,
+            "th-1",
+            SessionStatus::Done,
+            Some("https://x/c2"),
+            "completed",
+            None,
+        )
+        .expect("overwrite write");
         let after_some = get_pr_sessions(&db, "alpha", 12).expect("list");
         assert_eq!(after_some[0].comment_url.as_deref(), Some("https://x/c2"));
 
         // A later None terminal (e.g. a re-run that interrupted) overwrites with NULL — the
         // dedicated terminal write is explicit, not a COALESCE (only the start upsert preserves).
-        set_status_and_comment_url(&db, "th-1", SessionStatus::Failed, None).expect("none write");
+        set_status_and_comment_url(
+            &db,
+            "th-1",
+            SessionStatus::Failed,
+            None,
+            "failed",
+            Some("boom"),
+        )
+        .expect("none write");
         let after = get_pr_sessions(&db, "alpha", 12).expect("list");
         assert!(
             after[0].comment_url.is_none(),

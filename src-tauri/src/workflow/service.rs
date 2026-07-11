@@ -7,27 +7,28 @@ use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::events::{StreamEvent, WorkflowEvent};
 use crate::model::{
-    NotificationLevel, SendNotificationRequest, WorkflowInstance, WorkflowStatus, WorkflowStep,
-    WorkflowType,
+    NotificationLevel, ReviewReceiptStatus, SendNotificationRequest, WorkflowInstance,
+    WorkflowStatus, WorkflowStep, WorkflowType,
 };
 use crate::stream;
 use crate::workflow::manager::{ReviewNotifyRequest, ReviewNotifyState, WorkflowActions};
 use crate::workflow::store::{self, NewWorkflow};
 
 const STEP_LEASE_SECS: u64 = 5 * 60;
-const WAIT_REVIEW_LEASE_SECS: u64 = 24 * 60 * 60;
+const WAIT_RECEIPT_LEASE_SECS: u64 = 24 * 60 * 60;
 
-pub async fn start_review_notify<R: Runtime>(
+pub fn ensure_receipt_notify<R: Runtime>(
     app: &tauri::AppHandle<R>,
-    actions: &WorkflowActions,
     request: ReviewNotifyRequest,
 ) -> AppResult<()> {
     let input = serde_json::to_value(&request)
         .map_err(|e| AppError::new(format!("workflow input 序列化失败：{e}")))?;
     let dedupe_key = review_notify_dedupe_key(&request);
     let db = app.state::<Database>();
-    let instance = store::create_or_get(
+    let receipt_id = request.receipt_id;
+    let instance = store::create_or_get_for_receipt(
         db.inner(),
+        receipt_id,
         NewWorkflow {
             project_id: &request.reference,
             workflow_type: WorkflowType::ReviewNotify,
@@ -37,7 +38,7 @@ pub async fn start_review_notify<R: Runtime>(
         },
     )?;
     announce_updated(app, db.inner(), instance.id);
-    drive_instance(app, actions, instance).await
+    Ok(())
 }
 
 pub async fn drive_instance<R: Runtime>(
@@ -51,10 +52,10 @@ pub async fn drive_instance<R: Runtime>(
         }
         match instance.current_step {
             WorkflowStep::StartReview => {
-                instance = start_review_step(app, actions, instance).await?;
+                instance = resolve_receipt_step(app, actions, instance).await?;
             }
             WorkflowStep::WaitReview => {
-                instance = wait_review_step(app, actions, instance).await?;
+                instance = wait_receipt_step(app, actions, instance).await?;
             }
             WorkflowStep::EnqueueNotify => {
                 instance = enqueue_notify_step(app, actions, instance).await?;
@@ -99,13 +100,11 @@ pub fn announce_updated<R: Runtime>(app: &tauri::AppHandle<R>, db: &Database, id
     }
 }
 
-async fn start_review_step<R: Runtime>(
+async fn resolve_receipt_step<R: Runtime>(
     app: &tauri::AppHandle<R>,
-    actions: &WorkflowActions,
+    _actions: &WorkflowActions,
     instance: WorkflowInstance,
 ) -> AppResult<WorkflowInstance> {
-    let request: ReviewNotifyRequest = serde_json::from_value(instance.input.clone())
-        .map_err(|e| AppError::new(format!("workflow reviewNotify input 无效：{e}")))?;
     let db = app.state::<Database>();
     if !store::claim_step(
         db.inner(),
@@ -117,42 +116,28 @@ async fn start_review_step<R: Runtime>(
             .ok_or_else(|| AppError::new(format!("workflow 不存在：{}", instance.id)));
     }
     announce_updated(app, db.inner(), instance.id);
-    match (actions.start_review)(request, instance.created_at).await {
-        Ok(started) => {
-            let mut trace = review_notify_state(&instance)?;
-            trace.review_thread_id = Some(started.thread_id);
-            let state = review_notify_state_value(&trace)?;
-            if !store::update_progress(
-                db.inner(),
-                store::ProgressUpdate {
-                    id: instance.id,
-                    expected_step: WorkflowStep::StartReview,
-                    project_id: Some(&started.project_id),
-                    status: WorkflowStatus::Waiting,
-                    step: WorkflowStep::WaitReview,
-                    state: &state,
-                    next_wake_at: store::now_epoch().saturating_add(15),
-                },
-            )? {
-                return current_instance(db.inner(), instance.id);
-            }
-            announce_updated(app, db.inner(), instance.id);
-            current_instance(db.inner(), instance.id)
-        }
-        Err(e) => {
-            let _ = store::mark_failed_expected(
-                db.inner(),
-                instance.id,
-                WorkflowStep::StartReview,
-                &e.message,
-            )?;
-            announce_updated(app, db.inner(), instance.id);
-            Err(e)
-        }
+    // The request is already durable. Initialization advances directly to the receipt wait step;
+    // no review-starting action exists in this workflow, so replay cannot create a second review.
+    let state = review_notify_state_value(&review_notify_state(&instance)?)?;
+    if !store::update_progress(
+        db.inner(),
+        store::ProgressUpdate {
+            id: instance.id,
+            expected_step: WorkflowStep::StartReview,
+            project_id: None,
+            status: WorkflowStatus::Waiting,
+            step: WorkflowStep::WaitReview,
+            state: &state,
+            next_wake_at: store::now_epoch(),
+        },
+    )? {
+        return current_instance(db.inner(), instance.id);
     }
+    announce_updated(app, db.inner(), instance.id);
+    current_instance(db.inner(), instance.id)
 }
 
-async fn wait_review_step<R: Runtime>(
+async fn wait_receipt_step<R: Runtime>(
     app: &tauri::AppHandle<R>,
     actions: &WorkflowActions,
     instance: WorkflowInstance,
@@ -162,27 +147,18 @@ async fn wait_review_step<R: Runtime>(
         db.inner(),
         instance.id,
         WorkflowStep::WaitReview,
-        store::now_epoch().saturating_add(WAIT_REVIEW_LEASE_SECS),
+        store::now_epoch().saturating_add(WAIT_RECEIPT_LEASE_SECS),
     )? {
         return current_instance(db.inner(), instance.id);
     }
     announce_updated(app, db.inner(), instance.id);
-    let trace = review_notify_state(&instance)?;
-    let Some(thread_id) = trace.review_thread_id.clone() else {
-        let e = AppError::new("workflow 缺少 reviewThreadId".to_string());
-        let _ = store::mark_failed_expected(
-            db.inner(),
-            instance.id,
-            WorkflowStep::WaitReview,
-            &e.message,
-        )?;
-        announce_updated(app, db.inner(), instance.id);
-        return Err(e);
-    };
-    match (actions.wait_review)(thread_id).await {
+    let mut trace = review_notify_state(&instance)?;
+    let request: ReviewNotifyRequest = serde_json::from_value(instance.input.clone())
+        .map_err(|e| AppError::new(format!("workflow reviewNotify input 无效：{e}")))?;
+    match (actions.wait_receipt)(request.receipt_id).await {
         Ok(outcome) => {
-            let mut trace = trace;
-            trace.review_wire_status = Some(outcome.wire_status);
+            trace.review_thread_id = outcome.thread_id;
+            trace.review_wire_status = Some(receipt_status_wire(outcome.status).to_string());
             trace.comment_url = outcome.comment_url;
             let state = review_notify_state_value(&trace)?;
             if !store::update_progress(
@@ -190,7 +166,7 @@ async fn wait_review_step<R: Runtime>(
                 store::ProgressUpdate {
                     id: instance.id,
                     expected_step: WorkflowStep::WaitReview,
-                    project_id: None,
+                    project_id: Some(&outcome.project_id),
                     status: WorkflowStatus::Pending,
                     step: WorkflowStep::EnqueueNotify,
                     state: &state,
@@ -223,10 +199,12 @@ async fn enqueue_notify_step<R: Runtime>(
     let request: ReviewNotifyRequest = serde_json::from_value(instance.input.clone())
         .map_err(|e| AppError::new(format!("workflow reviewNotify input 无效：{e}")))?;
     let mut trace = review_notify_state(&instance)?;
-    let wire_status = trace.review_wire_status.as_deref().unwrap_or("completed");
+    let status = match trace.review_wire_status.as_deref() {
+        Some("failed") => ReviewReceiptStatus::Failed,
+        _ => ReviewReceiptStatus::Done,
+    };
     let comment_url = trace.comment_url.clone();
-    let send =
-        review_completion_notification_request(&request, &instance, wire_status, comment_url);
+    let send = review_completion_notification_request(&request, &instance, status, comment_url);
     let dedupe_prefix = format!("workflow:{}:notify", instance.id);
     let db = app.state::<Database>();
     if !trace.notification_outbox_ids.is_empty() {
@@ -295,13 +273,12 @@ async fn enqueue_notify_step<R: Runtime>(
 fn review_completion_notification_request(
     request: &ReviewNotifyRequest,
     instance: &WorkflowInstance,
-    wire_status: &str,
+    status: ReviewReceiptStatus,
     comment_url: Option<String>,
 ) -> SendNotificationRequest {
-    let (status_label, fallback) = match wire_status {
-        "completed" => ("完成", "本次 review 完成（无评论链接）"),
-        "interrupted" => ("已中断", "本次 review 已中断（无评论链接）"),
-        "failed" => ("失败", "本次 review 失败（无评论链接）"),
+    let (status_label, fallback) = match status {
+        ReviewReceiptStatus::Done => ("完成", "本次 review 完成（无评论链接）"),
+        ReviewReceiptStatus::Failed => ("失败", "本次 review 失败（无评论链接）"),
         _ => ("结束", "本次 review 结束（无评论链接）"),
     };
     SendNotificationRequest {
@@ -311,6 +288,19 @@ fn review_completion_notification_request(
         url: comment_url,
         project_id: Some(instance.project_id.clone()).filter(|s| !s.is_empty()),
         channel_ids: Vec::new(),
+    }
+}
+
+fn receipt_status_wire(status: ReviewReceiptStatus) -> &'static str {
+    match status {
+        ReviewReceiptStatus::Done => "completed",
+        ReviewReceiptStatus::Failed => "failed",
+        ReviewReceiptStatus::Received
+        | ReviewReceiptStatus::Queued
+        | ReviewReceiptStatus::Blocked
+        | ReviewReceiptStatus::Starting
+        | ReviewReceiptStatus::Running
+        | ReviewReceiptStatus::Interrupting => "running",
     }
 }
 
@@ -340,7 +330,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use crate::model::SendNotificationResponse;
+    use crate::model::{ReviewKind, ReviewReceiptId, SendNotificationResponse};
 
     fn test_app() -> tauri::App<tauri::test::MockRuntime> {
         let app = tauri::test::mock_app();
@@ -351,35 +341,27 @@ mod tests {
 
     fn request() -> ReviewNotifyRequest {
         ReviewNotifyRequest {
+            receipt_id: ReviewReceiptId::new(17).expect("receipt"),
             reference: "repo".to_string(),
             pr_number: 7,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
         }
     }
 
     fn happy_actions(
-        start_calls: Arc<AtomicUsize>,
         wait_calls: Arc<AtomicUsize>,
         send_calls: Arc<AtomicUsize>,
     ) -> WorkflowActions {
         WorkflowActions {
-            start_review: Arc::new(move |_request, _created_at| {
-                let start_calls = Arc::clone(&start_calls);
-                Box::pin(async move {
-                    start_calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(crate::workflow::manager::StartedReview {
-                        thread_id: "t1".to_string(),
-                        project_id: "p1".to_string(),
-                    })
-                })
-            }),
-            wait_review: Arc::new(move |thread_id| {
+            wait_receipt: Arc::new(move |receipt_id| {
                 let wait_calls = Arc::clone(&wait_calls);
                 Box::pin(async move {
                     wait_calls.fetch_add(1, Ordering::SeqCst);
-                    assert_eq!(thread_id, "t1");
+                    assert_eq!(receipt_id.get(), 17);
                     Ok(crate::workflow::manager::ReviewCompletion {
-                        wire_status: "completed".to_string(),
+                        thread_id: Some("t1".to_string()),
+                        project_id: "p1".to_string(),
+                        status: ReviewReceiptStatus::Done,
                         comment_url: Some("https://example.com/pr/7#comment".to_string()),
                     })
                 })
@@ -397,30 +379,48 @@ mod tests {
         }
     }
 
+    async fn initialize_waiting(
+        handle: &tauri::AppHandle<tauri::test::MockRuntime>,
+        actions: &WorkflowActions,
+    ) {
+        ensure_receipt_notify(handle, request()).expect("persist workflow");
+        let db = handle.state::<Database>();
+        let pending = crate::workflow::store::list_by_project(db.inner(), Some("repo"))
+            .expect("list")
+            .remove(0);
+        drive_instance(handle, actions, pending)
+            .await
+            .expect("initialize wait step");
+    }
+
+    #[test]
+    fn ensure_receipt_notify_persists_handoff_before_returning() {
+        let app = test_app();
+        let handle = app.handle().clone();
+        ensure_receipt_notify(&handle, request()).expect("ensure");
+        let db = handle.state::<Database>();
+        let rows = crate::workflow::store::list_by_project(db.inner(), Some("repo")).expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, WorkflowStatus::Pending);
+        assert_eq!(rows[0].current_step, WorkflowStep::StartReview);
+    }
+
     #[tokio::test]
     async fn review_notify_state_machine_records_success_trace() {
         let app = test_app();
         let handle = app.handle().clone();
-        let start_calls = Arc::new(AtomicUsize::new(0));
         let wait_calls = Arc::new(AtomicUsize::new(0));
         let send_calls = Arc::new(AtomicUsize::new(0));
-        let actions = happy_actions(
-            Arc::clone(&start_calls),
-            Arc::clone(&wait_calls),
-            Arc::clone(&send_calls),
-        );
+        let actions = happy_actions(Arc::clone(&wait_calls), Arc::clone(&send_calls));
 
-        start_review_notify(&handle, &actions, request())
-            .await
-            .expect("start");
+        initialize_waiting(&handle, &actions).await;
         let db = handle.state::<Database>();
-        let waiting = crate::workflow::store::list_by_project(db.inner(), Some("p1"))
+        let waiting = crate::workflow::store::list_by_project(db.inner(), Some("repo"))
             .expect("list")
             .remove(0);
         assert_eq!(waiting.status, WorkflowStatus::Waiting);
         assert_eq!(waiting.current_step, WorkflowStep::WaitReview);
-        assert_eq!(waiting.state["reviewThreadId"], "t1");
-        assert_eq!(start_calls.load(Ordering::SeqCst), 1);
+        assert!(waiting.state.get("reviewThreadId").is_none());
         assert_eq!(wait_calls.load(Ordering::SeqCst), 0);
         assert_eq!(send_calls.load(Ordering::SeqCst), 0);
 
@@ -435,39 +435,89 @@ mod tests {
         assert_eq!(done.state["reviewWireStatus"], "completed");
         assert_eq!(done.state["commentUrl"], "https://example.com/pr/7#comment");
         assert_eq!(done.state["notificationOutboxIds"], serde_json::json!([9]));
-        assert_eq!(start_calls.load(Ordering::SeqCst), 1);
         assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
         assert_eq!(send_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn start_review_failure_is_visible_on_instance() {
+    async fn failed_receipt_without_thread_still_enqueues_completion_notification() {
+        let app = test_app();
+        let handle = app.handle().clone();
+        let send_calls = Arc::new(AtomicUsize::new(0));
+        let actions = WorkflowActions {
+            wait_receipt: Arc::new(|receipt_id| {
+                Box::pin(async move {
+                    assert_eq!(receipt_id.get(), 17);
+                    Ok(crate::workflow::manager::ReviewCompletion {
+                        thread_id: None,
+                        project_id: "p1".to_string(),
+                        status: ReviewReceiptStatus::Failed,
+                        comment_url: None,
+                    })
+                })
+            }),
+            send_notification: Arc::new({
+                let send_calls = Arc::clone(&send_calls);
+                move |request, _dedupe_prefix| {
+                    let send_calls = Arc::clone(&send_calls);
+                    Box::pin(async move {
+                        send_calls.fetch_add(1, Ordering::SeqCst);
+                        assert!(request.title.contains("失败"));
+                        Ok(SendNotificationResponse {
+                            outbox_ids: vec![11],
+                        })
+                    })
+                }
+            }),
+        };
+
+        initialize_waiting(&handle, &actions).await;
+        let db = handle.state::<Database>();
+        let waiting = crate::workflow::store::list_by_project(db.inner(), Some("repo"))
+            .expect("list")
+            .remove(0);
+        drive_instance(&handle, &actions, waiting)
+            .await
+            .expect("finish failed receipt workflow");
+
+        let done = crate::workflow::store::list_by_project(db.inner(), Some("p1"))
+            .expect("list")
+            .remove(0);
+        assert_eq!(done.status, WorkflowStatus::Done);
+        assert_eq!(done.state["reviewWireStatus"], "failed");
+        assert!(done.state.get("reviewThreadId").is_none());
+        assert_eq!(send_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn receipt_wait_failure_is_visible_on_instance() {
         let app = test_app();
         let handle = app.handle().clone();
         let actions = WorkflowActions {
-            start_review: Arc::new(move |_request, _created_at| {
-                Box::pin(async move { Err(AppError::new("start boom".to_string())) })
-            }),
-            wait_review: Arc::new(move |_thread_id| {
-                Box::pin(async move { Err(AppError::new("should not wait".to_string())) })
+            wait_receipt: Arc::new(move |_receipt_id| {
+                Box::pin(async move { Err(AppError::new("receipt boom".to_string())) })
             }),
             send_notification: Arc::new(move |_request, _dedupe_prefix| {
                 Box::pin(async move { Err(AppError::new("should not send".to_string())) })
             }),
         };
 
-        let err = start_review_notify(&handle, &actions, request())
-            .await
-            .expect_err("start fails");
-        assert_eq!(err.message, "start boom");
+        initialize_waiting(&handle, &actions).await;
         let db = handle.state::<Database>();
+        let waiting = crate::workflow::store::list_by_project(db.inner(), Some("repo"))
+            .expect("list")
+            .remove(0);
+        let err = drive_instance(&handle, &actions, waiting)
+            .await
+            .expect_err("receipt wait fails");
+        assert_eq!(err.message, "receipt boom");
         let failed = crate::workflow::store::list_by_project(db.inner(), Some("repo"))
             .expect("list")
             .remove(0);
         assert_eq!(failed.status, WorkflowStatus::Failed);
-        assert_eq!(failed.current_step, WorkflowStep::StartReview);
+        assert_eq!(failed.current_step, WorkflowStep::WaitReview);
         assert_eq!(failed.attempt_count, 1);
-        assert_eq!(failed.last_error.as_deref(), Some("start boom"));
+        assert_eq!(failed.last_error.as_deref(), Some("receipt boom"));
     }
 
     #[tokio::test]
@@ -508,11 +558,7 @@ mod tests {
         .expect("advance");
         let current = current_instance(db.inner(), instance.id).expect("current");
         let send_calls = Arc::new(AtomicUsize::new(0));
-        let actions = happy_actions(
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(AtomicUsize::new(0)),
-            Arc::clone(&send_calls),
-        );
+        let actions = happy_actions(Arc::new(AtomicUsize::new(0)), Arc::clone(&send_calls));
 
         drive_instance(&handle, &actions, current)
             .await
@@ -548,17 +594,13 @@ mod tests {
             99,
         )
         .expect("claim elsewhere"));
-        let start_calls = Arc::new(AtomicUsize::new(0));
-        let actions = happy_actions(
-            Arc::clone(&start_calls),
-            Arc::new(AtomicUsize::new(0)),
-            Arc::new(AtomicUsize::new(0)),
-        );
+        let wait_calls = Arc::new(AtomicUsize::new(0));
+        let actions = happy_actions(Arc::clone(&wait_calls), Arc::new(AtomicUsize::new(0)));
 
         drive_instance(&handle, &actions, stale)
             .await
             .expect("stale driver exits");
-        assert_eq!(start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(wait_calls.load(Ordering::SeqCst), 0);
         let current = current_instance(db.inner(), 1).expect("current");
         assert_eq!(current.status, WorkflowStatus::Running);
         assert_eq!(current.current_step, WorkflowStep::StartReview);
@@ -567,9 +609,10 @@ mod tests {
     #[test]
     fn review_notify_dedupe_key_is_stable() {
         let req = ReviewNotifyRequest {
+            receipt_id: ReviewReceiptId::new(17).expect("receipt"),
             reference: "repo".to_string(),
             pr_number: 7,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
         };
         assert_eq!(
             review_notify_dedupe_key(&req),
@@ -580,9 +623,10 @@ mod tests {
     #[test]
     fn review_completion_notification_request_maps_terminal_payload() {
         let req = ReviewNotifyRequest {
+            receipt_id: ReviewReceiptId::new(17).expect("receipt"),
             reference: "repo".to_string(),
             pr_number: 7,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
         };
         let instance = WorkflowInstance {
             id: 1,
@@ -601,7 +645,7 @@ mod tests {
         let request = review_completion_notification_request(
             &req,
             &instance,
-            "completed",
+            ReviewReceiptStatus::Done,
             Some("https://example.com/pr/7#comment".to_string()),
         );
         assert_eq!(request.title, "PR #7 review 完成");
@@ -615,7 +659,12 @@ mod tests {
         );
         assert_eq!(request.project_id.as_deref(), Some("p1"));
 
-        let failed = review_completion_notification_request(&req, &instance, "failed", None);
+        let failed = review_completion_notification_request(
+            &req,
+            &instance,
+            ReviewReceiptStatus::Failed,
+            None,
+        );
         assert_eq!(failed.title, "PR #7 review 失败");
         assert_eq!(
             failed.body.as_deref(),

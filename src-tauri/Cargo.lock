@@ -3198,6 +3198,7 @@ dependencies = [
  "tokio-stream",
  "ts-rs",
  "url",
+ "uuid",
 ]
 
 [[package]]

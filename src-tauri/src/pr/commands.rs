@@ -3,14 +3,14 @@
 use crate::config::service as config_service;
 use crate::error::AppResult;
 use crate::events::{PrEvent, StreamEvent};
-use crate::model::{Candidate, CliTool, PullRequestView, SourceKind, UpdateMode};
+use crate::model::{Candidate, CliTool, PullRequestView, ReviewKind, SourceKind, UpdateMode};
 
 use super::azure::{az_auth_status, AzStatus, AzureDevOpsCli};
 use super::bitbucket::BitbucketServer;
 use super::discover::{self, MonitorParams};
 use super::gh::{gh_auth_status, GhStatus, GithubCli};
 use super::ledger::{now_epoch, Ledger};
-use super::scheduler::{PollStatus, ProjectDispatcher};
+use super::scheduler::PollStatus;
 use super::source::{DiscoveredEvent, EventSourceProvider};
 use super::webhook::{DeliveryStatus, IngestIntent, WebhookDelivery, WebhookEvent, WebhookStatus};
 
@@ -45,9 +45,18 @@ fn build_view(
 ) -> (PullRequestView, Option<Candidate>) {
     build_view_parts(
         de.candidate.clone(),
-        de.event.title.clone(),
-        de.event.labels.clone(),
-        de.event.url.clone(),
+        de.event
+            .as_observation()
+            .map(|o| o.subject.title.clone())
+            .unwrap_or_default(),
+        de.event
+            .as_observation()
+            .map(|o| o.subject.labels.clone())
+            .unwrap_or_default(),
+        de.event
+            .as_observation()
+            .map(|o| o.subject.url.clone())
+            .unwrap_or_default(),
         de.conflict,
         params,
         ledger,
@@ -129,7 +138,7 @@ fn partition_events(
 /// This is the shared discovery body driven by the scheduler's per-project poll loop
 /// (`scheduler::discover_emit_dispatch`), its only caller; there is no manual-fetch
 /// command — the frontend triggers a refresh via `poll_now`. The dispatchable
-/// candidates flow to the auto-trigger dispatcher ([`crate::dispatch`]).
+/// candidates flow to the durable event sink.
 pub(crate) async fn discover<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     project_id: &str,
@@ -348,8 +357,7 @@ pub async fn poll_now<R: tauri::Runtime>(
         PollNowAction::OneShot => {
             // One-shot CLI discovery (manual has no periodic loop). Drives the same
             // per-cycle body the loop would, so it discovers / persists / emits / dispatches.
-            state.scheduler.discover_once(&app, project_id).await;
-            Ok(())
+            state.scheduler.discover_once(&app, project_id).await
         }
         PollNowAction::RejectWebhookOnly => Err(crate::error::AppError::new(
             "webhook-only 模式不支持手动拉取",
@@ -601,7 +609,7 @@ fn decide_ingest(
                 title,
                 labels,
                 url,
-                kind: "review".to_string(),
+                kind: ReviewKind::Review,
                 skip_reason: Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string()),
             };
             IngestDecision {
@@ -623,7 +631,7 @@ fn decide_ingest(
                 title,
                 labels,
                 url,
-                kind: "review".to_string(),
+                kind: ReviewKind::Review,
                 skip_reason: Some(reason.clone()),
             };
             IngestDecision {
@@ -664,7 +672,6 @@ fn decide_ingest(
 /// and lose a write).
 pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    _dispatcher: &ProjectDispatcher,
     ev: WebhookEvent,
 ) -> AppResult<Option<Candidate>> {
     let WebhookEvent {
@@ -793,7 +800,7 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
             action,
             repo: Some(repo),
             pr_number: Some(number),
-            kind: Some(view.kind),
+            kind: Some(view.kind.to_string()),
             status: final_status,
             message,
         },
@@ -975,7 +982,13 @@ pub async fn poll_status<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Candidate;
+    use crate::model::{Candidate, ReviewActionKey, ReviewKind};
+
+    fn action_key(pr: u64, head: &str, kind: &str) -> String {
+        ReviewActionKey::for_parts(pr, head, kind.parse().unwrap())
+            .unwrap()
+            .into_inner()
+    }
 
     fn params() -> MonitorParams {
         MonitorParams {
@@ -988,7 +1001,7 @@ mod tests {
     // AB#1070: the source-agnostic discovered row is now a `DiscoveredEvent` (normalized
     // `Event` + gating `Candidate`). `.candidate` still surfaces for the gating-only tests.
     fn row(number: u64, kind: &str, conflict: bool) -> DiscoveredEvent {
-        use crate::model::{Event, EventType};
+        use crate::model::{EventEnvelope, EventSubject, EventType, InboxDedupeKey};
         let candidate = Candidate {
             number,
             head_sha: "sha".to_string(),
@@ -996,22 +1009,25 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: kind.to_string(),
+            kind: kind.parse().unwrap(),
         };
         DiscoveredEvent {
-            event: Event {
-                dedupe_key: format!("github:pullRequest:o/r#{number}@sha"),
-                source: SourceKind::Github,
-                event_type: EventType::PullRequest,
-                project_id: String::new(),
-                repo: "o/r".to_string(),
-                number: Some(number),
-                title: format!("PR {number}"),
-                body: String::new(),
-                labels: vec!["review-label".to_string()],
-                url: format!("https://x/{number}"),
-                received_at_epoch: 0,
-            },
+            event: EventEnvelope::observation(
+                InboxDedupeKey::new(format!("github:pullRequest:o/r#{number}@sha")).unwrap(),
+                SourceKind::Github,
+                "discovery",
+                "o/r",
+                EventType::PullRequest,
+                EventSubject {
+                    number: Some(number),
+                    title: format!("PR {number}"),
+                    body: String::new(),
+                    labels: vec!["review-label".to_string()],
+                    url: format!("https://x/{number}"),
+                },
+                0,
+            )
+            .unwrap(),
             candidate,
             conflict,
         }
@@ -1038,7 +1054,7 @@ mod tests {
             0,
         );
         assert_eq!(view.number, 1);
-        assert_eq!(view.kind, "review");
+        assert_eq!(view.kind, ReviewKind::Review);
         assert_eq!(view.title, "Real title");
         assert_eq!(view.url, "https://dev.azure.com/o/p/_git/r/pullrequest/1");
         assert_eq!(
@@ -1138,7 +1154,7 @@ mod tests {
     fn build_view_clean_row_has_no_skip_reason_and_is_dispatchable() {
         let (view, cand) = build_view(&row(1, "review", false), &params(), &Ledger::default(), 0);
         assert_eq!(view.number, 1);
-        assert_eq!(view.kind, "review");
+        assert_eq!(view.kind, ReviewKind::Review);
         // AB#1070: display fields (title / url / labels) come from the `DiscoveredEvent.event`,
         // not the `Candidate` (which has no title/url/labels) — locks the event-as-display source.
         assert_eq!(view.title, "PR 1");
@@ -1148,7 +1164,7 @@ mod tests {
         // Clean row (skip_reason None) → surfaced as a dispatchable candidate.
         let cand = cand.expect("clean row yields a dispatchable candidate");
         assert_eq!(cand.number, 1);
-        assert_eq!(cand.kind, "review");
+        assert_eq!(cand.kind, crate::model::ReviewKind::Review);
     }
 
     #[test]
@@ -1173,11 +1189,11 @@ mod tests {
 
     #[test]
     fn build_view_propagates_cooldown_skip_and_omits_candidate() {
-        use crate::pr::ledger::{dispatch_key, DispatchEvent};
+        use crate::pr::ledger::DispatchEvent;
         use std::collections::HashSet;
 
         let r = row(4, "review", false);
-        let key = dispatch_key(4, &r.candidate.head_sha, "review");
+        let key = action_key(4, &r.candidate.head_sha, "review");
         let ledger = Ledger {
             dispatched: HashSet::new(),
             events: vec![DispatchEvent {
@@ -1208,7 +1224,7 @@ mod tests {
     // tested at their source in `discover.rs`.
     #[test]
     fn webhook_view_applies_both_static_and_cooldown_gates() {
-        use crate::pr::ledger::{dispatch_key, DispatchEvent};
+        use crate::pr::ledger::DispatchEvent;
         use std::collections::HashSet;
 
         let clean = row(1, "review", false).candidate;
@@ -1217,13 +1233,13 @@ mod tests {
 
         let ledger = Ledger {
             // #2 already dispatched at this head_sha → should_skip drops it.
-            dispatched: HashSet::from([dispatch_key(2, &dispatched.head_sha, "review")]),
+            dispatched: HashSet::from([action_key(2, &dispatched.head_sha, "review")]),
             // #3 dispatched 500s before `now` (1800s cooldown) → cooldown_skip drops it.
             events: vec![DispatchEvent {
                 pr: 3,
                 kind: "review".to_string(),
                 head_sha: cooled.head_sha.clone(),
-                key: dispatch_key(3, &cooled.head_sha, "review"),
+                key: action_key(3, &cooled.head_sha, "review"),
                 dispatched_at_epoch: 1_000,
             }],
         };
@@ -1300,7 +1316,7 @@ mod tests {
     #[test]
     fn decide_ingest_clean_candidate_lists_for_rule_engine() {
         // A clean candidate updates the list. Action enqueueing is owned by the rule engine,
-        // so webhook ingest itself no longer reports Dispatched.
+        // so webhook ingest itself only reports list updates.
         let d = decide_ingest(
             wrap_some(1),
             1,
@@ -1312,7 +1328,7 @@ mod tests {
             0,
         );
         assert_eq!(d.view.number, 1);
-        assert_eq!(d.view.kind, "review");
+        assert_eq!(d.view.kind, ReviewKind::Review);
         assert_eq!(d.view.skip_reason, None);
         assert!(matches!(d.write, WriteKind::Upsert));
         assert!(matches!(d.status, DeliveryStatus::ListUpdated));
@@ -1349,7 +1365,7 @@ mod tests {
     fn decide_ingest_cooldown_gated_candidate_is_gated_no_dispatch() {
         // A candidate within its dispatch cooldown is gated by `cooldown_skip` → Gated row,
         // no candidate for rule processing, message = the cooldown reason.
-        use crate::pr::ledger::{dispatch_key, DispatchEvent};
+        use crate::pr::ledger::DispatchEvent;
         use std::collections::HashSet;
 
         let cand = row(4, "review", false).candidate;
@@ -1359,7 +1375,7 @@ mod tests {
                 pr: 4,
                 kind: "review".to_string(),
                 head_sha: cand.head_sha.clone(),
-                key: dispatch_key(4, &cand.head_sha, "review"),
+                key: action_key(4, &cand.head_sha, "review"),
                 dispatched_at_epoch: 1_000,
             }],
         };
@@ -1413,7 +1429,7 @@ mod tests {
             0,
         );
         assert_eq!(d.view.number, 5);
-        assert_eq!(d.view.kind, "review");
+        assert_eq!(d.view.kind, ReviewKind::Review);
         assert_eq!(
             d.view.skip_reason,
             Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string())
@@ -1444,7 +1460,7 @@ mod tests {
             0,
         );
         assert_eq!(d.view.number, 6);
-        assert_eq!(d.view.kind, "review");
+        assert_eq!(d.view.kind, ReviewKind::Review);
         assert_eq!(d.view.skip_reason, Some("PR 已关闭或合并".to_string()));
         assert!(matches!(d.write, WriteKind::UpdatePresent));
         assert!(matches!(d.status, DeliveryStatus::NotOpen));
@@ -1470,7 +1486,7 @@ mod tests {
             0,
         );
         assert_eq!(d.view.number, 7);
-        assert_eq!(d.view.kind, "review");
+        assert_eq!(d.view.kind, ReviewKind::Review);
         assert_eq!(d.view.skip_reason, Some("触发 label 已移除".to_string()));
         assert!(matches!(d.write, WriteKind::UpdatePresent));
         assert!(matches!(d.status, DeliveryStatus::NoTriggerLabel));

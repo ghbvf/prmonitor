@@ -7,9 +7,9 @@
 //! `discover_views` body in [`super::commands`] composes them, driven by the
 //! scheduler's poll loop (and the `poll_now` manual trigger).
 
-use crate::model::Candidate;
+use crate::model::{Candidate, ReviewActionKey};
 
-use super::ledger::{cooldown_remaining, dispatch_key, Ledger};
+use super::ledger::{cooldown_remaining, Ledger};
 
 /// Skip reason for a PR carrying BOTH trigger labels (ambiguous mode). Single
 /// source shared by the live gate here and the discovery-stage drop in
@@ -45,8 +45,11 @@ pub fn should_skip(cand: &Candidate, params: &MonitorParams, ledger: &Ledger) ->
     if !params.authors.is_empty() && !params.authors.iter().any(|a| a == &cand.author) {
         return Some(format!("author {:?} not in allowlist", cand.author));
     }
-    let key = dispatch_key(cand.number, &cand.head_sha, &cand.kind);
-    if ledger.has_dispatched(&key) {
+    let key = match ReviewActionKey::for_candidate(cand) {
+        Ok(key) => key,
+        Err(error) => return Some(format!("invalid candidate: {error}")),
+    };
+    if ledger.has_dispatched(key.as_str()) {
         return Some(format!("already dispatched key {key}"));
     }
     None
@@ -64,7 +67,7 @@ pub fn cooldown_skip(
     if params.pr_cooldown_seconds == 0 {
         return None;
     }
-    let last = ledger.last_dispatch_at(cand.number, &cand.kind)?;
+    let last = ledger.last_dispatch_at(cand.number, cand.kind.as_str())?;
     let remaining = cooldown_remaining(now, last, params.pr_cooldown_seconds)?;
     Some(format!(
         "recent {} dispatch within cooldown ({remaining}s remaining)",
@@ -113,6 +116,12 @@ mod tests {
     use crate::pr::ledger::DispatchEvent;
     use std::collections::HashSet;
 
+    fn action_key(pr: u64, head: &str, kind: &str) -> String {
+        ReviewActionKey::for_parts(pr, head, kind.parse().unwrap())
+            .unwrap()
+            .into_inner()
+    }
+
     fn params() -> MonitorParams {
         MonitorParams {
             repo: "o/r".to_string(),
@@ -129,7 +138,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: kind.to_string(),
+            kind: kind.parse().unwrap(),
         }
     }
 
@@ -140,6 +149,14 @@ mod tests {
             should_skip(&cand("review"), &params(), &Ledger::default()),
             None
         );
+    }
+
+    #[test]
+    fn should_skip_rejects_candidate_with_invalid_typed_action_key() {
+        let mut candidate = cand("review");
+        candidate.head_sha.clear();
+        assert!(should_skip(&candidate, &params(), &Ledger::default())
+            .is_some_and(|reason| reason.contains("invalid candidate")));
     }
 
     #[test]
@@ -181,7 +198,7 @@ mod tests {
     #[test]
     fn should_skip_already_dispatched() {
         let c = cand("review");
-        let key = dispatch_key(c.number, &c.head_sha, &c.kind);
+        let key = ReviewActionKey::for_candidate(&c).unwrap().into_inner();
         let ledger = Ledger {
             dispatched: HashSet::from([key.clone()]),
             events: vec![],
@@ -201,7 +218,7 @@ mod tests {
                 pr: c.number,
                 kind: "review".to_string(),
                 head_sha: c.head_sha.clone(),
-                key: dispatch_key(c.number, &c.head_sha, "review"),
+                key: action_key(c.number, &c.head_sha, "review"),
                 dispatched_at_epoch: 1_000,
             }],
         };
@@ -220,7 +237,7 @@ mod tests {
                 pr: c.number,
                 kind: "review".to_string(),
                 head_sha: c.head_sha.clone(),
-                key: dispatch_key(c.number, &c.head_sha, "review"),
+                key: action_key(c.number, &c.head_sha, "review"),
                 dispatched_at_epoch: 1_000,
             }],
         };

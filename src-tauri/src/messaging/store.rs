@@ -360,8 +360,8 @@ mod tests {
         db.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO action_outbox \
-                 (id, project_id, kind, summary, payload, status, next_attempt_at, created_at, updated_at) \
-                 VALUES (9, 'fs', 'messagingReply', 'reply help', '{}', 'done', 0, 0, 0)",
+                 (id, project_id, kind, summary, payload, status, next_attempt_at, created_at, updated_at, producer_key) \
+                 VALUES (9, 'fs', 'messagingReply', 'reply help', '{}', 'done', 0, 0, 0, 'test:messaging-reply:9')",
                 [],
             )?;
             Ok(())

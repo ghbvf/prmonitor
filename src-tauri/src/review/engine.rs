@@ -6,6 +6,26 @@
 //! [`crate::events::ReviewEvent`]s, never a concrete engine.
 
 use crate::error::AppResult;
+use crate::model::ReviewKind;
+
+/// Unforgeable in safe Rust: direct engine start authority is minted only by the composition root
+/// for the desktop command and durable outbox consumer. External adapters own only
+/// `ExternalReviewIngress`, so aliasing a function name or importing this trait cannot skip the
+/// receipt -> inbox -> outbox funnel.
+pub(crate) struct ReviewStartCapability {
+    _private: (),
+}
+
+impl ReviewStartCapability {
+    /// Mint the composition-root capability.
+    ///
+    /// # Safety
+    /// The caller must be a root-owned desktop command wrapper or the durable outbox executor.
+    /// Calling this from an external adapter would violate the durable-ingress invariant.
+    pub(crate) unsafe fn new_composition_root() -> Self {
+        Self { _private: () }
+    }
+}
 
 /// Identifies a running review session.
 pub type SessionId = String;
@@ -34,14 +54,17 @@ pub enum StartReviewOutcome {
 /// Starts a review for a PR and streams [`crate::events::ReviewEvent`]s
 /// out-of-band to the frontend; a running session can be interrupted.
 #[allow(async_fn_in_trait)]
-pub trait ReviewEngine {
-    /// Start a review. `kind` is `"review"` or `"check"`. Returns
+pub(crate) trait ReviewEngine {
+    /// Start a review. Returns
     /// [`StartReviewOutcome::Started`] with the session id, or
     /// [`StartReviewOutcome::Deduped`] when the `(pr, kind)` was already covered by an
     /// in-flight review — a dedup is never confused with a start failure (`Err`).
-    async fn start(&self, pr_number: u64, kind: &str) -> AppResult<StartReviewOutcome>;
-    /// Interrupt a running session.
-    async fn stop(&self, session: &SessionId) -> AppResult<()>;
+    async fn start(
+        &self,
+        capability: &ReviewStartCapability,
+        pr_number: u64,
+        kind: ReviewKind,
+    ) -> AppResult<StartReviewOutcome>;
     /// Continue an EXISTING (terminal `Done`/`Failed`) session with a follow-up user
     /// `message`, streaming the reply through the SAME [`crate::events::ReviewEvent`]
     /// pipeline (`MessageDelta` / `ReasoningDelta` / `TurnCompleted`) the initial review

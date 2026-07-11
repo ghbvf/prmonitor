@@ -270,7 +270,19 @@ async fn handle_static<R: tauri::Runtime>(
     };
     let mime = mime_guess::from_path(key).first_or_octet_stream();
     let body = if key == INDEX_HTML {
-        scope_index_html(body.into_owned(), &ctx.base_path)
+        let config = match config_service::load(&ctx.app) {
+            Ok(config) => config,
+            Err(error) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("读取 Remote Web API 路由失败：{}", error.message),
+                )
+            }
+        };
+        let api_base_path =
+            config_service::local_api_path_for_entrypoint(&config, &ctx.entrypoint_id)
+                .unwrap_or_else(|| config_service::local_api_path(&config));
+        scope_index_html(body.into_owned(), &ctx.base_path, &api_base_path)
     } else {
         body.into_owned()
     };
@@ -292,7 +304,7 @@ async fn handle_static<R: tauri::Runtime>(
     )
 }
 
-fn scope_index_html(body: Vec<u8>, base_path: &str) -> Vec<u8> {
+fn scope_index_html(body: Vec<u8>, base_path: &str, api_base_path: &str) -> Vec<u8> {
     let base_path = normalise_base_path(base_path);
     let html = match String::from_utf8(body) {
         Ok(html) => html,
@@ -307,7 +319,7 @@ fn scope_index_html(body: Vec<u8>, base_path: &str) -> Vec<u8> {
             .replace("src=\"./", &format!("src=\"{attr_base_path}/"))
             .replace("href=\"./", &format!("href=\"{attr_base_path}/"))
     };
-    inject_remote_base_path(html, &base_path).into_bytes()
+    inject_remote_paths(html, &base_path, &normalise_base_path(api_base_path)).into_bytes()
 }
 
 fn normalise_base_path(path: &str) -> String {
@@ -319,9 +331,12 @@ fn normalise_base_path(path: &str) -> String {
     }
 }
 
-fn inject_remote_base_path(html: String, base_path: &str) -> String {
-    let value = script_json_string(base_path);
-    let script = format!("<script>window.__PRMONITOR_REMOTE_BASE_PATH__={value};</script>");
+fn inject_remote_paths(html: String, base_path: &str, api_base_path: &str) -> String {
+    let remote_value = script_json_string(base_path);
+    let api_value = script_json_string(api_base_path);
+    let script = format!(
+        "<script>window.__PRMONITOR_REMOTE_BASE_PATH__={remote_value};window.__PRMONITOR_API_BASE_PATH__={api_value};</script>"
+    );
     if let Some(idx) = html.find("</head>") {
         let mut out = String::with_capacity(html.len() + script.len());
         out.push_str(&html[..idx]);
@@ -1382,8 +1397,10 @@ mod tests {
     #[test]
     fn scoped_index_html_rewrites_assets_and_injects_remote_base_path() {
         let html = br#"<!doctype html><html><head><link rel="icon" href="./vite.svg"><script type="module" src="/assets/app.js"></script><script type="module" src="./assets/chunk.js"></script><link rel="stylesheet" href="/assets/app.css"><link rel="stylesheet" href="./assets/chunk.css"></head><body></body></html>"#;
-        let scoped = String::from_utf8(scope_index_html(html.to_vec(), "terminal/")).unwrap();
+        let scoped =
+            String::from_utf8(scope_index_html(html.to_vec(), "terminal/", "/local-api")).unwrap();
         assert!(scoped.contains("window.__PRMONITOR_REMOTE_BASE_PATH__=\"\\/terminal\""));
+        assert!(scoped.contains("window.__PRMONITOR_API_BASE_PATH__=\"\\/local-api\""));
         assert!(scoped.contains("href=\"/terminal/vite.svg\""));
         assert!(scoped.contains("src=\"/terminal/assets/app.js\""));
         assert!(scoped.contains("src=\"/terminal/assets/chunk.js\""));
@@ -1397,11 +1414,14 @@ mod tests {
         let scoped = String::from_utf8(scope_index_html(
             html.to_vec(),
             r#"/terminal"></script><script>alert(1)</script>"#,
+            r#"/api"></script><script>alert(2)</script>"#,
         ))
         .unwrap();
         assert!(!scoped.contains(r#"</script><script>alert(1)</script>"#));
+        assert!(!scoped.contains(r#"</script><script>alert(2)</script>"#));
         assert!(scoped.contains("&quot;&gt;&lt;/script&gt;&lt;script&gt;alert(1)&lt;/script&gt;"));
         assert!(scoped.contains(r#"window.__PRMONITOR_REMOTE_BASE_PATH__="\/terminal\""#));
+        assert!(scoped.contains(r#"window.__PRMONITOR_API_BASE_PATH__="\/api\""#));
         assert!(scoped.contains(r#"<\/script><script>alert(1)<\/script>"#));
     }
 

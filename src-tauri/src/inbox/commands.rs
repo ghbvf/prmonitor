@@ -3,14 +3,13 @@
 //! Thin shells over [`super::store`] / [`super::service`]: they resolve the `Database` (and, for
 //! replay, the composition-installed hooks on [`crate::state::AppState`]) and delegate. The wire
 //! contract (`InboxEntry` newest-first; `inbox_get_raw` errs on an unknown id; `inbox_replay`
-//! re-processes + re-emits) matches the frontend mirror exactly.
+//! only requeues a failed entry for the single worker) matches the frontend mirror exactly.
 
 use tauri::Manager;
 
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::model::InboxEntry;
-use crate::state::AppState;
 
 /// List inbox entries, NEWEST FIRST (AB#1065). `project_id: None` lists across all projects (the
 /// panel's "all" view); `Some(pid)` scopes to one project.
@@ -36,37 +35,11 @@ pub async fn inbox_get_raw<R: tauri::Runtime>(
         .ok_or_else(|| AppError::new(format!("inbox 条目不存在（id={id}）")))
 }
 
-/// Re-process a stored inbox entry by id (AB#1065/#1379): re-feed a GitHub delivery through the
-/// vetted dispatch path, re-invoke the Azure refresh, or re-run a candidate-backed rule event;
-/// then mark the entry Processed/Failed and re-emit `inbox:updated`. Works on ANY entry. Fails
-/// closed if the composition root hasn't installed the replay hooks yet.
+/// Requeue a failed inbox entry (AB#1065/#1379). This command performs only the guarded
+/// `Failed → Received` transition and wakes the single consumer worker; it never executes the
+/// entry inline. Unknown ids and every other status fail closed.
 #[tauri::command]
 pub async fn inbox_replay(app: tauri::AppHandle, id: i64) -> AppResult<()> {
-    let github_refeed = app
-        .state::<AppState>()
-        .inbox
-        .github_refeed()
-        .ok_or_else(|| AppError::new("inbox 重放未初始化（github_refeed 未安装）".to_string()))?;
-    let refresher = app
-        .state::<AppState>()
-        .inbox
-        .refresher()
-        .ok_or_else(|| AppError::new("inbox 重放未初始化（refresher 未安装）".to_string()))?;
-    let rule_processor = app
-        .state::<AppState>()
-        .inbox
-        .rule_processor()
-        .ok_or_else(|| AppError::new("inbox 重放未初始化（rule_processor 未安装）".to_string()))?;
-    // Resolve the DB handle, then delegate. Cloning the handle out of `State` is not needed — the
-    // service borrows `&Database` for the duration of the await (the connection mutex is internal).
     let db = app.state::<Database>();
-    super::service::replay(
-        &app,
-        db.inner(),
-        &github_refeed,
-        &refresher,
-        &rule_processor,
-        id,
-    )
-    .await
+    super::service::requeue_failed(&app, db.inner(), id)
 }

@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -212,6 +212,9 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 14 {
         apply_v14(conn)?;
     }
+    if version < 15 {
+        apply_v15(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -282,7 +285,7 @@ fn apply_v6(conn: &Connection) -> AppResult<()> {
 
 /// v7 (AB#1204): add a `FOREIGN KEY(outbox_id) REFERENCES action_outbox(id) ON DELETE CASCADE` to
 /// `outbox_review_claim` so a claim is AUTOMATICALLY removed when its owning `action_outbox` row is
-/// deleted (retention prune in `outbox::store`, `DELETE FROM action_outbox`). SQLite cannot
+/// explicitly deleted by maintenance or migration. SQLite cannot
 /// `ALTER TABLE … ADD CONSTRAINT`, so the only way to add an FK to an existing table is the
 /// documented 12-step table-rebuild: create a `_new` table WITH the FK, copy the rows, drop the old
 /// table, rename `_new` into place (see [`SCHEMA_V7`]). A fresh DB (version 0) runs v1..v6 (creating
@@ -340,6 +343,19 @@ fn apply_v13(conn: &Connection) -> AppResult<()> {
 fn apply_v14(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(SCHEMA_V14).map_err(map_err)?;
     Ok(())
+}
+
+/// v15 (#1374): replace flat inbox JSON with the typed envelope and rebuild the outbox with
+/// permanent producer identity, persisted review output, and a closed status domain.
+fn apply_v15(conn: &Connection) -> AppResult<()> {
+    match conn.execute_batch(SCHEMA_V15) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.pragma_update(None, "foreign_keys", true);
+            Err(map_err(error))
+        }
+    }
 }
 
 /// v1 schema — the unified store (#70). `review_session` precedes `review_history_item`
@@ -512,13 +528,13 @@ CREATE TABLE IF NOT EXISTS outbox_review_claim (
 /// copy is positional, so the column layout MUST stay byte-identical) PLUS the trailing FK.
 ///
 /// **Hard carrier (`FOREIGN KEY(outbox_id) REFERENCES action_outbox(id) ON DELETE CASCADE`):** the
-/// claim is a CHILD of its `action_outbox` row, so "the owning outbox row is deleted (retention
-/// prune in `outbox::store`) but the claim survives as an orphan" is now UNEXPRESSIBLE at the DB
+/// claim is a CHILD of its `action_outbox` row, so "the owning outbox row is deleted but the claim
+/// survives as an orphan" is now UNEXPRESSIBLE at the DB
 /// layer — SQLite cascades the delete automatically (`foreign_keys=ON`, set in `from_conn`). This
 /// is what bounds `outbox_review_claim` WITHOUT the outbox slice ever naming the claim table: it
 /// pairs with F2 (a `Dead` row RETAINS its claim as a manual-retry suppress breadcrumb), so a
-/// dead/leaked claim is not eagerly released but is instead reaped when its owning row is finally
-/// pruned — review-blind cleanup driven purely by the FK. The PK shape (`outbox_id PRIMARY KEY`)
+/// dead claim is not eagerly released but follows its permanent producer row; any explicit row
+/// deletion still performs review-blind cleanup through the FK. The PK shape (`outbox_id PRIMARY KEY`)
 /// and all other columns are unchanged from v6; only the FK is added.
 ///
 /// `foreign_keys` is toggled OFF for the rebuild (SQLite's documented 12-step procedure): the
@@ -659,6 +675,162 @@ CREATE INDEX IF NOT EXISTS idx_workflow_project
     ON workflow_instance(project_id, updated_at DESC, id DESC);
 "#;
 
+const SCHEMA_V15: &str = r#"
+PRAGMA foreign_keys=OFF;
+BEGIN IMMEDIATE;
+ALTER TABLE review_session ADD COLUMN terminal_outcome TEXT;
+ALTER TABLE review_session ADD COLUMN terminal_error TEXT;
+UPDATE inbox_event
+SET event_json = json_object(
+        'dedupeKey', dedupe_key,
+        'source', source,
+        'projectId', project_id,
+        'repo', repo,
+        'payload', json_object(
+            'kind', 'observation',
+            'eventType', event_type,
+            'subject', json_object(
+                'number', number,
+                'title', '',
+                'body', '',
+                'labels', json('[]'),
+                'url', ''
+            )
+        ),
+        'receivedAtEpoch', received_at_epoch
+    ),
+    status = 'failed',
+    processed_at_epoch = COALESCE(processed_at_epoch, received_at_epoch),
+    error = COALESCE(error, 'legacy event_json invalid during schema v15 migration')
+WHERE NOT json_valid(event_json);
+UPDATE inbox_event
+SET event_json = json_object(
+    'dedupeKey', json_extract(event_json, '$.dedupeKey'),
+    'source', json_extract(event_json, '$.source'),
+    'projectId', json_extract(event_json, '$.projectId'),
+    'repo', json_extract(event_json, '$.repo'),
+    'payload', json_object(
+        'kind', 'observation',
+        'eventType', json_extract(event_json, '$.eventType'),
+        'subject', json_object(
+            'number', json_extract(event_json, '$.number'),
+            'title', json_extract(event_json, '$.title'),
+            'body', json_extract(event_json, '$.body'),
+            'labels', json(json_extract(event_json, '$.labels')),
+            'url', json_extract(event_json, '$.url')
+        )
+    ),
+    'receivedAtEpoch', json_extract(event_json, '$.receivedAtEpoch')
+)
+WHERE json_type(event_json, '$.payload') IS NULL;
+
+-- v14 accepted arbitrary TEXT. Preserve the row as an observable dead letter while replacing
+-- malformed bytes with valid JSON required by the rebuilt table.
+UPDATE action_outbox
+SET payload = '{}',
+    status = 'dead',
+    last_error = 'legacy payload invalid during schema v15 migration'
+WHERE NOT json_valid(payload);
+
+-- v14 review/check actions used the untagged {candidate: ...} payload. Convert every valid
+-- legacy row before the v15 CHECK-constrained copy so the current tagged enum can execute it.
+UPDATE action_outbox
+SET payload = json_object(
+        'kind', 'automatic',
+        'candidate', json(json_extract(payload, '$.candidate'))
+    )
+WHERE kind IN ('review','check')
+  AND json_type(payload, '$.kind') IS NULL
+  AND json_type(payload, '$.candidate') IS NOT NULL;
+
+-- v15 receipt-driven notification workflows cannot recover a v14 workflow because the old input
+-- has no durable receiptId. Terminalize it explicitly instead of leaving a permanently retrying row.
+UPDATE workflow_instance
+SET status = 'failed',
+    next_wake_at = 0,
+    last_error = 'legacy reviewNotify workflow retired by schema v15'
+WHERE workflow_type = 'reviewNotify'
+  AND status IN ('pending','running','waiting')
+  AND CASE WHEN json_valid(input_json)
+           THEN json_type(input_json, '$.receiptId')
+           ELSE NULL END IS NULL;
+
+CREATE TABLE inbox_event_v15 (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    dedupe_key         TEXT    NOT NULL UNIQUE,
+    source             TEXT    NOT NULL CHECK(source IN ('github','azure','bitbucket')),
+    event_type         TEXT    NOT NULL CHECK(event_type IN ('pullRequest','issue','comment','label','generic')),
+    project_id         TEXT    NOT NULL,
+    repo               TEXT    NOT NULL,
+    number             INTEGER,
+    event_json         TEXT    NOT NULL CHECK(json_valid(event_json)),
+    raw_payload        TEXT    NOT NULL,
+    webhook_event_json TEXT,
+    status             TEXT    NOT NULL CHECK(status IN ('received','processed','failed')),
+    received_at_epoch  INTEGER NOT NULL,
+    processed_at_epoch INTEGER,
+    error              TEXT,
+    candidate_json     TEXT    CHECK(candidate_json IS NULL OR json_valid(candidate_json))
+);
+INSERT INTO inbox_event_v15 (
+    id, dedupe_key, source, event_type, project_id, repo, number, event_json, raw_payload,
+    webhook_event_json, status, received_at_epoch, processed_at_epoch, error, candidate_json
+)
+SELECT id, dedupe_key, source, event_type, project_id, repo, number, event_json, raw_payload,
+       webhook_event_json, status, received_at_epoch, processed_at_epoch, error, candidate_json
+FROM inbox_event;
+DROP TABLE inbox_event;
+ALTER TABLE inbox_event_v15 RENAME TO inbox_event;
+CREATE INDEX idx_inbox_event_project ON inbox_event(project_id, id DESC);
+
+CREATE TABLE action_outbox_v15 (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id       TEXT    NOT NULL,
+    kind             TEXT    NOT NULL CHECK(kind IN ('notification','review','check','stopReview','messagingReply','messagingSend')),
+    summary          TEXT    NOT NULL,
+    payload          TEXT    NOT NULL CHECK(json_valid(payload)),
+    status           TEXT    NOT NULL CHECK(status IN ('pending','blocked','done','dead')),
+    attempt_count    INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+    next_attempt_at  INTEGER NOT NULL,
+    last_error       TEXT,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    dedupe_key       TEXT,
+    producer_key     TEXT    NOT NULL CHECK(length(producer_key) > 0),
+    review_thread_id TEXT    CHECK(review_thread_id IS NULL OR kind IN ('review','check')),
+    FOREIGN KEY(review_thread_id) REFERENCES review_session(thread_id) ON DELETE SET NULL
+);
+INSERT INTO action_outbox_v15 (
+    id, project_id, kind, summary, payload, status, attempt_count, next_attempt_at,
+    last_error, created_at, updated_at, dedupe_key, producer_key, review_thread_id
+)
+SELECT id, project_id, kind, summary, payload,
+       CASE WHEN kind='notification' AND status='pending'
+                  AND json_type(payload, '$.notification') IS NULL
+            THEN 'dead' ELSE status END,
+       attempt_count, next_attempt_at,
+       CASE WHEN kind='notification' AND status='pending'
+                  AND json_type(payload, '$.notification') IS NULL
+            THEN 'legacy notification payload removed by schema v15' ELSE last_error END,
+       created_at, updated_at, dedupe_key, 'legacy:' || id, NULL
+FROM action_outbox;
+DROP TABLE action_outbox;
+ALTER TABLE action_outbox_v15 RENAME TO action_outbox;
+CREATE INDEX idx_action_outbox_due ON action_outbox(status, next_attempt_at);
+CREATE INDEX idx_action_outbox_project ON action_outbox(project_id, id DESC);
+CREATE UNIQUE INDEX idx_action_outbox_dedupe
+    ON action_outbox(project_id, dedupe_key)
+    WHERE dedupe_key IS NOT NULL AND status IN ('pending','blocked');
+CREATE UNIQUE INDEX idx_action_outbox_producer_key ON action_outbox(producer_key);
+CREATE TABLE review_receipt_workflow (
+    receipt_id  INTEGER PRIMARY KEY,
+    workflow_id INTEGER NOT NULL UNIQUE,
+    FOREIGN KEY(workflow_id) REFERENCES workflow_instance(id) ON DELETE CASCADE
+);
+COMMIT;
+PRAGMA foreign_keys=ON;
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -668,6 +840,246 @@ mod tests {
     };
     use std::thread;
     use std::time::Instant;
+
+    fn database_at_v14() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        conn.execute_batch("PRAGMA foreign_keys=ON;").expect("fk");
+        apply_v1(&conn).expect("v1");
+        apply_v2(&conn).expect("v2");
+        apply_v3(&conn).expect("v3");
+        apply_v4(&conn).expect("v4");
+        apply_v5(&conn).expect("v5");
+        apply_v6(&conn).expect("v6");
+        apply_v7(&conn).expect("v7");
+        apply_v8(&conn).expect("v8");
+        apply_v9(&conn).expect("v9");
+        apply_v10(&conn).expect("v10");
+        apply_v11(&conn).expect("v11");
+        apply_v12(&conn).expect("v12");
+        apply_v13(&conn).expect("v13");
+        apply_v14(&conn).expect("v14");
+        conn.pragma_update(None, "user_version", 14)
+            .expect("stamp v14");
+        conn
+    }
+
+    #[test]
+    fn v15_quarantines_malformed_legacy_outbox_payload() {
+        let conn = database_at_v14();
+        conn.execute(
+            "INSERT INTO action_outbox (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, created_at, updated_at) VALUES ('p1','notification','broken','not-json','pending',0,1,1,1)",
+            [],
+        )
+        .expect("seed malformed v14 payload");
+
+        run_migrations(&conn).expect("malformed legacy payload must be quarantined");
+        let (payload, status, error): (String, String, String) = conn
+            .query_row(
+                "SELECT payload, status, last_error FROM action_outbox WHERE summary='broken'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("quarantined row");
+        assert!(serde_json::from_str::<serde_json::Value>(&payload).is_ok());
+        assert_eq!(status, "dead");
+        assert!(error.contains("schema v15"));
+    }
+
+    #[test]
+    fn v15_converts_legacy_review_payload_and_terminalizes_legacy_workflow() {
+        let conn = database_at_v14();
+        let candidate = serde_json::json!({
+            "number": 7, "kind": "review", "headSha": "abc", "headRef": "main",
+            "author": "octocat", "isCrossRepository": false, "isDraft": false
+        });
+        conn.execute(
+            "INSERT INTO action_outbox (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, created_at, updated_at) VALUES ('p1','review','legacy review',?1,'pending',0,1,1,1)",
+            [serde_json::json!({"candidate": candidate}).to_string()],
+        )
+        .expect("seed legacy review");
+        conn.execute(
+            "INSERT INTO workflow_instance (project_id, workflow_type, status, current_step, input_json, state_json, attempt_count, next_wake_at, created_at, updated_at, dedupe_key) VALUES ('p1','reviewNotify','waiting','waitReview',?1,'{}',0,1,1,1,'legacy-workflow')",
+            [serde_json::json!({"reference":"p1","prNumber":7,"kind":"review"}).to_string()],
+        )
+        .expect("seed legacy workflow");
+
+        run_migrations(&conn).expect("v14 to v15");
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM action_outbox WHERE summary='legacy review'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("review payload");
+        let payload: crate::model::ReviewActionPayload =
+            serde_json::from_str(&payload).expect("migrated payload executes");
+        assert!(matches!(
+            payload,
+            crate::model::ReviewActionPayload::Automatic { .. }
+        ));
+        let (status, error): (String, String) = conn
+            .query_row("SELECT status, last_error FROM workflow_instance WHERE dedupe_key='legacy-workflow'", [], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("workflow");
+        assert_eq!(status, "failed");
+        assert!(error.contains("schema v15"));
+    }
+
+    #[test]
+    fn v15_migrates_events_and_hardens_outbox_identity_and_status() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        conn.execute_batch("PRAGMA foreign_keys=ON;").expect("fk");
+        apply_v1(&conn).expect("v1");
+        apply_v2(&conn).expect("v2");
+        apply_v3(&conn).expect("v3");
+        apply_v4(&conn).expect("v4");
+        apply_v5(&conn).expect("v5");
+        apply_v6(&conn).expect("v6");
+        apply_v7(&conn).expect("v7");
+        apply_v8(&conn).expect("v8");
+        apply_v9(&conn).expect("v9");
+        apply_v10(&conn).expect("v10");
+        apply_v11(&conn).expect("v11");
+        apply_v12(&conn).expect("v12");
+        apply_v13(&conn).expect("v13");
+        apply_v14(&conn).expect("v14");
+        conn.pragma_update(None, "user_version", 14)
+            .expect("stamp v14");
+
+        let old_event = serde_json::json!({
+            "dedupeKey": "github:d1", "source": "github", "eventType": "pullRequest",
+            "projectId": "p1", "repo": "octocat/hello", "number": 7,
+            "title": "Ready", "body": "Body", "labels": ["review"],
+            "url": "https://example.test/7", "receivedAtEpoch": 42
+        });
+        conn.execute(
+            "INSERT INTO inbox_event (dedupe_key, source, event_type, project_id, repo, number, event_json, raw_payload, status, received_at_epoch) VALUES (?1,'github','pullRequest','p1','octocat/hello',7,?2,'{}','received',42)",
+            rusqlite::params!["github:d1", old_event.to_string()],
+        ).expect("seed inbox");
+        conn.execute(
+            "INSERT INTO inbox_event (dedupe_key, source, event_type, project_id, repo, number, event_json, raw_payload, status, received_at_epoch) VALUES ('github:corrupt','github','pullRequest','p1','octocat/hello',8,'not-json','{}','received',43)",
+            [],
+        ).expect("seed historically valid malformed inbox JSON");
+        conn.execute(
+            "INSERT INTO action_outbox (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, created_at, updated_at) VALUES ('p1','review','review','{}','pending',0,42,42,42)",
+            [],
+        ).expect("seed outbox");
+        conn.execute(
+            "INSERT INTO rule_match (rule_id, rule_name, inbox_event_id, project_id, action_count, created_at) VALUES ('r1','rule',1,'p1',0,42)",
+            [],
+        ).expect("seed inbox foreign key");
+        let legacy_notification = serde_json::json!({
+            "level": "info", "title": "old", "url": "", "body": "old",
+            "projectId": "p1"
+        });
+        conn.execute(
+            "INSERT INTO action_outbox (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, created_at, updated_at) VALUES ('p1','notification','old notification',?1,'pending',0,42,42,42)",
+            [legacy_notification.to_string()],
+        ).expect("seed legacy notification");
+
+        run_migrations(&conn).expect("v14 -> current");
+        assert_eq!(SCHEMA_VERSION, 15);
+        for column in ["producer_key", "review_thread_id"] {
+            assert!(
+                table_has_column(&conn, "action_outbox", column),
+                "missing {column}"
+            );
+        }
+
+        let migrated: String = conn
+            .query_row(
+                "SELECT event_json FROM inbox_event WHERE dedupe_key='github:d1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migrated event");
+        let migrated: serde_json::Value = serde_json::from_str(&migrated).unwrap();
+        assert_eq!(migrated["payload"]["kind"], "observation");
+        assert_eq!(migrated["payload"]["eventType"], "pullRequest");
+        assert!(migrated.get("eventType").is_none(), "legacy shape removed");
+        let quarantined: (String, String, String) = conn
+            .query_row(
+                "SELECT status, error, event_json FROM inbox_event WHERE dedupe_key='github:corrupt'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("malformed legacy row quarantined");
+        assert_eq!(quarantined.0, "failed");
+        assert!(quarantined.1.contains("schema v15"));
+        assert!(serde_json::from_str::<serde_json::Value>(&quarantined.2).is_ok());
+        assert!(conn
+            .execute(
+                "UPDATE inbox_event SET event_json='not-json' WHERE id=1",
+                []
+            )
+            .is_err());
+        assert!(conn
+            .execute("UPDATE inbox_event SET status='bogus' WHERE id=1", [])
+            .is_err());
+        assert!(conn
+            .execute("UPDATE inbox_event SET source='gitlab' WHERE id=1", [])
+            .is_err());
+        let migrated_trace_inbox_id: i64 = conn
+            .query_row(
+                "SELECT inbox_event_id FROM rule_match WHERE rule_id='r1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("migrated inbox foreign key");
+        assert_eq!(migrated_trace_inbox_id, 1);
+        let legacy_notification_status: (String, Option<String>) = conn
+            .query_row(
+                "SELECT status, last_error FROM action_outbox WHERE kind='notification'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("migrated legacy notification");
+        assert_eq!(legacy_notification_status.0, "dead");
+        assert!(legacy_notification_status.1.unwrap().contains("schema v15"));
+
+        conn.execute(
+            "INSERT INTO review_session (thread_id, project_id, pr_number, kind, status, created_at, updated_at) VALUES ('thread-1','p1',7,'review','running',42,42)",
+            [],
+        ).expect("seed review session");
+        conn.execute(
+            "UPDATE action_outbox SET status='blocked', producer_key='producer:1', review_thread_id='thread-1' WHERE id=1",
+            [],
+        ).expect("blocked is valid");
+        assert!(conn.execute(
+            "INSERT INTO action_outbox (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, created_at, updated_at, producer_key) VALUES ('p1','review','duplicate','{}','done',0,42,42,42,'producer:1')",
+            [],
+        ).is_err(), "producer key unique across every status");
+        assert!(conn
+            .execute("UPDATE action_outbox SET status='bogus' WHERE id=1", [])
+            .is_err());
+        assert!(conn
+            .execute("UPDATE action_outbox SET kind='unknown' WHERE id=1", [])
+            .is_err());
+        assert!(conn
+            .execute("UPDATE action_outbox SET payload='not-json' WHERE id=1", [])
+            .is_err());
+        assert!(conn
+            .execute("UPDATE action_outbox SET producer_key='' WHERE id=1", [])
+            .is_err());
+        conn.execute("DELETE FROM review_session WHERE thread_id='thread-1'", [])
+            .expect("session retention must not be blocked by receipt history");
+        let retained_action_thread: Option<String> = conn
+            .query_row(
+                "SELECT review_thread_id FROM action_outbox WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .expect("retained action");
+        assert_eq!(
+            retained_action_thread, None,
+            "ON DELETE SET NULL keeps action queryable"
+        );
+        let foreign_key_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .expect("foreign key check");
+        assert_eq!(foreign_key_violations, 0);
+    }
 
     /// v1 migration lock (Medium per ai-robust.md): a missing/renamed table here means
     /// a slice store's first query fails at runtime, not at compile time — so pin the
@@ -764,7 +1176,7 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 14, "current schema is v14");
+            assert_eq!(SCHEMA_VERSION, 15, "current schema is v15");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"
@@ -872,6 +1284,18 @@ mod tests {
             assert!(
                 index_exists(conn, "idx_workflow_project"),
                 "fresh v0 → v14 has the workflow project listing index"
+            );
+            assert!(
+                table_has_column(conn, "action_outbox", "producer_key"),
+                "fresh v0 → v15 has permanent producer identity"
+            );
+            assert!(
+                table_has_column(conn, "action_outbox", "review_thread_id"),
+                "fresh v0 → v15 persists review execution output"
+            );
+            assert!(
+                index_exists(conn, "idx_action_outbox_producer_key"),
+                "fresh v0 → v15 enforces producer identity uniqueness"
             );
             Ok(())
         })
@@ -1178,7 +1602,7 @@ mod tests {
             .expect("count after delete");
         assert_eq!(
             after, 0,
-            "ON DELETE CASCADE reaps the claim when its owning outbox row is pruned"
+            "ON DELETE CASCADE reaps the claim when its owning outbox row is deleted"
         );
     }
 
@@ -1683,8 +2107,8 @@ mod tests {
                 .prepare(
                     "INSERT INTO action_outbox \
                      (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, \
-                      last_error, created_at, updated_at) \
-                     VALUES ('project-a', 'notification', ?1, '{}', 'pending', 0, ?2, NULL, ?2, ?2)",
+                      last_error, created_at, updated_at, producer_key) \
+                     VALUES ('project-a', 'notification', ?1, '{}', 'pending', 0, ?2, NULL, ?2, ?2, 'test:writer')",
                 )
                 .map_err(map_err)?;
             let mut tracked = tx

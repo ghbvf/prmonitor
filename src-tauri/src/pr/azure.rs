@@ -21,7 +21,10 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
-use crate::model::{Candidate, Event, EventType, LabelSource, SourceKind};
+use crate::model::{
+    Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, LabelSource, ReviewKind,
+    SourceKind,
+};
 
 use super::labels;
 use super::source::{pr_dedupe_key, DiscoveredEvent, EventSourceProvider};
@@ -152,6 +155,8 @@ struct RawPr {
     #[serde(default)]
     title: String,
     #[serde(default)]
+    description: String,
+    #[serde(default)]
     last_merge_source_commit: Option<RawMergeCommit>,
     #[serde(default)]
     source_ref_name: String,
@@ -181,6 +186,7 @@ struct RawPr {
 struct AzRow {
     candidate: Candidate,
     title: String,
+    body: String,
     labels: Vec<String>,
     url: String,
     conflict: bool,
@@ -287,9 +293,10 @@ fn parse_rows(
                 author,
                 is_cross_repository: pr.fork_source.is_some(),
                 is_draft: pr.is_draft,
-                kind: "review".to_string(),
+                kind: ReviewKind::Review,
             },
             title: pr.title,
+            body: pr.description,
             labels,
             url,
             conflict: false,
@@ -473,21 +480,29 @@ impl AzureDevOpsCli {
 /// the future inbox (AB#1065) to stamp on ingest. Always a `PullRequest` event (the only class
 /// a PR source emits).
 fn row_into_event(row: AzRow, repo: &str) -> DiscoveredEvent {
-    let event = Event {
+    let event = EventEnvelope::observation(
         // Wire literal "azure" matches `SourceKind::Azure`'s serde string (format single-sourced).
-        dedupe_key: pr_dedupe_key("azure", repo, row.candidate.number, &row.candidate.head_sha),
-        source: SourceKind::Azure,
-        event_type: EventType::PullRequest,
-        project_id: String::new(),
-        repo: repo.to_string(),
-        number: Some(row.candidate.number),
-        title: row.title.clone(),
-        // body 抓取留待 AB#1068（rule engine）
-        body: String::new(),
-        labels: row.labels.clone(),
-        url: row.url.clone(),
-        received_at_epoch: 0,
-    };
+        InboxDedupeKey::new(pr_dedupe_key(
+            "azure",
+            repo,
+            row.candidate.number,
+            &row.candidate.head_sha,
+        ))
+        .expect("discovery dedupe key is non-empty"),
+        SourceKind::Azure,
+        "discovery",
+        repo,
+        EventType::PullRequest,
+        EventSubject {
+            number: Some(row.candidate.number),
+            title: row.title.clone(),
+            body: row.body.clone(),
+            labels: row.labels.clone(),
+            url: row.url.clone(),
+        },
+        0,
+    )
+    .expect("discovery event is valid");
     DiscoveredEvent {
         event,
         candidate: row.candidate,
@@ -638,7 +653,15 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].candidate.number, 42);
-        assert_eq!(events[0].event.title, "Configured az");
+        assert_eq!(
+            events[0]
+                .event
+                .as_observation()
+                .expect("discovery event is an observation")
+                .subject
+                .title,
+            "Configured az"
+        );
         let captured = fs::read_to_string(&invocation).unwrap();
         let mut lines = captured.lines();
         let path = lines.next().unwrap().strip_prefix("PATH=").unwrap();
@@ -734,6 +757,7 @@ mod tests {
                 {{
                     "pullRequestId": 12,
                     "title": "Add widget",
+                    "description": "Widget details",
                     "lastMergeSourceCommit": {{ "commitId": "abc123" }},
                     "sourceRefName": "refs/heads/feature/widget",
                     "createdBy": {{ "uniqueName": "octocat@example.com", "displayName": "Octo Cat" }},
@@ -750,11 +774,12 @@ mod tests {
         assert_eq!(row.candidate.head_sha, "abc123");
         assert_eq!(row.candidate.head_ref, "feature/widget"); // refs/heads/ stripped
         assert_eq!(row.candidate.author, "octocat@example.com"); // uniqueName preferred
-        assert_eq!(row.candidate.kind, "review");
+        assert_eq!(row.candidate.kind, crate::model::ReviewKind::Review);
         assert!(!row.candidate.is_cross_repository);
         assert!(!row.candidate.is_draft);
         // Display fields (the parity goal): real title, ALL labels, constructed url.
         assert_eq!(row.title, "Add widget");
+        assert_eq!(row.body, "Widget details");
         assert_eq!(row.labels, vec![REVIEW.to_string(), "area/ui".to_string()]);
         assert_eq!(
             row.url,
@@ -766,21 +791,25 @@ mod tests {
         // `DiscoveredEvent`, built from the SAME parsed locals, while the gating
         // `Candidate` rides along unchanged.
         let de = row_into_event(r[0].clone(), REPO);
-        assert_eq!(de.event.source, SourceKind::Azure);
-        assert_eq!(de.event.event_type, EventType::PullRequest);
-        assert_eq!(de.event.number, Some(de.candidate.number));
-        assert_eq!(de.event.title, "Add widget");
+        let observation = de.event.as_observation().unwrap();
+        assert_eq!(de.event.source(), SourceKind::Azure);
+        assert_eq!(observation.event_type, EventType::PullRequest);
+        assert_eq!(observation.subject.number, Some(de.candidate.number));
+        assert_eq!(observation.subject.title, "Add widget");
         assert_eq!(
-            de.event.url,
+            observation.subject.url,
             "https://dev.azure.com/myorg/myproject/_git/myrepo/pullrequest/12"
         );
         assert_eq!(
-            de.event.labels,
+            observation.subject.labels,
             vec![REVIEW.to_string(), "area/ui".to_string()]
         );
-        assert_eq!(de.event.body, "");
+        assert_eq!(observation.subject.body, "Widget details");
         // dedupe_key is the exact inbox idempotency-key seed (format single-sourced).
-        assert_eq!(de.event.dedupe_key, "azure:pullRequest:myrepo#12@abc123");
+        assert_eq!(
+            de.event.dedupe_key().as_str(),
+            "azure:pullRequest:myrepo#12@abc123"
+        );
         assert!(!de.conflict);
     }
 
@@ -850,7 +879,7 @@ mod tests {
         let r = rows(&json).expect("parses");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].candidate.number, 5);
-        assert_eq!(r[0].candidate.kind, "review");
+        assert_eq!(r[0].candidate.kind, crate::model::ReviewKind::Review);
         assert_eq!(r[0].title, "Fix it");
         assert_eq!(
             r[0].url,
@@ -883,7 +912,7 @@ mod tests {
             "a conflict row is KEPT (not dropped) by parse_rows"
         );
         assert!(!r[0].conflict);
-        assert_eq!(r[0].candidate.kind, "review");
+        assert_eq!(r[0].candidate.kind, crate::model::ReviewKind::Review);
         // Both labels surface in the row's labels.
         assert_eq!(r[0].labels, vec![REVIEW.to_string(), CHECK.to_string()]);
 
@@ -981,7 +1010,7 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].candidate.kind, "review");
+        assert_eq!(r[0].candidate.kind, crate::model::ReviewKind::Review);
         // Effective labels come from the title, NOT the native `area/ui`.
         assert_eq!(r[0].labels, vec![REVIEW.to_string()]);
 
@@ -1079,7 +1108,7 @@ mod tests {
         let r = rows(&json).expect("parses");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].candidate.head_sha, "");
-        assert_eq!(r[0].candidate.kind, "review");
+        assert_eq!(r[0].candidate.kind, crate::model::ReviewKind::Review);
     }
 
     #[test]

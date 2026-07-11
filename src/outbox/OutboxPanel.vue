@@ -54,6 +54,8 @@ function statusTone(s: OutboxStatus): string {
       return "fail";
     case "pending":
       return "pending";
+    case "blocked":
+      return "blocked";
     default:
       return assertNever(s);
   }
@@ -316,6 +318,10 @@ onUnmounted(() => unlisten?.());
 .badge.status.pending {
   background: var(--color-neutral-bg);
   color: var(--color-text-muted);
+}
+.badge.status.blocked {
+  background: var(--color-accent-badge-bg);
+  color: var(--color-accent);
 }
 /* Per-row project identity chip (mirrors InboxPanel): neutral tone so it reads as metadata,
    not a status. */

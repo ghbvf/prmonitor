@@ -38,7 +38,7 @@ export const RULE_ACTION_DEDUPE_POLICIES = ["event","action"] as const;
 
 export type RuleActionTarget = { "kind": "none" } | { "kind": "notificationChannels", channelIds: Array<string>, } | { "kind": "messagingConversation", integrationId: string, conversationId: string, };
 
-export type RuleActionConfig = { id: string, kind: RuleActionKind, enabled: boolean, target: RuleActionTarget, dedupePolicy: RuleActionDedupePolicy, delaySecs: number, dependsOn: Array<string>, level: string, };
+export type RuleActionConfig = { id: string, kind: RuleActionKind, enabled: boolean, target: RuleActionTarget, dedupePolicy: RuleActionDedupePolicy, delaySecs: number, level: string, };
 
 export type ReviewLifecycleEvent = "started" | "completed" | "failed" | "interrupted";
 export const REVIEW_LIFECYCLE_EVENTS = ["started","completed","failed","interrupted"] as const;

@@ -27,7 +27,7 @@ use super::history_store::HistoryItemKind;
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, StreamEvent};
-use crate::model::{EngineKind, ReviewLifecycleDispatch, ReviewLifecycleEvent};
+use crate::model::{EngineKind, ReviewKind, ReviewLifecycleDispatch, ReviewLifecycleEvent};
 use crate::review::engine::StartReviewOutcome;
 
 /// A review session is identified by its codex `threadId`.
@@ -86,8 +86,8 @@ pub struct SessionInfo {
     pub thread_id: String,
     pub turn_id: String,
     pub pr_number: u64,
-    /// `"review"` or `"check"` — the trigger-label mode the review was started in.
-    pub kind: String,
+    /// The trigger-label mode the review was started in.
+    pub kind: ReviewKind,
     /// Engine that created this session. Follow-up chat must route back to this engine even
     /// if the project's current config changes later.
     pub engine_kind: EngineKind,
@@ -126,6 +126,7 @@ pub struct CompletionOutcome {
     /// `SessionStatus::Done`). See the struct doc.
     pub wire_status: String,
     pub comment_url: Option<String>,
+    pub error: Option<String>,
 }
 
 /// The source context [`finalize_turn`] needs to resolve the pr-review comment URL (AB#1042),
@@ -174,7 +175,7 @@ pub struct SessionRegistry {
 #[derive(Default)]
 struct RegistryState {
     sessions: HashMap<ThreadId, SessionInfo>,
-    reserved: HashSet<(String, u64, String)>,
+    reserved: HashSet<(String, u64, ReviewKind)>,
     /// Per-`thread_id` completion broadcast (AB#1042): a `watch::Sender` whose value goes
     /// `None` → `Some(CompletionOutcome)` exactly once, when the turn reaches a terminal
     /// state via [`finalize_turn`]. Get-or-create on BOTH ends ([`SessionRegistry::subscribe_completion`]
@@ -280,7 +281,7 @@ impl SessionRegistry {
     /// makes the idempotency boundary atomic rather than a snapshot. `project_id` scopes
     /// the dedup (#35): the same PR number in two different projects reserves
     /// independently.
-    pub fn try_reserve_pair(&self, project_id: &str, pr_number: u64, kind: &str) -> bool {
+    pub fn try_reserve_pair(&self, project_id: &str, pr_number: u64, kind: ReviewKind) -> bool {
         let mut st = self.inner.lock().unwrap();
         let covered_by_session = st.sessions.values().any(|s| {
             s.project_id == project_id
@@ -294,12 +295,12 @@ impl SessionRegistry {
         if covered_by_session
             || st
                 .reserved
-                .contains(&(project_id.to_string(), pr_number, kind.to_string()))
+                .contains(&(project_id.to_string(), pr_number, kind))
         {
             return false;
         }
         st.reserved
-            .insert((project_id.to_string(), pr_number, kind.to_string()));
+            .insert((project_id.to_string(), pr_number, kind));
         true
     }
 
@@ -311,12 +312,12 @@ impl SessionRegistry {
     /// `(project_id, pr, kind)` so it frees exactly the triple `try_reserve_pair` took.
     /// `pub(super)` so the claude orchestration's [`ReservationGuard`] analogue can
     /// release on an early failure (#718).
-    pub(super) fn release_pair(&self, project_id: &str, pr_number: u64, kind: &str) {
-        self.inner.lock().unwrap().reserved.remove(&(
-            project_id.to_string(),
-            pr_number,
-            kind.to_string(),
-        ));
+    pub(super) fn release_pair(&self, project_id: &str, pr_number: u64, kind: ReviewKind) {
+        self.inner
+            .lock()
+            .unwrap()
+            .reserved
+            .remove(&(project_id.to_string(), pr_number, kind));
     }
 
     /// Insert the just-started session as `Starting` AND drop its reservation in ONE
@@ -334,7 +335,7 @@ impl SessionRegistry {
     pub(super) fn promote_reservation(&self, info: SessionInfo, url_ctx: CommentUrlContext) {
         let mut st = self.inner.lock().unwrap();
         st.reserved
-            .remove(&(info.project_id.clone(), info.pr_number, info.kind.clone()));
+            .remove(&(info.project_id.clone(), info.pr_number, info.kind));
         st.url_contexts.insert(info.thread_id.clone(), url_ctx);
         st.sessions.insert(info.thread_id.clone(), info);
     }
@@ -449,9 +450,9 @@ impl SessionRegistry {
     /// consumes only the pairs, so it never imports the session state machine. The
     /// returned pairs drop the project dimension because the caller already scopes its
     /// candidate batch to this project.
-    pub fn active_pairs(&self, project_id: &str) -> Vec<(u64, String)> {
+    pub fn active_pairs(&self, project_id: &str) -> Vec<(u64, ReviewKind)> {
         let st = self.inner.lock().unwrap();
-        let mut pairs: Vec<(u64, String)> = st
+        let mut pairs: Vec<(u64, ReviewKind)> = st
             .sessions
             .values()
             .filter(|s| {
@@ -463,7 +464,7 @@ impl SessionRegistry {
                             | SessionStatus::Interrupting
                     )
             })
-            .map(|s| (s.pr_number, s.kind.clone()))
+            .map(|s| (s.pr_number, s.kind))
             .collect();
         // A reserved triple has no session yet (its `thread/start` is mid-flight) but is
         // every bit as "in flight" — include it (scoped to this project) so the dispatch
@@ -473,7 +474,7 @@ impl SessionRegistry {
             st.reserved
                 .iter()
                 .filter(|(pid, _, _)| pid == project_id)
-                .map(|(_, pr, kind)| (*pr, kind.clone())),
+                .map(|(_, pr, kind)| (*pr, *kind)),
         );
         pairs
     }
@@ -488,7 +489,7 @@ impl SessionRegistry {
     /// promote-into-session swap is atomic under this same lock, so the two never both register, but
     /// checking sessions first is the correct precedence. Project-scoped (#35). Synchronous (no
     /// `.await` under the lock).
-    pub fn stop_target(&self, project_id: &str, pr_number: u64, kind: &str) -> StopTarget {
+    pub fn stop_target(&self, project_id: &str, pr_number: u64, kind: ReviewKind) -> StopTarget {
         let st = self.inner.lock().unwrap();
         if let Some(s) = st.sessions.values().find(|s| {
             s.project_id == project_id
@@ -505,7 +506,7 @@ impl SessionRegistry {
         // interrupt yet. NOT `Absent` — dropping the stop here would let the start promote unimpeded.
         if st
             .reserved
-            .contains(&(project_id.to_string(), pr_number, kind.to_string()))
+            .contains(&(project_id.to_string(), pr_number, kind))
         {
             return StopTarget::Reserved;
         }
@@ -558,7 +559,7 @@ struct ReservationGuard<'a> {
     registry: &'a SessionRegistry,
     project_id: String,
     pr_number: u64,
-    kind: String,
+    kind: ReviewKind,
     armed: bool,
 }
 
@@ -573,7 +574,7 @@ impl Drop for ReservationGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.registry
-                .release_pair(&self.project_id, self.pr_number, &self.kind);
+                .release_pair(&self.project_id, self.pr_number, self.kind);
         }
     }
 }
@@ -603,7 +604,7 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
     codex_model: &str,
     project_id: &str,
     pr_number: u64,
-    kind: &str,
+    kind: ReviewKind,
     // The IMMUTABLE comment-URL source context (AB#1042), captured by the caller from the
     // project at start. Handed to the `Starting` session in `promote_reservation` so the
     // terminal `finalize_turn` resolves the URL against the project the review ran against.
@@ -629,7 +630,7 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
         registry,
         project_id: project_id.to_string(),
         pr_number,
-        kind: kind.to_string(),
+        kind,
         armed: true,
     };
 
@@ -657,34 +658,15 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
         thread_id: thread_id.clone(),
         turn_id: String::new(),
         pr_number,
-        kind: kind.to_string(),
+        kind,
         engine_kind: EngineKind::Codex,
         status: SessionStatus::Starting,
         created_at_epoch: super::history_store::now_epoch(),
         // No comment yet — filled by `finalize_turn` at a `completed` terminal (AB#1042).
         comment_url: None,
     };
-    registry.promote_reservation(starting.clone(), url_ctx);
-    // Mirror the in-memory session into the durable `review_session` table (#70) so this
-    // PR's session list survives a restart and its history can be reopened. Best-effort.
-    persist_session(app, &starting);
+    commit_starting_session(app, registry, starting.clone(), url_ctx, outbox_claim_id)?;
     reservation.disarm();
-
-    // F1 (AB#1204): write the outbox claim's thread_id breadcrumb HERE — right after thread/start
-    // yields a stable thread_id and the Starting session is persisted, but BEFORE `start_turn`
-    // lets the turn run / post a `pm:` comment. This closes the window where a crash between the
-    // turn starting and the (former) post-return attach left the claim NULL → replay duplicated.
-    // Best-effort: a failure only narrows back toward the pre-AB#1204 window (no regression) and
-    // must NOT fail the started review.
-    if let Some(outbox_id) = outbox_claim_id {
-        let db = app.state::<crate::db::Database>();
-        if let Err(e) = super::claim_store::attach_thread(db.inner(), outbox_id, &thread_id) {
-            eprintln!(
-                "outbox review claim：记录 thread_id 失败（outbox_id={outbox_id}）：{}",
-                e.message
-            );
-        }
-    }
 
     let prompt = review_prompt(repo, &skill_command(pr_number, kind));
     let turn_id = match process::start_turn(
@@ -723,14 +705,14 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
 
     registry.set_running(&thread_id, turn_id.clone());
     // Mirror the Running transition (+ the now-known turn id) into `review_session` (#70).
-    persist_session(
+    let _ = persist_session(
         app,
         &SessionInfo {
             project_id: project_id.to_string(),
             thread_id: thread_id.clone(),
             turn_id,
             pr_number,
-            kind: kind.to_string(),
+            kind,
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             // Same creation instant as the `Starting` row above — `upsert_session` keys
@@ -899,13 +881,13 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
             thread_id: thread_id.to_string(),
             turn_id,
             pr_number,
-            kind: durable_info.kind.clone(),
+            kind: durable_info.kind,
             engine_kind: durable_info.engine_kind,
             status: SessionStatus::Running,
             created_at_epoch: durable_info.created_at_epoch,
             comment_url: durable_info.comment_url.clone(),
         });
-    persist_session(app, &live);
+    let _ = persist_session(app, &live);
 
     // Spawn the SAME pump as `start_review` — same signature/usage — to stream the reply.
     tauri::async_runtime::spawn(pump(
@@ -1049,7 +1031,10 @@ pub(super) fn notify_persist_failure_once<R: tauri::Runtime>(
 /// table (#70). Logs + swallows errors: a persistence hiccup must never break the live
 /// session (the in-memory registry stays the authority for dedup / status). The first
 /// failure also raises a one-time user-facing notice (review F9).
-fn persist_session<R: tauri::Runtime>(app: &tauri::AppHandle<R>, info: &SessionInfo) {
+fn persist_session<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    info: &SessionInfo,
+) -> AppResult<()> {
     let db = app.state::<crate::db::Database>();
     if let Err(e) = super::history_store::upsert_session(db.inner(), info) {
         eprintln!(
@@ -1057,7 +1042,41 @@ fn persist_session<R: tauri::Runtime>(app: &tauri::AppHandle<R>, info: &SessionI
             info.thread_id, e.message
         );
         notify_persist_failure_once(app, &info.project_id);
+        return Err(e);
     }
+    Ok(())
+}
+
+/// Establish the durable start boundary before exposing a `Starting` session in memory.
+///
+/// Outbox starts commit the session row and claim breadcrumb in one SQLite transaction. Only after
+/// that commit succeeds is the reservation promoted, so every error leaves the guard owning the
+/// pair and its `Drop` makes a retry possible. Manual starts retain their historical best-effort
+/// persistence contract because they have no durable claim to satisfy.
+pub(super) fn commit_starting_session<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    registry: &SessionRegistry,
+    starting: SessionInfo,
+    url_ctx: CommentUrlContext,
+    outbox_claim_id: Option<i64>,
+) -> AppResult<()> {
+    if let Some(outbox_id) = outbox_claim_id {
+        let db = app.state::<crate::db::Database>();
+        if let Err(error) =
+            super::claim_store::attach_started_session(db.inner(), outbox_id, &starting)
+        {
+            eprintln!(
+                "review durable start linkage 失败（{} / outbox_id={}）：{}",
+                starting.thread_id, outbox_id, error.message
+            );
+            notify_persist_failure_once(app, &starting.project_id);
+            return Err(error);
+        }
+    } else {
+        let _ = persist_session(app, &starting);
+    }
+    registry.promote_reservation(starting, url_ctx);
+    Ok(())
 }
 
 /// Best-effort mirror of a session status transition into `review_session` (#70). Used at
@@ -1295,6 +1314,8 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
         thread_id,
         terminal,
         comment_url.as_deref(),
+        wire_status,
+        error.as_deref(),
     ) {
         eprintln!(
             "review session 终态持久化失败（{thread_id}）：{}",
@@ -1304,7 +1325,7 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
     }
 
     // 4. Optional Error, then the terminal TurnCompleted carrying the URL.
-    if let Some(message) = error {
+    if let Some(message) = error.clone() {
         crate::stream::emit(
             app,
             StreamEvent::Review(ReviewEvent::Error {
@@ -1325,13 +1346,20 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
     );
     if let Some(event) = lifecycle_event_from_wire_status(wire_status) {
         let state = app.state::<crate::state::AppState>();
+        let kind = registry.get(thread_id).map(|info| info.kind).or_else(|| {
+            super::history_store::get_session(db.inner(), thread_id)
+                .ok()
+                .flatten()
+                .map(|info| info.kind)
+        });
+        let Some(kind) = kind else {
+            eprintln!("review lifecycle terminal 缺少类型化 session（{thread_id}），跳过通知");
+            return;
+        };
         if let Err(e) = state.review_lifecycle.fire(ReviewLifecycleDispatch {
             project_id: project_id.to_string(),
             pr_number,
-            kind: registry
-                .get(thread_id)
-                .map(|info| info.kind)
-                .unwrap_or_else(|| "review".to_string()),
+            kind,
             thread_id: thread_id.to_string(),
             event,
             comment_url: comment_url.clone(),
@@ -1352,6 +1380,7 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
             // (both terminal-map to `Done`) — `wire_status` is in scope here as `&str`.
             wire_status: wire_status.to_string(),
             comment_url,
+            error,
         },
     );
 }
@@ -1360,14 +1389,14 @@ fn fire_failed_lifecycle<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     project_id: &str,
     pr_number: u64,
-    kind: &str,
+    kind: ReviewKind,
     thread_id: &str,
 ) {
     let state = app.state::<crate::state::AppState>();
     if let Err(e) = state.review_lifecycle.fire(ReviewLifecycleDispatch {
         project_id: project_id.to_string(),
         pr_number,
-        kind: kind.to_string(),
+        kind,
         thread_id: thread_id.to_string(),
         event: ReviewLifecycleEvent::Failed,
         comment_url: None,
@@ -1452,11 +1481,10 @@ fn should_resolve_url(wire_status: &str) -> bool {
 
 /// The skill command the review turn instructs codex to run: `/pr-review <N>` for
 /// a review, `/pr-review <N> --check` for a check.
-fn skill_command(pr_number: u64, kind: &str) -> String {
-    if kind == "check" {
-        format!("/{PR_REVIEW_SKILL} {pr_number} --check")
-    } else {
-        format!("/{PR_REVIEW_SKILL} {pr_number}")
+fn skill_command(pr_number: u64, kind: ReviewKind) -> String {
+    match kind {
+        ReviewKind::Review => format!("/{PR_REVIEW_SKILL} {pr_number}"),
+        ReviewKind::Check => format!("/{PR_REVIEW_SKILL} {pr_number} --check"),
     }
 }
 
@@ -1611,8 +1639,8 @@ mod tests {
 
     #[test]
     fn skill_command_matches_kind() {
-        assert_eq!(skill_command(7, "review"), "/pr-review 7");
-        assert_eq!(skill_command(7, "check"), "/pr-review 7 --check");
+        assert_eq!(skill_command(7, ReviewKind::Review), "/pr-review 7");
+        assert_eq!(skill_command(7, ReviewKind::Check), "/pr-review 7 --check");
     }
 
     #[test]
@@ -1649,7 +1677,7 @@ mod tests {
             thread_id: "t1".to_string(),
             turn_id: "tn1".to_string(),
             pr_number: 7,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 0,
@@ -1669,33 +1697,33 @@ mod tests {
     #[test]
     fn active_pairs_returns_only_in_flight_sessions() {
         let reg = SessionRegistry::default();
-        let info = |thread: &str, pr: u64, kind: &str, status| {
+        let info = |thread: &str, pr: u64, kind: ReviewKind, status| {
             reg.insert(SessionInfo {
                 project_id: "p1".to_string(),
                 thread_id: thread.to_string(),
                 turn_id: String::new(),
                 pr_number: pr,
-                kind: kind.to_string(),
+                kind,
                 engine_kind: EngineKind::Codex,
                 status,
                 created_at_epoch: 0,
                 comment_url: None,
             });
         };
-        info("a", 1, "review", SessionStatus::Starting);
-        info("b", 2, "check", SessionStatus::Running);
-        info("c", 3, "review", SessionStatus::Interrupting);
-        info("d", 4, "review", SessionStatus::Done); // terminal → excluded
-        info("e", 5, "check", SessionStatus::Failed); // terminal → excluded
+        info("a", 1, ReviewKind::Review, SessionStatus::Starting);
+        info("b", 2, ReviewKind::Check, SessionStatus::Running);
+        info("c", 3, ReviewKind::Review, SessionStatus::Interrupting);
+        info("d", 4, ReviewKind::Review, SessionStatus::Done); // terminal → excluded
+        info("e", 5, ReviewKind::Check, SessionStatus::Failed); // terminal → excluded
 
         let mut pairs = reg.active_pairs("p1");
-        pairs.sort();
+        pairs.sort_by_key(|(pr_number, _)| *pr_number);
         assert_eq!(
             pairs,
             vec![
-                (1, "review".to_string()),
-                (2, "check".to_string()),
-                (3, "review".to_string()),
+                (1, ReviewKind::Review),
+                (2, ReviewKind::Check),
+                (3, ReviewKind::Review),
             ]
         );
     }
@@ -1706,39 +1734,48 @@ mod tests {
         // terminal / absent / wrong-project → Absent (the idempotency hinge — Absent → the executor
         // no-ops the stop instead of erroring).
         let reg = SessionRegistry::default();
-        let info = |thread: &str, project: &str, pr: u64, kind: &str, status| {
+        let info = |thread: &str, project: &str, pr: u64, kind: ReviewKind, status| {
             reg.insert(SessionInfo {
                 project_id: project.to_string(),
                 thread_id: thread.to_string(),
                 turn_id: String::new(),
                 pr_number: pr,
-                kind: kind.to_string(),
+                kind,
                 engine_kind: EngineKind::Codex,
                 status,
                 created_at_epoch: 0,
                 comment_url: None,
             });
         };
-        info("a", "p1", 1, "review", SessionStatus::Running);
-        info("b", "p1", 1, "check", SessionStatus::Starting); // same PR, different kind
-        info("c", "p1", 2, "review", SessionStatus::Done); // terminal → not stoppable
+        info("a", "p1", 1, ReviewKind::Review, SessionStatus::Running);
+        info("b", "p1", 1, ReviewKind::Check, SessionStatus::Starting); // same PR, different kind
+        info("c", "p1", 2, ReviewKind::Review, SessionStatus::Done); // terminal → not stoppable
 
         // In-flight pair → Live(thread_id).
         assert_eq!(
-            reg.stop_target("p1", 1, "review"),
+            reg.stop_target("p1", 1, ReviewKind::Review),
             StopTarget::Live("a".to_string())
         );
         // Kind is part of the key — review and check for the same PR are independent sessions.
         assert_eq!(
-            reg.stop_target("p1", 1, "check"),
+            reg.stop_target("p1", 1, ReviewKind::Check),
             StopTarget::Live("b".to_string())
         );
         // Terminal session → Absent (finished, nothing to stop).
-        assert_eq!(reg.stop_target("p1", 2, "review"), StopTarget::Absent);
+        assert_eq!(
+            reg.stop_target("p1", 2, ReviewKind::Review),
+            StopTarget::Absent
+        );
         // Absent pair → Absent.
-        assert_eq!(reg.stop_target("p1", 99, "review"), StopTarget::Absent);
+        assert_eq!(
+            reg.stop_target("p1", 99, ReviewKind::Review),
+            StopTarget::Absent
+        );
         // Project-scoped (#35): another project's id never matches.
-        assert_eq!(reg.stop_target("p2", 1, "review"), StopTarget::Absent);
+        assert_eq!(
+            reg.stop_target("p2", 1, ReviewKind::Review),
+            StopTarget::Absent
+        );
     }
 
     #[test]
@@ -1748,11 +1785,17 @@ mod tests {
         // `Reserved`, distinct from `Absent`, so the executor retries until promotion / start failure.
         // (`active_pairs` lumps reservations in as "taken"; `stop_target` keeps the distinction.)
         let reg = SessionRegistry::default();
-        assert!(reg.try_reserve_pair("p1", 7, "review"));
-        assert!(reg.active_pairs("p1").contains(&(7, "review".to_string())));
-        assert_eq!(reg.stop_target("p1", 7, "review"), StopTarget::Reserved);
+        assert!(reg.try_reserve_pair("p1", 7, ReviewKind::Review));
+        assert!(reg.active_pairs("p1").contains(&(7, ReviewKind::Review)));
+        assert_eq!(
+            reg.stop_target("p1", 7, ReviewKind::Review),
+            StopTarget::Reserved
+        );
         // A different pair is still Absent.
-        assert_eq!(reg.stop_target("p1", 7, "check"), StopTarget::Absent);
+        assert_eq!(
+            reg.stop_target("p1", 7, ReviewKind::Check),
+            StopTarget::Absent
+        );
     }
 
     // Characterization (AB#1069 → AB#1204): try_reserve_pair consults ONLY in-memory state and
@@ -1771,7 +1814,7 @@ mod tests {
     fn try_reserve_pair_is_in_memory_only_documents_restart_duplicate_window() {
         let reg = SessionRegistry::default(); // a fresh post-restart registry
         assert!(
-            reg.try_reserve_pair("p1", 7, "review"),
+            reg.try_reserve_pair("p1", 7, ReviewKind::Review),
             "a fresh (empty) registry reserves freely — try_reserve_pair stays in-memory by design; \
              the cross-restart guard (AB#1204) lives at the outbox executor, keyed by outbox_id"
         );
@@ -1781,22 +1824,22 @@ mod tests {
     fn try_reserve_pair_is_atomic_test_and_set() {
         let reg = SessionRegistry::default();
         assert!(
-            reg.try_reserve_pair("p1", 7, "review"),
+            reg.try_reserve_pair("p1", 7, ReviewKind::Review),
             "first reservation wins"
         );
         assert!(
-            !reg.try_reserve_pair("p1", 7, "review"),
+            !reg.try_reserve_pair("p1", 7, ReviewKind::Review),
             "second is rejected while reserved"
         );
         // A reservation shows up in active_pairs BEFORE any Starting session exists —
         // exactly the gap the old snapshot-then-act guard could not see.
-        assert!(reg.active_pairs("p1").contains(&(7, "review".to_string())));
+        assert!(reg.active_pairs("p1").contains(&(7, ReviewKind::Review)));
         // A different kind for the same PR is independent (key is (project, pr, kind)).
-        assert!(reg.try_reserve_pair("p1", 7, "check"));
+        assert!(reg.try_reserve_pair("p1", 7, ReviewKind::Check));
         // Release frees it for a later cycle.
-        reg.release_pair("p1", 7, "review");
+        reg.release_pair("p1", 7, ReviewKind::Review);
         assert!(
-            reg.try_reserve_pair("p1", 7, "review"),
+            reg.try_reserve_pair("p1", 7, ReviewKind::Review),
             "reservable again after release"
         );
     }
@@ -1810,16 +1853,16 @@ mod tests {
             thread_id: "t1".to_string(),
             turn_id: "tn".to_string(),
             pr_number: 7,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 0,
             comment_url: None,
         });
-        assert!(!reg.try_reserve_pair("p1", 7, "review"));
+        assert!(!reg.try_reserve_pair("p1", 7, ReviewKind::Review));
         // A different kind is still reservable; a terminal session would not block
         // (covered by the active_pairs in-flight filter, exercised elsewhere).
-        assert!(reg.try_reserve_pair("p1", 7, "check"));
+        assert!(reg.try_reserve_pair("p1", 7, ReviewKind::Check));
     }
 
     #[test]
@@ -1829,20 +1872,23 @@ mod tests {
         // project — a PR #7 review in project A must never block PR #7 in project B,
         // nor leak into B's active-pairs snapshot.
         let reg = SessionRegistry::default();
-        assert!(reg.try_reserve_pair("A", 7, "review"), "A reserves freely");
         assert!(
-            reg.try_reserve_pair("B", 7, "review"),
+            reg.try_reserve_pair("A", 7, ReviewKind::Review),
+            "A reserves freely"
+        );
+        assert!(
+            reg.try_reserve_pair("B", 7, ReviewKind::Review),
             "B reserves the same (pr, kind) independently of A"
         );
         // Re-reserving within the SAME project still dedups (the within-project guard).
         assert!(
-            !reg.try_reserve_pair("A", 7, "review"),
+            !reg.try_reserve_pair("A", 7, ReviewKind::Review),
             "dedup within a project is preserved"
         );
 
         // Each project's active_pairs sees ONLY its own reservation.
-        assert_eq!(reg.active_pairs("A"), vec![(7, "review".to_string())]);
-        assert_eq!(reg.active_pairs("B"), vec![(7, "review".to_string())]);
+        assert_eq!(reg.active_pairs("A"), vec![(7, ReviewKind::Review)]);
+        assert_eq!(reg.active_pairs("B"), vec![(7, ReviewKind::Review)]);
         assert!(
             reg.active_pairs("C").is_empty(),
             "a project with nothing in flight sees an empty snapshot"
@@ -1856,7 +1902,7 @@ mod tests {
                 thread_id: "tA".to_string(),
                 turn_id: String::new(),
                 pr_number: 9,
-                kind: "review".to_string(),
+                kind: ReviewKind::Review,
                 engine_kind: EngineKind::Codex,
                 status: SessionStatus::Running,
                 created_at_epoch: 0,
@@ -1865,26 +1911,26 @@ mod tests {
             test_url_ctx(),
         );
         assert!(
-            reg.active_pairs("A").contains(&(9, "review".to_string())),
+            reg.active_pairs("A").contains(&(9, ReviewKind::Review)),
             "A's session shows in A"
         );
         assert!(
-            !reg.active_pairs("B").contains(&(9, "review".to_string())),
+            !reg.active_pairs("B").contains(&(9, ReviewKind::Review)),
             "A's session must not leak into B"
         );
         assert!(
-            reg.try_reserve_pair("B", 9, "review"),
+            reg.try_reserve_pair("B", 9, ReviewKind::Review),
             "A's in-flight (9, review) session does not block B's (9, review)"
         );
 
         // Releasing A's reservation leaves B's untouched (full-triple keying).
-        reg.release_pair("A", 7, "review");
+        reg.release_pair("A", 7, ReviewKind::Review);
         assert!(
-            reg.try_reserve_pair("A", 7, "review"),
+            reg.try_reserve_pair("A", 7, ReviewKind::Review),
             "A reservable again after its own release"
         );
         assert!(
-            !reg.try_reserve_pair("B", 7, "review"),
+            !reg.try_reserve_pair("B", 7, ReviewKind::Review),
             "B's reservation was not disturbed by A's release"
         );
     }
@@ -1892,14 +1938,14 @@ mod tests {
     #[test]
     fn promote_reservation_hands_off_without_a_gap() {
         let reg = SessionRegistry::default();
-        assert!(reg.try_reserve_pair("p1", 7, "review"));
+        assert!(reg.try_reserve_pair("p1", 7, ReviewKind::Review));
         reg.promote_reservation(
             SessionInfo {
                 project_id: "p1".to_string(),
                 thread_id: "t1".to_string(),
                 turn_id: String::new(),
                 pr_number: 7,
-                kind: "review".to_string(),
+                kind: ReviewKind::Review,
                 engine_kind: EngineKind::Codex,
                 status: SessionStatus::Starting,
                 created_at_epoch: 0,
@@ -1909,13 +1955,13 @@ mod tests {
         );
         // After promotion the pair is covered by the Starting session, not the reserved
         // set — and a concurrent reserve still loses (continuous coverage, no gap).
-        assert!(!reg.try_reserve_pair("p1", 7, "review"));
+        assert!(!reg.try_reserve_pair("p1", 7, ReviewKind::Review));
         // The reservation was CONSUMED, not double-counted: exactly one active pair.
         let pairs = reg.active_pairs("p1");
         assert_eq!(
             pairs
                 .iter()
-                .filter(|p| **p == (7, "review".to_string()))
+                .filter(|p| **p == (7, ReviewKind::Review))
                 .count(),
             1
         );
@@ -1927,14 +1973,14 @@ mod tests {
         // its thread_id. A known id returns its snapshot; an unknown id is None (the caller
         // then falls through to the durable by-id read).
         let reg = SessionRegistry::default();
-        assert!(reg.try_reserve_pair("p1", 7, "review"));
+        assert!(reg.try_reserve_pair("p1", 7, ReviewKind::Review));
         reg.promote_reservation(
             SessionInfo {
                 project_id: "p1".to_string(),
                 thread_id: "t1".to_string(),
                 turn_id: String::new(),
                 pr_number: 7,
-                kind: "review".to_string(),
+                kind: ReviewKind::Review,
                 engine_kind: EngineKind::Codex,
                 status: SessionStatus::Starting,
                 created_at_epoch: 0,
@@ -1957,7 +2003,7 @@ mod tests {
         // review ran against, independent of any later config change (which would never touch
         // this captured value).
         let reg = SessionRegistry::default();
-        assert!(reg.try_reserve_pair("p1", 7, "review"));
+        assert!(reg.try_reserve_pair("p1", 7, ReviewKind::Review));
         let ctx = CommentUrlContext {
             gh: None,
             source_kind: crate::model::SourceKind::Azure,
@@ -1971,7 +2017,7 @@ mod tests {
                 thread_id: "t1".to_string(),
                 turn_id: String::new(),
                 pr_number: 7,
-                kind: "review".to_string(),
+                kind: ReviewKind::Review,
                 engine_kind: EngineKind::Codex,
                 status: SessionStatus::Starting,
                 created_at_epoch: 0,
@@ -2009,7 +2055,7 @@ mod tests {
             let reg = reg.clone();
             let winners = Arc::clone(&winners);
             handles.push(tokio::spawn(async move {
-                if reg.try_reserve_pair("p1", 7, "review") {
+                if reg.try_reserve_pair("p1", 7, ReviewKind::Review) {
                     winners.fetch_add(1, Ordering::SeqCst);
                 }
             }));
@@ -2032,7 +2078,7 @@ mod tests {
             thread_id: "t1".to_string(),
             turn_id: "tn1".to_string(),
             pr_number: 7,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 0,
@@ -2068,7 +2114,7 @@ mod tests {
                 thread_id: thread.to_string(),
                 turn_id: "tn".to_string(),
                 pr_number: 7,
-                kind: "review".to_string(),
+                kind: ReviewKind::Review,
                 engine_kind: EngineKind::Codex,
                 status,
                 created_at_epoch: 0,
@@ -2124,7 +2170,7 @@ mod tests {
                 thread_id: "th-1".to_string(),
                 turn_id: String::new(),
                 pr_number: 7,
-                kind: "review".to_string(),
+                kind: ReviewKind::Review,
                 engine_kind: EngineKind::Codex,
                 status: SessionStatus::Done,
                 created_at_epoch: 0,
@@ -2151,7 +2197,7 @@ mod tests {
             thread_id: "t1".to_string(),
             turn_id: "tn1".to_string(),
             pr_number: 7,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 0,
@@ -2178,7 +2224,7 @@ mod tests {
             thread_id: "t1".to_string(),
             turn_id: "tn1".to_string(),
             pr_number: 7,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 1_700_000_000,
@@ -2217,7 +2263,7 @@ mod tests {
                 thread_id: "t1".to_string(),
                 turn_id: "tn1".to_string(),
                 pr_number: 7,
-                kind: "review".to_string(),
+                kind: ReviewKind::Review,
                 engine_kind: EngineKind::Codex,
                 status: SessionStatus::Running,
                 created_at_epoch: 1_700_000_000,
@@ -2253,7 +2299,7 @@ mod tests {
             thread_id: "t1".to_string(),
             turn_id: String::new(),
             pr_number: 7,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Starting,
             created_at_epoch: 0,
@@ -2284,6 +2330,7 @@ mod tests {
                 status: SessionStatus::Done,
                 wire_status: "completed".to_string(),
                 comment_url: Some("https://x/c".to_string()),
+                error: None,
             },
         );
         let got = rx.borrow_and_update().clone().expect("outcome delivered");
@@ -2304,6 +2351,7 @@ mod tests {
                 status: SessionStatus::Failed,
                 wire_status: "failed".to_string(),
                 comment_url: None,
+                error: Some("boom".to_string()),
             },
         );
         let rx = reg.subscribe_completion("t1");
@@ -2332,6 +2380,7 @@ mod tests {
                     status,
                     wire_status: wire.to_string(),
                     comment_url: None,
+                    error: None,
                 },
             );
             assert_eq!(rx.borrow().as_ref().expect("delivered").status, status);

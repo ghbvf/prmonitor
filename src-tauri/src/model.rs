@@ -4,6 +4,200 @@
 //! boundary lives here. Serialized fields use camelCase for the frontend.
 
 use serde::{Deserialize, Serialize};
+use std::{fmt, ops::Deref};
+
+macro_rules! validated_string_newtype {
+    ($name:ident, $validator:expr) => {
+        #[cfg_attr(test, derive(ts_rs::TS))]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, String> {
+                let value = value.into();
+                ($validator)(&value)?;
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            pub fn into_inner(self) -> String {
+                self.0
+            }
+        }
+
+        impl Deref for $name {
+            type Target = str;
+
+            fn deref(&self) -> &Self::Target {
+                self.as_str()
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+fn non_empty(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        Err("value must not be empty".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+validated_string_newtype!(InboxDedupeKey, non_empty);
+validated_string_newtype!(ReviewActionKey, non_empty);
+validated_string_newtype!(OutboxProducerKey, non_empty);
+
+/// Stable idempotency id supplied by an external review trigger.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct ExternalRequestId(String);
+
+impl ExternalRequestId {
+    pub const LENGTH: usize = 32;
+
+    pub fn parse(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        if value.len() != Self::LENGTH
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(
+                "requestId must be exactly 32 lowercase hexadecimal characters".to_string(),
+            );
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for ExternalRequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ExternalRequestId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct InboxEventId(i64);
+
+impl InboxEventId {
+    pub fn new(value: i64) -> Result<Self, String> {
+        (value > 0)
+            .then_some(Self(value))
+            .ok_or_else(|| "inbox event id must be positive".to_string())
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for InboxEventId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(i64::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct ReviewReceiptId(i64);
+
+impl ReviewReceiptId {
+    pub fn new(value: i64) -> Result<Self, String> {
+        (value > 0)
+            .then_some(Self(value))
+            .ok_or_else(|| "review receipt id must be positive".to_string())
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ReviewReceiptId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(i64::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl From<InboxEventId> for ReviewReceiptId {
+    fn from(value: InboxEventId) -> Self {
+        Self(value.get())
+    }
+}
+
+/// Public lifecycle of an external review receipt. This is intentionally distinct from inbox,
+/// outbox, and review-session statuses: callers see one stable funnel state while the backing row
+/// advances across those three stores.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewReceiptStatus {
+    Received,
+    Queued,
+    Blocked,
+    Starting,
+    Running,
+    Interrupting,
+    Done,
+    Failed,
+}
+
+/// Durable status returned for an external review request. The receipt id is the originating
+/// inbox id; optional review fields become available as the outbox/session linkage is persisted.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewReceiptSnapshot {
+    pub receipt_id: ReviewReceiptId,
+    pub status: ReviewReceiptStatus,
+    pub thread_id: Option<String>,
+    pub comment_url: Option<String>,
+    pub outcome: Option<String>,
+    pub error: Option<String>,
+}
 
 /// Review lifecycle events emitted by the review slice and consumed by horizontal notification
 /// orchestration. Kept in `model.rs` so review/state/config do not import each other's internals.
@@ -37,10 +231,47 @@ impl ReviewLifecycleEvent {
 pub struct ReviewLifecycleDispatch {
     pub project_id: String,
     pub pr_number: u64,
-    pub kind: String,
+    pub kind: ReviewKind,
     pub thread_id: String,
     pub event: ReviewLifecycleEvent,
     pub comment_url: Option<String>,
+}
+
+/// The only two supported review execution modes.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ReviewKind {
+    #[default]
+    Review,
+    Check,
+}
+
+impl ReviewKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Review => "review",
+            Self::Check => "check",
+        }
+    }
+}
+
+impl fmt::Display for ReviewKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ReviewKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "review" => Ok(Self::Review),
+            "check" => Ok(Self::Check),
+            _ => Err(format!("unsupported review kind: {value}")),
+        }
+    }
 }
 
 /// A PR discovered by a [`crate::pr::source::EventSourceProvider`] that may need review.
@@ -53,8 +284,56 @@ pub struct Candidate {
     pub author: String,
     pub is_cross_repository: bool,
     pub is_draft: bool,
-    /// `"review"` or `"check"` — which pr-review mode the trigger label maps to.
-    pub kind: String,
+    pub kind: ReviewKind,
+}
+
+impl ReviewActionKey {
+    pub fn for_candidate(candidate: &Candidate) -> Result<Self, String> {
+        Self::for_parts(candidate.number, &candidate.head_sha, candidate.kind)
+    }
+
+    pub fn for_parts(pr_number: u64, head_sha: &str, kind: ReviewKind) -> Result<Self, String> {
+        if pr_number == 0 {
+            return Err("review action key requires a positive PR number".to_string());
+        }
+        if head_sha.trim().is_empty() {
+            return Err("review action key requires a non-empty head SHA".to_string());
+        }
+        Self::new(format!("{pr_number}@{head_sha}:{kind}"))
+    }
+}
+
+impl OutboxProducerKey {
+    pub fn for_rule_action(
+        inbox_id: InboxEventId,
+        rule_id: &str,
+        action_id: &str,
+    ) -> Result<Self, String> {
+        if rule_id.trim().is_empty() || action_id.trim().is_empty() {
+            return Err("rule and action ids must not be empty".to_string());
+        }
+        Self::new(format!(
+            "inbox:{}:rule:{}:{}:action:{}:{}",
+            inbox_id.get(),
+            rule_id.len(),
+            rule_id,
+            action_id.len(),
+            action_id
+        ))
+    }
+
+    pub fn for_dedupe(project_id: &str, dedupe_key: &str) -> Result<Self, String> {
+        if project_id.trim().is_empty() || dedupe_key.trim().is_empty() {
+            return Err("project id and dedupe key must not be empty".to_string());
+        }
+        Self::new(format!(
+            "dedupe:{}:{}:{}:{}",
+            project_id.len(),
+            project_id,
+            dedupe_key.len(),
+            dedupe_key
+        ))
+    }
 }
 
 /// Third-party executables managed by the config slice.
@@ -295,6 +574,7 @@ pub enum WebhookTunnelMode {
 }
 
 /// A PR row shown in the UI (display superset of [`Candidate`]).
+#[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PullRequestView {
@@ -302,8 +582,9 @@ pub struct PullRequestView {
     pub title: String,
     pub labels: Vec<String>,
     pub url: String,
-    /// `"review"` or `"check"` — the trigger-label mode this PR maps to.
-    pub kind: String,
+    /// The trigger-label mode this PR maps to. Typed at the Rust source so the
+    /// generated TypeScript projection cannot claim a narrower value domain.
+    pub kind: ReviewKind,
     /// Why this PR would be skipped (not dispatched), or `None` when it would
     /// dispatch. Serializes to `null` / a string for the frontend.
     pub skip_reason: Option<String>,
@@ -344,7 +625,7 @@ pub struct TrackedPrView {
     pub archived: bool,
 }
 
-/// The class of a normalized inbound [`Event`] (AB#1079, epic AB#1078): the event
+/// The class of a normalized inbound [`EventEnvelope`] observation: the event
 /// pipeline's first cross-slice discriminator. The inbox (AB#1065) persists it; the rule
 /// engine (AB#1068) matches on it.
 ///
@@ -375,51 +656,310 @@ pub enum EventType {
     Generic,
 }
 
-/// A normalized inbound event — the event pipeline's cross-slice envelope (AB#1079,
-/// epic AB#1078). External deliveries (the webhook today; future connectors, AB#1070) are
-/// normalized into this shape; the inbox (AB#1065) persists it (dedup by
-/// [`dedupe_key`](Self::dedupe_key)), the rule engine (AB#1068) matches on its fields, and
-/// the outbox (AB#1066) acts on the result. It GENERALIZES the existing
-/// `crate::pr::webhook::WebhookEvent` (`project_id` / `repo` / `number` / `title` /
-/// `labels` / `url`), adding the cross-source identity (`source` / `event_type`) and the
-/// idempotency key the inbox dedups on.
-///
-/// `Serialize` + `Deserialize`: the inbox stores it (as JSON) and reads it back, and it is
-/// a front/back contract mirrored in `src/types.ts` (`Event`). The serde golden below
-/// (`event_wire_shape_is_camel_case`) is the **Medium** carrier locking the camelCase wire
-/// shape (upstream = Rust `rename_all`; the downstream TS mirror is hand-kept — the open
-/// end of this funnel, future Hard path = codegen `types.ts` from `model.rs` +
-/// `git diff --exit-code`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Event {
-    /// Idempotency key the inbox dedups on (AB#1065): the SAME logical delivery (a webhook
-    /// retry, a tunnel re-delivery) yields the SAME key, so it is processed exactly once.
-    /// Composed by the inbox normalizer from a delivery's stable identity; the exact key
-    /// format is defined by the inbox (AB#1065), not pinned here.
-    pub dedupe_key: String,
-    /// Which source produced the event (reuses the existing source discriminator).
-    pub source: SourceKind,
-    /// The event class (PR / issue / comment / label / generic).
-    pub event_type: EventType,
-    /// The matched project id (routing key), mirroring `WebhookEvent::project_id`.
-    pub project_id: String,
-    /// The repo `owner/name` (GitHub) or bare repo name (Azure), for matching / diagnostics.
-    pub repo: String,
-    /// The PR/issue number, or `None` for an event class that has none (a generic webhook).
-    /// Serializes to JSON `null` (not omitted) so the TS mirror's `number | null` stays a
-    /// closed contract.
+pub enum ExternalTriggerOrigin {
+    Http,
+    Cli,
+    RemoteWeb,
+    DeepLink,
+    MessagingBot,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventSubject {
     pub number: Option<u64>,
-    /// The PR/issue title (`""` when absent), for title matchers / display.
     pub title: String,
-    /// The PR/issue body (`""` when absent), for body matchers.
     pub body: String,
-    /// The effective labels (post-[`LabelSource`] resolution), for label matchers.
     pub labels: Vec<String>,
-    /// The event's HTML URL (`""` when absent).
     pub url: String,
-    /// When the event was received (epoch seconds), stamped by the ingress.
-    pub received_at_epoch: u64,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum EventPayload {
+    Observation {
+        #[serde(rename = "eventType")]
+        event_type: EventType,
+        subject: EventSubject,
+    },
+    ReviewRequest {
+        #[serde(rename = "prNumber")]
+        pr_number: u64,
+        #[serde(rename = "reviewKind")]
+        review_kind: ReviewKind,
+        #[serde(rename = "requestId")]
+        request_id: ExternalRequestId,
+        origin: ExternalTriggerOrigin,
+        #[serde(rename = "notifyOnCompletion")]
+        notify_on_completion: bool,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+enum EventPayloadWire {
+    Observation {
+        #[serde(rename = "eventType")]
+        event_type: EventType,
+        subject: EventSubject,
+    },
+    ReviewRequest {
+        #[serde(rename = "prNumber")]
+        pr_number: u64,
+        #[serde(rename = "reviewKind")]
+        review_kind: ReviewKind,
+        #[serde(rename = "requestId")]
+        request_id: ExternalRequestId,
+        origin: ExternalTriggerOrigin,
+        #[serde(rename = "notifyOnCompletion")]
+        notify_on_completion: bool,
+    },
+}
+
+impl<'de> Deserialize<'de> for EventPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match EventPayloadWire::deserialize(deserializer)? {
+            EventPayloadWire::Observation {
+                event_type,
+                subject,
+            } => Self::Observation {
+                event_type,
+                subject,
+            },
+            EventPayloadWire::ReviewRequest {
+                pr_number,
+                review_kind,
+                request_id,
+                origin,
+                notify_on_completion,
+            } => Self::ReviewRequest {
+                pr_number,
+                review_kind,
+                request_id,
+                origin,
+                notify_on_completion,
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ObservationRef<'a> {
+    pub event_type: EventType,
+    pub subject: &'a EventSubject,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewRequestRef<'a> {
+    pub pr_number: u64,
+    pub review_kind: ReviewKind,
+    pub request_id: &'a ExternalRequestId,
+    pub origin: ExternalTriggerOrigin,
+    pub notify_on_completion: bool,
+}
+
+/// Typed inbound envelope. Private fields plus constructors make an invalid payload/envelope
+/// pairing unrepresentable; serde rejects the removed flat event shape.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventEnvelope {
+    dedupe_key: InboxDedupeKey,
+    source: SourceKind,
+    project_id: String,
+    repo: String,
+    payload: EventPayload,
+    received_at_epoch: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EventEnvelopeWire {
+    dedupe_key: InboxDedupeKey,
+    source: SourceKind,
+    project_id: String,
+    repo: String,
+    payload: EventPayload,
+    received_at_epoch: u64,
+}
+
+impl<'de> Deserialize<'de> for EventEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = EventEnvelopeWire::deserialize(deserializer)?;
+        match wire.payload {
+            EventPayload::Observation {
+                event_type,
+                subject,
+            } => Self::observation(
+                wire.dedupe_key,
+                wire.source,
+                wire.project_id,
+                wire.repo,
+                event_type,
+                subject,
+                wire.received_at_epoch,
+            ),
+            EventPayload::ReviewRequest {
+                pr_number,
+                review_kind,
+                request_id,
+                origin,
+                notify_on_completion,
+            } => Self::review_request(
+                wire.dedupe_key,
+                wire.source,
+                wire.project_id,
+                wire.repo,
+                pr_number,
+                review_kind,
+                request_id,
+                origin,
+                notify_on_completion,
+                wire.received_at_epoch,
+            ),
+        }
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl EventEnvelope {
+    pub fn observation(
+        dedupe_key: InboxDedupeKey,
+        source: SourceKind,
+        project_id: impl Into<String>,
+        repo: impl Into<String>,
+        event_type: EventType,
+        subject: EventSubject,
+        received_at_epoch: u64,
+    ) -> Result<Self, String> {
+        Self::new(
+            dedupe_key,
+            source,
+            project_id,
+            repo,
+            EventPayload::Observation {
+                event_type,
+                subject,
+            },
+            received_at_epoch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn review_request(
+        dedupe_key: InboxDedupeKey,
+        source: SourceKind,
+        project_id: impl Into<String>,
+        repo: impl Into<String>,
+        pr_number: u64,
+        review_kind: ReviewKind,
+        request_id: ExternalRequestId,
+        origin: ExternalTriggerOrigin,
+        notify_on_completion: bool,
+        received_at_epoch: u64,
+    ) -> Result<Self, String> {
+        if pr_number == 0 {
+            return Err("review request PR number must be positive".to_string());
+        }
+        Self::new(
+            dedupe_key,
+            source,
+            project_id,
+            repo,
+            EventPayload::ReviewRequest {
+                pr_number,
+                review_kind,
+                request_id,
+                origin,
+                notify_on_completion,
+            },
+            received_at_epoch,
+        )
+    }
+
+    fn new(
+        dedupe_key: InboxDedupeKey,
+        source: SourceKind,
+        project_id: impl Into<String>,
+        repo: impl Into<String>,
+        payload: EventPayload,
+        received_at_epoch: u64,
+    ) -> Result<Self, String> {
+        let project_id = project_id.into();
+        if project_id.trim().is_empty() {
+            return Err("event project id must not be empty".to_string());
+        }
+        Ok(Self {
+            dedupe_key,
+            source,
+            project_id,
+            repo: repo.into(),
+            payload,
+            received_at_epoch,
+        })
+    }
+
+    pub fn dedupe_key(&self) -> &InboxDedupeKey {
+        &self.dedupe_key
+    }
+    pub fn source(&self) -> SourceKind {
+        self.source
+    }
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+    pub fn payload(&self) -> &EventPayload {
+        &self.payload
+    }
+    pub fn received_at_epoch(&self) -> u64 {
+        self.received_at_epoch
+    }
+
+    pub fn as_observation(&self) -> Option<ObservationRef<'_>> {
+        match &self.payload {
+            EventPayload::Observation {
+                event_type,
+                subject,
+            } => Some(ObservationRef {
+                event_type: *event_type,
+                subject,
+            }),
+            EventPayload::ReviewRequest { .. } => None,
+        }
+    }
+
+    pub fn as_review_request(&self) -> Option<ReviewRequestRef<'_>> {
+        match &self.payload {
+            EventPayload::ReviewRequest {
+                pr_number,
+                review_kind,
+                request_id,
+                origin,
+                notify_on_completion,
+            } => Some(ReviewRequestRef {
+                pr_number: *pr_number,
+                review_kind: *review_kind,
+                request_id,
+                origin: *origin,
+                notify_on_completion: *notify_on_completion,
+            }),
+            EventPayload::Observation { .. } => None,
+        }
+    }
 }
 
 /// The processing state of one persisted inbox delivery (AB#1065, epic AB#1078): the
@@ -448,7 +988,7 @@ pub enum InboxStatus {
     Failed,
 }
 
-/// One persisted inbox delivery row (AB#1065, epic AB#1078): a normalized [`Event`] plus
+/// One persisted inbox delivery row: a normalized [`EventEnvelope`] plus
 /// its processing state, surfaced to the frontend's event-inbox panel and the source of a
 /// replay.
 ///
@@ -458,7 +998,7 @@ pub enum InboxStatus {
 /// (`inbox_entry_wire_shape_is_camel_case`) is the **Medium** carrier locking the camelCase
 /// wire shape.
 ///
-/// The [`Event`] is NESTED (a real `event` object), NOT flattened — the panel renders the
+/// The [`EventEnvelope`] is NESTED (a real `event` object), NOT flattened — the panel renders the
 /// envelope as a unit and the wire stays `{ id, event: { … }, status, processedAtEpoch,
 /// error }`, distinct from [`TrackedPrView`]'s flatten.
 #[derive(Debug, Clone, Serialize)]
@@ -467,7 +1007,7 @@ pub struct InboxEntry {
     /// The inbox row id (the `inbox_event` table PRIMARY KEY) — the replay / get-raw key.
     pub id: i64,
     /// The normalized delivery envelope (nested, not flattened).
-    pub event: Event,
+    pub event: EventEnvelope,
     /// The processing state of this delivery.
     pub status: InboxStatus,
     /// When processing finished (epoch seconds), or `None` while still `Received`.
@@ -529,7 +1069,7 @@ impl RedactedNotificationBody {
 
 /// The normalized OUTBOUND payload (AB#1070): what the core hands a
 /// [`crate::review::notify::NotificationProvider`], the output-side mirror of the
-/// inbound [`Event`]. **Backend-internal** cross-Rust-slice contract (like
+/// inbound [`EventEnvelope`]. **Backend-internal** cross-Rust-slice contract (like
 /// [`Candidate`], NOT [`PullRequestView`]): consumed only by Rust providers — today
 /// the review slice's desktop notifier; a future outbox (AB#1066) drives it — so per
 /// the charter it is intentionally NOT mirrored in `src/types.ts` (the funnel has no
@@ -941,7 +1481,16 @@ pub struct NotificationDeliveryChannel {
 /// HTTP/SMTP failures into this type before the generic outbox worker records state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionExecutionResult {
-    Done,
+    Done {
+        output: ActionExecutionOutput,
+    },
+    Blocked {
+        message: String,
+        /// Resume generation observed immediately before the executor classified this action as
+        /// blocked. Persisting that observation lets the worker distinguish an already-fired
+        /// resume from a future resume without a check-then-sleep race.
+        observed_resume_generation: u64,
+    },
     Retry {
         message: String,
         retry_after_secs: Option<u64>,
@@ -949,6 +1498,22 @@ pub enum ActionExecutionResult {
     Dead {
         message: String,
     },
+}
+
+impl ActionExecutionResult {
+    pub fn done() -> Self {
+        Self::Done {
+            output: ActionExecutionOutput::None,
+        }
+    }
+
+    pub fn review(thread_id: impl Into<String>) -> Self {
+        Self::Done {
+            output: ActionExecutionOutput::Review {
+                thread_id: thread_id.into(),
+            },
+        }
+    }
 }
 
 /// The kind of side effect a persisted outbox row executes (AB#1066/AB#1069, epic AB#1078).
@@ -992,6 +1557,37 @@ pub enum ActionKind {
     // Email/IM notification channels are NOT kinds here — see the doc comment.
 }
 
+impl ActionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Notification => "notification",
+            Self::Review => "review",
+            Self::Check => "check",
+            Self::StopReview => "stopReview",
+            Self::MessagingReply => "messagingReply",
+            Self::MessagingSend => "messagingSend",
+        }
+    }
+}
+
+impl OutboxProducerKey {
+    pub fn for_manual(
+        project_id: &str,
+        kind: ActionKind,
+        nonce: &ExternalRequestId,
+    ) -> Result<Self, String> {
+        if project_id.trim().is_empty() {
+            return Err("manual producer key requires a project id".to_string());
+        }
+        Self::new(format!(
+            "manual:{}:{}:{}:{nonce}",
+            project_id.len(),
+            project_id,
+            kind.as_str()
+        ))
+    }
+}
+
 /// The outbox payload for a [`ActionKind::Review`] / [`ActionKind::Check`] action (AB#1069): the PR
 /// the executor reviews via the review funnel (`review::commands::start_for_outbox`).
 ///
@@ -1008,11 +1604,38 @@ pub enum ActionKind {
 /// outbox `payload` column and replayed, so its camelCase shape must stay stable. serde camelCase;
 /// the golden locks it (Medium carrier).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReviewActionPayload {
-    /// The candidate to review. Carries the dispatch key inputs (`pr_number`, `head_sha`, `kind`)
-    /// so the executor can land the ledger after the outbox action succeeds.
-    pub candidate: Candidate,
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ReviewActionPayload {
+    Automatic {
+        candidate: Candidate,
+    },
+    Explicit {
+        #[serde(rename = "prNumber")]
+        pr_number: u64,
+        #[serde(rename = "requestId")]
+        request_id: ExternalRequestId,
+        origin: ExternalTriggerOrigin,
+    },
+}
+
+impl ReviewActionPayload {
+    pub fn automatic_candidate(&self) -> Option<&Candidate> {
+        match self {
+            Self::Automatic { candidate } => Some(candidate),
+            Self::Explicit { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+pub enum ActionExecutionOutput {
+    #[default]
+    None,
+    Review {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+    },
 }
 
 /// The outbox payload for a [`ActionKind::StopReview`] action (AB#1069): which in-flight session to
@@ -1030,8 +1653,8 @@ pub struct ReviewActionPayload {
 pub struct StopReviewActionPayload {
     /// The PR / MR number whose session to stop (re-validated `> 0` at the executor boundary).
     pub pr_number: u64,
-    /// Which session mode to stop: `"review"` | `"check"` (re-validated at the executor boundary).
-    pub kind: String,
+    /// Which session mode to stop. The enum keeps invalid modes out of the persisted payload.
+    pub kind: ReviewKind,
 }
 
 /// The lifecycle state of one persisted outbox action (AB#1066, epic AB#1078): surfaced to the
@@ -1041,13 +1664,13 @@ pub struct StopReviewActionPayload {
 /// `match ActionStatus { ... }` ([`crate::outbox::store::status_as_wire`]), so adding a variant
 /// without an arm is a compile error — the missing case cannot be expressed.
 ///
-/// Three states (no transient `Processing`): a queued action is [`Pending`](Self::Pending)
+/// Four states (no transient `Processing`): a queued action is [`Pending`](Self::Pending)
 /// (`Default` — every action starts here) until the worker executes it; on success it is
 /// [`Done`](Self::Done); a failure that exhausts the retry budget is [`Dead`](Self::Dead) — the
 /// terminal dead-letter. A transient failure stays `Pending` (the row's `attempt_count` /
 /// `last_error` carry the detail and `next_attempt_at` reschedules it), so a crash mid-execute
 /// re-runs the action next boot (at-least-once). Wire strings are pinned camelCase
-/// (`"pending" | "done" | "dead"`) — the frontend's `OUTBOX_STATUSES` (`src/types.ts`) mirrors
+/// (`"pending" | "blocked" | "done" | "dead"`) — generated TypeScript mirrors
 /// them; the serde golden below is the **Medium** carrier locking them against a `rename_all` /
 /// variant drift.
 #[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
@@ -1057,6 +1680,8 @@ pub enum ActionStatus {
     /// Queued (or awaiting a retry); the worker will execute it when `next_attempt_at` is due.
     #[default]
     Pending,
+    /// Waiting for an explicit Codex resume. Blocking does not consume a retry attempt.
+    Blocked,
     /// Executed successfully — terminal.
     Done,
     /// The retry budget was exhausted — terminal dead-letter (`last_error` carries the reason).
@@ -1117,6 +1742,179 @@ pub struct OutboxEntry {
 mod tests {
     use super::*;
 
+    #[test]
+    fn typed_event_envelope_and_review_request_wire_contract() {
+        let request_id = ExternalRequestId::parse("0123456789abcdef0123456789abcdef")
+            .expect("32 lowercase hex request id");
+        assert!(ExternalRequestId::parse("not-hex").is_err());
+        assert!(ExternalRequestId::parse("0123456789ABCDEF0123456789ABCDEF").is_err());
+
+        let event = EventEnvelope::review_request(
+            InboxDedupeKey::new("http:0123456789abcdef0123456789abcdef").expect("non-empty key"),
+            SourceKind::Github,
+            "p1",
+            "octocat/hello",
+            7,
+            ReviewKind::Check,
+            request_id.clone(),
+            ExternalTriggerOrigin::Http,
+            true,
+            42,
+        )
+        .expect("valid event");
+        let wire = serde_json::to_value(&event).expect("event serializes");
+        assert_eq!(wire["dedupeKey"], "http:0123456789abcdef0123456789abcdef");
+        assert_eq!(wire["payload"]["kind"], "reviewRequest");
+        assert_eq!(wire["payload"]["reviewKind"], "check");
+        assert_eq!(wire["payload"]["requestId"], request_id.as_str());
+        assert_eq!(wire["payload"]["origin"], "http");
+        assert_eq!(wire["payload"]["notifyOnCompletion"], true);
+        assert!(
+            wire.get("eventType").is_none(),
+            "event type belongs in Observation"
+        );
+        assert_eq!(event.as_review_request().expect("request").pr_number, 7);
+    }
+
+    #[test]
+    fn review_receipt_wire_contract_is_exhaustive_and_camel_case() {
+        let statuses = [
+            (ReviewReceiptStatus::Received, "received"),
+            (ReviewReceiptStatus::Queued, "queued"),
+            (ReviewReceiptStatus::Blocked, "blocked"),
+            (ReviewReceiptStatus::Starting, "starting"),
+            (ReviewReceiptStatus::Running, "running"),
+            (ReviewReceiptStatus::Interrupting, "interrupting"),
+            (ReviewReceiptStatus::Done, "done"),
+            (ReviewReceiptStatus::Failed, "failed"),
+        ];
+        for (status, expected) in statuses {
+            assert_eq!(serde_json::to_value(status).unwrap(), expected);
+        }
+
+        let snapshot = ReviewReceiptSnapshot {
+            receipt_id: ReviewReceiptId::new(9).unwrap(),
+            status: ReviewReceiptStatus::Running,
+            thread_id: Some("thread-9".into()),
+            comment_url: None,
+            outcome: None,
+            error: None,
+        };
+        let wire = serde_json::to_value(snapshot).unwrap();
+        assert_eq!(wire["receiptId"], 9);
+        assert_eq!(wire["status"], "running");
+        assert_eq!(wire["threadId"], "thread-9");
+        assert_eq!(wire["commentUrl"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn typed_action_and_producer_keys_validate_and_frame_components() {
+        assert_eq!(
+            ReviewActionKey::for_parts(7, "abc123", ReviewKind::Check)
+                .unwrap()
+                .as_str(),
+            "7@abc123:check"
+        );
+        assert!(ReviewActionKey::for_parts(0, "abc123", ReviewKind::Review).is_err());
+        assert!(ReviewActionKey::for_parts(7, "", ReviewKind::Review).is_err());
+
+        let inbox = InboxEventId::new(9).unwrap();
+        let left = OutboxProducerKey::for_rule_action(inbox, "a:b", "c").unwrap();
+        let right = OutboxProducerKey::for_rule_action(inbox, "a", "b:c").unwrap();
+        assert_ne!(left, right, "length framing prevents component collisions");
+        assert!(OutboxProducerKey::for_dedupe("", "key").is_err());
+        let nonce = ExternalRequestId::parse("00112233445566778899aabbccddeeff").unwrap();
+        assert!(OutboxProducerKey::for_manual("", ActionKind::Review, &nonce).is_err());
+    }
+
+    #[test]
+    fn blocked_execution_carries_observed_resume_generation() {
+        let result = ActionExecutionResult::Blocked {
+            message: "codex stopped".to_string(),
+            observed_resume_generation: 41,
+        };
+        match result {
+            ActionExecutionResult::Blocked {
+                message,
+                observed_resume_generation,
+            } => {
+                assert_eq!(message, "codex stopped");
+                assert_eq!(observed_resume_generation, 41);
+            }
+            other => panic!("expected blocked result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typed_observation_and_action_contracts_round_trip() {
+        let event = EventEnvelope::observation(
+            InboxDedupeKey::new("github:delivery-1").expect("key"),
+            SourceKind::Github,
+            "p1",
+            "octocat/hello",
+            EventType::PullRequest,
+            EventSubject {
+                number: Some(7),
+                title: "Ready".into(),
+                body: "Body".into(),
+                labels: vec!["review".into()],
+                url: "https://example.test/7".into(),
+            },
+            42,
+        )
+        .expect("valid event");
+        let wire = serde_json::to_value(&event).expect("event serializes");
+        assert_eq!(wire["payload"]["kind"], "observation");
+        assert_eq!(wire["payload"]["eventType"], "pullRequest");
+        assert_eq!(wire["payload"]["subject"]["number"], 7);
+        assert_eq!(
+            event.as_observation().expect("observation").subject.title,
+            "Ready"
+        );
+
+        let automatic = ReviewActionPayload::Automatic {
+            candidate: Candidate {
+                number: 7,
+                head_sha: "sha".into(),
+                head_ref: "main".into(),
+                author: "octocat".into(),
+                is_cross_repository: false,
+                is_draft: false,
+                kind: ReviewKind::Review,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&automatic).unwrap()["kind"],
+            "automatic"
+        );
+
+        let explicit = ReviewActionPayload::Explicit {
+            pr_number: 7,
+            request_id: ExternalRequestId::parse("0123456789abcdef0123456789abcdef").unwrap(),
+            origin: ExternalTriggerOrigin::RemoteWeb,
+        };
+        let wire = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(wire["kind"], "explicit");
+        assert_eq!(wire["prNumber"], 7);
+        assert_eq!(wire["origin"], "remoteWeb");
+
+        assert_eq!(
+            serde_json::to_value(ActionStatus::Blocked).unwrap(),
+            "blocked"
+        );
+        assert_eq!(
+            serde_json::to_value(ActionExecutionOutput::Review {
+                thread_id: "thread-1".into(),
+            })
+            .unwrap(),
+            serde_json::json!({"kind":"review","threadId":"thread-1"})
+        );
+        assert_eq!(
+            serde_json::to_value(ActionExecutionOutput::None).unwrap(),
+            serde_json::json!({"kind":"none"})
+        );
+    }
+
     // Backend-internal cross-slice lock: `Candidate` is not exposed to the
     // frontend and is intentionally absent from `src/types.ts` (per the charter).
     #[test]
@@ -1128,7 +1926,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
         };
 
         let v = serde_json::to_value(&candidate).expect("Candidate serializes");
@@ -1361,7 +2159,7 @@ mod tests {
             title: "Add feature".to_string(),
             labels: vec!["review".to_string()],
             url: "https://example.com/pr/1".to_string(),
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
             skip_reason: Some("draft PR".to_string()),
         };
 
@@ -1389,7 +2187,7 @@ mod tests {
             title: "Ready".to_string(),
             labels: vec![],
             url: "https://example.com/pr/2".to_string(),
-            kind: "check".to_string(),
+            kind: ReviewKind::Check,
             skip_reason: None,
         };
 
@@ -1412,7 +2210,7 @@ mod tests {
                 title: "Add feature".to_string(),
                 labels: vec!["review".to_string()],
                 url: "https://example.com/pr/1".to_string(),
-                kind: "review".to_string(),
+                kind: ReviewKind::Review,
                 skip_reason: None,
             },
             presence: PrPresence::Current,
@@ -1487,63 +2285,66 @@ mod tests {
         );
     }
 
-    // Front/back contract lock for the AB#1079 normalized `Event` envelope (Medium carrier
-    // per ai-robust.md): mirrored in `src/types.ts` (`Event`); a field change must be synced
-    // there in lockstep (the open end of the funnel — future Hard path = codegen from
-    // `model.rs` + `git diff --exit-code`). Locks camelCase keys present + snake_case absent,
-    // the nested `source`/`eventType` wire strings, and that an absent `number` (a generic /
-    // non-numbered event) serializes as JSON null (not omitted) so the TS mirror's
-    // `number: number | null` stays a closed contract.
+    // The generated TS declaration and this golden close both ends of the typed event envelope.
     #[test]
     fn event_wire_shape_is_camel_case() {
-        let event = Event {
-            dedupe_key: "github:pullRequest:owner/repo#7:labeled".to_string(),
-            source: SourceKind::Github,
-            event_type: EventType::PullRequest,
-            project_id: "p1".to_string(),
-            repo: "owner/repo".to_string(),
-            number: Some(7),
-            title: "Add feature".to_string(),
-            body: "body text".to_string(),
-            labels: vec!["pr-review".to_string()],
-            url: "https://example.com/pr/7".to_string(),
-            received_at_epoch: 1_700_000_000,
-        };
+        let event = EventEnvelope::observation(
+            InboxDedupeKey::new("github:pullRequest:owner/repo#7:labeled").unwrap(),
+            SourceKind::Github,
+            "p1",
+            "owner/repo",
+            EventType::PullRequest,
+            EventSubject {
+                number: Some(7),
+                title: "Add feature".into(),
+                body: "body text".into(),
+                labels: vec!["pr-review".into()],
+                url: "https://example.com/pr/7".into(),
+            },
+            1_700_000_000,
+        )
+        .unwrap();
 
         let v = serde_json::to_value(&event).expect("Event serializes");
 
         // camelCase keys present.
         assert!(v.get("dedupeKey").is_some());
         assert!(v.get("source").is_some());
-        assert!(v.get("eventType").is_some());
         assert!(v.get("projectId").is_some());
         assert!(v.get("repo").is_some());
-        assert!(v.get("number").is_some());
-        assert!(v.get("title").is_some());
-        assert!(v.get("body").is_some());
-        assert!(v.get("labels").is_some());
-        assert!(v.get("url").is_some());
+        assert!(v.get("payload").is_some());
         assert!(v.get("receivedAtEpoch").is_some());
 
         // snake_case forms absent — a rename of any multi-word field surfaces here.
         assert!(v.get("dedupe_key").is_none());
-        assert!(v.get("event_type").is_none());
         assert!(v.get("project_id").is_none());
         assert!(v.get("received_at_epoch").is_none());
 
         // The nested kind enums serialize to their pinned wire strings.
         assert_eq!(v["source"], "github");
-        assert_eq!(v["eventType"], "pullRequest");
+        assert_eq!(v["payload"]["kind"], "observation");
+        assert_eq!(v["payload"]["eventType"], "pullRequest");
 
         // An absent `number` (a generic / non-numbered event) serializes as JSON null
         // (not omitted), keeping the TS mirror's `number: number | null` a closed contract.
-        let generic = Event {
-            number: None,
-            event_type: EventType::Generic,
-            ..event
-        };
+        let generic = EventEnvelope::observation(
+            InboxDedupeKey::new("generic:1").unwrap(),
+            SourceKind::Github,
+            "p1",
+            "owner/repo",
+            EventType::Generic,
+            EventSubject {
+                number: None,
+                title: String::new(),
+                body: String::new(),
+                labels: vec![],
+                url: String::new(),
+            },
+            1_700_000_000,
+        )
+        .unwrap();
         let gv = serde_json::to_value(&generic).expect("Event serializes");
-        assert_eq!(gv["number"], serde_json::Value::Null);
+        assert_eq!(gv["payload"]["subject"]["number"], serde_json::Value::Null);
     }
 
     // Cross-agent wire contract lock for the AB#1065 inbox status (Medium carrier per
@@ -1582,19 +2383,22 @@ mod tests {
     fn inbox_entry_wire_shape_is_camel_case() {
         let entry = InboxEntry {
             id: 7,
-            event: Event {
-                dedupe_key: "github:abc-123".to_string(),
-                source: SourceKind::Github,
-                event_type: EventType::PullRequest,
-                project_id: "p1".to_string(),
-                repo: "owner/repo".to_string(),
-                number: Some(7),
-                title: "Add feature".to_string(),
-                body: String::new(),
-                labels: vec!["pr-review".to_string()],
-                url: "https://example.com/pr/7".to_string(),
-                received_at_epoch: 1_700_000_000,
-            },
+            event: EventEnvelope::observation(
+                InboxDedupeKey::new("github:abc-123").unwrap(),
+                SourceKind::Github,
+                "p1",
+                "owner/repo",
+                EventType::PullRequest,
+                EventSubject {
+                    number: Some(7),
+                    title: "Add feature".into(),
+                    body: String::new(),
+                    labels: vec!["pr-review".into()],
+                    url: "https://example.com/pr/7".into(),
+                },
+                1_700_000_000,
+            )
+            .unwrap(),
             status: InboxStatus::Processed,
             processed_at_epoch: Some(1_700_000_005),
             error: None,
@@ -1617,7 +2421,7 @@ mod tests {
         let ev = &v["event"];
         assert!(ev.is_object(), "event is a nested object, not flattened");
         assert!(ev.get("dedupeKey").is_some());
-        assert!(ev.get("eventType").is_some());
+        assert!(ev.get("payload").is_some());
         assert!(ev.get("receivedAtEpoch").is_some());
         assert!(
             v.get("dedupeKey").is_none(),
@@ -1643,7 +2447,7 @@ mod tests {
     }
 
     // Backend-internal cross-slice lock for the AB#1070 normalized `Notification` (Medium
-    // carrier per ai-robust.md): the output-side mirror of `Event`. Like `Candidate` it is
+    // carrier per ai-robust.md): the output-side mirror of `EventEnvelope`. Like `Candidate` it is
     // NOT mirrored in `src/types.ts` (consumed only by Rust providers / a future outbox), so
     // this lock guards the camelCase wire shape the producer/consumer rely on — the funnel has
     // no open TS end. Locks camelCase keys present + snake_case absent + the nested level string.
@@ -1907,6 +2711,10 @@ mod tests {
             "pending"
         );
         assert_eq!(
+            serde_json::to_value(ActionStatus::Blocked).expect("ActionStatus serializes"),
+            "blocked"
+        );
+        assert_eq!(
             serde_json::to_value(ActionStatus::Done).expect("ActionStatus serializes"),
             "done"
         );
@@ -2140,7 +2948,7 @@ mod tests {
     // camelCase shape must stay stable. Round-trips (the executor deserializes it).
     #[test]
     fn review_action_payload_wire_shape_is_camel_case() {
-        let payload = ReviewActionPayload {
+        let payload = ReviewActionPayload::Automatic {
             candidate: Candidate {
                 number: 7,
                 head_sha: "sha".to_string(),
@@ -2148,7 +2956,7 @@ mod tests {
                 author: "octocat".to_string(),
                 is_cross_repository: false,
                 is_draft: false,
-                kind: "review".to_string(),
+                kind: ReviewKind::Review,
             },
         };
         let v = serde_json::to_value(&payload).expect("ReviewActionPayload serializes");
@@ -2174,7 +2982,7 @@ mod tests {
     fn stop_review_action_payload_wire_shape_is_camel_case() {
         let payload = StopReviewActionPayload {
             pr_number: 7,
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
         };
         let v = serde_json::to_value(&payload).expect("StopReviewActionPayload serializes");
         assert!(v.get("prNumber").is_some());

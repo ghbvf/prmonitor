@@ -22,7 +22,6 @@ pub mod cli;
 mod composition;
 pub mod config;
 pub mod db;
-pub mod dispatch;
 pub mod error;
 pub mod events;
 pub mod inbox;
@@ -48,19 +47,12 @@ mod slice_boundary_test;
 #[cfg(test)]
 mod typegen;
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
-use model::{Candidate, Event};
+use model::{Candidate, EventEnvelope};
 use pr::source::DiscoveredEvent;
 use state::AppState;
 use tauri::{Manager, Runtime};
-
-enum NotificationActionPayload {
-    Delivery(model::NotificationDeliveryPayload),
-    Legacy(model::Notification),
-}
 
 /// Composition-level CLI probe: config owns resolution, while only the root may aggregate active
 /// resident fingerprints from review/webhook/remote without creating sibling-slice coupling.
@@ -97,18 +89,6 @@ fn resolve_remote_cloudflared<R: tauri::Runtime>(
         config::service::resolve_cli(app, model::CliTool::Cloudflared, false).map(Some)
     } else {
         Ok(None)
-    }
-}
-
-fn parse_notification_action_payload(payload: &str) -> error::AppResult<NotificationActionPayload> {
-    match serde_json::from_str::<model::NotificationDeliveryPayload>(payload) {
-        Ok(payload) => Ok(NotificationActionPayload::Delivery(payload)),
-        Err(new_err) => match serde_json::from_str::<model::Notification>(payload) {
-            Ok(note) => Ok(NotificationActionPayload::Legacy(note)),
-            Err(old_err) => Err(error::AppError::new(format!(
-                "outbox 通知 payload 既不是 NotificationDeliveryPayload，也不是 legacy Notification：new={new_err}; legacy={old_err}"
-            ))),
-        },
     }
 }
 
@@ -228,18 +208,22 @@ impl<R: tauri::Runtime> messaging::service::MessagingActions<R> for MessagingAct
         Ok(filtered)
     }
 
-    fn trigger_review<'a>(
-        &'a self,
-        app: &'a tauri::AppHandle<R>,
+    fn submit_review(
+        &self,
+        app: &tauri::AppHandle<R>,
         reference: String,
         pr_number: u64,
-        kind: String,
-    ) -> Pin<Box<dyn Future<Output = error::AppResult<String>> + Send + 'a>> {
-        Box::pin(async move {
-            let state = app.state::<AppState>();
-            review::commands::trigger_review_with_state(app, &state, reference, pr_number, kind)
-                .await
-        })
+        kind: model::ReviewKind,
+        request_id: model::ExternalRequestId,
+    ) -> error::AppResult<model::ReviewReceiptId> {
+        app.state::<AppState>().external_review.submit(
+            reference,
+            pr_number,
+            kind,
+            request_id,
+            model::ExternalTriggerOrigin::MessagingBot,
+            false,
+        )
     }
 }
 
@@ -281,6 +265,10 @@ pub(crate) fn make_messaging_local_api_ctx<R: tauri::Runtime>(
     }
 }
 
+fn reconcile_blocked_reviews_after_restart(db: &db::Database) -> error::AppResult<u64> {
+    outbox::store::unblock_reviews(db, outbox::store::now_epoch())
+}
+
 #[tauri::command]
 async fn notification_test_send<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -296,12 +284,34 @@ async fn notification_test_send<R: tauri::Runtime>(
         String::new(),
     );
     match review::notify::deliver_channel_with_app(&app, &delivery_channel, &note).await? {
-        model::ActionExecutionResult::Done => {
+        model::ActionExecutionResult::Done { .. } => {
             Ok(format!("通知渠道「{}」测试发送成功", channel.name))
         }
-        model::ActionExecutionResult::Retry { message, .. }
+        model::ActionExecutionResult::Blocked { message, .. }
+        | model::ActionExecutionResult::Retry { message, .. }
         | model::ActionExecutionResult::Dead { message } => Err(error::AppError::new(message)),
     }
+}
+
+#[tauri::command]
+async fn start_review<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    pr_number: u64,
+    kind: model::ReviewKind,
+) -> error::AppResult<String> {
+    // SAFETY: this composition-root command is an authorized durable review ingress.
+    let capability = unsafe { review::engine::ReviewStartCapability::new_composition_root() };
+    review::commands::start_review_authorized(
+        &capability,
+        app,
+        state.inner(),
+        project_id,
+        pr_number,
+        kind,
+    )
+    .await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -375,107 +385,90 @@ fn build_app() {
                 }
             }));
             composition::install_review_lifecycle_sink(&state, app.handle().clone());
-            let workflow_app = app.handle().clone();
-            state.workflow.set_actions(workflow::manager::WorkflowActions {
-                start_review: Arc::new({
-                    let app = workflow_app.clone();
-                    move |request, workflow_created_at| {
-                    let app = app.clone();
-                    Box::pin(async move {
-                        let project = config::service::project_by_ref_validated(
-                            &app,
-                            &request.reference,
-                        )?;
-                        let db = app.state::<db::Database>();
-                        if let Some(existing) =
-                            review::history_store::get_pr_sessions(
-                                db.inner(),
-                                &project.id,
-                                request.pr_number,
-                            )?
-                            .into_iter()
-                            .find(|session| {
-                                session.kind == request.kind
-                                    && session.created_at_epoch >= workflow_created_at
-                            })
-                        {
-                            return Ok(workflow::manager::StartedReview {
-                                thread_id: existing.thread_id,
-                                project_id: existing.project_id,
-                            });
-                        }
-                        let state = app.state::<AppState>();
-                        let thread_id = review::commands::trigger_review(
-                            app.clone(),
-                            state,
+            state.review_resume.set_sink(Arc::new({
+                let app = app.handle().clone();
+                move || {
+                    let db = app.state::<db::Database>();
+                    outbox::store::unblock_reviews(db.inner(), outbox::store::now_epoch())?;
+                    app.state::<AppState>().outbox.wake();
+                    Ok(())
+                }
+            }));
+            state.external_review.set_sinks(
+                Arc::new({
+                    let app = app.handle().clone();
+                    move |reference, pr_number, kind, request_id, origin, notify_on_completion| {
+                        let project = config::service::project_by_ref_validated(&app, &reference)?;
+                        let dedupe = model::InboxDedupeKey::new(format!("external:{request_id}"))
+                            .map_err(error::AppError::new)?;
+                        let event = model::EventEnvelope::review_request(
+                            dedupe,
+                            project.source_kind,
                             project.id.clone(),
-                            request.pr_number,
-                            request.kind.clone(),
+                            project.repo.clone(),
+                            pr_number,
+                            kind,
+                            request_id,
+                            origin,
+                            notify_on_completion,
+                            inbox::store::now_epoch(),
                         )
-                        .await?;
-                        let project_id = review::history_store::get_session(db.inner(), &thread_id)?
-                            .map(|s| s.project_id)
-                            .unwrap_or(project.id);
-                        Ok(workflow::manager::StartedReview {
-                            thread_id,
-                            project_id,
-                        })
-                    })
+                        .map_err(error::AppError::new)?;
+                        let db = app.state::<db::Database>();
+                        let key = event.dedupe_key().as_str().to_string();
+                        let id = match inbox::store::insert_dedup(
+                            db.inner(),
+                            &event,
+                            "external-review-request",
+                            None,
+                            None,
+                        )? {
+                            Some(id) => id,
+                            None => {
+                                let id = inbox::store::id_by_dedupe_key(db.inner(), &key)?
+                                    .ok_or_else(|| error::AppError::new("重复 review request 未找到 receipt"))?;
+                                let existing = inbox::store::get_entry(db.inner(), id)?
+                                    .ok_or_else(|| error::AppError::new("重复 review request 的 receipt 已丢失"))?;
+                                ensure_same_external_review_request(&existing.event, &event)?;
+                                id
+                            }
+                        };
+                        let receipt = model::ReviewReceiptId::new(id).map_err(error::AppError::new)?;
+                        let app_state = app.state::<AppState>();
+                        app_state.inbox.wake();
+                        if notify_on_completion {
+                            app_state.workflow.start_receipt_notify(
+                                app.clone(), receipt, reference, pr_number, kind,
+                            )?;
+                        }
+                        Ok(receipt)
                     }
                 }),
-                wait_review: Arc::new({
+                Arc::new(inbox::store::get_review_receipt),
+            );
+            let workflow_app = app.handle().clone();
+            state.workflow.set_actions(workflow::manager::WorkflowActions {
+                wait_receipt: Arc::new({
                     let app = workflow_app.clone();
-                    move |thread_id| {
+                    move |receipt_id| {
                     let app = app.clone();
                     Box::pin(async move {
-                        let state = app.state::<AppState>();
-                        if let Some(info) = state.sessions.get(&thread_id) {
-                            match info.status {
-                                review::session::SessionStatus::Done => {
-                                    return Ok(workflow::manager::ReviewCompletion {
-                                        wire_status: "completed".to_string(),
-                                        comment_url: info.comment_url,
-                                    });
-                                }
-                                review::session::SessionStatus::Failed => {
-                                    return Ok(workflow::manager::ReviewCompletion {
-                                        wire_status: "failed".to_string(),
-                                        comment_url: info.comment_url,
-                                    });
-                                }
-                                _ => {}
-                            }
-                        }
                         let db = app.state::<db::Database>();
-                        if let Some(info) = review::history_store::get_session(db.inner(), &thread_id)? {
-                            match info.status {
-                                review::session::SessionStatus::Done => {
-                                    return Ok(workflow::manager::ReviewCompletion {
-                                        wire_status: "completed".to_string(),
-                                        comment_url: info.comment_url,
-                                    });
-                                }
-                                review::session::SessionStatus::Failed => {
-                                    return Ok(workflow::manager::ReviewCompletion {
-                                        wire_status: "failed".to_string(),
-                                        comment_url: info.comment_url,
-                                    });
-                                }
-                                _ => {}
-                            }
-                        }
-                        let mut rx = state.sessions.subscribe_completion(&thread_id);
+                        let state = app.state::<AppState>();
+                        let project_id = inbox::store::get_entry(db.inner(), receipt_id.get())?
+                            .map(|entry| entry.event.project_id().to_string())
+                            .ok_or_else(|| error::AppError::new("review receipt 不存在"))?;
+                        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
                         loop {
-                            if let Some(outcome) = rx.borrow_and_update().clone() {
+                            ticker.tick().await;
+                            let receipt = state.external_review.get(db.inner(), receipt_id)?;
+                            if matches!(receipt.status, model::ReviewReceiptStatus::Done | model::ReviewReceiptStatus::Failed) {
                                 return Ok(workflow::manager::ReviewCompletion {
-                                    wire_status: outcome.wire_status,
-                                    comment_url: outcome.comment_url,
+                                    thread_id: receipt.thread_id,
+                                    project_id,
+                                    status: receipt.status,
+                                    comment_url: receipt.comment_url,
                                 });
-                            }
-                            if rx.changed().await.is_err() {
-                                return Err(error::AppError::new(format!(
-                                    "review completion watcher closed before terminal outcome: {thread_id}"
-                                )));
                             }
                         }
                     })
@@ -494,47 +487,20 @@ fn build_app() {
                     }
                 }),
             });
-            state.review_workflow.set_sink(Arc::new(|app, reference, pr_number, kind| {
-                let app_for_state = app.clone();
-                let state = app_for_state.state::<AppState>();
-                state
-                    .workflow
-                    .start_review_notify(app, reference, pr_number, kind)
-            }));
-            // Install the auto-trigger dispatcher BEFORE starting the loop, so the
+            // Install the auto-trigger event_sink BEFORE starting the loop, so the
             // immediate first tick already persists dispatchable reviews/checks into
             // inbox + outbox. The closure is the `pr` slice's review-agnostic
-            // `Dispatcher` seam; its body is [`run_auto_dispatch`], the
+            // event sink; its body is the durable discovery ingestor, the
             // composition-root assembly that injects durable inbox/outbox writers into
             // the default producer.
             state
                 .scheduler
-                .set_dispatcher(make_dispatcher(app.handle().clone()));
-            // Install the WEBHOOK trigger hooks (#9 / #61 / AB#822) — now FRONTED BY THE EVENT
-            // INBOX (AB#1065). The webhook is a second auto-trigger source: its axum handler
-            // parses + routes a push payload into a `WebhookEvent` and hands the verbatim body +
-            // delivery GUID + event here through the WIDENED ingestor seam. The inbox
-            // (`inbox::service::ingest_github`) PERSISTS + DEDUPS the delivery
-            // (`UNIQUE(dedupe_key)` — the Hard ingress-idempotency carrier), then re-feeds the
-            // SAME `WebhookEvent` through the UNCHANGED `pr::commands::ingest_webhook` (which
-            // upserts the list + emits `prs:updated` + applies the per-project gates + the
-            // downstream `dispatch_key` gate + dispatches). The inbox is ADDITIVE: it adds durable
-            // persistence + replay in front of the vetted path, it does NOT replace the
-            // authoritative dispatch dedup. Holding the concrete AppHandle + the shared
-            // dispatcher here keeps `pr::webhook` runtime-agnostic.
-            let webhook_dispatcher = make_dispatcher(app.handle().clone());
-            // The GitHub RE-FEED hook (AB#1065 decoupling): the ONLY place that names
-            // `pr::webhook::WebhookEvent` / the `ProjectDispatcher`. Given the AppHandle + the
-            // stored parsed-`WebhookEvent` JSON, it deserializes the event and re-feeds it through
-            // the UNCHANGED `pr::commands::ingest_webhook` (which upserts the list + emits
-            // `prs:updated` + applies the per-project gates + the downstream `dispatch_key` gate +
-            // dispatches). Built ONCE and shared by the live GitHub ingestor AND the inbox replay
-            // hook, so a replay re-feeds identically. The inbox slice holds this only as the OPAQUE
-            // `GithubRefeed` closure — it never names a `pr` type.
+                .set_event_sink(make_event_sink(app.handle().clone()));
+            // Install the GitHub re-feed used exclusively by the inbox worker. It restores the
+            // provider event for list/gate reconciliation; the worker then plans rules and commits
+            // traces, actions, and Processed atomically. Live ingress only inserts and wakes.
             let github_refeed: inbox::GithubRefeed = Arc::new({
-                let dispatcher = webhook_dispatcher.clone();
                 move |app: tauri::AppHandle, webhook_event_json: String| {
-                    let dispatcher = dispatcher.clone();
                     Box::pin(async move {
                         // F2: a deser failure of the persisted replay JSON now PROPAGATES as Err so
                         // the inbox marks the row Failed (not falsely Processed) and surfaces it on
@@ -545,7 +511,7 @@ fn build_app() {
                                     "重放/再投递时 WebhookEvent 反序列化失败：{e}"
                                 ))
                             })?;
-                        pr::commands::ingest_webhook(&app, &dispatcher, ev).await
+                        pr::commands::ingest_webhook(&app, ev).await
                     })
                 }
             });
@@ -562,17 +528,14 @@ fn build_app() {
                         app.state::<AppState>()
                             .scheduler
                             .discover_once(&app, &project_id)
-                            .await;
-                        // `discover_once` is best-effort (emits its own PrEvent::Error on failure)
-                        // and returns (); the refresh "succeeding" here means it ran, so Ok(()).
-                        Ok(())
+                            .await
                     })
                 }
             });
             let rule_processor: inbox::RuleProcessor = Arc::new(
                 move |app: tauri::AppHandle,
                       inbox_event_id: i64,
-                      event: Event,
+                      event: EventEnvelope,
                       candidate: Option<Candidate>| {
                     Box::pin(async move {
                         process_rule_event(&app, inbox_event_id, event, candidate).map(|_| ())
@@ -586,18 +549,15 @@ fn build_app() {
                 azure_refresh.clone(),
                 rule_processor.clone(),
             );
+            state.inbox.start(app.handle().clone());
             // The GitHub ingestor: normalize the `WebhookEvent` → neutral `model::Event` HERE (pr
             // owns `WebhookEvent`), then hand the inbox the neutral event + the verbatim body + the
             // parsed JSON. The inbox persists+dedups and re-feeds via the injected `github_refeed` —
             // it never sees a `pr` type.
             state.webhook.set_ingestor(Arc::new({
                 let app = app.handle().clone();
-                let github_refeed = github_refeed.clone();
-                let rule_processor = rule_processor.clone();
                 move |raw: String, guid: Option<String>, ev: pr::webhook::WebhookEvent| {
                     let app = app.clone();
-                    let github_refeed = github_refeed.clone();
-                    let rule_processor = rule_processor.clone();
                     Box::pin(async move {
                         use tauri::Manager;
                         // Normalize at the seam (the composition root owns the pr↔inbox boundary):
@@ -611,16 +571,16 @@ fn build_app() {
                             _ => None,
                         };
                         let event = pr::webhook::event_from_webhook(&ev, guid.as_deref(), &raw);
-                        let webhook_event_json = serde_json::to_string(&ev).unwrap_or_default();
+                        let webhook_event_json = serde_json::to_string(&ev).map_err(|error| {
+                            error::AppError::new(format!(
+                                "WebhookEvent 序列化失败，拒绝空 payload fallback：{error}"
+                            ))
+                        })?;
                         let db = app.state::<db::Database>();
                         // F1: return the DURABLE-PERSIST Result so the handler gates the ACK on it.
                         inbox::service::ingest_github(
                             &app,
                             db.inner(),
-                            inbox::service::GithubIngestHooks {
-                                github_refeed: &github_refeed,
-                                rule_processor: &rule_processor,
-                            },
                             event,
                             raw,
                             webhook_event_json,
@@ -633,12 +593,8 @@ fn build_app() {
             // The Azure refresher: persist an audit entry, then invoke the original re-discovery.
             state.webhook.set_refresher(Arc::new({
                 let app = app.handle().clone();
-                let azure_refresh = azure_refresh.clone();
-                let rule_processor = rule_processor.clone();
                 move |raw, project_id, repo| {
                     let app = app.clone();
-                    let azure_refresh = azure_refresh.clone();
-                    let rule_processor = rule_processor.clone();
                     Box::pin(async move {
                         use tauri::Manager;
                         let db = app.state::<db::Database>();
@@ -646,8 +602,6 @@ fn build_app() {
                         inbox::service::ingest_azure_refresh(
                             &app,
                             db.inner(),
-                            &azure_refresh,
-                            &rule_processor,
                             raw,
                             project_id,
                             repo,
@@ -670,26 +624,19 @@ fn build_app() {
             let outbox_executor: outbox::ActionExecutor =
                 Arc::new(|app: tauri::AppHandle, action: outbox::OutboxAction| {
                     Box::pin(async move {
-                        match action.kind {
+                        match action.kind() {
                             model::ActionKind::Notification => {
-                                let payload =
-                                    match parse_notification_action_payload(&action.payload) {
-                                        Ok(payload) => payload,
-                                        Err(e) => {
-                                            return Ok(model::ActionExecutionResult::Dead {
-                                                message: e.message,
-                                            });
-                                        }
-                                    };
-                                let payload = match payload {
-                                    NotificationActionPayload::Delivery(payload) => payload,
-                                    NotificationActionPayload::Legacy(note) => {
-                                        return review::notify::deliver(
-                                            &app,
-                                            model::NotificationKind::Desktop,
-                                            &note,
-                                        )
-                                        .await;
+                                let payload = match serde_json::from_str::<
+                                    model::NotificationDeliveryPayload,
+                                >(action.payload())
+                                {
+                                    Ok(payload) => payload,
+                                    Err(e) => {
+                                        return Ok(model::ActionExecutionResult::Dead {
+                                            message: format!(
+                                                "outbox 通知 payload 无效（仅接受 NotificationDeliveryPayload）：{e}"
+                                            ),
+                                        });
                                     }
                                 };
                                 let channel = match config::service::notification_channel(
@@ -728,19 +675,25 @@ fn build_app() {
                                 )
                                 .await
                             }
-                            model::ActionKind::Review => run_review_action(&app, &action, "review")
-                                .await
-                                .map(|_| model::ActionExecutionResult::Done),
-                            model::ActionKind::Check => run_review_action(&app, &action, "check")
-                                .await
-                                .map(|_| model::ActionExecutionResult::Done),
+                            model::ActionKind::Review => run_review_action(
+                                &app,
+                                &action,
+                                model::ReviewKind::Review,
+                            )
+                                .await,
+                            model::ActionKind::Check => run_review_action(
+                                &app,
+                                &action,
+                                model::ReviewKind::Check,
+                            )
+                                .await,
                             model::ActionKind::StopReview => run_stop_action(&app, &action)
                                 .await
-                                .map(|_| model::ActionExecutionResult::Done),
+                                .map(|_| model::ActionExecutionResult::done()),
                             model::ActionKind::MessagingReply => {
                                 let payload =
                                     match serde_json::from_str::<model::MessagingReplyPayload>(
-                                        &action.payload,
+                                        action.payload(),
                                     ) {
                                         Ok(payload) => payload,
                                         Err(e) => {
@@ -756,7 +709,7 @@ fn build_app() {
                             model::ActionKind::MessagingSend => {
                                 let payload =
                                     match serde_json::from_str::<model::MessagingSendPayload>(
-                                        &action.payload,
+                                        action.payload(),
                                     ) {
                                         Ok(payload) => payload,
                                         Err(e) => {
@@ -808,6 +761,13 @@ fn build_app() {
                             "启动：遗留 review 会话 reconcile 失败（继续启动）：{}",
                             e.message
                         ),
+                    }
+                    match reconcile_blocked_reviews_after_restart(db.inner()) {
+                        Ok(resumed) if resumed > 0 => {
+                            eprintln!("启动：{resumed} 个 blocked review 动作已恢复为 pending");
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("启动：blocked review reconcile 失败：{}", e.message),
                     }
                 }
             };
@@ -861,7 +821,7 @@ fn build_app() {
             // repoRoot default) or an invalid hand-edit, the gate errors → we discard it
             // (no loop, so no gh poll fires and no per-cycle DispatchError spams the
             // banner). The frontend onboarding/Settings save calls start_polling once a
-            // valid config lands, running the same gate. The dispatcher hook above stays
+            // valid config lands, running the same gate. The event_sink hook above stays
             // installed, so the first tick after a later start already dispatches.
             let _ = pr::commands::start_if_config_valid(app.handle(), state.inner());
             // Start the Remote Access listener runtime (AB#1225): reconcile `config.listeners[]` →
@@ -901,7 +861,7 @@ fn build_app() {
             }));
 
             // Deeplink trigger (AB#1045): route opened `prmonitor://review?…` URLs into the
-            // `trigger_review` funnel. `register_all` is DEBUG-ONLY — it runtime-registers the
+            // manual review funnel. `register_all` is DEBUG-ONLY — it runtime-registers the
             // scheme for Windows/Linux `tauri dev`; a release build relies solely on the static
             // OS registration (Info.plist on macOS, installer on Windows), so production never
             // honors a runtime-registered (forge-able) scheme. macOS can only test deeplinks from
@@ -920,7 +880,7 @@ fn build_app() {
                 // on macOS the launch URL arrives later via `RunEvent::Opened` (which re-fires
                 // `on_open_url`), so `get_current` is empty at setup there — net single handling on
                 // every platform. A duplicate (if both paths ever fire) is dedup-safe via
-                // `trigger_review`'s `try_reserve_pair`.
+                // manual start's `try_reserve_pair`.
                 if let Ok(Some(urls)) = app.deep_link().get_current() {
                     review::deeplink::handle_review_deeplink(app.handle().clone(), urls);
                 }
@@ -964,8 +924,7 @@ fn build_app() {
             review::commands::get_claude_status,
             review::commands::start_codex,
             review::commands::stop_codex,
-            review::commands::start_review,
-            review::commands::trigger_review,
+            start_review,
             review::commands::stop_review,
             review::commands::send_review_message,
             review::commands::list_review_sessions,
@@ -1006,6 +965,7 @@ fn build_app() {
                 // Stop the Remote Access listener runtime (AB#1225): fire each listener's graceful
                 // shutdown + abort its serve task so none outlives the app (same contract).
                 state.remote.shutdown();
+                state.inbox.shutdown();
                 // Stop the action-outbox worker (AB#1066): signal + abort the task so it never
                 // outlives the app (same "软件关闭时一起关闭" contract).
                 state.outbox.shutdown();
@@ -1113,18 +1073,47 @@ fn import_legacy_into_db(
     })
 }
 
-/// Build the per-cycle [`pr::scheduler::ProjectDispatcher`] both auto-trigger sources
+/// Build the per-cycle discovery event sink the poll source uses.
 /// share — the poll scheduler and the webhook ingestor. Both drive a dispatchable
-/// `(project_id, candidates)` through the SAME [`run_auto_dispatch`] producer, so this
-/// single helper removes the duplicated `Arc::new(move |..| Box::pin(run_auto_dispatch(..)))`
+/// `(project_id, candidates)` through the durable inbox producer.
 /// closure that was built verbatim at both wiring sites.
-fn make_dispatcher<R: tauri::Runtime>(
+fn make_event_sink<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
-) -> pr::scheduler::ProjectDispatcher {
+) -> pr::scheduler::DiscoveredEventSink {
     Arc::new(move |project_id, cands| {
         let app = app.clone();
-        Box::pin(run_auto_dispatch(app, project_id, cands))
+        Box::pin(ingest_discovered_events(app, project_id, cands))
     })
+}
+
+fn ensure_same_external_review_request(
+    existing: &model::EventEnvelope,
+    requested: &model::EventEnvelope,
+) -> error::AppResult<()> {
+    let same_envelope = existing.source() == requested.source()
+        && existing.project_id() == requested.project_id()
+        && existing.repo() == requested.repo();
+    let same_request = match (existing.as_review_request(), requested.as_review_request()) {
+        (Some(existing), Some(requested)) => {
+            existing.pr_number == requested.pr_number
+                && existing.review_kind == requested.review_kind
+                && existing.request_id == requested.request_id
+                && existing.origin == requested.origin
+                && existing.notify_on_completion == requested.notify_on_completion
+        }
+        _ => false,
+    };
+    if same_envelope && same_request {
+        Ok(())
+    } else {
+        Err(error::AppError::new(format!(
+            "requestId {} 已绑定到不同的 review request",
+            requested
+                .as_review_request()
+                .map(|request| request.request_id.as_str())
+                .unwrap_or("<invalid>")
+        )))
+    }
 }
 
 /// Execute an AB#1069 `review` / `check` outbox action (the composition root's executor arm body):
@@ -1145,28 +1134,53 @@ fn make_dispatcher<R: tauri::Runtime>(
 async fn run_review_action(
     app: &tauri::AppHandle,
     action: &outbox::OutboxAction,
-    kind: &str,
-) -> error::AppResult<()> {
-    let payload: model::ReviewActionPayload = serde_json::from_str(&action.payload)
+    kind: model::ReviewKind,
+) -> error::AppResult<model::ActionExecutionResult> {
+    let payload: model::ReviewActionPayload = serde_json::from_str(action.payload())
         .map_err(|e| error::AppError::new(format!("outbox review action 反序列化失败：{e}")))?;
-    let mut candidate = payload.candidate;
-    candidate.kind = kind.to_string();
+    let (pr_number, candidate, explicit) = match payload {
+        model::ReviewActionPayload::Automatic { mut candidate } => {
+            candidate.kind = kind;
+            model::ReviewActionKey::for_candidate(&candidate).map_err(error::AppError::new)?;
+            (candidate.number, Some(candidate), false)
+        }
+        model::ReviewActionPayload::Explicit { pr_number, .. } => (pr_number, None, true),
+    };
     let state = app.state::<AppState>();
+    let project = config::service::project_validated(app, action.project_id())?;
+    let observed_resume_generation = state.review_resume.generation();
+    if project.engine_kind == model::EngineKind::Codex && state.codex.is_stopped() && !explicit {
+        return Ok(model::ActionExecutionResult::Blocked {
+            message: "Codex 已由用户停止，等待显式恢复".to_string(),
+            observed_resume_generation,
+        });
+    }
+    if explicit && project.engine_kind == model::EngineKind::Codex {
+        state.codex.resume();
+        state.review_resume.fire()?;
+    }
+    // SAFETY: the durable outbox executor is the composition root's authorized replay ingress.
+    let capability = unsafe { review::engine::ReviewStartCapability::new_composition_root() };
     let outcome = review::commands::start_for_outbox(
+        &capability,
         app,
         state.inner(),
-        &action.project_id,
-        candidate.number,
+        action.project_id(),
+        pr_number,
         kind,
         // AB#1204: the outbox ROW id is the dedup key — a crash-replay of this row resolves its
         // prior review's claim instead of starting a duplicate.
-        action.id,
+        action.id(),
     )
     .await?;
-    if review::commands::should_record_dispatch_ledger(outcome) {
-        pr::ledger::record_dispatched(app, &action.project_id, &[candidate])?;
+    if !explicit && review::commands::should_record_dispatch_ledger(outcome.clone()) {
+        pr::ledger::record_dispatched(
+            app,
+            action.project_id(),
+            &[candidate.expect("automatic candidate")],
+        )?;
     }
-    Ok(())
+    Ok(model::ActionExecutionResult::review(outcome.thread_id()))
 }
 
 /// Execute an AB#1069 `stop-review` outbox action (the composition root's executor arm body):
@@ -1181,61 +1195,49 @@ async fn run_stop_action(
     action: &outbox::OutboxAction,
 ) -> error::AppResult<()> {
     let payload: model::StopReviewActionPayload =
-        serde_json::from_str(&action.payload).map_err(|e| {
+        serde_json::from_str(action.payload()).map_err(|e| {
             error::AppError::new(format!("outbox stop-review action 反序列化失败：{e}"))
         })?;
     let state = app.state::<AppState>();
     review::commands::stop_for_outbox(
         app,
         state.inner(),
-        &action.project_id,
+        action.project_id(),
         payload.pr_number,
-        &payload.kind,
+        payload.kind,
     )
     .await
 }
 
 /// Composition-root assembly for one auto-trigger cycle: validate config, snapshot active
 /// `(pr, kind)` pairs, and inject durable inbox/outbox writers + UI error reporting into the
-/// default [`dispatch::auto_dispatch`] producer. The executor is the only place that starts review
+/// durable discovery producer. The executor is the only place that starts review
 /// work; this path only materializes replayable actions.
-async fn run_auto_dispatch<R: tauri::Runtime>(
+async fn ingest_discovered_events<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     project_id: String,
     events: Vec<DiscoveredEvent>,
-) {
+) -> error::AppResult<()> {
     if events.is_empty() {
-        return;
+        return Ok(());
     }
 
-    // Resolve + validate THIS project (#35): a bad / hand-edited project config (e.g. an
-    // escaped skill path) must not take the poll loop down — skip the batch, logged +
-    // surfaced to the UI scoped to the project (a desktop user never sees stderr).
-    // `project_validated` re-runs the skill-path validation before codex attaches it.
-    let project = match config::service::project_validated(&app, &project_id) {
-        Ok(p) => p,
-        Err(e) => {
-            let msg = format!("配置无效，自动 review 跳过本轮（{}）", e.message);
-            eprintln!("auto-dispatch 跳过本轮（{project_id}）：{msg}");
-            emit_dispatch_error(&app, &project_id, msg);
-            return;
-        }
-    };
     let state = app.state::<AppState>();
-    if should_skip_auto_dispatch_for_stopped_codex(project.engine_kind, state.codex.is_stopped()) {
-        eprintln!("auto-dispatch 跳过本轮（{project_id}）：codex app-server 已停止");
-        return;
-    }
     let db = app.state::<db::Database>();
-    for mut discovered in events {
-        discovered.event.project_id = project_id.clone();
-        discovered.event.received_at_epoch = inbox::store::now_epoch();
-        if discovered.event.repo.is_empty() {
-            discovered.event.repo = project.repo.clone();
-        }
+    let mut first_error = None;
+    for discovered in events {
+        let event =
+            match normalize_discovered_event(&project_id, &discovered, inbox::store::now_epoch()) {
+                Ok(event) => event,
+                Err(error) => {
+                    emit_dispatch_error(&app, &project_id, error.message.clone());
+                    first_error.get_or_insert(error);
+                    continue;
+                }
+            };
         let inserted = match inbox::store::insert_dedup(
             db.inner(),
-            &discovered.event,
+            &event,
             "rule-engine-discovery",
             None,
             Some(&discovered.candidate),
@@ -1247,6 +1249,7 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
                     &project_id,
                     format!("规则引擎 inbox 持久化失败：{}", e.message),
                 );
+                first_error.get_or_insert(e);
                 continue;
             }
         };
@@ -1254,49 +1257,82 @@ async fn run_auto_dispatch<R: tauri::Runtime>(
             continue;
         };
         inbox::service::emit_for_id(&app, db.inner(), &project_id, inbox_id);
-        let result = process_rule_event(
-            &app,
-            inbox_id,
-            discovered.event.clone(),
-            Some(discovered.candidate.clone()),
-        );
-        if let Err(e) = inbox::service::record_terminal(db.inner(), inbox_id, &result) {
-            eprintln!(
-                "rule-engine: 记录 inbox 终态失败（id={inbox_id}）：{}",
-                e.message
-            );
-        }
-        if let Err(e) = result {
-            emit_dispatch_error(&app, &project_id, format!("规则执行失败：{}", e.message));
-        }
-        inbox::service::emit_for_id(&app, db.inner(), &project_id, inbox_id);
+        state.inbox.wake();
     }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn normalize_discovered_event(
+    project_id: &str,
+    discovered: &DiscoveredEvent,
+    received_at_epoch: u64,
+) -> error::AppResult<EventEnvelope> {
+    let observation = discovered
+        .event
+        .as_observation()
+        .ok_or_else(|| error::AppError::new("poll source produced a non-observation event"))?;
+    let mut subject = observation.subject.clone();
+    subject.labels.sort();
+    subject.labels.dedup();
+    let snapshot = serde_json::json!({
+        "projectId": project_id,
+        "source": discovered.event.source(),
+        "repo": discovered.event.repo(),
+        "eventType": observation.event_type,
+        "subject": &subject,
+        "candidate": &discovered.candidate,
+    });
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(
+        serde_json::to_vec(&snapshot)
+            .map_err(|error| error::AppError::new(format!("poll snapshot 序列化失败：{error}")))?,
+    );
+    EventEnvelope::observation(
+        model::InboxDedupeKey::new(format!("poll:sha256:{}", hex::encode(digest)))
+            .map_err(error::AppError::new)?,
+        discovered.event.source(),
+        project_id,
+        discovered.event.repo(),
+        observation.event_type,
+        subject,
+        received_at_epoch,
+    )
+    .map_err(error::AppError::new)
 }
 
 fn process_rule_event<R: Runtime>(
     app: &tauri::AppHandle<R>,
     inbox_event_id: i64,
-    event: Event,
+    event: EventEnvelope,
     candidate: Option<Candidate>,
 ) -> error::AppResult<()> {
     let cfg = config::service::load(app)?;
     let plans = rule::service::plan_event(&cfg.rules, &event, candidate.as_ref());
-    if plans.is_empty() {
-        return Ok(());
-    }
-
     let db = app.state::<db::Database>();
-    let mut announced_action_ids = Vec::new();
-    let mut blocking_errors = Vec::new();
-    for plan in plans {
-        let now = rule::store::now_epoch();
-        let (action_ids, plan_blocking_errors) = db.inner().with_tx(|tx| {
+    let now = rule::store::now_epoch();
+    let announced_action_ids = db.inner().with_tx(|tx| {
+        let mut all_action_ids = Vec::new();
+        for plan in &plans {
+            if !plan.errors.is_empty() {
+                return Err(error::AppError::new(format!(
+                    "规则动作规划失败：{}",
+                    plan.errors.join("; ")
+                )));
+            }
             let mut action_ids = Vec::new();
-            let mut errors = plan.errors.clone();
-            let mut blocking = plan.errors.clone();
             for action in &plan.actions {
                 match &action.dispatch {
                     rule::service::RuleActionDispatch::Outbox { payload } => {
+                        let producer_key = model::OutboxProducerKey::for_rule_action(
+                            model::InboxEventId::new(inbox_event_id)
+                                .map_err(error::AppError::new)?,
+                            &plan.rule_id,
+                            &action.action_id,
+                        )
+                        .map_err(error::AppError::new)?;
                         let row = outbox::store::EnqueueInput {
                             project_id: &plan.project_id,
                             kind: action.kind,
@@ -1305,48 +1341,34 @@ fn process_rule_event<R: Runtime>(
                             dedupe_key: Some(&action.dedupe_key),
                             next_attempt_at: Some(now.saturating_add(action.delay_secs)),
                         };
-                        match outbox::store::enqueue_in_tx(tx, &row, now) {
-                            Ok(id) => action_ids.push(id),
-                            Err(e) => {
-                                errors.push(e.message.clone());
-                                blocking.push(e.message);
-                            }
-                        }
+                        action_ids.push(outbox::store::enqueue_in_tx_with_producer(
+                            tx,
+                            &row,
+                            &producer_key,
+                            now,
+                        )?);
                     }
                     rule::service::RuleActionDispatch::Notification { request } => {
-                        match notification::enqueue_notification_in_tx(
+                        action_ids.extend(notification::enqueue_notification_in_tx(
                             tx,
                             &cfg,
                             request.clone(),
                             Some(&action.dedupe_key),
                             action.delay_secs,
                             now,
-                        ) {
-                            Ok(ids) => action_ids.extend(ids),
-                            Err(e) => {
-                                errors.push(e.message.clone());
-                                blocking.push(e.message);
-                            }
-                        }
+                        )?);
                     }
                     rule::service::RuleActionDispatch::Messaging { request } => {
-                        match messaging_outbox::enqueue_send_once_after_in_tx(
+                        action_ids.push(messaging_outbox::enqueue_send_once_after_in_tx(
                             tx,
                             &cfg,
                             request.clone(),
                             action.delay_secs,
                             now,
-                        ) {
-                            Ok(id) => action_ids.push(id),
-                            Err(e) => {
-                                errors.push(e.message.clone());
-                                blocking.push(e.message);
-                            }
-                        }
+                        )?);
                     }
                 }
             }
-            let error = (!errors.is_empty()).then(|| errors.join("; "));
             rule::store::insert_match_in_tx(
                 tx,
                 rule::store::NewRuleMatch {
@@ -1355,15 +1377,15 @@ fn process_rule_event<R: Runtime>(
                     inbox_event_id,
                     project_id: &plan.project_id,
                     action_ids: &action_ids,
-                    error: error.as_deref(),
+                    error: None,
                     now,
                 },
             )?;
-            Ok((action_ids, blocking))
-        })?;
-        announced_action_ids.extend(action_ids);
-        blocking_errors.extend(plan_blocking_errors);
-    }
+            all_action_ids.extend(action_ids);
+        }
+        inbox::store::mark_processed_in_tx(tx, inbox_event_id, now)?;
+        Ok(all_action_ids)
+    })?;
 
     for id in &announced_action_ids {
         outbox::service::announce_updated(app, db.inner(), *id);
@@ -1371,21 +1393,7 @@ fn process_rule_event<R: Runtime>(
     if !announced_action_ids.is_empty() {
         app.state::<AppState>().outbox.wake();
     }
-    if blocking_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(error::AppError::new(format!(
-            "规则动作入队失败：{}",
-            blocking_errors.join("; ")
-        )))
-    }
-}
-
-fn should_skip_auto_dispatch_for_stopped_codex(
-    engine_kind: model::EngineKind,
-    codex_stopped: bool,
-) -> bool {
-    engine_kind == model::EngineKind::Codex && codex_stopped
+    Ok(())
 }
 
 /// Emit a session-less [`events::ReviewEvent::DispatchError`] to the review area
@@ -1412,19 +1420,179 @@ mod tests {
     use crate::db::Database;
 
     #[test]
-    fn auto_dispatch_skips_only_stopped_codex_projects() {
-        assert!(
-            should_skip_auto_dispatch_for_stopped_codex(model::EngineKind::Codex, true),
-            "user-stopped codex should prevent automatic outbox production"
+    fn startup_reconcile_returns_blocked_review_to_claimable_pending_state() {
+        let db = Database::open_in_memory().expect("db");
+        let payload = serde_json::to_string(&model::ReviewActionPayload::Explicit {
+            pr_number: 7,
+            request_id: model::ExternalRequestId::parse("0123456789abcdef0123456789abcdef")
+                .unwrap(),
+            origin: model::ExternalTriggerOrigin::Http,
+        })
+        .expect("payload");
+        let id =
+            outbox::store::enqueue(&db, "p1", model::ActionKind::Review, "review", &payload, 1)
+                .expect("enqueue");
+        outbox::store::mark_blocked(&db, id, "stopped", 2).expect("block");
+        assert!(outbox::store::claim_due(&db, 3)
+            .expect("claim")
+            .0
+            .is_empty());
+
+        assert_eq!(
+            reconcile_blocked_reviews_after_restart(&db).expect("reconcile"),
+            1
         );
-        assert!(
-            !should_skip_auto_dispatch_for_stopped_codex(model::EngineKind::Codex, false),
-            "running codex projects can auto-dispatch"
+        let claimed = outbox::store::claim_due(&db, i64::MAX as u64)
+            .expect("claim")
+            .0;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id(), id);
+    }
+
+    fn discovered_snapshot() -> DiscoveredEvent {
+        let candidate = Candidate {
+            number: 7,
+            head_sha: "same-head".to_string(),
+            head_ref: "feature/x".to_string(),
+            author: "octocat".to_string(),
+            is_cross_repository: false,
+            is_draft: false,
+            kind: model::ReviewKind::Review,
+        };
+        DiscoveredEvent {
+            event: EventEnvelope::observation(
+                model::InboxDedupeKey::new("source-seed").unwrap(),
+                model::SourceKind::Github,
+                "discovery",
+                "owner/repo",
+                model::EventType::PullRequest,
+                model::EventSubject {
+                    number: Some(7),
+                    title: "Title".to_string(),
+                    body: "Body".to_string(),
+                    labels: vec!["b".to_string(), "a".to_string()],
+                    url: "https://example.com/7".to_string(),
+                },
+                0,
+            )
+            .unwrap(),
+            candidate,
+            conflict: false,
+        }
+    }
+
+    #[test]
+    fn poll_snapshot_hash_is_canonical_and_semantic() {
+        let base = discovered_snapshot();
+        let first = normalize_discovered_event("p1", &base, 1).unwrap();
+        let later = normalize_discovered_event("p1", &base, 999).unwrap();
+        assert_eq!(
+            first.dedupe_key(),
+            later.dedupe_key(),
+            "receipt time is excluded"
         );
-        assert!(
-            !should_skip_auto_dispatch_for_stopped_codex(model::EngineKind::Claude, true),
-            "Claude has no resident codex stop flag"
+
+        let mut reordered = base.clone();
+        if let Some(observation) = reordered.event.as_observation() {
+            let mut subject = observation.subject.clone();
+            let event_type = observation.event_type;
+            let source = reordered.event.source();
+            let repo = reordered.event.repo().to_string();
+            subject.labels.reverse();
+            reordered.event = EventEnvelope::observation(
+                model::InboxDedupeKey::new("other-seed").unwrap(),
+                source,
+                "discovery",
+                repo,
+                event_type,
+                subject,
+                42,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            first.dedupe_key(),
+            normalize_discovered_event("p1", &reordered, 2)
+                .unwrap()
+                .dedupe_key()
         );
+
+        for variant in 0..4 {
+            let mut changed = base.clone();
+            let observation = changed.event.as_observation().unwrap();
+            let mut subject = observation.subject.clone();
+            let event_type = observation.event_type;
+            let source = changed.event.source();
+            let repo = changed.event.repo().to_string();
+            match variant {
+                0 => subject.title.push('!'),
+                1 => subject.body.push('!'),
+                2 => subject.labels.push("new".to_string()),
+                _ => changed.candidate.kind = model::ReviewKind::Check,
+            }
+            changed.event = EventEnvelope::observation(
+                model::InboxDedupeKey::new("changed-seed").unwrap(),
+                source,
+                "discovery",
+                repo,
+                event_type,
+                subject,
+                0,
+            )
+            .unwrap();
+            assert_ne!(
+                first.dedupe_key(),
+                normalize_discovered_event("p1", &changed, 3)
+                    .unwrap()
+                    .dedupe_key()
+            );
+        }
+    }
+
+    #[test]
+    fn external_request_id_is_bound_to_request_semantics() {
+        let make = |pr_number, kind, received_at| {
+            model::EventEnvelope::review_request(
+                model::InboxDedupeKey::new("external:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+                model::SourceKind::Github,
+                "p1",
+                "owner/repo",
+                pr_number,
+                kind,
+                model::ExternalRequestId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+                model::ExternalTriggerOrigin::Http,
+                true,
+                received_at,
+            )
+            .unwrap()
+        };
+        let first = make(7, model::ReviewKind::Review, 1);
+        let retry = make(7, model::ReviewKind::Review, 2);
+        assert!(ensure_same_external_review_request(&first, &retry).is_ok());
+
+        let different_pr = make(8, model::ReviewKind::Review, 3);
+        assert!(ensure_same_external_review_request(&first, &different_pr).is_err());
+        let different_kind = make(7, model::ReviewKind::Check, 4);
+        assert!(ensure_same_external_review_request(&first, &different_kind).is_err());
+    }
+
+    fn rule_event() -> model::EventEnvelope {
+        model::EventEnvelope::observation(
+            model::InboxDedupeKey::new("delivery-1").unwrap(),
+            model::SourceKind::Github,
+            "p1",
+            "owner/repo",
+            model::EventType::PullRequest,
+            model::EventSubject {
+                number: Some(7),
+                title: "Ready to ship".to_string(),
+                body: String::new(),
+                labels: vec!["ready".to_string()],
+                url: "https://example.com/pull/7".to_string(),
+            },
+            10,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1473,19 +1641,7 @@ mod tests {
             Ok(())
         })
         .expect("seed config");
-        let event = model::Event {
-            dedupe_key: "delivery-1".to_string(),
-            source: model::SourceKind::Github,
-            event_type: model::EventType::PullRequest,
-            project_id: "p1".to_string(),
-            repo: "owner/repo".to_string(),
-            number: Some(7),
-            title: "Ready to ship".to_string(),
-            body: String::new(),
-            labels: vec!["ready".to_string()],
-            url: "https://example.com/pull/7".to_string(),
-            received_at_epoch: 10,
-        };
+        let event = rule_event();
         let inbox_id = inbox::store::insert_dedup(&db, &event, "raw", None, None)
             .expect("insert inbox")
             .expect("new inbox");
@@ -1498,7 +1654,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: "review".to_string(),
+            kind: model::ReviewKind::Review,
         };
 
         process_rule_event(app.handle(), inbox_id, event, Some(candidate)).expect("process rules");
@@ -1560,19 +1716,7 @@ mod tests {
             Ok(())
         })
         .expect("seed config");
-        let event = model::Event {
-            dedupe_key: "delivery-1".to_string(),
-            source: model::SourceKind::Github,
-            event_type: model::EventType::PullRequest,
-            project_id: "p1".to_string(),
-            repo: "owner/repo".to_string(),
-            number: Some(7),
-            title: "Ready to ship".to_string(),
-            body: String::new(),
-            labels: vec!["ready".to_string()],
-            url: "https://example.com/pull/7".to_string(),
-            received_at_epoch: 10,
-        };
+        let event = rule_event();
         let inbox_id = inbox::store::insert_dedup(&db, &event, "raw", None, None)
             .expect("insert inbox")
             .expect("new inbox");
@@ -1584,29 +1728,95 @@ mod tests {
         assert!(err.message.contains("需要 PR candidate"), "{}", err.message);
         let db = app.state::<Database>();
         let trace = rule::store::list_by_inbox(db.inner(), inbox_id).expect("trace");
-        assert_eq!(trace.len(), 1);
-        assert_eq!(trace[0].action_count, 0);
-        assert!(trace[0]
-            .error
-            .as_deref()
-            .is_some_and(|e| e.contains("需要 PR candidate")));
+        assert!(
+            trace.is_empty(),
+            "failed planning rolls back trace and actions"
+        );
     }
 
     #[test]
-    fn notification_action_payload_accepts_legacy_naked_notification() {
-        let note = model::Notification::new(
-            model::NotificationLevel::Info,
-            "done".to_string(),
-            "https://example.com/pr/1".to_string(),
-            model::RedactedNotificationBody::fixed("review done"),
-            "p1".to_string(),
-        );
-        let raw = serde_json::to_string(&note).expect("legacy note serializes");
+    fn process_rule_event_final_status_failure_rolls_back_every_prior_write() {
+        let app = tauri::test::mock_app();
+        let db = Database::open_in_memory().expect("open db");
+        let config = config::model::AppConfig {
+            projects: vec![config::model::Project {
+                id: "p1".to_string(),
+                repo: "owner/repo".to_string(),
+                enabled: false,
+                ..config::model::Project::default()
+            }],
+            active_project_id: "p1".to_string(),
+            rules: vec![config::model::RuleConfig {
+                id: "r1".to_string(),
+                name: "Atomic".to_string(),
+                enabled: true,
+                event_type: Some(model::EventType::PullRequest),
+                project_id: "p1".to_string(),
+                labels_any: vec!["ready".to_string()],
+                actions: vec![config::model::RuleActionConfig::new(
+                    "review",
+                    config::model::RuleActionKind::Review,
+                )],
+                ..config::model::RuleConfig::default()
+            }],
+            ..config::model::AppConfig::default()
+        };
+        let config_json = serde_json::to_string(&config).expect("config serializes");
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO config_blob (id, json) VALUES (1, ?1)",
+                [config_json],
+            )?;
+            Ok(())
+        })
+        .expect("seed config");
+        let event = rule_event();
+        let inbox_id = inbox::store::insert_dedup(&db, &event, "raw", None, None)
+            .expect("insert inbox")
+            .expect("new inbox");
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER fail_processed_cutpoint \
+                 BEFORE UPDATE OF status ON inbox_event \
+                 WHEN NEW.status='processed' \
+                 BEGIN SELECT RAISE(ABORT, 'forced final cutpoint'); END;",
+            )
+        })
+        .expect("install cutpoint");
+        app.manage(db);
+        app.manage(AppState::default());
+        let candidate = Candidate {
+            number: 7,
+            head_sha: "sha".to_string(),
+            head_ref: "feature/atomic".to_string(),
+            author: "octocat".to_string(),
+            is_cross_repository: false,
+            is_draft: false,
+            kind: model::ReviewKind::Review,
+        };
 
-        match parse_notification_action_payload(&raw).expect("legacy note parses") {
-            NotificationActionPayload::Legacy(parsed) => assert_eq!(parsed, note),
-            NotificationActionPayload::Delivery(_) => panic!("legacy note parsed as new payload"),
-        }
+        let error = process_rule_event(app.handle(), inbox_id, event, Some(candidate))
+            .expect_err("final status cutpoint aborts transaction");
+        assert!(error.message.contains("forced final cutpoint"));
+
+        let db = app.state::<Database>();
+        let counts: (i64, i64, i64) = db
+            .inner()
+            .with_conn(|conn| {
+                Ok((
+                    conn.query_row("SELECT COUNT(*) FROM rule_match", [], |row| row.get(0))?,
+                    conn.query_row("SELECT COUNT(*) FROM rule_match_action", [], |row| {
+                        row.get(0)
+                    })?,
+                    conn.query_row("SELECT COUNT(*) FROM action_outbox", [], |row| row.get(0))?,
+                ))
+            })
+            .expect("read rollback counts");
+        assert_eq!(counts, (0, 0, 0), "trace and actions roll back together");
+        let inbox = inbox::store::get_entry(db.inner(), inbox_id)
+            .expect("get inbox")
+            .expect("inbox exists");
+        assert_eq!(inbox.status, model::InboxStatus::Received);
     }
 
     // Cross-slice legacy-import ASSEMBLY + guard (review F11). The per-slice

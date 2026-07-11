@@ -4,6 +4,7 @@
 // the listener apply results. Mirrors the option-store pattern set by usePrStore.
 import { defineStore } from "pinia";
 import { inboxGetRaw, inboxList, inboxReplay, onInboxUpdated } from "./api";
+import { assertNever } from "../types";
 import type { InboxEntry } from "../types";
 
 interface InboxState {
@@ -52,12 +53,19 @@ export const useInboxStore = defineStore("inbox", {
     // Returns the `Promise<UnlistenFn>` so the component can await it for cleanup.
     subscribe() {
       return onInboxUpdated((e) => {
-        if (e.kind !== "updated") return;
-        // Honor the active project filter: a scoped view ignores other projects' pushes.
-        if (this.projectId !== null && e.entry.event.projectId !== this.projectId) {
-          return;
+        switch (e.kind) {
+          case "updated":
+            if (this.projectId !== null && e.entry.event.projectId !== this.projectId) {
+              return;
+            }
+            this.upsert(e.entry);
+            return;
+          case "error":
+            this.error = `${e.operation}: ${e.message}`;
+            return;
+          default:
+            return assertNever(e);
         }
-        this.upsert(e.entry);
       });
     },
     // Replace-or-prepend an entry by id, then re-sort newest-first. Extracted so the

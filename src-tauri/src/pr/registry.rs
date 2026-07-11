@@ -21,7 +21,7 @@ use tauri::Manager;
 use crate::config::service as config_service;
 use crate::db::{map_err, Database};
 use crate::error::AppResult;
-use crate::model::{PrPresence, PullRequestView, TrackedPrView};
+use crate::model::{PrPresence, PullRequestView, ReviewKind, TrackedPrView};
 
 /// Unbounded-growth cap, applied PER PROJECT (#35). Beyond this, [`TrackedPrs::prune`]
 /// drops the least recently seen records (never the recent working set) — see its doc.
@@ -56,7 +56,7 @@ pub struct TrackedPr {
     pub title: String,
     pub labels: Vec<String>,
     pub url: String,
-    pub kind: String,
+    pub kind: ReviewKind,
     pub skip_reason: Option<String>,
     pub first_seen_epoch: u64,
     pub last_seen_epoch: u64,
@@ -93,12 +93,23 @@ impl TrackedPrs {
             )?;
             let rows = stmt.query_map([project_id], |r| {
                 let labels_json: String = r.get(2)?;
+                let kind: String = r.get(4)?;
+                let kind = kind.parse().map_err(|message: String| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        4,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            message,
+                        )),
+                    )
+                })?;
                 Ok(TrackedPr {
                     number: r.get::<_, i64>(0)? as u64,
                     title: r.get(1)?,
                     labels: serde_json::from_str(&labels_json).unwrap_or_default(),
                     url: r.get(3)?,
-                    kind: r.get(4)?,
+                    kind,
                     skip_reason: r.get(5)?,
                     first_seen_epoch: r.get::<_, i64>(6)? as u64,
                     last_seen_epoch: r.get::<_, i64>(7)? as u64,
@@ -151,7 +162,7 @@ impl TrackedPrs {
                     pr.title,
                     labels_json,
                     pr.url,
-                    pr.kind,
+                    pr.kind.as_str(),
                     pr.skip_reason,
                     pr.first_seen_epoch as i64,
                     pr.last_seen_epoch as i64,
@@ -174,7 +185,7 @@ impl TrackedPrs {
                 existing.title = view.title.clone();
                 existing.labels = view.labels.clone();
                 existing.url = view.url.clone();
-                existing.kind = view.kind.clone();
+                existing.kind = view.kind;
                 existing.skip_reason = view.skip_reason.clone();
                 existing.last_seen_epoch = now;
                 // first_seen_epoch and archived are preserved across upserts.
@@ -184,7 +195,7 @@ impl TrackedPrs {
                     title: view.title.clone(),
                     labels: view.labels.clone(),
                     url: view.url.clone(),
-                    kind: view.kind.clone(),
+                    kind: view.kind,
                     skip_reason: view.skip_reason.clone(),
                     first_seen_epoch: now,
                     last_seen_epoch: now,
@@ -247,7 +258,7 @@ impl TrackedPrs {
             existing.title = view.title.clone();
             existing.labels = view.labels.clone();
             existing.url = view.url.clone();
-            existing.kind = view.kind.clone();
+            existing.kind = view.kind;
             existing.skip_reason = view.skip_reason.clone();
             existing.last_seen_epoch = now;
             // first_seen_epoch and archived are preserved (parity with the upsert hit).
@@ -330,7 +341,7 @@ pub fn import_legacy_tracked(
             pr.title,
             labels_json,
             pr.url,
-            pr.kind,
+            pr.kind.as_str(),
             pr.skip_reason,
             pr.first_seen_epoch as i64,
             pr.last_seen_epoch as i64,
@@ -356,7 +367,7 @@ pub fn to_view_list(tracked: &TrackedPrs, now: u64, grace_secs: u64) -> Vec<Trac
                 title: p.title.clone(),
                 labels: p.labels.clone(),
                 url: p.url.clone(),
-                kind: p.kind.clone(),
+                kind: p.kind,
                 skip_reason: p.skip_reason.clone(),
             },
             presence: if now.saturating_sub(p.last_seen_epoch) <= grace_secs {
@@ -413,7 +424,7 @@ mod tests {
             title: title.to_string(),
             labels: vec!["review-label".to_string()],
             url: format!("https://x/{number}"),
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
             skip_reason: None,
         }
     }
@@ -424,7 +435,7 @@ mod tests {
             title: format!("PR {number}"),
             labels: vec![],
             url: format!("https://x/{number}"),
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
             skip_reason: None,
             first_seen_epoch: 0,
             last_seen_epoch: last_seen,
@@ -527,6 +538,28 @@ mod tests {
         assert_eq!(back.prs[0].title, "PR 7");
     }
 
+    #[test]
+    fn load_db_rejects_unknown_review_kind() {
+        let db = Database::open_in_memory().expect("open db");
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO tracked_pr \
+                 (project_id, number, title, labels_json, url, kind, skip_reason, \
+                  first_seen_epoch, last_seen_epoch, archived) \
+                 VALUES ('alpha', 7, 'PR 7', '[]', 'https://x/7', 'surprise', NULL, 1, 2, 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .expect("seed invalid kind");
+
+        let error = TrackedPrs::load_db(&db, "alpha").expect_err("unknown kind must fail closed");
+        assert!(
+            error.message.contains("unsupported review kind"),
+            "{error:?}"
+        );
+    }
+
     // Wire-shape lock for the persisted `prs.json` records (Medium carrier per
     // ai-robust.md). A field rename would make `TrackedPrs::load` silently drop the
     // records (deserialize → `unwrap_or_default()`), wiping the retained set and
@@ -538,7 +571,7 @@ mod tests {
             title: "Add feature".to_string(),
             labels: vec!["review-label".to_string()],
             url: "https://x/12".to_string(),
-            kind: "review".to_string(),
+            kind: ReviewKind::Review,
             skip_reason: Some("draft PR".to_string()),
             first_seen_epoch: 1_700_000_000,
             last_seen_epoch: 1_700_000_500,

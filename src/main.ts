@@ -29,20 +29,27 @@ async function browserRoot() {
 
 async function browserTransport() {
   const http = await import("./transport/http");
-  const existing = sessionStorage.getItem(http.REMOTE_BEARER_TOKEN_KEY)?.trim();
-  if (!existing) {
-    const entered = promptForToken()?.trim();
-    if (entered) sessionStorage.setItem(http.REMOTE_BEARER_TOKEN_KEY, entered);
+  ensureBrowserToken(http.REMOTE_BEARER_TOKEN_KEY, "Remote access token");
+  if (isRemoteWebConsolePath(window.location.pathname)) {
+    const { LOCAL_API_BEARER_TOKEN_KEY } = await import("./remoteConsole/api");
+    ensureBrowserToken(LOCAL_API_BEARER_TOKEN_KEY, "Local API token");
   }
   return http.createHttpTransport(browserApiBaseUrl(), {
     onAuthRejected: () => {
       sessionStorage.removeItem(http.REMOTE_BEARER_TOKEN_KEY);
-      const entered = promptForToken()?.trim();
+      const entered = promptForToken("Remote access token")?.trim();
       if (!entered) return false;
       sessionStorage.setItem(http.REMOTE_BEARER_TOKEN_KEY, entered);
       return true;
     },
   });
+}
+
+function ensureBrowserToken(key: string, label: string): void {
+  const existing = sessionStorage.getItem(key)?.trim();
+  if (existing) return;
+  const entered = promptForToken(label)?.trim();
+  if (entered) sessionStorage.setItem(key, entered);
 }
 
 function browserApiBaseUrl(): string {
@@ -55,8 +62,8 @@ function trimTrailingSlashes(value: string): string {
   return value.replace(/\/+$/, "");
 }
 
-function promptForToken(): string | null {
-  return window.prompt("Remote access token");
+function promptForToken(label: string): string | null {
+  return window.prompt(label);
 }
 
 void boot();

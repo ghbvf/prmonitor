@@ -5,7 +5,7 @@
 // Self-manages its `inbox:updated` listener over the panel's lifetime (mirrors
 // ReviewPanel's onMounted/onUnmounted), so App.vue mounts it without central wiring.
 import { onMounted, onUnmounted, ref } from "vue";
-import { assertNever, eventTypeLabel, inboxStatusLabel } from "../types";
+import { assertNever, eventTypeLabel, inboxStatusLabel, presentEvent } from "../types";
 import type { InboxStatus } from "../types";
 import { useInboxStore } from "./useInboxStore";
 
@@ -89,11 +89,11 @@ onUnmounted(() => unlisten?.());
     <ul class="entries">
       <li v-for="entry in store.entries" :key="entry.id" class="entry">
         <div class="row-head">
-          <span class="badge type">{{ eventTypeLabel(entry.event.eventType) }}</span>
+          <span class="badge type">{{ eventTypeLabel(presentEvent(entry.event).eventType) }}</span>
           <span class="badge status" :class="statusTone(entry.status)">
             {{ inboxStatusLabel(entry.status) }}
           </span>
-          <span class="title" :title="entry.event.title">{{ entry.event.title }}</span>
+          <span class="title" :title="presentEvent(entry.event).title">{{ presentEvent(entry.event).title }}</span>
         </div>
 
         <div class="meta">
@@ -101,8 +101,8 @@ onUnmounted(() => unlisten?.());
                events), so surface which project each row belongs to (pr-review F4). -->
           <span class="badge project">{{ entry.event.projectId }}</span>
           <span class="repo">{{ entry.event.repo }}</span>
-          <span v-if="entry.event.number != null" class="number">
-            #{{ entry.event.number }}
+          <span v-if="presentEvent(entry.event).number != null" class="number">
+            #{{ presentEvent(entry.event).number }}
           </span>
         </div>
 
@@ -121,6 +121,7 @@ onUnmounted(() => unlisten?.());
             {{ rawOpen.has(entry.id) ? "隐藏原文 / hide raw" : "查看原文 / view raw" }}
           </button>
           <button
+            v-if="entry.status === 'failed'"
             type="button"
             class="link"
             :disabled="store.replayLoading[entry.id]"
