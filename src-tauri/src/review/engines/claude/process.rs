@@ -16,13 +16,10 @@ use std::process::Stdio;
 
 use serde::Serialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdout};
 
+use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
-
-/// The `claude` binary name (PATH-resolved). Single source mirrored by the review
-/// command + composition root, like codex's `CODEX_BIN`.
-pub const CLAUDE_BIN: &str = "claude";
 
 /// Wall-clock budget for the `claude --version` availability probe. Mirrors codex's
 /// status probe discipline; `kill_on_drop(true)` kills a hung child.
@@ -77,8 +74,8 @@ fn classify_claude(probe: ClaudeProbe) -> ClaudeStatus {
 /// `available: false` with a human-readable message. Fast + non-interactive. Only the
 /// exit code is read (the message text is fixed by `classify_claude`), so stdout/stderr
 /// are discarded to `null` rather than buffered.
-pub async fn claude_availability(claude_bin: &str) -> ClaudeStatus {
-    let mut cmd = Command::new(claude_bin);
+pub async fn claude_availability(claude: &ResolvedCli) -> ClaudeStatus {
+    let mut cmd = claude.command();
     cmd.args(["--version"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -325,13 +322,13 @@ fn claude_stdin_chat_args(model: &str, resume: &str) -> Vec<String> {
 /// Some(id)` continues an existing transcript (the chat-continuation follow-up path); the
 /// initial review passes `None`.
 pub fn spawn_claude(
-    claude_bin: &str,
+    claude: &ResolvedCli,
     repo_root: &str,
     model: &str,
     prompt: &str,
     resume: Option<&str>,
 ) -> AppResult<ClaudeProcess> {
-    let mut cmd = Command::new(claude_bin);
+    let mut cmd = claude.command();
     cmd.args(claude_cli_args(model, prompt, resume))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -362,13 +359,13 @@ pub fn spawn_claude(
 /// Spawn a restricted follow-up `claude -p --resume <id>` and send the user's message through
 /// stdin instead of argv. The returned stdout/stderr are ready for the normal stream parser.
 pub async fn spawn_claude_stdin_chat(
-    claude_bin: &str,
+    claude: &ResolvedCli,
     repo_root: &str,
     model: &str,
     prompt: &str,
     resume: &str,
 ) -> AppResult<ClaudeProcess> {
-    let mut cmd = Command::new(claude_bin);
+    let mut cmd = claude.command();
     cmd.args(claude_stdin_chat_args(model, resume))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -484,6 +481,152 @@ pub fn stdout_reader(stdout: ChildStdout) -> BufReader<ChildStdout> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn resolved_recording_claude(
+        name: &str,
+    ) -> (std::path::PathBuf, crate::config::service::ResolvedCli) {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        use crate::{
+            config::service::{resolve_cli_from, CliResolver, CliToolsConfig},
+            model::CliTool,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "prmonitor-claude-{name}-自定义 路径-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("claude");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > '{0}/cwd'\nprintf '%s\\n' \"$PATH\" > '{0}/path'\nprintf '%s\\n' \"$@\" > '{0}/args'\ncat > '{0}/stdin'\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let tools: CliToolsConfig = serde_json::from_value(serde_json::json!({
+            "ghPath": "",
+            "azPath": "",
+            "codexPath": "",
+            "claudePath": executable,
+            "cloudflaredPath": ""
+        }))
+        .unwrap();
+        let resolved =
+            resolve_cli_from(&CliResolver::default(), &tools, CliTool::Claude, false).unwrap();
+        (root, resolved)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn configured_claude_spawn_and_stdin_continuation_preserve_launch_contract() {
+        use std::fs;
+
+        let repo = std::env::temp_dir().join(format!(
+            "prmonitor-claude-repo-工作区 路径-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&repo).unwrap();
+        let canonical_repo = fs::canonicalize(&repo).unwrap();
+
+        let (first_root, first_cli) = resolved_recording_claude("first");
+        let mut first = spawn_claude(
+            &first_cli,
+            repo.to_str().unwrap(),
+            " sonnet ",
+            "/pr-review 41",
+            None,
+        )
+        .unwrap();
+        assert!(first.child.id().is_some());
+        assert!(first.child.wait().await.unwrap().success());
+        assert!(first.child.id().is_none(), "completed child must be reaped");
+        assert_eq!(
+            fs::read_to_string(first_root.join("cwd")).unwrap().trim(),
+            canonical_repo.to_str().unwrap()
+        );
+        let first_path = fs::read_to_string(first_root.join("path")).unwrap();
+        assert!(!std::env::split_paths(first_path.trim()).any(|entry| entry == first_root));
+        assert_eq!(
+            fs::read_to_string(first_root.join("args"))
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec![
+                "-p",
+                "/pr-review 41",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--permission-mode",
+                "bypassPermissions",
+                "--model",
+                "sonnet",
+            ]
+        );
+        assert_eq!(fs::read(first_root.join("stdin")).unwrap(), b"");
+
+        let (chat_root, chat_cli) = resolved_recording_claude("chat");
+        let mut chat = spawn_claude_stdin_chat(
+            &chat_cli,
+            repo.to_str().unwrap(),
+            " opus ",
+            "follow-up secret",
+            "session-41",
+        )
+        .await
+        .unwrap();
+        assert!(chat.child.id().is_some());
+        assert!(chat.child.wait().await.unwrap().success());
+        assert!(chat.child.id().is_none(), "completed child must be reaped");
+        assert_eq!(
+            fs::read_to_string(chat_root.join("cwd")).unwrap().trim(),
+            canonical_repo.to_str().unwrap()
+        );
+        let chat_path = fs::read_to_string(chat_root.join("path")).unwrap();
+        assert!(!std::env::split_paths(chat_path.trim()).any(|entry| entry == chat_root));
+        let chat_args = fs::read_to_string(chat_root.join("args")).unwrap();
+        assert_eq!(
+            chat_args.lines().collect::<Vec<_>>(),
+            vec![
+                "-p",
+                "--input-format",
+                "text",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--permission-mode",
+                "bypassPermissions",
+                "--resume",
+                "session-41",
+                "--model",
+                "opus",
+            ]
+        );
+        assert!(!chat_args.contains("follow-up secret"));
+        assert_eq!(
+            fs::read_to_string(chat_root.join("stdin")).unwrap(),
+            "follow-up secret"
+        );
+
+        let _ = fs::remove_dir_all(first_root);
+        let _ = fs::remove_dir_all(chat_root);
+        let _ = fs::remove_dir_all(repo);
+    }
+
     // ── claude availability status (the StatusBar wire type + pure classifier) ───
     // Wire-shape lock for `ClaudeStatus`, mirrored in `src/review/types.ts` (Medium
     // carrier per ai-robust.md). Both fields are single-word, so there is no snake_case
@@ -516,6 +659,44 @@ mod tests {
             assert!(!s.available, "{probe:?} must map to available:false");
             assert!(!s.message.is_empty(), "{probe:?} must carry a message");
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn availability_uses_custom_cli_resolved_from_config() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        use crate::{
+            config::service::{resolve_cli_from, CliResolver, CliToolsConfig},
+            model::CliTool,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "prmonitor-claude-status-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("claude");
+        fs::write(&path, b"#!/bin/sh\n[ \"$1\" = \"--version\" ]\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let tools: CliToolsConfig = serde_json::from_value(serde_json::json!({
+            "ghPath": "",
+            "azPath": "",
+            "codexPath": "",
+            "claudePath": path,
+            "cloudflaredPath": ""
+        }))
+        .unwrap();
+        let claude =
+            resolve_cli_from(&CliResolver::default(), &tools, CliTool::Claude, false).unwrap();
+
+        let status = claude_availability(&claude).await;
+        assert!(status.available, "{}", status.message);
+        let _ = fs::remove_dir_all(root);
     }
 
     // ── prompt builder ──────────────────────────────────────────────────────────

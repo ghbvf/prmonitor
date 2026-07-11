@@ -17,6 +17,16 @@ const REVIEW_LIFECYCLE_NOTIFICATION_CONFIG: ReviewLifecycleNotificationConfig = 
   endDelaySecs: 0,
 };
 
+// This slice test only needs an empty CLI-path payload to hydrate project state.
+// Keep the fixture local so the PR slice has no runtime dependency on config defaults.
+const CLI_TOOLS_CONFIG_FIXTURE = {
+  ghPath: "",
+  azPath: "",
+  codexPath: "",
+  claudePath: "",
+  cloudflaredPath: "",
+};
+
 // Captured callback handed to `onPrsUpdated`, so a test can push a `PrEvent`
 // through the same path `subscribe()` wires up.
 let prsCb: ((e: PrEvent) => void) | null = null;
@@ -145,7 +155,7 @@ beforeEach(() => {
     webhookEnabled: false,
     webhookPort: 0,
     webhookSecret: "",
-    cloudflaredBin: "",
+    cliTools: { ...CLI_TOOLS_CONFIG_FIXTURE },
     webhookTunnelMode: "quick",
     webhookTunnelCommand: "",
     webhookPublicUrl: "",
@@ -293,7 +303,7 @@ describe("usePrStore toggle()", () => {
       webhookEnabled: false,
       webhookPort: 0,
       webhookSecret: "",
-      cloudflaredBin: "",
+      cliTools: { ...CLI_TOOLS_CONFIG_FIXTURE },
       webhookTunnelMode: "quick",
       webhookTunnelCommand: "",
       webhookPublicUrl: "",

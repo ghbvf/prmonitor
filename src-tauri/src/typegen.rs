@@ -11,19 +11,20 @@ use ts_rs::{Config, TS};
 
 use crate::{
     config::model::{
-        AppConfig, MessagingIntegration, MessagingSettings, NotificationChannel,
-        NotificationSettings, OutboxConfig, Project, RemoteAccessConfig, RemoteCapability,
-        RemoteEntrypoint, RemoteRoute, RemoteTunnel, RemoteTunnelMode,
-        ReviewLifecycleNotificationConfig, ReviewLifecycleTarget, RuleActionConfig,
-        RuleActionDedupePolicy, RuleActionKind, RuleActionTarget, RuleConfig, SourcePolicy,
-        SourcePolicyMode,
+        AppConfig, CliPath, CliToolProbeStatus, CliToolsConfig, MessagingIntegration,
+        MessagingSettings, NotificationChannel, NotificationSettings, OutboxConfig, Project,
+        RemoteAccessConfig, RemoteCapability, RemoteEntrypoint, RemoteRoute, RemoteTunnel,
+        RemoteTunnelMode, ReviewLifecycleNotificationConfig, ReviewLifecycleTarget,
+        RuleActionConfig, RuleActionDedupePolicy, RuleActionKind, RuleActionTarget, RuleConfig,
+        SourcePolicy, SourcePolicyMode,
     },
     model::{
-        ActionStatus, EngineKind, EventType, LabelSource, MessagingEvent, MessagingEventEntry,
-        MessagingEventStatus, MessagingIntegrationOption, MessagingProviderCapability,
-        MessagingProviderKind, MessagingReplyAudit, NotificationKind, NotificationLevel,
-        ReviewLifecycleEvent, SendMessagingRequest, SendMessagingResponse, SendNotificationRequest,
-        SendNotificationResponse, SourceKind, UpdateMode, WebhookTunnelMode,
+        ActionStatus, CliResolutionSource, CliTool, EngineKind, EventType, LabelSource,
+        MessagingEvent, MessagingEventEntry, MessagingEventStatus, MessagingIntegrationOption,
+        MessagingProviderCapability, MessagingProviderKind, MessagingReplyAudit, NotificationKind,
+        NotificationLevel, ReviewLifecycleEvent, SendMessagingRequest, SendMessagingResponse,
+        SendNotificationRequest, SendNotificationResponse, SourceKind, UpdateMode,
+        WebhookTunnelMode,
     },
     remote::status::{
         RemoteAccessRuntimeStatus, RemoteEntrypointRuntimeStatus, RemoteEntrypointState,
@@ -95,6 +96,14 @@ fn repo_root() -> PathBuf {
 fn generated_outputs() -> Vec<(&'static str, String)> {
     let cfg = config();
     let mut shared = String::from(HEADER);
+    shared.push_str(&declaration::<CliTool>(&cfg));
+    shared.push_str(&option_array::<CliTool>("CLI_TOOLS"));
+    shared.push('\n');
+    shared.push_str(&declaration::<CliResolutionSource>(&cfg));
+    shared.push_str(&option_array::<CliResolutionSource>(
+        "CLI_RESOLUTION_SOURCES",
+    ));
+    shared.push('\n');
     shared.push_str(&declaration::<SourceKind>(&cfg));
     shared.push_str(&option_array::<SourceKind>("SOURCE_KINDS"));
     shared.push('\n');
@@ -151,7 +160,7 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
 
     let mut config_types = String::from(HEADER);
     config_types.push_str(
-        "import type { EngineKind, EventType, LabelSource, MessagingProviderKind, NotificationKind, SourceKind, UpdateMode } from \"../types.generated\";\n\n",
+        "import type { CliResolutionSource, CliTool, EngineKind, EventType, LabelSource, MessagingProviderKind, NotificationKind, SourceKind, UpdateMode } from \"../types.generated\";\n\n",
     );
     config_types.push_str(&declaration::<WebhookTunnelMode>(&cfg));
     config_types.push_str(&option_array::<WebhookTunnelMode>("WEBHOOK_TUNNEL_MODES"));
@@ -235,6 +244,17 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     config_types.push_str(&declaration::<RemoteTunnel>(&cfg));
     config_types.push('\n');
     config_types.push_str(&declaration::<RemoteAccessConfig>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<CliPath>(&cfg));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<CliToolsConfig>(&cfg));
+    config_types.push_str(&default_const(
+        "DEFAULT_CLI_TOOLS_CONFIG",
+        "CliToolsConfig",
+        &CliToolsConfig::default(),
+    ));
+    config_types.push('\n');
+    config_types.push_str(&declaration::<CliToolProbeStatus>(&cfg));
     config_types.push('\n');
     config_types.push_str(&declaration::<Project>(&cfg));
     config_types.push('\n');

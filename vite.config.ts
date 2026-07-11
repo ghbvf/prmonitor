@@ -8,6 +8,10 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [vue()],
 
+  // Tauri exposes its target platform to beforeDevCommand/beforeBuildCommand. Keep it available
+  // to the UI so its path hint follows the same host semantics as Rust's Path::is_absolute.
+  envPrefix: ["VITE_", "TAURI_ENV_*"],
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

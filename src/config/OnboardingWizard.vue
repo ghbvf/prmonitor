@@ -12,6 +12,7 @@ import { useConfigStore } from "./useConfigStore";
 import type { AppConfig, Project } from "./types";
 import { cloneReviewLifecycleNotifications, cloneRule } from "./configClone";
 import {
+  DEFAULT_CLI_TOOLS_CONFIG,
   DEFAULT_MESSAGING_SETTINGS,
   DEFAULT_NOTIFICATION_SETTINGS,
   DEFAULT_OUTBOX_CONFIG,
@@ -20,6 +21,7 @@ import {
   NEW_PROJECT_DEFAULTS,
   applySourceKindDefaults,
 } from "./defaults";
+import { cloneCliTools } from "./cliTools";
 import type { SourceKind } from "../types";
 import {
   STEPS,
@@ -165,7 +167,7 @@ function composeConfig(): AppConfig {
     webhookEnabled: false,
     webhookPort: 8787,
     webhookSecret: "",
-    cloudflaredBin: "cloudflared",
+    cliTools: cloneCliTools(store.config?.cliTools ?? DEFAULT_CLI_TOOLS_CONFIG),
     webhookTunnelMode: "quick",
     webhookTunnelCommand: "",
     webhookPublicUrl: "",

@@ -6,7 +6,7 @@
 // Multi-project (#35): coverage is split into PROJECT_GROUPS (per-project `Project`
 // keys) and GLOBAL_GROUPS (global webhook `AppConfig` keys).
 import { describe, expect, it } from "vitest";
-import type { AppConfig, Project } from "./types";
+import type { Project } from "./types";
 import {
   UPDATE_MODES,
   ENGINE_KINDS,
@@ -23,6 +23,7 @@ import {
   visibleStepFields,
   validateStep,
   errorToStep,
+  type GlobalFieldKey,
 } from "./fields";
 
 // A fully-valid single project; each test perturbs one field to assert its step's gate.
@@ -56,12 +57,12 @@ function validProject(): Project {
 // by the project list/selector UI, not a field group. AB#1225 PR1: `localApiPort` has been
 // removed from AppConfig (port is now owned by remoteAccess.entrypoints[] routes);
 // only `localApiToken` remains in the global form. AB#1182: `outbox` is a nested policy
-// object with no settings-panel control yet — none of these is a field group.
-const GLOBAL_FORM_KEYS: (keyof AppConfig)[] = [
+// object with no settings-panel control yet. `cliTools` has its own structured panel,
+// so it is intentionally not flattened into GLOBAL_GROUPS either.
+const GLOBAL_FORM_KEYS: GlobalFieldKey[] = [
   "webhookEnabled",
   "webhookPort",
   "webhookSecret",
-  "cloudflaredBin",
   "webhookTunnelMode",
   "webhookTunnelCommand",
   "webhookPublicUrl",
@@ -250,7 +251,7 @@ describe("manualPullAllowedForMode (818 F7)", () => {
 });
 
 describe("GLOBAL_GROUPS", () => {
-  it("covers all global (webhook) AppConfig keys exactly once across groups", () => {
+  it("covers all scalar global form keys exactly once across groups", () => {
     const keys = GLOBAL_GROUPS.flatMap((g) => g.fields.map((f) => f.key)).sort();
     expect(keys).toEqual([...GLOBAL_FORM_KEYS].sort());
   });
@@ -279,6 +280,12 @@ describe("GLOBAL_GROUPS", () => {
   it("localApiPort is absent from GLOBAL_GROUPS (port moved to remoteAccess)", () => {
     const all = GLOBAL_GROUPS.flatMap((g) => g.fields);
     expect(all.find((f) => (f.key as string) === "localApiPort")).toBeUndefined();
+  });
+
+  it("keeps cliTools in its dedicated structured panel and removes cloudflaredBin", () => {
+    const all = GLOBAL_GROUPS.flatMap((g) => g.fields);
+    expect(all.find((f) => (f.key as string) === "cliTools")).toBeUndefined();
+    expect(all.find((f) => (f.key as string) === "cloudflaredBin")).toBeUndefined();
   });
 });
 

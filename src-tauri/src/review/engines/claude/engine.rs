@@ -13,6 +13,7 @@ use tokio::process::Child;
 
 use super::manager::ClaudeManager;
 use super::process::{self, ParsedEvent, ParserState};
+use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, StreamEvent};
 use crate::model::EngineKind;
@@ -29,8 +30,8 @@ pub struct ClaudeEngine<'a, R: tauri::Runtime> {
     pub app: &'a tauri::AppHandle<R>,
     pub claude: &'a ClaudeManager,
     pub registry: &'a SessionRegistry,
-    /// The claude binary name (PATH-resolved; mirrors codex's `codex_bin`).
-    pub claude_bin: &'a str,
+    /// Typed claude launch credential resolved by the config slice.
+    pub claude_cli: &'a ResolvedCli,
     /// Owning project id (#35): scopes the registry reservation / dedup and stamps
     /// every streamed `ReviewEvent` so the frontend routes it to the right project.
     pub project_id: &'a str,
@@ -70,7 +71,7 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
             self.app,
             self.claude,
             self.registry,
-            self.claude_bin,
+            self.claude_cli,
             self.project_id,
             self.repo_root,
             self.claude_model,
@@ -105,7 +106,7 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
             self.app,
             self.claude,
             self.registry,
-            self.claude_bin,
+            self.claude_cli,
             self.project_id,
             self.repo_root,
             self.claude_model,
@@ -139,7 +140,7 @@ async fn start_review<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     claude: &ClaudeManager,
     registry: &SessionRegistry,
-    claude_bin: &str,
+    claude_cli: &ResolvedCli,
     project_id: &str,
     repo_root: &str,
     claude_model: &str,
@@ -173,7 +174,7 @@ async fn start_review<R: tauri::Runtime>(
     // Spawn the one-shot child. `?` releases the reservation (guard Drop) on failure.
     // `None` resume → a FRESH review (no `--resume`); the follow-up path is `resume_review`.
     let prompt = process::review_prompt(pr_number, kind);
-    let proc = process::spawn_claude(claude_bin, repo_root, claude_model, &prompt, None)?;
+    let proc = process::spawn_claude(claude_cli, repo_root, claude_model, &prompt, None)?;
     let process::ClaudeProcess {
         child,
         stdout,
@@ -298,7 +299,7 @@ async fn resume_review<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     claude: &ClaudeManager,
     registry: &SessionRegistry,
-    claude_bin: &str,
+    claude_cli: &ResolvedCli,
     project_id: &str,
     repo_root: &str,
     claude_model: &str,
@@ -340,7 +341,7 @@ async fn resume_review<R: tauri::Runtime>(
     // stdin, not argv. On a spawn/write failure flip back to `Failed` (the session was set
     // `Running` by `begin_resume`) so it isn't stuck, then surface the error.
     let proc = match process::spawn_claude_stdin_chat(
-        claude_bin,
+        claude_cli,
         repo_root,
         claude_model,
         message,

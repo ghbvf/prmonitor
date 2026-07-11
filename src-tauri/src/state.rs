@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use crate::config::model::AppConfig;
+use crate::config::service::CliResolver;
 use crate::error::{AppError, AppResult};
 use crate::model::{ReviewLifecycleDispatch, SendNotificationRequest, SendNotificationResponse};
 
@@ -133,6 +134,10 @@ impl ReviewLifecycleNotifier {
 
 #[derive(Default)]
 pub struct AppState {
+    /// Process-lifetime cache + typed resolution funnel for managed third-party CLIs. The resolver's
+    /// construction API is private to `config`; sibling slices can only call `config::service` and
+    /// receive an opaque `ResolvedCli` launch capability.
+    pub cli_resolver: CliResolver,
     /// The per-project scheduled-pull loops (#35): a `project_id → Scheduler` set the
     /// composition root reconciles to the enabled projects. Long-lived; methods take
     /// `&self`. Pre-#35 this was a single `Scheduler`; now one app drives N parallel

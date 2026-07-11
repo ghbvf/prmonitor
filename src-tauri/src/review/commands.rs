@@ -5,20 +5,15 @@ use tauri::Manager;
 use crate::config::service as config_service;
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
-use crate::model::{EngineKind, ReviewLifecycleDispatch};
+use crate::model::{CliTool, EngineKind, ReviewLifecycleDispatch, SourceKind};
 use crate::review::claim_store;
 use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
-use crate::review::engines::claude::process::{claude_availability, ClaudeStatus, CLAUDE_BIN};
+use crate::review::engines::claude::process::{claude_availability, ClaudeStatus};
 use crate::review::engines::claude::ClaudeEngine;
 use crate::review::engines::codex::{CodexEngine, CodexStatus};
 use crate::review::history_store::{self, HistoryItem};
 use crate::review::session::{CommentUrlContext, SessionInfo, SessionStatus, StopTarget};
 use crate::state::AppState;
-
-/// The codex binary name (PATH-resolved). Single source for every review command
-/// and the composition-layer dispatcher ([`crate::dispatch`]), which imports this
-/// `pub(crate)` const rather than re-stating the literal.
-pub(crate) const CODEX_BIN: &str = "codex";
 
 /// Rejects any review `kind` other than `review` / `check` at the command boundary.
 ///
@@ -65,21 +60,51 @@ pub(crate) fn validate_pr_number(pr_number: u64) -> AppResult<()> {
 /// projects); its spawn-handshake cwd is the ACTIVE project's `repo_root`, read from
 /// the config slice's public service (#35). Per-turn `cwd` scopes each review's
 /// working dir, so this is only the handshake cwd. `AppConfig` stays config-private.
+enum CodexStatusInput<T> {
+    Resident(CodexStatus),
+    Cold(T),
+}
+
+fn codex_status_input<T>(
+    manager: &crate::review::engines::codex::CodexManager,
+    cold: impl FnOnce() -> AppResult<T>,
+) -> AppResult<CodexStatusInput<T>> {
+    match manager.resident_status() {
+        Some(status) => Ok(CodexStatusInput::Resident(status)),
+        None => cold().map(CodexStatusInput::Cold),
+    }
+}
+
 #[tauri::command]
 pub async fn get_codex_status<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: tauri::State<'_, AppState>,
 ) -> AppResult<CodexStatus> {
-    let repo_root = config_service::active_repo_root(&app)?;
-    Ok(state.codex.status(CODEX_BIN, &repo_root).await)
+    // A stopped or live resident is authoritative and does not need the currently configured
+    // executable. Resolve config only for the cold-start path; otherwise a stale CLI path would
+    // hide the user's stopped state or a healthy process that is already serving requests.
+    match codex_status_input(&state.codex, || {
+        Ok((
+            config_service::resolve_cli(&app, CliTool::Codex, false)?,
+            config_service::active_repo_root(&app)?,
+        ))
+    })? {
+        CodexStatusInput::Resident(status) => Ok(status),
+        CodexStatusInput::Cold((codex, repo_root)) => {
+            Ok(state.codex.status(&codex, &repo_root).await)
+        }
+    }
 }
 
 /// Reports `claude` CLI availability for the StatusBar. One-shot `claude --version`
 /// probe — claude has NO resident server (unlike codex), so there is no start/stop
 /// and this takes no `app`/`state`/repo_root. The probe never errors.
 #[tauri::command]
-pub async fn get_claude_status() -> AppResult<ClaudeStatus> {
-    Ok(claude_availability(CLAUDE_BIN).await)
+pub async fn get_claude_status<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> AppResult<ClaudeStatus> {
+    let claude = config_service::resolve_cli(&app, CliTool::Claude, false)?;
+    Ok(claude_availability(&claude).await)
 }
 
 /// 显式启动常驻 codex app-server（清除「已停止」标记并拉起握手）。返回最新状态。
@@ -90,7 +115,8 @@ pub async fn start_codex<R: tauri::Runtime>(
     state: tauri::State<'_, AppState>,
 ) -> AppResult<CodexStatus> {
     let repo_root = config_service::active_repo_root(&app)?;
-    Ok(state.codex.start(CODEX_BIN, &repo_root).await)
+    let codex = config_service::resolve_cli(&app, CliTool::Codex, false)?;
+    Ok(state.codex.start(&codex, &repo_root).await)
 }
 
 /// 显式停止常驻 codex app-server（设「已停止」标记 + 杀进程；被动状态探测此后不再自动拉起，显式 review 仍会强制启动）。
@@ -145,7 +171,7 @@ async fn start_via_engine<R: tauri::Runtime>(
     // `finalize_turn` resolves the pr-review comment URL against the project the review ran
     // against — never a config edited mid-review. Both engines carry this owned context into
     // their `Starting` session; built once here since the fields are identical for either.
-    let url_ctx = comment_url_ctx_from(project);
+    let url_ctx = comment_url_ctx_from(app, project);
     let outcome = match project.engine_kind {
         EngineKind::Codex => {
             let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
@@ -158,11 +184,12 @@ async fn start_via_engine<R: tauri::Runtime>(
             if trigger == StartTrigger::Explicit {
                 state.codex.resume();
             }
+            let codex_cli = config_service::resolve_cli(app, CliTool::Codex, false)?;
             let engine = CodexEngine {
                 app,
                 codex: &state.codex,
                 registry: &state.sessions,
-                codex_bin: CODEX_BIN,
+                codex_cli: &codex_cli,
                 project_id: &project.id,
                 repo: &project.repo,
                 repo_root: &project.repo_root,
@@ -178,11 +205,12 @@ async fn start_via_engine<R: tauri::Runtime>(
             engine.start(pr_number, kind).await
         }
         EngineKind::Claude => {
+            let claude_cli = config_service::resolve_cli(app, CliTool::Claude, false)?;
             let engine = ClaudeEngine {
                 app,
                 claude: &state.claude,
                 registry: &state.sessions,
-                claude_bin: CLAUDE_BIN,
+                claude_cli: &claude_cli,
                 project_id: &project.id,
                 repo: &project.repo,
                 repo_root: &project.repo_root,
@@ -416,8 +444,23 @@ pub(crate) fn should_record_dispatch_ledger(outcome: OutboxReviewStartOutcome) -
 /// path), so both snapshot the same `(source_kind, repo, azure_org, azure_project)` fields
 /// the terminal `finalize_turn` resolves the pr-review comment URL against. Pinning one
 /// builder keeps the two paths from drifting on which project fields the URL is resolved from.
-fn comment_url_ctx_from(project: &config_service::Project) -> CommentUrlContext {
+fn optional_comment_url_cli(
+    source_kind: SourceKind,
+    resolve_gh: impl FnOnce() -> AppResult<config_service::ResolvedCli>,
+) -> Option<config_service::ResolvedCli> {
+    (source_kind == SourceKind::Github)
+        .then(resolve_gh)
+        .and_then(Result::ok)
+}
+
+fn comment_url_ctx_from<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    project: &config_service::Project,
+) -> CommentUrlContext {
     CommentUrlContext {
+        gh: optional_comment_url_cli(project.source_kind, || {
+            config_service::resolve_cli(app, CliTool::Gh, false)
+        }),
         source_kind: project.source_kind,
         repo: project.repo.clone(),
         azure_org: project.azure_org.clone(),
@@ -509,18 +552,19 @@ pub async fn send_review_message<R: tauri::Runtime>(
     // must not route this existing conversation to a different engine.
     let session_info = resolve_session_info(&app, &state, &project_id, &thread_id)?;
     let pr_number = session_info.pr_number;
-    let url_ctx = comment_url_ctx_from(&project);
+    let url_ctx = comment_url_ctx_from(&app, &project);
     match session_info.engine_kind {
         EngineKind::Codex => {
             // MANUAL / explicit force-start (parity with `dispatch_engine`'s Codex arm): a
             // follow-up is an explicit user action, so clear any prior `stop_codex` before
             // the `connection()` funnel (which refuses when stopped).
             state.codex.resume();
+            let codex_cli = config_service::resolve_cli(&app, CliTool::Codex, false)?;
             let engine = CodexEngine {
                 app: &app,
                 codex: &state.codex,
                 registry: &state.sessions,
-                codex_bin: CODEX_BIN,
+                codex_cli: &codex_cli,
                 project_id: &project.id,
                 repo: &project.repo,
                 repo_root: &project.repo_root,
@@ -537,11 +581,12 @@ pub async fn send_review_message<R: tauri::Runtime>(
                 .await
         }
         EngineKind::Claude => {
+            let claude_cli = config_service::resolve_cli(&app, CliTool::Claude, false)?;
             let engine = ClaudeEngine {
                 app: &app,
                 claude: &state.claude,
                 registry: &state.sessions,
-                claude_bin: CLAUDE_BIN,
+                claude_cli: &claude_cli,
                 project_id: &project.id,
                 repo: &project.repo,
                 repo_root: &project.repo_root,
@@ -628,46 +673,14 @@ pub(crate) async fn trigger_review_with_state<R: tauri::Runtime>(
 /// already gone) → fall through to the codex interrupt path. `pub(crate)` so the composition root
 /// (`lib.rs`) reuses it for the outbox action — names only review-internal / config types.
 pub(crate) async fn stop_session_by_id<R: tauri::Runtime>(
-    app: &tauri::AppHandle<R>,
+    _app: &tauri::AppHandle<R>,
     state: &AppState,
     session_id: &str,
 ) -> AppResult<()> {
     if state.claude.stop(session_id) {
         return Ok(());
     }
-    // `stop` interrupts an already-live turn purely by its session id (codex
-    // `threadId`); it needs neither the project, the repo, nor the skill path (see
-    // `session::stop_review`, where `codex_bin`/`repo_root` are bound to `_`). So we
-    // build the engine with empty context fields and skip the config read entirely —
-    // a missing / invalid config must not block stopping a running review.
-    let engine = CodexEngine {
-        app,
-        codex: &state.codex,
-        registry: &state.sessions,
-        codex_bin: CODEX_BIN,
-        project_id: "",
-        repo: "",
-        repo_root: "",
-        skill_abs_path: "",
-        // `stop` resolves purely by session id; model is irrelevant on the interrupt path.
-        codex_model: "",
-        // `stop` never reaches `start_review`/`promote_reservation`, so the URL context is
-        // unused here — a default (empty) value satisfies the field without a config read.
-        url_ctx: CommentUrlContext {
-            source_kind: crate::model::SourceKind::default(),
-            repo: String::new(),
-            azure_org: String::new(),
-            azure_project: String::new(),
-        },
-        // `stop` resolves purely by session id; pr_number is the follow-up path's field only.
-        pr_number: 0,
-        session_info: None,
-        // `stop` never starts a review → no AB#1204 claim breadcrumb.
-        outbox_claim_id: None,
-    };
-    // The trait's `stop` takes `&SessionId` (== `&String`); `claude.stop` above took `&str`. Own the
-    // id once for the codex arm (a stop is rare, so the single allocation is irrelevant).
-    engine.stop(&session_id.to_string()).await
+    crate::review::session::stop_review(&state.codex, &state.sessions, session_id).await
 }
 
 /// Interrupt a running review session (by its `threadId`). The terminal `turnCompleted` (status
@@ -797,6 +810,42 @@ pub(crate) fn skill_abs_path(repo_root: &str, skill_rel_path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_codex_status_skips_failing_cold_start_resolution() {
+        let manager = crate::review::engines::codex::CodexManager::default();
+        manager.stop();
+        let mut called = false;
+        let input = codex_status_input(&manager, || -> AppResult<()> {
+            called = true;
+            Err(AppError::new("stale configured path"))
+        })
+        .expect("resident status must bypass cold resolution");
+        assert!(!called);
+        let CodexStatusInput::Resident(status) = input else {
+            panic!("stopped manager must return resident snapshot");
+        };
+        assert!(!status.available);
+        assert!(!status.desired_running);
+    }
+
+    #[test]
+    fn github_comment_url_context_tolerates_missing_gh() {
+        let gh =
+            optional_comment_url_cli(SourceKind::Github, || Err(AppError::new("gh unavailable")));
+        assert!(gh.is_none(), "comment URL enrichment must stay best-effort");
+    }
+
+    #[test]
+    fn non_github_comment_url_context_does_not_resolve_gh() {
+        let mut called = false;
+        let gh = optional_comment_url_cli(SourceKind::Azure, || {
+            called = true;
+            Err(AppError::new("must not run"))
+        });
+        assert!(gh.is_none());
+        assert!(!called, "non-GitHub sources must not resolve gh");
+    }
 
     #[test]
     fn validate_kind_accepts_review_and_check_only() {

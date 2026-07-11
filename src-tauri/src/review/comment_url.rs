@@ -22,8 +22,8 @@ use std::process::Stdio;
 
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
 
+use crate::config::service::ResolvedCli;
 use crate::model::SourceKind;
 
 /// Wall-clock budget for the single read-only `gh pr view` call. Mirrors `pr::gh`'s
@@ -50,6 +50,7 @@ const PM_REVIEW_MARKER: &str = "<!-- pm:pr-review -->";
 ///
 /// `pub(super)` so only the review slice's funnel calls it (the slice boundary).
 pub(super) async fn resolve_comment_url(
+    gh: Option<&ResolvedCli>,
     source_kind: SourceKind,
     repo: &str,
     azure_org: &str,
@@ -59,7 +60,7 @@ pub(super) async fn resolve_comment_url(
     match source_kind {
         SourceKind::Github => {
             // Read-only `gh pr view` — never a write subcommand (governance backstop).
-            let json = run_gh_pr_view(repo, pr).await?;
+            let json = run_gh_pr_view(gh?, repo, pr).await?;
             pick_last_pm_comment_url(&json)
         }
         // Azure: the PR-level web URL, purely constructed (no thread-id API round-trip).
@@ -144,9 +145,9 @@ fn encode_path_segment(segment: &str) -> String {
 /// — the funnel degrades a failed resolve to "no URL", never an error. Mirrors `pr::gh`'s
 /// subprocess discipline: `Command::new` + [`GH_TIMEOUT`] + `kill_on_drop(true)` + a bounded
 /// stdout read.
-async fn run_gh_pr_view(repo: &str, pr: u64) -> Option<String> {
+async fn run_gh_pr_view(gh: &ResolvedCli, repo: &str, pr: u64) -> Option<String> {
     let pr_str = pr.to_string();
-    let mut cmd = Command::new("gh");
+    let mut cmd = gh.command();
     // `gh pr view` is READ-ONLY (the governance scan forbids only write subcommands).
     cmd.args(["pr", "view", &pr_str, "--repo", repo, "--json", "comments"])
         .stdout(Stdio::piped())
@@ -201,6 +202,47 @@ async fn read_bounded<R: AsyncRead + Unpin>(mut reader: R, limit: usize) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn github_comment_lookup_uses_resolved_program() {
+        use crate::{
+            config::service::{resolve_cli_from, CliResolver, CliToolsConfig},
+            model::CliTool,
+        };
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "prmonitor-comment-gh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let gh_path = root.join("gh");
+        fs::write(
+            &gh_path,
+            b"#!/bin/sh\nprintf '%s\\n' '{\"comments\":[{\"body\":\"<!-- pm:pr-review --> done\",\"url\":\"https://example.test/comment\"}]}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&gh_path, fs::Permissions::from_mode(0o755)).unwrap();
+        let tools: CliToolsConfig = serde_json::from_value(serde_json::json!({
+            "ghPath": gh_path,
+            "azPath": "",
+            "codexPath": "",
+            "claudePath": "",
+            "cloudflaredPath": ""
+        }))
+        .unwrap();
+        let gh = resolve_cli_from(&CliResolver::default(), &tools, CliTool::Gh, false).unwrap();
+
+        let url = resolve_comment_url(Some(&gh), SourceKind::Github, "owner/repo", "", "", 7).await;
+        assert_eq!(url.as_deref(), Some("https://example.test/comment"));
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn pick_last_pm_comment_url_takes_the_last_pm_comment() {
@@ -304,12 +346,12 @@ mod tests {
     #[tokio::test]
     async fn resolve_comment_url_bitbucket_is_none() {
         assert_eq!(
-            resolve_comment_url(SourceKind::Bitbucket, "repo", "", "", 7).await,
+            resolve_comment_url(None, SourceKind::Bitbucket, "repo", "", "", 7).await,
             None
         );
         // Azure resolves to the constructed PR URL (no CLI call), so it is testable here too.
         assert_eq!(
-            resolve_comment_url(SourceKind::Azure, "myrepo", "myorg", "myproject", 5).await,
+            resolve_comment_url(None, SourceKind::Azure, "myrepo", "myorg", "myproject", 5,).await,
             Some("https://dev.azure.com/myorg/myproject/_git/myrepo/pullrequest/5".to_string())
         );
     }

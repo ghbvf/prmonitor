@@ -58,7 +58,7 @@ const webhookDirty = computed(() => {
     s.webhookEnabled !== d.webhookEnabled ||
     s.webhookPort !== d.webhookPort ||
     s.webhookSecret !== d.webhookSecret ||
-    s.cloudflaredBin !== d.cloudflaredBin ||
+    s.cliTools.cloudflaredPath !== d.cliTools.cloudflaredPath ||
     s.webhookTunnelMode !== d.webhookTunnelMode ||
     s.webhookTunnelCommand !== d.webhookTunnelCommand ||
     s.webhookPublicUrl !== d.webhookPublicUrl

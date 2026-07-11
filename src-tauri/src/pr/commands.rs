@@ -3,7 +3,7 @@
 use crate::config::service as config_service;
 use crate::error::AppResult;
 use crate::events::{PrEvent, StreamEvent};
-use crate::model::{Candidate, PullRequestView, SourceKind, UpdateMode};
+use crate::model::{Candidate, CliTool, PullRequestView, SourceKind, UpdateMode};
 
 use super::azure::{az_auth_status, AzStatus, AzureDevOpsCli};
 use super::bitbucket::BitbucketServer;
@@ -171,7 +171,12 @@ pub(crate) async fn discover<R: tauri::Runtime>(
     // its events to `build_view`.
     let (views, dispatchable) = match source_kind {
         SourceKind::Github => {
-            let source = GithubCli::new(params.repo.clone(), trigger_labels.clone(), label_source);
+            let source = GithubCli::new(
+                config_service::resolve_cli(app, CliTool::Gh, false)?,
+                params.repo.clone(),
+                trigger_labels.clone(),
+                label_source,
+            );
             partition_events(source.discover_events().await?, &params, &ledger, now)
         }
         SourceKind::Azure => {
@@ -186,6 +191,7 @@ pub(crate) async fn discover<R: tauri::Runtime>(
                 ));
             }
             let source = AzureDevOpsCli::new(
+                config_service::resolve_cli(app, CliTool::Az, false)?,
                 azure_org,
                 azure_project,
                 params.repo.clone(),
@@ -371,15 +377,31 @@ pub async fn reschedule<R: tauri::Runtime>(
 
 /// Reports `gh` CLI auth status for the StatusBar.
 #[tauri::command]
-pub async fn gh_status() -> AppResult<GhStatus> {
-    Ok(gh_auth_status("gh").await)
+pub async fn gh_status<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> AppResult<GhStatus> {
+    Ok(
+        match config_service::resolve_cli(&app, CliTool::Gh, false) {
+            Ok(gh) => gh_auth_status(&gh).await,
+            Err(error) => GhStatus {
+                authenticated: false,
+                message: error.message,
+            },
+        },
+    )
 }
 
 /// Reports `az` CLI auth status for the StatusBar (Azure source). Mirrors `gh_status`:
 /// no args, hardcodes the PATH-resolved `az` binary; the probe never errors.
 #[tauri::command]
-pub async fn az_status() -> AppResult<AzStatus> {
-    Ok(az_auth_status("az").await)
+pub async fn az_status<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> AppResult<AzStatus> {
+    Ok(
+        match config_service::resolve_cli(&app, CliTool::Az, false) {
+            Ok(az) => az_auth_status(&az).await,
+            Err(error) => AzStatus {
+                authenticated: false,
+                message: error.message,
+            },
+        },
+    )
 }
 
 /// Returns `project_id`'s retained tracked-PR list (#35) — that project's persisted
@@ -806,6 +828,17 @@ fn webhook_route_eligible(mode: UpdateMode) -> bool {
     }
 }
 
+fn resolve_webhook_cloudflared<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    mode: crate::model::WebhookTunnelMode,
+) -> AppResult<Option<config_service::ResolvedCli>> {
+    if mode == crate::model::WebhookTunnelMode::Quick {
+        config_service::resolve_cli(app, CliTool::Cloudflared, false).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
 /// Starts the webhook receiver + Cloudflare Quick Tunnel. Requires `webhook_enabled`
 /// in the persisted config; returns the resolved status (incl. the public
 /// `*.trycloudflare.com` URL to paste into GitHub). The local server binds
@@ -815,7 +848,7 @@ fn webhook_route_eligible(mode: UpdateMode) -> bool {
 /// incoming event by repo, so this builds a [`super::webhook::ProjectRoute`] from every
 /// `enabled` project (its repo + trigger labels + id) and hands the snapshot to
 /// [`super::webhook::WebhookManager::start`]. The receiver params (port / secret /
-/// cloudflared_bin / tunnel) stay GLOBAL on [`AppConfig`]. The route snapshot is fixed
+/// cloudflared credential / tunnel) stay GLOBAL on [`AppConfig`]. The route snapshot is fixed
 /// for the runtime's life — a project add/remove requires a webhook restart (the
 /// composition root wires that on `set_config`).
 ///
@@ -868,13 +901,14 @@ pub async fn start_webhook<R: tauri::Runtime>(
             label_source: p.label_source,
         })
         .collect();
+    let cloudflared = resolve_webhook_cloudflared(&app, cfg.webhook_tunnel_mode);
     state
         .webhook
         .start(
             cfg.webhook_port,
             cfg.webhook_secret,
             routes,
-            cfg.cloudflared_bin,
+            cloudflared,
             super::webhook::TunnelSpec {
                 mode: cfg.webhook_tunnel_mode,
                 command: cfg.webhook_tunnel_command,
@@ -893,9 +927,10 @@ pub async fn stop_webhook<R: tauri::Runtime>(
 ) -> AppResult<WebhookStatus> {
     state.webhook.stop().await;
     let cfg = config_service::load(&app)?;
+    let cloudflared = resolve_webhook_cloudflared(&app, cfg.webhook_tunnel_mode);
     Ok(state
         .webhook
-        .status(&cfg.cloudflared_bin, cfg.webhook_tunnel_mode)
+        .status(cloudflared, cfg.webhook_tunnel_mode)
         .await)
 }
 
@@ -907,9 +942,10 @@ pub async fn webhook_status<R: tauri::Runtime>(
     state: tauri::State<'_, crate::state::AppState>,
 ) -> AppResult<WebhookStatus> {
     let cfg = config_service::load(&app)?;
+    let cloudflared = resolve_webhook_cloudflared(&app, cfg.webhook_tunnel_mode);
     Ok(state
         .webhook
-        .status(&cfg.cloudflared_bin, cfg.webhook_tunnel_mode)
+        .status(cloudflared, cfg.webhook_tunnel_mode)
         .await)
 }
 

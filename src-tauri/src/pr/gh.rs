@@ -13,8 +13,8 @@
 //! unit-tested without invoking `gh`.
 
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
 
+use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 use crate::model::{Candidate, Event, EventType, LabelSource, SourceKind};
 
@@ -231,16 +231,21 @@ pub struct GhStatus {
 
 /// The GitHub PR source backed by the `gh` CLI.
 pub struct GithubCli {
-    gh_bin: String,
+    gh: ResolvedCli,
     repo: String,
     trigger_labels: Vec<String>,
     label_source: LabelSource,
 }
 
 impl GithubCli {
-    pub fn new(repo: String, trigger_labels: Vec<String>, label_source: LabelSource) -> Self {
+    pub fn new(
+        gh: ResolvedCli,
+        repo: String,
+        trigger_labels: Vec<String>,
+        label_source: LabelSource,
+    ) -> Self {
         Self {
-            gh_bin: "gh".to_string(),
+            gh,
             repo,
             trigger_labels,
             label_source,
@@ -253,7 +258,7 @@ impl GithubCli {
     /// scheduler's stop-select tearing down an in-flight cycle), the child `gh`
     /// process is killed — closing the cancellation domain (F1).
     async fn run_pr_list(&self, label: Option<&str>) -> AppResult<String> {
-        let mut cmd = Command::new(&self.gh_bin);
+        let mut cmd = self.gh.command();
         cmd.args(["pr", "list", "--repo", &self.repo, "--state", "open"]);
         // AB#717: the native path filters server-side per trigger label (one call each);
         // the title-label path passes `None` to fetch ALL open PRs and classify client-side
@@ -349,8 +354,8 @@ impl EventSourceProvider for GithubCli {
 /// Probes `gh auth status` for the StatusBar. Never errors — any failure (gh
 /// missing, not logged in, scheduling failure) maps to `authenticated: false`
 /// with a human-readable message.
-pub async fn gh_auth_status(gh_bin: &str) -> GhStatus {
-    let mut cmd = Command::new(gh_bin);
+pub async fn gh_auth_status(gh: &ResolvedCli) -> GhStatus {
+    let mut cmd = gh.command();
     cmd.args(["auth", "status"]).kill_on_drop(true);
     let result = tokio::time::timeout(GH_TIMEOUT, cmd.output()).await;
 
@@ -387,6 +392,114 @@ pub async fn gh_auth_status(gh_bin: &str) -> GhStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn unique_test_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "prmonitor-{name}-自定义 路径-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discover_events_runs_configured_gh_with_resolved_path_and_argv() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        use crate::{
+            config::service::{resolve_cli_from, CliResolver, CliToolsConfig},
+            model::CliTool,
+        };
+
+        let root = unique_test_root("gh-discovery");
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("gh");
+        let invocation = root.join("invocation");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf 'PATH=%s\\n' \"$PATH\" > '{}'\nprintf 'ARG=%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' '[{{\"number\":41,\"title\":\"Configured gh\",\"url\":\"https://github.com/acme/widgets/pull/41\",\"headRefName\":\"feature/cli\",\"headRefOid\":\"abc41\",\"author\":{{\"login\":\"octocat\"}},\"isCrossRepository\":false,\"isDraft\":false,\"labels\":[{{\"name\":\"ready\"}}]}}]'\n",
+                invocation.display(),
+                invocation.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let tools: CliToolsConfig = serde_json::from_value(serde_json::json!({
+            "ghPath": executable,
+            "azPath": "",
+            "codexPath": "",
+            "claudePath": "",
+            "cloudflaredPath": ""
+        }))
+        .unwrap();
+        let gh = resolve_cli_from(&CliResolver::default(), &tools, CliTool::Gh, false).unwrap();
+        let source = GithubCli::new(
+            gh,
+            "acme/widgets".to_string(),
+            vec!["ready".to_string()],
+            LabelSource::Native,
+        );
+
+        let events = source.discover_events().await.unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].candidate.number, 41);
+        assert_eq!(events[0].event.title, "Configured gh");
+        let captured = fs::read_to_string(&invocation).unwrap();
+        let mut lines = captured.lines();
+        let path = lines.next().unwrap().strip_prefix("PATH=").unwrap();
+        assert!(!std::env::split_paths(path).any(|entry| entry == root));
+        assert_eq!(
+            lines.collect::<Vec<_>>(),
+            vec![
+                "ARG=pr",
+                "ARG=list",
+                "ARG=--repo",
+                "ARG=acme/widgets",
+                "ARG=--state",
+                "ARG=open",
+                "ARG=--label",
+                "ARG=ready",
+                "ARG=--limit",
+                "ARG=1000",
+                "ARG=--json",
+                &format!("ARG={PR_LIST_FIELDS}"),
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auth_status_runs_resolved_gh_program() {
+        use crate::{
+            config::service::{resolve_cli_from, CliResolver, CliToolsConfig},
+            model::CliTool,
+        };
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let root = std::env::temp_dir().join(format!("prmonitor-gh-status-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("gh");
+        fs::write(&path, b"#!/bin/sh\necho 'Logged in to github.com' >&2\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let tools: CliToolsConfig = serde_json::from_value(serde_json::json!({
+            "ghPath": path,
+            "azPath": "",
+            "codexPath": "",
+            "claudePath": "",
+            "cloudflaredPath": ""
+        }))
+        .unwrap();
+        let gh = resolve_cli_from(&CliResolver::default(), &tools, CliTool::Gh, false).unwrap();
+        let status = gh_auth_status(&gh).await;
+        assert!(status.authenticated);
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn parse_pr_list_maps_fields_and_kind() {

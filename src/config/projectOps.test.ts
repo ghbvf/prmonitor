@@ -8,7 +8,11 @@ import {
   deleteProjectFromDraft,
   makeProject,
 } from "./projectOps";
-import { DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG, NEW_PROJECT_DEFAULTS } from "./defaults";
+import {
+  DEFAULT_CLI_TOOLS_CONFIG,
+  DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
+  NEW_PROJECT_DEFAULTS,
+} from "./defaults";
 import type { AppConfig, Project } from "./types";
 
 function project(id: string, name = id): Project {
@@ -22,7 +26,7 @@ function draft(projects: Project[], activeProjectId: string): AppConfig {
     webhookEnabled: false,
     webhookPort: 8787,
     webhookSecret: "",
-    cloudflaredBin: "cloudflared",
+    cliTools: { ...DEFAULT_CLI_TOOLS_CONFIG },
     webhookTunnelMode: "quick",
     webhookTunnelCommand: "",
     webhookPublicUrl: "",

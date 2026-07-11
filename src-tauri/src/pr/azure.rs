@@ -18,8 +18,8 @@ use std::process::Stdio;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
 
+use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 use crate::model::{Candidate, Event, EventType, LabelSource, SourceKind};
 
@@ -339,7 +339,7 @@ fn parse_pr_list(
 
 /// The Azure DevOps PR source backed by the `az` CLI (#818).
 pub struct AzureDevOpsCli {
-    az_bin: String,
+    az: ResolvedCli,
     org: String,
     project: String,
     repo: String,
@@ -349,6 +349,7 @@ pub struct AzureDevOpsCli {
 
 impl AzureDevOpsCli {
     pub fn new(
+        az: ResolvedCli,
         org: String,
         project: String,
         repo: String,
@@ -356,7 +357,7 @@ impl AzureDevOpsCli {
         label_source: LabelSource,
     ) -> Self {
         Self {
-            az_bin: "az".to_string(),
+            az,
             org,
             project,
             repo,
@@ -372,7 +373,7 @@ impl AzureDevOpsCli {
     /// domain (F1 parity with `gh.rs`).
     async fn run_pr_list(&self) -> AppResult<String> {
         let org_url = format!("https://dev.azure.com/{}", self.org);
-        let mut cmd = Command::new(&self.az_bin);
+        let mut cmd = self.az.command();
         cmd.args([
             "repos",
             "pr",
@@ -565,8 +566,8 @@ fn classify_az(probe: AzProbe) -> AzStatus {
 /// `kill_on_drop(true)` + `AZ_TIMEOUT` bound a hung/auth-prompting child. Only the exit
 /// code is read (the message text is fixed by `classify_az`), so stdout/stderr are
 /// discarded to `null` — no account JSON is buffered into memory or surfaced anywhere.
-pub async fn az_auth_status(az_bin: &str) -> AzStatus {
-    let mut cmd = Command::new(az_bin);
+pub async fn az_auth_status(az: &ResolvedCli) -> AzStatus {
+    let mut cmd = az.command();
     cmd.args(["account", "show"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -583,6 +584,112 @@ pub async fn az_auth_status(az_bin: &str) -> AzStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discover_events_runs_configured_az_with_resolved_path_and_argv() {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        use crate::{
+            config::service::{resolve_cli_from, CliResolver, CliToolsConfig},
+            model::CliTool,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "prmonitor-az-discovery-自定义 路径-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("az");
+        let invocation = root.join("invocation");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf 'PATH=%s\\n' \"$PATH\" > '{}'\nprintf 'ARG=%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' '[{{\"pullRequestId\":42,\"title\":\"Configured az\",\"lastMergeSourceCommit\":{{\"commitId\":\"abc42\"}},\"sourceRefName\":\"refs/heads/feature/cli\",\"createdBy\":{{\"uniqueName\":\"dev@example.com\"}},\"isDraft\":false,\"labels\":[{{\"name\":\"ready\"}}]}}]'\n",
+                invocation.display(),
+                invocation.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let tools: CliToolsConfig = serde_json::from_value(serde_json::json!({
+            "ghPath": "",
+            "azPath": executable,
+            "codexPath": "",
+            "claudePath": "",
+            "cloudflaredPath": ""
+        }))
+        .unwrap();
+        let az = resolve_cli_from(&CliResolver::default(), &tools, CliTool::Az, false).unwrap();
+        let source = AzureDevOpsCli::new(
+            az,
+            "acme".to_string(),
+            "platform".to_string(),
+            "widgets".to_string(),
+            vec!["ready".to_string()],
+            LabelSource::Native,
+        );
+
+        let events = source.discover_events().await.unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].candidate.number, 42);
+        assert_eq!(events[0].event.title, "Configured az");
+        let captured = fs::read_to_string(&invocation).unwrap();
+        let mut lines = captured.lines();
+        let path = lines.next().unwrap().strip_prefix("PATH=").unwrap();
+        assert!(!std::env::split_paths(path).any(|entry| entry == root));
+        assert_eq!(
+            lines.collect::<Vec<_>>(),
+            vec![
+                "ARG=repos",
+                "ARG=pr",
+                "ARG=list",
+                "ARG=--organization",
+                "ARG=https://dev.azure.com/acme",
+                "ARG=--project",
+                "ARG=platform",
+                "ARG=--repository",
+                "ARG=widgets",
+                "ARG=--status",
+                "ARG=active",
+                "ARG=--output",
+                "ARG=json",
+            ]
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auth_status_runs_resolved_az_program() {
+        use crate::{
+            config::service::{resolve_cli_from, CliResolver, CliToolsConfig},
+            model::CliTool,
+        };
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let root = std::env::temp_dir().join(format!("prmonitor-az-status-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("az");
+        fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let tools: CliToolsConfig = serde_json::from_value(serde_json::json!({
+            "ghPath": "",
+            "azPath": path,
+            "codexPath": "",
+            "claudePath": "",
+            "cloudflaredPath": ""
+        }))
+        .unwrap();
+        let az = resolve_cli_from(&CliResolver::default(), &tools, CliTool::Az, false).unwrap();
+        let status = az_auth_status(&az).await;
+        assert!(status.authenticated);
+        let _ = fs::remove_dir_all(root);
+    }
 
     const REVIEW: &str = "pr-status/needs-review-again";
     const CHECK: &str = "pr-status/needs-check-fix";

@@ -11,13 +11,14 @@ use std::sync::Arc;
 
 use serde::Serialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdin, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin};
 
 use super::protocol::{
     rpc_methods, ClientInfo, InitializeParams, InitializeResult, ThreadStartParams,
     ThreadStartResult, TurnInterruptParams, TurnStartParams, TurnStartResult,
 };
 use super::rpc::RpcClient;
+use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 
 /// Broadcast ring capacity for streamed notifications (generous for delta streams).
@@ -45,6 +46,7 @@ pub struct CodexProcess {
     client: Arc<RpcClient<ChildStdin>>,
     /// `initialize` result captured at handshake (carries `userAgent`).
     pub info: InitializeResult,
+    fingerprint: String,
 }
 
 impl CodexProcess {
@@ -52,8 +54,8 @@ impl CodexProcess {
     /// `initialize` + `initialized` handshake. Does NOT start a thread. An empty
     /// `repo_root` leaves the child's cwd at the process default (the handshake is
     /// cwd-independent), so an unconfigured app can still probe availability.
-    pub async fn spawn(codex_bin: &str, repo_root: &str) -> AppResult<Self> {
-        let mut cmd = Command::new(codex_bin);
+    pub(super) async fn spawn(codex: &ResolvedCli, repo_root: &str) -> AppResult<Self> {
+        let mut cmd = codex.command();
         cmd.args(["app-server", "--stdio"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -92,6 +94,7 @@ impl CodexProcess {
             child,
             client: Arc::new(client),
             info,
+            fingerprint: codex.fingerprint().to_string(),
         })
     }
 
@@ -141,6 +144,10 @@ impl CodexProcess {
     /// Whether the underlying connection is still live (reader task running).
     pub fn is_connected(&self) -> bool {
         self.client.is_connected()
+    }
+
+    pub(super) fn fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 
     /// Kill the child and reap it. Sends SIGKILL synchronously (immediate, safe
@@ -276,6 +283,42 @@ async fn discard_to_newline<R: AsyncBufRead + Unpin>(reader: &mut R) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires the real codex binary; run with: cargo test -- --ignored"]
+    async fn real_app_server_handshake_and_manager_reuse() {
+        use crate::review::engines::codex::manager::CodexManager;
+        use crate::{
+            config::service::{resolve_cli_from, CliResolver, CliToolsConfig},
+            model::CliTool,
+        };
+
+        let cli = resolve_cli_from(
+            &CliResolver::default(),
+            &CliToolsConfig::default(),
+            CliTool::Codex,
+            true,
+        )
+        .expect("resolve real codex from configured discovery");
+        let repo_root = env!("CARGO_MANIFEST_DIR");
+        let process = CodexProcess::spawn(&cli, repo_root)
+            .await
+            .expect("spawn + handshake");
+        assert!(!process.info.user_agent.is_empty());
+        process.kill_and_reap();
+
+        let manager = CodexManager::default();
+        let first = manager
+            .ensure_started(&cli, repo_root)
+            .await
+            .expect("first");
+        let second = manager
+            .ensure_started(&cli, repo_root)
+            .await
+            .expect("reuse");
+        assert_eq!(first.user_agent, second.user_agent);
+        manager.shutdown();
+    }
 
     #[test]
     fn codex_status_wire_shape_is_camel_case() {

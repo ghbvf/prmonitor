@@ -5,13 +5,201 @@ use std::path::Path;
 use base64::{engine::general_purpose, Engine as _};
 use lettre::message::Mailbox;
 use serde::{Deserialize, Serialize};
+use strum::IntoEnumIterator;
 use url::Url;
 
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    EngineKind, EventType, LabelSource, MessagingProviderKind, NotificationKind,
+    CliTool, EngineKind, EventType, LabelSource, MessagingProviderKind, NotificationKind,
     ReviewLifecycleEvent, SourceKind, UpdateMode, WebhookTunnelMode,
 };
+
+/// A user-configured executable path. Empty means automatic discovery; every non-empty value is
+/// absolute at the serde boundary, so an invalid relative program cannot enter [`AppConfig`].
+/// Tool-specific basename validation is owned by [`CliToolsConfig::validate`].
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(type = "string"))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Default)]
+pub struct CliPath(String);
+
+impl CliPath {
+    pub fn is_auto(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for CliPath {
+    type Error = AppError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.is_empty() || Path::new(&value).is_absolute() {
+            Ok(Self(value))
+        } else {
+            Err(AppError::new(format!(
+                "CLI 路径必须为空或绝对路径: {value}"
+            )))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CliPath {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Global paths for every managed third-party CLI. A field left empty uses discovery.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CliToolsConfig {
+    pub gh_path: CliPath,
+    pub az_path: CliPath,
+    pub codex_path: CliPath,
+    pub claude_path: CliPath,
+    pub cloudflared_path: CliPath,
+}
+
+/// One row returned by the composition-level CLI probe command.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliToolProbeStatus {
+    pub tool: CliTool,
+    pub configured_path: String,
+    pub resolved_path: Option<String>,
+    pub source: Option<crate::model::CliResolutionSource>,
+    pub available: bool,
+    pub pending_restart: bool,
+    pub message: String,
+}
+
+impl CliToolsConfig {
+    pub(super) fn path(&self, tool: CliTool) -> &CliPath {
+        match tool {
+            CliTool::Gh => &self.gh_path,
+            CliTool::Az => &self.az_path,
+            CliTool::Codex => &self.codex_path,
+            CliTool::Claude => &self.claude_path,
+            CliTool::Cloudflared => &self.cloudflared_path,
+        }
+    }
+
+    pub(super) fn validate(&self) -> AppResult<()> {
+        for tool in CliTool::iter() {
+            self.validate_tool(tool)?;
+        }
+        Ok(())
+    }
+
+    /// Validate only the selected probe row. Persisting still calls [`Self::validate`] and checks
+    /// all five rows; a draft error in one row must not hide the probe result for its siblings.
+    pub(super) fn validate_tool(&self, tool: CliTool) -> AppResult<()> {
+        let path = self.path(tool);
+        if path.is_auto() {
+            return Ok(());
+        }
+
+        let executable = Path::new(path.as_str());
+        if !has_canonical_cli_basename(executable, tool) {
+            return Err(AppError::new(format!(
+                "{}Path 文件名必须为 {}: {}",
+                canonical_cli_name(tool),
+                canonical_cli_name(tool),
+                path.as_str()
+            )));
+        }
+        if !is_executable_file(executable) {
+            return Err(AppError::new(format!(
+                "{}Path 不是存在且可执行的文件: {}",
+                canonical_cli_name(tool),
+                path.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_for_test(&mut self, tool: CliTool, path: CliPath) {
+        match tool {
+            CliTool::Gh => self.gh_path = path,
+            CliTool::Az => self.az_path = path,
+            CliTool::Codex => self.codex_path = path,
+            CliTool::Claude => self.claude_path = path,
+            CliTool::Cloudflared => self.cloudflared_path = path,
+        }
+    }
+}
+
+pub(super) const fn canonical_cli_name(tool: CliTool) -> &'static str {
+    match tool {
+        CliTool::Gh => "gh",
+        CliTool::Az => "az",
+        CliTool::Codex => "codex",
+        CliTool::Claude => "claude",
+        CliTool::Cloudflared => "cloudflared",
+    }
+}
+
+fn has_canonical_cli_basename(path: &Path, tool: CliTool) -> bool {
+    let canonical = canonical_cli_name(tool);
+    #[cfg(not(windows))]
+    {
+        path.file_name().and_then(|name| name.to_str()) == Some(canonical)
+    }
+    #[cfg(windows)]
+    {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let candidate = Path::new(name);
+        candidate
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.eq_ignore_ascii_case(canonical))
+            && candidate
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(is_windows_cli_extension)
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn is_windows_cli_extension(extension: &str) -> bool {
+    matches!(
+        extension
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+            .as_str(),
+        "exe" | "com" | "cmd" | "bat"
+    )
+}
+
+pub(super) fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(windows)]
+    {
+        true
+    }
+}
 
 /// One monitored project (#35). What was previously the flat per-repo subset of
 /// [`AppConfig`] is now a list element: each project carries its own repo, paths,
@@ -474,8 +662,8 @@ pub struct AppConfig {
     /// GitHub webhook 的 HMAC secret（`X-Hub-Signature-256` 验签）。`webhook_enabled`
     /// 时必填——公网端点没有验签即可被任意 POST 伪造触发 review。
     pub webhook_secret: String,
-    /// `cloudflared` 可执行文件（PATH 名或绝对路径）。Quick Tunnel 子进程由此拉起。
-    pub cloudflared_bin: String,
+    /// Managed third-party executable paths. Empty fields use deterministic discovery.
+    pub cli_tools: CliToolsConfig,
     /// 隧道暴露模式（#9）。`quick`=Cloudflare Quick Tunnel（默认，现状）；
     /// `command`=自定义隧道命令（见 `webhook_tunnel_command`）；`listener`=只监听本地端口、
     /// 隧道完全外置。接收端只管 bind/验签/派发，隧道如何暴露公网由本字段分支。
@@ -529,7 +717,7 @@ impl Default for AppConfig {
             webhook_enabled: false,
             webhook_port: 8787,
             webhook_secret: String::new(),
-            cloudflared_bin: "cloudflared".to_string(),
+            cli_tools: CliToolsConfig::default(),
             webhook_tunnel_mode: WebhookTunnelMode::default(),
             webhook_tunnel_command: String::new(),
             webhook_public_url: String::new(),
@@ -1972,6 +2160,8 @@ fn validate_remote_access(config: &AppConfig) -> AppResult<()> {
 /// empty `projects` list (first launch, before onboarding adds one) is VALID —
 /// onboarding is the gate that fills it.
 pub fn validate(config: &AppConfig) -> AppResult<()> {
+    config.cli_tools.validate()?;
+
     // Webhook fields are only constrained when the receiver is enabled: a public
     // endpoint (reached via the cloudflared tunnel) MUST have a secret or any POST
     // could forge a review trigger; a zero port can't bind. Disabled → unconstrained
@@ -2136,6 +2326,62 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
 mod tests {
     use super::*;
 
+    struct ExecutableContractDir(std::path::PathBuf);
+
+    impl ExecutableContractDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "prmonitor-executable-contract-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock is after Unix epoch")
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&path).expect("create contract test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for ExecutableContractDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn executable_file_contract_rejects_missing_paths_and_directories() {
+        let root = ExecutableContractDir::new();
+        assert!(!is_executable_file(&root.0.join("missing")));
+        assert!(!is_executable_file(&root.0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_file_contract_requires_an_execute_permission_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = ExecutableContractDir::new();
+        let program = root.0.join("gh");
+        std::fs::write(&program, b"#!/bin/sh\n").expect("write contract fixture");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644))
+            .expect("make fixture non-executable");
+        assert!(!is_executable_file(&program));
+
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+            .expect("make fixture executable");
+        assert!(is_executable_file(&program));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executable_file_contract_accepts_regular_files_on_windows() {
+        let root = ExecutableContractDir::new();
+        let program = root.0.join("gh.exe");
+        std::fs::write(&program, b"fixture").expect("write contract fixture");
+        assert!(is_executable_file(&program));
+    }
+
     /// A [`Project`] whose filesystem-dependent fields point at this crate (so
     /// `validate_project` passes) — the per-project analogue of the old `valid_base`.
     fn valid_project() -> Project {
@@ -2199,7 +2445,7 @@ mod tests {
             webhook_enabled: false,
             webhook_port: 8787,
             webhook_secret: "shh".to_string(),
-            cloudflared_bin: "cloudflared".to_string(),
+            cli_tools: CliToolsConfig::default(),
             webhook_tunnel_mode: WebhookTunnelMode::default(),
             webhook_tunnel_command: String::new(),
             webhook_public_url: String::new(),
@@ -2241,7 +2487,13 @@ mod tests {
         assert!(v.get("webhookEnabled").is_some());
         assert!(v.get("webhookPort").is_some());
         assert!(v.get("webhookSecret").is_some());
-        assert!(v.get("cloudflaredBin").is_some());
+        assert!(v.get("cliTools").is_some());
+        assert_eq!(v["cliTools"]["ghPath"], "");
+        assert_eq!(v["cliTools"]["azPath"], "");
+        assert_eq!(v["cliTools"]["codexPath"], "");
+        assert_eq!(v["cliTools"]["claudePath"], "");
+        assert_eq!(v["cliTools"]["cloudflaredPath"], "");
+        assert!(v.get("cloudflaredBin").is_none());
         assert!(v.get("webhookTunnelMode").is_some());
         assert_eq!(v["webhookTunnelMode"], "quick");
         assert!(v.get("webhookTunnelCommand").is_some());
@@ -2262,6 +2514,7 @@ mod tests {
         assert!(v.get("webhook_enabled").is_none());
         assert!(v.get("webhook_port").is_none());
         assert!(v.get("webhook_secret").is_none());
+        assert!(v.get("cli_tools").is_none());
         assert!(v.get("cloudflared_bin").is_none());
         assert!(v.get("webhook_tunnel_mode").is_none());
         assert!(v.get("webhook_tunnel_command").is_none());

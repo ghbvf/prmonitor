@@ -6,12 +6,14 @@
 // the user-supplied repo/repoRoot.
 import type { SourceKind } from "../types";
 import type {
+  CliToolsConfig,
   NotificationChannel,
   OutboxConfig,
   Project,
   ReviewLifecycleNotificationConfig,
 } from "./types";
 import {
+  DEFAULT_CLI_TOOLS_CONFIG as GENERATED_DEFAULT_CLI_TOOLS_CONFIG,
   DEFAULT_MESSAGING_INTEGRATION as GENERATED_DEFAULT_MESSAGING_INTEGRATION,
   DEFAULT_MESSAGING_SETTINGS as GENERATED_DEFAULT_MESSAGING_SETTINGS,
   DEFAULT_NOTIFICATION_SETTINGS as GENERATED_DEFAULT_NOTIFICATION_SETTINGS,
@@ -22,6 +24,9 @@ import {
 // fixed id for symmetry. ProjectsManager mints a fresh uuid per added project, so
 // only the onboarding seed uses this.
 export const DEFAULT_PROJECT_ID = "default";
+
+export const DEFAULT_CLI_TOOLS_CONFIG: CliToolsConfig =
+  GENERATED_DEFAULT_CLI_TOOLS_CONFIG;
 
 // Global outbox worker policy default (AB#1182): mirrors the backend `OutboxConfig::default`
 // (`DEFAULT_NOTIFICATION_TTL_SECS` = 7200 = 2h). There's no settings-panel control for it yet, so

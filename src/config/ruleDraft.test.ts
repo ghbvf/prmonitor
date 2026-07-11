@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_CLI_TOOLS_CONFIG,
   DEFAULT_NOTIFICATION_SETTINGS,
   DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
   NEW_PROJECT_DEFAULTS,
@@ -23,7 +24,7 @@ function draft(projects: Project[], activeProjectId: string): AppConfig {
     webhookEnabled: false,
     webhookPort: 8787,
     webhookSecret: "",
-    cloudflaredBin: "cloudflared",
+    cliTools: { ...DEFAULT_CLI_TOOLS_CONFIG },
     webhookTunnelMode: "quick",
     webhookTunnelCommand: "",
     webhookPublicUrl: "",

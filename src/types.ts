@@ -3,6 +3,8 @@
 import type { EventType, SourceKind, UpdateMode } from "./types.generated";
 
 export {
+  CLI_RESOLUTION_SOURCES,
+  CLI_TOOLS,
   ENGINE_KINDS,
   EVENT_TYPES,
   LABEL_SOURCES,
@@ -11,6 +13,8 @@ export {
   UPDATE_MODES,
 } from "./types.generated";
 export type {
+  CliResolutionSource,
+  CliTool,
   EngineKind,
   EventType,
   LabelSource,

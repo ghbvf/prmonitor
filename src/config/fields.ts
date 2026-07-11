@@ -18,10 +18,14 @@ import {
   type UpdateMode,
 } from "../types";
 
-// A project field's key (per-project form/wizard) or a global AppConfig field's key
-// (the webhook group). Generic `FieldDef<K>` keeps each group set precisely typed.
+// A project field's key (per-project form/wizard) or a scalar global AppConfig field's
+// key (the webhook group). Structured objects such as `cliTools` cannot be placed in
+// GLOBAL_GROUPS by mistake; their dedicated managers own those shapes.
 export type ProjectFieldKey = keyof Project;
-export type GlobalFieldKey = keyof AppConfig;
+type ScalarFormValue = string | number | boolean | string[];
+export type GlobalFieldKey = {
+  [K in keyof AppConfig]: AppConfig[K] extends ScalarFormValue ? K : never;
+}[keyof AppConfig];
 export type FieldKey = ProjectFieldKey | GlobalFieldKey;
 type FieldKind = "text" | "number" | "csv" | "select" | "checkbox";
 
@@ -293,12 +297,6 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
         kind: "text",
         secret: true,
         hint: "GitHub：与仓库 webhook 的 Secret 一致（HMAC 验签）。Azure DevOps：在 Service Hook 的「HTTP headers」加一行——名 Authorization，值 Bearer <此密钥>",
-      },
-      {
-        key: "cloudflaredBin",
-        label: "cloudflared 路径",
-        kind: "text",
-        hint: "cloudflared 可执行文件（默认 PATH 中的 cloudflared；未安装可 brew install cloudflared）",
       },
       {
         key: "webhookTunnelMode",

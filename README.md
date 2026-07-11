@@ -36,6 +36,21 @@ pnpm build          # type-check + build the frontend
 
 Rust backend lives in `src-tauri/`; the Vue frontend in `src/`.
 
+## Third-party CLI discovery
+
+The app manages `gh`, `az`, `codex`, `claude`, and `cloudflared` from the Third-party CLI
+settings panel. An empty path uses automatic discovery in the current process `PATH`, the login
+shell `PATH`, then common platform install directories. A custom value must be an absolute path to
+an existing executable whose filename matches the selected tool. Every managed child receives the
+same enhanced `PATH`, so skills launched by Codex or Claude can find the configured `gh` and `az`
+even when a desktop launch did not inherit shell environment variables.
+
+Changing a path affects the next one-shot command immediately. A running Codex app-server,
+Webhook Quick Tunnel, or Remote Access Quick Tunnel is not interrupted; the settings panel marks
+the change as pending until that resident process is stopped/restarted, exits naturally, or the app
+restarts. The removed `cloudflaredBin` setting is intentionally not migrated—configure
+`cliTools.cloudflaredPath` or leave it empty for automatic discovery.
+
 ## Default branch
 
 The default branch is `develop`. Open PRs against `develop`.

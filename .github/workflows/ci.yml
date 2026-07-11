@@ -73,3 +73,33 @@ jobs:
         run: cargo build --manifest-path src-tauri/Cargo.toml --locked
       - name: cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked
+
+  rust-platform-cli-resolution:
+    name: Rust (${{ matrix.platform }} CLI resolution)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Windows
+            os: windows-latest
+          - platform: macOS
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # tauri-build requires the configured frontendDist even for the resolver unit tests.
+      - run: pnpm build
+      - name: cargo test (platform CLI resolver)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib config::cli

@@ -5,7 +5,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
 import type { AppConfig } from "./types";
-import { DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG } from "./defaults";
+import {
+  DEFAULT_CLI_TOOLS_CONFIG,
+  DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
+} from "./defaults";
 
 vi.mock("./api", () => ({
   getConfig: vi.fn(),
@@ -46,7 +49,7 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
   webhookEnabled: false,
   webhookPort: 8787,
   webhookSecret: "",
-  cloudflaredBin: "cloudflared",
+  cliTools: { ...DEFAULT_CLI_TOOLS_CONFIG },
   webhookTunnelMode: "quick",
   webhookTunnelCommand: "",
   webhookPublicUrl: "",
@@ -104,6 +107,22 @@ describe("useConfigStore save()", () => {
     expect(store.savedOk).toBe(true);
     expect(store.error).toBeNull();
     expect(store.saving).toBe(false);
+  });
+
+  it("round-trips all custom CLI paths without dropping the nested structure", async () => {
+    const cliTools = {
+      ...DEFAULT_CLI_TOOLS_CONFIG,
+      ghPath: "/opt/homebrew/bin/gh",
+      claudePath: "C:\\Tools\\claude.exe",
+    };
+    const next = cfg({ cliTools });
+    const store = useConfigStore();
+
+    await store.save(next);
+
+    expect(api.setConfig).toHaveBeenCalledWith(expect.objectContaining({ cliTools }));
+    expect(store.config?.cliTools).toEqual(cliTools);
+    expect("cloudflaredBin" in store.config!).toBe(false);
   });
 
   it("on a rejected invoke sets error and leaves savedOk false", async () => {

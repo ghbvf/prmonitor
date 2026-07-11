@@ -24,6 +24,7 @@ use super::engines::codex::protocol::{
 };
 use super::engines::codex::CodexManager;
 use super::history_store::HistoryItemKind;
+use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, StreamEvent};
 use crate::model::{EngineKind, ReviewLifecycleDispatch, ReviewLifecycleEvent};
@@ -141,6 +142,7 @@ pub struct CompletionOutcome {
 /// crate-internal — never crosses the Tauri command boundary nor the DB.
 #[derive(Debug, Clone)]
 pub(crate) struct CommentUrlContext {
+    pub gh: Option<crate::config::service::ResolvedCli>,
     pub source_kind: crate::model::SourceKind,
     pub repo: String,
     pub azure_org: String,
@@ -594,7 +596,7 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     codex: &CodexManager,
     registry: &SessionRegistry,
-    codex_bin: &str,
+    codex_cli: &ResolvedCli,
     repo: &str,
     repo_root: &str,
     skill_abs_path: &str,
@@ -631,7 +633,7 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
         armed: true,
     };
 
-    let client = codex.connection(codex_bin, repo_root).await?;
+    let client = codex.connection(codex_cli, repo_root).await?;
 
     // Subscribe before starting the turn: the broadcast buffers from here, so the
     // pump (spawned after `turn/start` returns) sees every delta from turn start.
@@ -780,7 +782,7 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     codex: &CodexManager,
     registry: &SessionRegistry,
-    codex_bin: &str,
+    codex_cli: &ResolvedCli,
     repo_root: &str,
     codex_model: &str,
     project_id: &str,
@@ -821,7 +823,7 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
     // The command already called `state.codex.resume()`; `connection` spawns/reuses the
     // resident app-server. A connection failure leaves the session `Running` — flip it back
     // to `Failed` so it isn't stuck, then surface the error.
-    let client = match codex.connection(codex_bin, repo_root).await {
+    let client = match codex.connection(codex_cli, repo_root).await {
         Ok(client) => client,
         Err(e) => {
             registry.set_status(thread_id, SessionStatus::Failed);
@@ -950,7 +952,7 @@ pub(super) fn persist_user_message<R: tauri::Runtime>(
 /// Interrupt a running review session. The terminal `turn/completed` (status
 /// `interrupted`) arrives on the stream and the pump finishes the session.
 ///
-/// `codex_bin`/`repo_root` are no longer used to build the connection: interrupting
+/// A CLI credential/repo root is no longer used to build the connection: interrupting
 /// only makes sense against an already-live process, so we use
 /// [`CodexManager::existing_client`] (no spawn, no `stopped`-clear) rather than
 /// `connection` — interrupting a dead/stopped session must NOT revive the
@@ -965,13 +967,8 @@ pub(super) fn persist_user_message<R: tauri::Runtime>(
 pub async fn stop_review(
     codex: &CodexManager,
     registry: &SessionRegistry,
-    codex_bin: &str,
-    repo_root: &str,
     session_id: &str,
 ) -> AppResult<()> {
-    // `codex_bin`/`repo_root` are unused since the `existing_client` switch (F2); bind
-    // them to `_` so the intent is explicit (the signature keeps them for the engine).
-    let _ = (codex_bin, repo_root);
     // Atomic guard: only a `Running` session flips to `Interrupting` (and yields its
     // turn id); a repeat stop is an idempotent no-op, an unknown id an error.
     let turn_id = match registry.begin_interrupt(session_id) {
@@ -1276,6 +1273,7 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
     let comment_url = match registry.take_url_context(thread_id) {
         Some(ctx) if should_resolve_url(wire_status) => {
             super::comment_url::resolve_comment_url(
+                ctx.gh.as_ref(),
                 ctx.source_kind,
                 &ctx.repo,
                 &ctx.azure_org,
@@ -1506,6 +1504,7 @@ mod tests {
     /// own distinguishable context instead.
     fn test_url_ctx() -> CommentUrlContext {
         CommentUrlContext {
+            gh: None,
             source_kind: crate::model::SourceKind::Github,
             repo: "owner/name".to_string(),
             azure_org: String::new(),
@@ -1960,6 +1959,7 @@ mod tests {
         let reg = SessionRegistry::default();
         assert!(reg.try_reserve_pair("p1", 7, "review"));
         let ctx = CommentUrlContext {
+            gh: None,
             source_kind: crate::model::SourceKind::Azure,
             repo: "the-repo".to_string(),
             azure_org: "the-org".to_string(),
@@ -2112,6 +2112,7 @@ mod tests {
         let reg = SessionRegistry::default();
         assert!(reg.get("th-1").is_none(), "registry empty pre-rehydrate");
         let ctx = CommentUrlContext {
+            gh: None,
             source_kind: crate::model::SourceKind::Azure,
             repo: "the-repo".to_string(),
             azure_org: "the-org".to_string(),

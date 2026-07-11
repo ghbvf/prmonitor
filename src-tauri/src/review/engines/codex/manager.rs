@@ -13,6 +13,7 @@ use tokio::process::ChildStdin;
 use super::process::{CodexProcess, CodexStatus};
 use super::protocol::InitializeResult;
 use super::rpc::RpcClient;
+use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 
 /// Whole-handshake budget for the first `ensure_started` (spawn + initialize),
@@ -55,9 +56,9 @@ impl CodexManager {
     /// can only reach `pub` items (`#[ignore]` skips at run time, not compile time).
     /// Narrowing it would break that test's compile (PR #47 F8 — visibility tightening
     /// blocked by the live external-crate use).
-    pub async fn ensure_started(
+    pub(super) async fn ensure_started(
         &self,
-        codex_bin: &str,
+        codex: &ResolvedCli,
         repo_root: &str,
     ) -> AppResult<InitializeResult> {
         // Fast path: an already-live resident connection (sync std-Mutex read).
@@ -78,10 +79,9 @@ impl CodexManager {
 
         // Spawn OUTSIDE the std Mutex (it can't be held across the await) but
         // UNDER `start_lock`, so no other task spawns concurrently.
-        let proc =
-            tokio::time::timeout(HANDSHAKE_TIMEOUT, CodexProcess::spawn(codex_bin, repo_root))
-                .await
-                .map_err(|_| AppError::new("codex app-server 握手超时".to_string()))??;
+        let proc = tokio::time::timeout(HANDSHAKE_TIMEOUT, CodexProcess::spawn(codex, repo_root))
+            .await
+            .map_err(|_| AppError::new("codex app-server 握手超时".to_string()))??;
         let info = proc.info.clone();
 
         // Install the new connection, re-checking the user-stop flag in the SAME std
@@ -122,7 +122,7 @@ impl CodexManager {
     /// process later dies — its requests then fail fast and the next call respawns.
     pub async fn connection(
         &self,
-        codex_bin: &str,
+        codex: &ResolvedCli,
         repo_root: &str,
     ) -> AppResult<Arc<RpcClient<ChildStdin>>> {
         // Authoritative stop funnel (PR #47 F1, race-free close). This is the single
@@ -139,7 +139,7 @@ impl CodexManager {
         if self.stopped.load(Ordering::SeqCst) {
             return Err(AppError::new("codex app-server 已停止".to_string()));
         }
-        self.ensure_started(codex_bin, repo_root).await?;
+        self.ensure_started(codex, repo_root).await?;
         let guard = self.inner.lock().unwrap();
         let proc = guard
             .as_ref()
@@ -180,29 +180,58 @@ impl CodexManager {
         proc.is_connected().then(|| proc.info.clone())
     }
 
+    /// Return an authoritative resident lifecycle snapshot without resolving or spawning a CLI.
+    /// `None` means the manager is neither user-stopped nor currently live, so a caller may proceed
+    /// with cold-start configuration resolution. This keeps stale configuration from masking the
+    /// stopped/live axes while preserving lazy startup for a genuinely cold manager.
+    pub(crate) fn resident_status(&self) -> Option<CodexStatus> {
+        if self.stopped.load(Ordering::SeqCst) {
+            return Some(CodexStatus {
+                available: false,
+                desired_running: false,
+                message: "codex app-server 已停止".to_string(),
+            });
+        }
+        self.live_info().map(|info| CodexStatus {
+            available: true,
+            desired_running: true,
+            message: if info.user_agent.is_empty() {
+                "codex app-server 已就绪".to_string()
+            } else {
+                info.user_agent
+            },
+        })
+    }
+
+    /// Fingerprint of the currently live resident. A new configured path does not kill it; probe
+    /// compares this snapshot with the newly resolved credential to report `pendingRestart`.
+    pub fn active_fingerprint(&self) -> Option<String> {
+        let guard = self.inner.lock().unwrap();
+        let process = guard.as_ref()?;
+        process
+            .is_connected()
+            .then(|| process.fingerprint().to_string())
+    }
+
     /// Probe codex availability for the StatusBar: ensure the resident connection
     /// and report `available` + version (`userAgent`). Honors the user-stop flag —
     /// when `stop` was called this short-circuits to a stopped status WITHOUT
     /// calling `ensure_started`, so a passive probe never revives a stopped server.
     /// Never errors — every failure maps to `available: false` with a Chinese
     /// message (mirrors the pr slice's `gh_auth_status`).
-    pub async fn status(&self, codex_bin: &str, repo_root: &str) -> CodexStatus {
-        if self.stopped.load(Ordering::SeqCst) {
-            return CodexStatus {
-                available: false,
-                desired_running: false,
-                message: "codex app-server 已停止".to_string(),
-            };
+    pub async fn status(&self, codex: &ResolvedCli, repo_root: &str) -> CodexStatus {
+        if let Some(status) = self.resident_status() {
+            return status;
         }
-        self.status_inner(codex_bin, repo_root).await
+        self.status_inner(codex, repo_root).await
     }
 
     /// The probe body shared by `status` (passive) and `start` (explicit): ensure
     /// the resident connection and map the outcome to a `desired_running: true`
     /// status (success or spawn failure are both an intent-to-run state — only an
     /// explicit `stop` clears the intent). Calls `ensure_started`, so it CAN spawn.
-    async fn status_inner(&self, codex_bin: &str, repo_root: &str) -> CodexStatus {
-        match self.ensure_started(codex_bin, repo_root).await {
+    async fn status_inner(&self, codex: &ResolvedCli, repo_root: &str) -> CodexStatus {
+        match self.ensure_started(codex, repo_root).await {
             Ok(info) => {
                 let message = if info.user_agent.is_empty() {
                     "codex app-server 已就绪".to_string()
@@ -225,9 +254,9 @@ impl CodexManager {
 
     /// Explicitly (re)start the resident server: clear the user-stop flag and
     /// ensure the connection. Returns the latest status (`desired_running: true`).
-    pub async fn start(&self, codex_bin: &str, repo_root: &str) -> CodexStatus {
+    pub async fn start(&self, codex: &ResolvedCli, repo_root: &str) -> CodexStatus {
         self.resume();
-        self.status_inner(codex_bin, repo_root).await
+        self.status_inner(codex, repo_root).await
     }
 
     /// Explicitly stop the resident server: set the user-stop flag (so passive
@@ -257,7 +286,75 @@ impl CodexManager {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
     use super::*;
+
+    fn missing_codex() -> ResolvedCli {
+        ResolvedCli::for_test(std::env::temp_dir().join("prmonitor-no-such-codex-bin"))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn status_starts_custom_codex_resolved_from_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::{
+            config::service::{resolve_cli_from, CliResolver, CliToolsConfig},
+            model::CliTool,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "prmonitor-codex-status-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("codex");
+        fs::write(
+            &path,
+            br#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{"id":1,"result":{"userAgent":"fake-codex"}}'
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let tools: CliToolsConfig = serde_json::from_value(serde_json::json!({
+            "ghPath": "",
+            "azPath": "",
+            "codexPath": path,
+            "claudePath": "",
+            "cloudflaredPath": ""
+        }))
+        .unwrap();
+        let codex =
+            resolve_cli_from(&CliResolver::default(), &tools, CliTool::Codex, false).unwrap();
+        let manager = CodexManager::default();
+
+        let status = manager.status(&codex, root.to_str().unwrap()).await;
+        assert!(status.available, "{}", status.message);
+        assert_eq!(status.message, "fake-codex");
+        let resident = manager.resident_status().expect("live resident snapshot");
+        assert!(resident.available);
+        assert!(resident.desired_running);
+        assert_eq!(resident.message, "fake-codex");
+        assert_eq!(
+            manager.active_fingerprint().as_deref(),
+            Some(codex.fingerprint())
+        );
+
+        manager.shutdown();
+        let _ = fs::remove_dir_all(root);
+    }
 
     // CI-safe: the user-stop short-circuit returns before any spawn, and the
     // not-stopped paths use a bin name that doesn't exist so `spawn` errors
@@ -267,7 +364,11 @@ mod tests {
     async fn status_reports_stopped_without_spawning() {
         let m = CodexManager::default();
         m.stop();
-        let s = m.status("prmonitor-no-such-codex-bin", "").await;
+        let resident = m.resident_status().expect("stopped resident snapshot");
+        assert!(!resident.available);
+        assert!(!resident.desired_running);
+        assert_eq!(resident.message, "codex app-server 已停止");
+        let s = m.status(&missing_codex(), "").await;
         assert!(!s.available);
         assert!(!s.desired_running);
         assert_eq!(s.message, "codex app-server 已停止");
@@ -276,7 +377,7 @@ mod tests {
     #[tokio::test]
     async fn status_attempts_start_when_not_stopped() {
         let m = CodexManager::default();
-        let s = m.status("prmonitor-no-such-codex-bin", "").await;
+        let s = m.status(&missing_codex(), "").await;
         assert!(!s.available);
         assert!(s.desired_running);
     }
@@ -285,7 +386,7 @@ mod tests {
     async fn start_clears_stopped_then_attempts() {
         let m = CodexManager::default();
         m.stop();
-        let s = m.start("prmonitor-no-such-codex-bin", "").await;
+        let s = m.start(&missing_codex(), "").await;
         assert!(s.desired_running);
         assert!(!s.available);
     }
@@ -300,7 +401,7 @@ mod tests {
         let m = CodexManager::default();
         m.stop();
         assert!(m.is_stopped());
-        let r = m.connection("prmonitor-no-such-codex-bin", "").await;
+        let r = m.connection(&missing_codex(), "").await;
         assert!(r.is_err(), "stopped → connection refuses");
         assert!(
             m.is_stopped(),
@@ -344,5 +445,63 @@ mod tests {
         m.stop();
         assert!(m.existing_client().is_none());
         assert!(m.is_stopped());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn changed_fingerprint_reuses_live_process_until_stop() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn fake_codex(path: &Path, user_agent: &str) {
+            let script = format!(
+                "#!/bin/sh\nwhile IFS= read -r line; do\ncase \"$line\" in\n*\\\"method\\\":\\\"initialize\\\"*) printf '%s\\n' '{{\"id\":1,\"result\":{{\"userAgent\":\"{user_agent}\",\"codexHome\":\"/tmp\",\"platformFamily\":\"unix\",\"platformOs\":\"test\"}}}}' ;;\nesac\ndone\n"
+            );
+            fs::write(path, script).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "prmonitor-codex-manager-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first_dir = root.join("first");
+        let second_dir = root.join("second");
+        fs::create_dir_all(&first_dir).unwrap();
+        fs::create_dir_all(&second_dir).unwrap();
+        let first_path = first_dir.join("codex");
+        let second_path = second_dir.join("codex");
+        fake_codex(&first_path, "first");
+        fake_codex(&second_path, "second");
+        let first = ResolvedCli::for_test(first_path);
+        let second = ResolvedCli::for_test(second_path);
+        let manager = CodexManager::default();
+
+        assert_eq!(
+            manager.ensure_started(&first, "").await.unwrap().user_agent,
+            "first"
+        );
+        assert_eq!(
+            manager.active_fingerprint().as_deref(),
+            Some(first.fingerprint())
+        );
+        assert_eq!(
+            manager
+                .ensure_started(&second, "")
+                .await
+                .unwrap()
+                .user_agent,
+            "first",
+            "a config change must not kill or replace the live resident"
+        );
+        assert_eq!(
+            manager.active_fingerprint().as_deref(),
+            Some(first.fingerprint())
+        );
+        manager.shutdown();
+        let _ = fs::remove_dir_all(root);
     }
 }

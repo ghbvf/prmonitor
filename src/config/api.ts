@@ -2,6 +2,8 @@
 import { getTransport } from "../transport";
 import type {
   AppConfig,
+  CliToolProbeStatus,
+  CliToolsConfig,
   NotificationChannel,
   RemoteAccessRuntimeStatus,
 } from "./types";
@@ -16,6 +18,16 @@ export function getConfig(): Promise<AppConfig> {
 
 export function setConfig(config: AppConfig): Promise<void> {
   return getTransport().request<void>("set_config", { config });
+}
+
+export function probeCliTools(
+  cliTools: CliToolsConfig,
+  refreshPath: boolean,
+): Promise<CliToolProbeStatus[]> {
+  return getTransport().request<CliToolProbeStatus[]>("probe_cli_tools", {
+    cliTools,
+    refreshPath,
+  });
 }
 
 // Persist the active-project selection (#35). Centralizes the `set_active_project`

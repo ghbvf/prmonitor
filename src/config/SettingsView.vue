@@ -11,6 +11,7 @@ import { useConfigStore } from "./useConfigStore";
 import type { AppConfig } from "./types";
 import { cloneReviewLifecycleNotifications, cloneRuleAction } from "./configClone";
 import {
+  DEFAULT_CLI_TOOLS_CONFIG,
   DEFAULT_MESSAGING_SETTINGS,
   DEFAULT_NOTIFICATION_SETTINGS,
   DEFAULT_OUTBOX_CONFIG,
@@ -18,12 +19,14 @@ import {
 } from "./defaults";
 import { GLOBAL_GROUPS, type FieldDef, type GlobalFieldKey } from "./fields";
 import ConfigField from "./ConfigField.vue";
+import CliToolsManager from "./CliToolsManager.vue";
 import MessagingIntegrationsManager from "./MessagingIntegrationsManager.vue";
 import NotificationChannelsManager from "./NotificationChannelsManager.vue";
 import ProjectsManager from "./ProjectsManager.vue";
 import ReviewLifecycleNotificationsManager from "./ReviewLifecycleNotificationsManager.vue";
 import RemoteAccessManager from "./RemoteAccessManager.vue";
 import RulesManager from "./RulesManager.vue";
+import { cliToolsPathErrors, cloneCliTools, isCliToolsSaveError } from "./cliTools";
 // The webhook control panel lives in the `pr` slice; mounting it here would be a
 // config→pr edge. Instead we expose a `webhook` scoped slot (saved config + live
 // draft + saving flag) and let the composition root (App.vue) fill it — keeping
@@ -46,6 +49,7 @@ const PROJECTS_NAV_ID = "projects";
 // (RemoteAccessManager) instead of the scalar GLOBAL_GROUPS ConfigField path.
 const REMOTE_ACCESS_NAV_ID = "remoteAccess";
 const RULES_NAV_ID = "rules";
+const CLI_TOOLS_NAV_ID = "cliTools";
 
 const NOTIFICATIONS_NAV_ID = "notifications";
 const MESSAGING_NAV_ID = "messaging";
@@ -54,6 +58,7 @@ const MESSAGING_NAV_ID = "messaging";
 // (AB#1225 PR1). Forwarded through RemoteAccessManager → RemoteAccessRuntimeStatus via
 // the `refreshKey` prop chain.
 const remoteAccessRefreshKey = ref(0);
+const cliToolsRefreshKey = ref(0);
 
 // Editable draft (decoupled from the store). The full multi-project AppConfig:
 // `projects`/`activeProjectId` are edited by ProjectsManager; the webhook fields by
@@ -64,7 +69,7 @@ const draft = reactive<AppConfig>({
   webhookEnabled: false,
   webhookPort: 8787,
   webhookSecret: "",
-  cloudflaredBin: "cloudflared",
+  cliTools: cloneCliTools(DEFAULT_CLI_TOOLS_CONFIG),
   webhookTunnelMode: "quick",
   webhookTunnelCommand: "",
   webhookPublicUrl: "",
@@ -89,7 +94,7 @@ function hydrate(cfg: AppConfig) {
   draft.webhookEnabled = cfg.webhookEnabled;
   draft.webhookPort = cfg.webhookPort;
   draft.webhookSecret = cfg.webhookSecret;
-  draft.cloudflaredBin = cfg.cloudflaredBin;
+  draft.cliTools = cloneCliTools(cfg.cliTools);
   draft.webhookTunnelMode = cfg.webhookTunnelMode;
   draft.webhookTunnelCommand = cfg.webhookTunnelCommand;
   draft.webhookPublicUrl = cfg.webhookPublicUrl;
@@ -175,11 +180,18 @@ function onEdit() {
 }
 
 async function onSave() {
+  if (Object.keys(cliToolsPathErrors(draft.cliTools)).length > 0) {
+    store.savedOk = false;
+    store.error = "CLI 路径必须使用绝对路径；留空则自动探测。";
+    activeGroupId.value = CLI_TOOLS_NAV_ID;
+    return;
+  }
   // Projects already hold normalized authors arrays (each ProjectCard emits string[]),
   // so the whole draft persists as-is. Spread to a plain object so the store keeps a
   // detached snapshot (not the live reactive draft).
   await store.save({
     ...draft,
+    cliTools: cloneCliTools(draft.cliTools),
     projects: draft.projects.map((p) => ({ ...p, authors: [...p.authors] })),
     // Detach the remote-access resources too (AB#1064): clone each object and the
     // listener's allowedOrigins array so the store snapshot isn't the live reactive draft.
@@ -222,13 +234,16 @@ async function onSave() {
   if (store.savedOk) {
     emit("saved");
     remoteAccessRefreshKey.value += 1;
+    cliToolsRefreshKey.value += 1;
   }
   else if (store.error?.startsWith("rules[")) {
     activeGroupId.value = RULES_NAV_ID;
   }
   // On a failed save, route to the page that owns the offending field.
   else if (store.error) {
-    if (
+    if (isCliToolsSaveError(store.error)) {
+      activeGroupId.value = CLI_TOOLS_NAV_ID;
+    } else if (
       store.error.startsWith("notificationChannelId") ||
       store.error.startsWith("notificationTimeoutSecs") ||
       store.error.startsWith("notificationWebhookUrl") ||
@@ -296,6 +311,14 @@ async function onSave() {
         <button
           type="button"
           class="nav-item"
+          :class="{ active: activeGroupId === CLI_TOOLS_NAV_ID }"
+          @click="activeGroupId = CLI_TOOLS_NAV_ID"
+        >
+          第三方 CLI
+        </button>
+        <button
+          type="button"
+          class="nav-item"
           :class="{ active: activeGroupId === PROJECTS_NAV_ID }"
           @click="activeGroupId = PROJECTS_NAV_ID"
         >
@@ -359,6 +382,14 @@ async function onSave() {
 
         <div v-if="activeGroupId === RULES_NAV_ID" class="group rules-group">
           <RulesManager :draft="draft" @edit="onEdit" />
+        </div>
+
+        <div v-if="activeGroupId === CLI_TOOLS_NAV_ID" class="group cli-tools-group">
+          <CliToolsManager
+            :draft="draft"
+            :refresh-key="cliToolsRefreshKey"
+            @edit="onEdit"
+          />
         </div>
 
         <div
@@ -484,6 +515,9 @@ async function onSave() {
 }
 .rules-group {
   max-width: 960px;
+}
+.cli-tools-group {
+  max-width: 720px;
 }
 .actions {
   display: flex;

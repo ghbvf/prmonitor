@@ -50,6 +50,21 @@ const sources = import.meta.glob("./{config,pr,review,inbox,outbox,terminal,mess
 // The single legal importer:
 const TAURI_TRANSPORT_MODULE = "./transport/tauri.ts";
 
+// Root modules are either composition modules (allowed to wire slices together) or
+// shared modules (imported by slices as contracts/helpers). A shared root module must
+// not hide a runtime dependency back into a slice: that would let a slice import the
+// root carrier and transitively depend on a sibling, bypassing the direct-edge guard.
+// Keep the small composition set explicit; every other production file directly under
+// `src/` is governed by the shared-root rule below.
+const ROOT_COMPOSITION_MODULES = new Set([
+  "./App.vue",
+  "./RemoteTerminalApp.vue",
+  "./RemoteWebConsoleApp.vue",
+  "./StatusBar.vue",
+  "./main.ts",
+  "./projects.ts",
+]);
+
 // Eager-load EVERY src file as raw text (not just slices) so the tauri-import funnel is
 // CLOSED on the upstream side — a stray `@tauri-apps/*` import (static OR dynamic, see
 // extractImports) ANYWHERE under src/ is caught, not only inside a slice. `*.test.ts`
@@ -129,12 +144,41 @@ function crossSliceTarget(fromSlice: Slice, spec: string): Slice | null {
   return null; // resolves to src/ root (shared) or same slice — allowed
 }
 
+// Resolve a relative import from a root module to a slice. Unlike
+// `crossSliceTarget`, root files reach a slice with `./<slice>/...`.
+function rootSliceTarget(spec: string): Slice | null {
+  const match = spec.match(/^\.\/([^/]+)(?:\/|$)/);
+  if (!match) return null;
+  return SLICES.find((slice) => slice === match[1]) ?? null;
+}
+
+function isSharedRootModule(key: string): boolean {
+  if (!/^\.\/[^/]+\.(?:ts|vue)$/.test(key)) return false;
+  if (key.endsWith(".test.ts") || key.endsWith(".d.ts")) return false;
+  return !ROOT_COMPOSITION_MODULES.has(key);
+}
+
 describe("vertical slice boundary (config / pr / review / inbox / outbox / terminal)", () => {
   it("loaded slice sources for all declared slices", () => {
     // Guard against the glob silently matching nothing (which would make the next
     // assertion vacuously pass and let a real violation through).
     const seen = new Set(Object.keys(sources).map(ownerSlice));
     expect([...seen].sort()).toEqual([...SLICES].sort());
+  });
+
+  it("no shared root module imports or re-exports runtime values from a slice", () => {
+    const violations: string[] = [];
+
+    for (const [key, source] of Object.entries(allSources)) {
+      if (!isSharedRootModule(key)) continue;
+      for (const ref of extractImports(source)) {
+        const target = rootSliceTarget(ref.spec);
+        if (target === null || ref.typeOnly) continue;
+        violations.push(`${key} imports value from slice '${target}': ${ref.spec}`);
+      }
+    }
+
+    expect(violations).toEqual([]);
   });
 
   it("no slice has a runtime (value) import into a sibling slice", () => {
@@ -177,6 +221,23 @@ describe("vertical slice boundary (config / pr / review / inbox / outbox / termi
     // Root-module / same-slice specifiers resolve to no sibling slice.
     expect(crossSliceTarget("pr", "../types")).toBeNull();
     expect(crossSliceTarget("pr", "./api")).toBeNull();
+  });
+
+  it("shared-root detector flags runtime slice edges but allows type-only edges", () => {
+    const refs = extractImports(
+      `export { DEFAULT_CONFIG } from "./config/types.generated";\n` +
+        `import type { AppConfig } from "./config/types";`,
+    );
+
+    const runtimeRef = refs.find((ref) => !ref.typeOnly);
+    const typeRef = refs.find((ref) => ref.typeOnly);
+
+    expect(runtimeRef).toBeDefined();
+    expect(rootSliceTarget(runtimeRef!.spec)).toBe("config");
+    expect(typeRef).toBeDefined();
+    expect(rootSliceTarget(typeRef!.spec)).toBe("config");
+    expect(isSharedRootModule("./types.ts")).toBe(true);
+    expect(isSharedRootModule("./App.vue")).toBe(false);
   });
 });
 

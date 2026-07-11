@@ -13,7 +13,10 @@ import {
   messagingCallbackEndpoints,
   normalizeStringList,
 } from "./remoteAccessOps";
-import { DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG } from "./defaults";
+import {
+  DEFAULT_CLI_TOOLS_CONFIG,
+  DEFAULT_REVIEW_LIFECYCLE_NOTIFICATION_CONFIG,
+} from "./defaults";
 import type { AppConfig, RemoteAccessRuntimeStatus } from "./types";
 
 function draft(): AppConfig {
@@ -23,7 +26,7 @@ function draft(): AppConfig {
     webhookEnabled: false,
     webhookPort: 8787,
     webhookSecret: "",
-    cloudflaredBin: "cloudflared",
+    cliTools: { ...DEFAULT_CLI_TOOLS_CONFIG },
     webhookTunnelMode: "quick",
     webhookTunnelCommand: "",
     webhookPublicUrl: "",

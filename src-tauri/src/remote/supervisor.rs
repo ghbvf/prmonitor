@@ -23,6 +23,7 @@ use crate::config::model::{
     normalize_route_path, route_paths_conflict, terminal_auth_token_is_strong, RemoteAccessConfig,
     RemoteCapability, RemoteEntrypoint, RemoteTunnel, RemoteTunnelMode, SourcePolicyMode,
 };
+use crate::config::service::ResolvedCli;
 use crate::db::Database;
 use crate::messaging::local_api::build_router as build_messaging_local_api_router;
 use crate::review::local_api::build_router as build_review_local_api_router;
@@ -86,6 +87,10 @@ pub struct BoundTunnel {
     public_url: Arc<StdMutex<Option<String>>>,
     state: Arc<StdMutex<TunnelLifecycleState>>,
     logs: Arc<StdMutex<VecDeque<String>>>,
+    /// Present only for a successfully spawned Quick tunnel. Keeping the launch
+    /// credential on the runtime (instead of the supervisor) lets old and new CLI
+    /// paths coexist until each individual child exits or is restarted.
+    cloudflared_fingerprint: Option<String>,
 }
 
 struct TunnelLifecycleState {
@@ -111,7 +116,7 @@ impl ListenerSupervisor {
         &self,
         app: &tauri::AppHandle<R>,
         remote_access: &RemoteAccessConfig,
-        cloudflared_bin: &str,
+        cloudflared: crate::error::AppResult<Option<ResolvedCli>>,
     ) {
         let _serialize = self
             .reconcile_guard
@@ -181,7 +186,16 @@ impl ListenerSupervisor {
             }
         }
 
-        self.reconcile_tunnels(app, remote_access, cloudflared_bin);
+        let (cloudflared, resolution_error) = match cloudflared {
+            Ok(cloudflared) => (cloudflared, None),
+            Err(error) => (None, Some(error.message)),
+        };
+        self.reconcile_tunnels(
+            app,
+            remote_access,
+            cloudflared.as_ref(),
+            resolution_error.as_deref(),
+        );
     }
 
     pub fn status_snapshot(
@@ -353,11 +367,32 @@ impl ListenerSupervisor {
         }
     }
 
+    /// Fingerprints of the Quick tunnel processes that are alive right now.
+    ///
+    /// A set is required because a config save does not interrupt resident tunnels:
+    /// a tunnel started after the save may use the new executable while another keeps
+    /// running with the old one. Finished tasks are excluded immediately, even before
+    /// the next reconcile removes their runtime entry.
+    pub fn active_cloudflared_fingerprints(&self) -> Vec<String> {
+        let mut fingerprints = self
+            .tunnels
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .filter(|runtime| runtime.is_active_quick())
+            .filter_map(|runtime| runtime.cloudflared_fingerprint.clone())
+            .collect::<Vec<_>>();
+        fingerprints.sort();
+        fingerprints.dedup();
+        fingerprints
+    }
+
     fn reconcile_tunnels<R: tauri::Runtime>(
         &self,
         app: &tauri::AppHandle<R>,
         remote_access: &RemoteAccessConfig,
-        cloudflared_bin: &str,
+        cloudflared: Option<&ResolvedCli>,
+        cloudflared_resolution_error: Option<&str>,
     ) {
         let live_ports: HashMap<String, (String, u16)> = self
             .entrypoints
@@ -403,7 +438,7 @@ impl ListenerSupervisor {
             let mut current = self.tunnels.lock().unwrap_or_else(|p| p.into_inner());
             let remove = current
                 .iter()
-                .filter(|(id, rt)| desired.get(*id) != Some(&rt.desired))
+                .filter(|(id, rt)| desired.get(*id) != Some(&rt.desired) || rt.needs_restart())
                 .map(|(id, _)| id.clone())
                 .collect::<Vec<_>>();
             for id in &remove {
@@ -411,16 +446,19 @@ impl ListenerSupervisor {
                     rt.teardown();
                 }
             }
-            desired
+            let add = desired
                 .iter()
                 .filter(|(id, d)| current.get(*id).map(|rt| &rt.desired) != Some(*d))
                 .map(|(id, desired)| (id.clone(), desired.clone()))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            add
         };
 
         let mut started = Vec::new();
         for (id, desired) in add {
-            started.push((id, BoundTunnel::start(app, cloudflared_bin, desired)));
+            let runtime =
+                BoundTunnel::start(app, cloudflared, cloudflared_resolution_error, desired);
+            started.push((id, runtime));
         }
         if !started.is_empty() {
             let mut current = self.tunnels.lock().unwrap_or_else(|p| p.into_inner());
@@ -1019,7 +1057,8 @@ fn bind_std_with_retry(bind_host: &str, port: u16) -> Option<std::net::TcpListen
 impl BoundTunnel {
     fn start<R: tauri::Runtime>(
         app: &tauri::AppHandle<R>,
-        cloudflared_bin: &str,
+        cloudflared: Option<&ResolvedCli>,
+        cloudflared_resolution_error: Option<&str>,
         desired: TunnelDesired,
     ) -> Self {
         let logs = Arc::new(StdMutex::new(VecDeque::new()));
@@ -1037,6 +1076,7 @@ impl BoundTunnel {
                     shutdown: None,
                     drain_task: None,
                     logs,
+                    cloudflared_fingerprint: None,
                 }
             }
             RemoteTunnelMode::Lan => {
@@ -1075,6 +1115,7 @@ impl BoundTunnel {
                     shutdown: Some(bound.shutdown),
                     drain_task: None,
                     logs,
+                    cloudflared_fingerprint: None,
                 }
             }
             RemoteTunnelMode::Command => {
@@ -1105,11 +1146,19 @@ impl BoundTunnel {
                     shutdown: None,
                     drain_task: Some(drain_task),
                     logs,
+                    cloudflared_fingerprint: None,
                 }
             }
             RemoteTunnelMode::Quick => {
+                let Some(cloudflared) = cloudflared else {
+                    let message = cloudflared_resolution_error
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "未找到 cloudflared，请配置可执行文件".to_string());
+                    push_log(&logs, &message);
+                    return failed_tunnel(desired, logs, message);
+                };
                 let (child, drain_task, public_url) = match tauri::async_runtime::block_on(
-                    spawn_quick_tunnel(cloudflared_bin, desired.target_port, logs.clone()),
+                    spawn_quick_tunnel(cloudflared, desired.target_port, logs.clone()),
                 ) {
                     Ok(result) => result,
                     Err(e) => {
@@ -1134,6 +1183,7 @@ impl BoundTunnel {
                     shutdown: None,
                     drain_task: Some(drain_task),
                     logs,
+                    cloudflared_fingerprint: Some(cloudflared.fingerprint().to_string()),
                 }
             }
         }
@@ -1153,6 +1203,28 @@ impl BoundTunnel {
             task.abort();
         }
         let _ = self.process_task.take();
+    }
+
+    fn needs_restart(&self) -> bool {
+        match self.desired.mode {
+            RemoteTunnelMode::Quick | RemoteTunnelMode::Command => self
+                .process_task
+                .as_ref()
+                .is_none_or(|task| task.inner().is_finished()),
+            RemoteTunnelMode::Lan => self
+                .server_task
+                .as_ref()
+                .is_none_or(|task| task.inner().is_finished()),
+            RemoteTunnelMode::Listener => false,
+        }
+    }
+
+    fn is_active_quick(&self) -> bool {
+        self.desired.mode == RemoteTunnelMode::Quick
+            && self
+                .process_task
+                .as_ref()
+                .is_some_and(|task| !task.inner().is_finished())
     }
 
     fn logs(&self) -> Vec<String> {
@@ -1190,6 +1262,7 @@ fn failed_tunnel(
             message,
         })),
         logs,
+        cloudflared_fingerprint: None,
     }
 }
 
@@ -1274,12 +1347,12 @@ async fn spawn_custom_tunnel(
 }
 
 async fn spawn_quick_tunnel(
-    bin: &str,
+    cloudflared: &ResolvedCli,
     port: u16,
     logs: Arc<StdMutex<VecDeque<String>>>,
 ) -> crate::error::AppResult<(Child, JoinHandle<()>, Arc<StdMutex<Option<String>>>)> {
     push_log(&logs, "starting cloudflared quick tunnel");
-    let mut cmd = Command::new(bin);
+    let mut cmd = cloudflared.command();
     cmd.args([
         "tunnel",
         "--no-autoupdate",
@@ -1443,7 +1516,43 @@ fn bind_entrypoint_with_extra_hosts<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::model::{RemoteRoute, SourcePolicy};
+    use crate::{
+        config::{
+            model::{RemoteRoute, SourcePolicy},
+            service::{resolve_cli_from, CliPath, CliResolver, CliToolsConfig},
+        },
+        model::CliTool,
+    };
+
+    fn resolved_cloudflared(test_name: &str) -> (std::path::PathBuf, ResolvedCli) {
+        let root = std::env::temp_dir().join(format!(
+            "prmonitor-remote-cloudflared-{test_name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join(if cfg!(windows) {
+            "cloudflared.exe"
+        } else {
+            "cloudflared"
+        });
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let tools = CliToolsConfig {
+            cloudflared_path: CliPath::try_from(executable.to_string_lossy().into_owned()).unwrap(),
+            ..CliToolsConfig::default()
+        };
+        let resolved =
+            resolve_cli_from(&CliResolver::default(), &tools, CliTool::Cloudflared, false).unwrap();
+        (root, resolved)
+    }
 
     fn entrypoint() -> RemoteEntrypoint {
         RemoteEntrypoint {
@@ -1457,6 +1566,122 @@ mod tests {
             trusted_proxies: Vec::new(),
             routes: vec![RemoteRoute::local_api(), RemoteRoute::terminal()],
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_quick_tunnel_uses_configured_cloudflared_and_tears_it_down() {
+        use std::{
+            fs,
+            os::unix::fs::PermissionsExt,
+            process::{Command, Stdio},
+            thread,
+            time::Instant,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "prmonitor-remote-quick-e2e-自定义 路径-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("cloudflared");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{0}/pid'\nprintf '%s\\n' \"$PATH\" > '{0}/path'\nprintf '%s\\n' \"$@\" > '{0}/args'\nprintf '%s\\n' 'INF https://configured.trycloudflare.com' >&2\nexec sleep 30\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let tools = CliToolsConfig {
+            cloudflared_path: CliPath::try_from(executable.to_string_lossy().into_owned()).unwrap(),
+            ..CliToolsConfig::default()
+        };
+        let cloudflared =
+            resolve_cli_from(&CliResolver::default(), &tools, CliTool::Cloudflared, false).unwrap();
+        let fingerprint = cloudflared.fingerprint().to_string();
+
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let remote_access = RemoteAccessConfig {
+            entrypoints: vec![RemoteEntrypoint {
+                port,
+                routes: Vec::new(),
+                ..entrypoint()
+            }],
+            tunnels: vec![RemoteTunnel {
+                id: "quick".to_string(),
+                name: "Quick".to_string(),
+                mode: RemoteTunnelMode::Quick,
+                target_entrypoint_id: "ep".to_string(),
+                enabled: true,
+                ..RemoteTunnel::default()
+            }],
+        };
+        let app = tauri::test::mock_app();
+        let supervisor = ListenerSupervisor::default();
+
+        supervisor.reconcile(app.handle(), &remote_access, Ok(Some(cloudflared)));
+
+        let status = supervisor.status_snapshot(&remote_access, true);
+        assert_eq!(status.tunnels.len(), 1);
+        assert_eq!(status.tunnels[0].state, RemoteTunnelState::Running);
+        assert_eq!(
+            status.tunnels[0].public_url.as_deref(),
+            Some("https://configured.trycloudflare.com")
+        );
+        assert_eq!(
+            supervisor.active_cloudflared_fingerprints(),
+            vec![fingerprint]
+        );
+        let path = fs::read_to_string(root.join("path")).unwrap();
+        assert!(!std::env::split_paths(path.trim()).any(|entry| entry == root));
+        assert_eq!(
+            fs::read_to_string(root.join("args"))
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec![
+                "tunnel",
+                "--no-autoupdate",
+                "--url",
+                &format!("http://127.0.0.1:{port}"),
+            ]
+        );
+
+        let pid = fs::read_to_string(root.join("pid")).unwrap();
+        let pid = pid.trim().to_string();
+        supervisor.shutdown();
+        assert!(supervisor.active_cloudflared_fingerprints().is_empty());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline
+            && Command::new("kill")
+                .args(["-0", pid.as_str()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !Command::new("kill")
+                .args(["-0", pid.as_str()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success()),
+            "cloudflared child must be killed and reaped during teardown"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1552,6 +1777,7 @@ mod tests {
                 public_url: Arc::new(StdMutex::new(Some("http://192.168.5.10:8789".to_string()))),
                 state: state.clone(),
                 logs: logs.clone(),
+                cloudflared_fingerprint: None,
             },
         );
         supervisor.tunnels.lock().unwrap().insert(
@@ -1568,6 +1794,7 @@ mod tests {
                 ))),
                 state,
                 logs,
+                cloudflared_fingerprint: None,
             },
         );
 
@@ -1771,6 +1998,101 @@ mod tests {
             status.tunnels[0].logs,
             vec!["bind failure: address already in use".to_string()]
         );
+    }
+
+    #[test]
+    fn failed_quick_tunnel_is_not_active_and_is_eligible_for_retry() {
+        let entrypoint = entrypoint();
+        let desired = TunnelDesired {
+            mode: RemoteTunnelMode::Quick,
+            target_entrypoint_id: entrypoint.id.clone(),
+            target_bind_host: entrypoint.bind_host.clone(),
+            target_port: entrypoint.port,
+            lan_bind_host: String::new(),
+            lan_port: 0,
+            command: String::new(),
+            public_url: String::new(),
+            signature: "sig".to_string(),
+            entrypoint,
+        };
+        let runtime = failed_tunnel(
+            desired,
+            Arc::new(StdMutex::new(VecDeque::new())),
+            "spawn failed".to_string(),
+        );
+
+        assert!(runtime.needs_restart());
+        assert!(!runtime.is_active_quick());
+    }
+
+    #[tokio::test]
+    async fn active_quick_fingerprints_follow_each_live_runtime() {
+        let supervisor = ListenerSupervisor::default();
+        let entrypoint = entrypoint();
+        let (old_root, old_cli) = resolved_cloudflared("old");
+        let (new_root, new_cli) = resolved_cloudflared("new");
+
+        let quick_runtime = |id: &str, fingerprint: String, finished: bool| {
+            let (shutdown, shutdown_rx) = oneshot::channel::<()>();
+            let process_task = if finished {
+                spawn(async {})
+            } else {
+                spawn(async move {
+                    let _ = shutdown_rx.await;
+                })
+            };
+            BoundTunnel {
+                desired: TunnelDesired {
+                    mode: RemoteTunnelMode::Quick,
+                    target_entrypoint_id: entrypoint.id.clone(),
+                    target_bind_host: entrypoint.bind_host.clone(),
+                    target_port: entrypoint.port,
+                    lan_bind_host: String::new(),
+                    lan_port: 0,
+                    command: String::new(),
+                    public_url: String::new(),
+                    signature: id.to_string(),
+                    entrypoint: entrypoint.clone(),
+                },
+                process_task: Some(process_task),
+                process_shutdown: Some(shutdown),
+                server_task: None,
+                shutdown: None,
+                drain_task: None,
+                public_url: Arc::new(StdMutex::new(None)),
+                state: running_tunnel_state(RemoteTunnelMode::Quick),
+                logs: Arc::new(StdMutex::new(VecDeque::new())),
+                cloudflared_fingerprint: Some(fingerprint),
+            }
+        };
+
+        let old_fingerprint = old_cli.fingerprint().to_string();
+        let new_fingerprint = new_cli.fingerprint().to_string();
+        {
+            let mut tunnels = supervisor.tunnels.lock().unwrap();
+            tunnels.insert(
+                "old-live".to_string(),
+                quick_runtime("old-live", old_fingerprint.clone(), false),
+            );
+            tunnels.insert(
+                "new-live".to_string(),
+                quick_runtime("new-live", new_fingerprint.clone(), false),
+            );
+            tunnels.insert(
+                "old-exited".to_string(),
+                quick_runtime("old-exited", old_fingerprint.clone(), true),
+            );
+        }
+        tokio::task::yield_now().await;
+
+        let mut expected = vec![old_fingerprint, new_fingerprint];
+        expected.sort();
+        assert_eq!(supervisor.active_cloudflared_fingerprints(), expected);
+
+        supervisor.shutdown();
+        assert!(supervisor.active_cloudflared_fingerprints().is_empty());
+        let _ = std::fs::remove_dir_all(old_root);
+        let _ = std::fs::remove_dir_all(new_root);
     }
 
     #[test]

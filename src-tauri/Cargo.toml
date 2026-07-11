@@ -119,6 +119,11 @@ base64 = "0.22"
 # asset extension to `Content-Type`.
 rust-embed = "8"
 mime_guess = "2"
+# Production enum iteration keeps every managed-CLI fan-out derived from the sealed Rust enum.
+# Adding a tool therefore reaches config validation, probing, and TS codegen through one source.
+strum = { version = "0.28.0", features = ["derive"] }
+# Read the current Unix account's configured login shell when GUI launch environments omit SHELL.
+libc = "0.2"
 
 # Pin: brotli 8.0.3 (pulled transitively by tauri-codegen/tauri-utils) requires
 # alloc-no-stdlib "^2.0", but alloc-stdlib/brotli-decompressor accept ">=2.0.4,<4"
@@ -137,4 +142,6 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 # loopback bind→serve→teardown cycle (the unit tests cover the pure paths). CI-safe: 127.0.0.1 only.
 tauri = { version = "2", features = ["test"] }
 ts-rs = "12.0.1"
-strum = { version = "0.28.0", features = ["derive"] }
+# Parse Rust source in the managed-CLI side-door guard so test-only items can be
+# excluded without truncating the production file at the first `#[cfg(test)]`.
+syn = { version = "2", features = ["full", "visit"] }

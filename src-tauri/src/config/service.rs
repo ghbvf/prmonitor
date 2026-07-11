@@ -13,7 +13,11 @@ use tauri::Manager;
 use super::model::AppConfig;
 use crate::db::{map_err, Database};
 use crate::error::{AppError, AppResult};
-use crate::model::NotificationDeliveryChannel;
+use crate::model::{CliTool, NotificationDeliveryChannel};
+
+pub use super::cli::{
+    CliProbeDiagnostics, CliResolutionDiagnostics, CliResolver, ManagedCommand, ResolvedCli,
+};
 
 /// Re-export the project domain type THROUGH the config public service surface (#35,
 /// F9). The `pr` slice (scheduler / commands) depends on `Project` via
@@ -22,10 +26,60 @@ use crate::model::NotificationDeliveryChannel;
 /// detail the service mediates. The functions below (`project` / `project_validated`)
 /// use `Project` through this same re-export.
 pub use super::model::{
-    MessagingIntegration, MessagingSettings, NotificationChannel, NotificationSettings, Project,
-    ReviewLifecycleNotificationConfig, ReviewLifecycleTarget, RuleActionConfig,
-    RuleActionDedupePolicy, RuleActionKind, RuleActionTarget, RuleConfig,
+    CliPath, CliToolProbeStatus, CliToolsConfig, MessagingIntegration, MessagingSettings,
+    NotificationChannel, NotificationSettings, Project, ReviewLifecycleNotificationConfig,
+    ReviewLifecycleTarget, RuleActionConfig, RuleActionDedupePolicy, RuleActionKind,
+    RuleActionTarget, RuleConfig,
 };
+
+/// The public config-slice seam for managed process resolution. Sibling slices cannot reach the
+/// private resolver constructor or its environment assembly; they receive only the opaque Hard
+/// carrier whose command builder preserves program + PATH as one launch capability.
+pub fn resolve_cli<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    tool: CliTool,
+    refresh_path: bool,
+) -> AppResult<ResolvedCli> {
+    let config = load(app)?;
+    resolve_cli_from(
+        &app.state::<crate::state::AppState>().cli_resolver,
+        &config.cli_tools,
+        tool,
+        refresh_path,
+    )
+}
+
+/// Resolve a launch capability against a caller-supplied config draft without persisting it.
+/// Construction still stays inside the config slice and returns the same opaque Hard carrier.
+pub fn resolve_cli_from(
+    resolver: &CliResolver,
+    cli_tools: &CliToolsConfig,
+    tool: CliTool,
+    refresh_path: bool,
+) -> AppResult<ResolvedCli> {
+    resolver.resolve(cli_tools, tool, refresh_path)
+}
+
+/// Resolve display-only information without exposing the launch capability's executable or PATH.
+/// Runtime consumers use [`resolve_cli_from`]; the composition root uses this seam for probes.
+pub fn diagnose_cli_from(
+    resolver: &CliResolver,
+    cli_tools: &CliToolsConfig,
+    tool: CliTool,
+    refresh_path: bool,
+) -> CliProbeDiagnostics {
+    resolver.diagnostics(cli_tools, tool, refresh_path)
+}
+
+/// Diagnose all managed tools against one PATH snapshot. Refresh occurs before any per-tool draft
+/// validation, so an invalid first row cannot leave the remaining rows on a stale shell cache.
+pub fn diagnose_cli_tools_from(
+    resolver: &CliResolver,
+    cli_tools: &CliToolsConfig,
+    refresh_path: bool,
+) -> Vec<CliProbeDiagnostics> {
+    resolver.diagnostics_all(cli_tools, refresh_path)
+}
 pub use crate::model::ReviewLifecycleEvent;
 
 /// The DEFAULT outbox worker policy, exposed THROUGH the config public service surface (AB#1182
@@ -141,13 +195,12 @@ const PROJECT_KEYS: &[&str] = &[
     "autoReview",
 ];
 
-/// The 7 GLOBAL webhook/shell keys that stay at the top level of the migrated
+/// The GLOBAL webhook/shell keys that stay at the top level of the migrated
 /// [`AppConfig`] (#35: one webhook receiver serves every project).
 const WEBHOOK_KEYS: &[&str] = &[
     "webhookEnabled",
     "webhookPort",
     "webhookSecret",
-    "cloudflaredBin",
     "webhookTunnelMode",
     "webhookTunnelCommand",
     "webhookPublicUrl",
@@ -166,7 +219,7 @@ const WEBHOOK_KEYS: &[&str] = &[
 /// no-op. Otherwise the legacy flat single-project shape is upgraded:
 /// - the 11 [`PROJECT_KEYS`] (whichever exist) are lifted into one project object
 ///   tagged `id`/`name` = `"default"`, `enabled` = `true`;
-/// - the 7 [`WEBHOOK_KEYS`] (whichever exist) stay at the top level;
+/// - the [`WEBHOOK_KEYS`] (whichever exist) stay at the top level;
 /// - `projects` = `[thatProject]`, `activeProjectId` = `"default"`.
 ///
 /// An empty object `{}` (and any non-object) is treated as FIRST LAUNCH — it produces
@@ -174,11 +227,44 @@ const WEBHOOK_KEYS: &[&str] = &[
 /// migrated default project. (A `{}` has no flat keys to lift; materializing a
 /// gocell-default project would skip onboarding.)
 ///
-/// Two passes: [`normalize_multiproject`] first (legacy-flat → multi-project shape), then
-/// [`migrate_remote_access`] (#1553) so legacy `listeners[]` / `tunnels[]` / `localApiPort`
-/// are lifted into `remoteAccess.entrypoints[]` / `remoteAccess.tunnels[]`.
+/// Three passes: [`migrate_cli_tools`] first preserves the legacy flat `cloudflaredBin`
+/// before shape normalization can discard it; [`normalize_multiproject`] then lifts the
+/// legacy-flat project; finally [`migrate_remote_access`] (#1553) lifts legacy remote fields.
 fn migrate_value(raw: Value) -> Value {
-    seed_rule_configs(migrate_remote_access(normalize_multiproject(raw)))
+    seed_rule_configs(migrate_remote_access(normalize_multiproject(
+        migrate_cli_tools(raw),
+    )))
+}
+
+/// Move the removed top-level `cloudflaredBin` field into the managed CLI config.
+///
+/// Presence of the new field always wins, including an explicit empty string (auto discovery).
+/// The historical default bare program name also becomes auto; only a platform-absolute custom
+/// path is preserved. Removing the old key in every case makes the result a fixed point.
+fn migrate_cli_tools(value: Value) -> Value {
+    let Value::Object(mut obj) = value else {
+        return value;
+    };
+    let Some(legacy) = obj.remove("cloudflaredBin") else {
+        return Value::Object(obj);
+    };
+
+    let cli_tools = obj
+        .entry("cliTools".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(cli_tools) = cli_tools.as_object_mut() else {
+        return Value::Object(obj);
+    };
+    if cli_tools.contains_key("cloudflaredPath") {
+        return Value::Object(obj);
+    }
+
+    let path = legacy
+        .as_str()
+        .filter(|path| std::path::Path::new(path).is_absolute())
+        .unwrap_or_default();
+    cli_tools.insert("cloudflaredPath".to_string(), json!(path));
+    Value::Object(obj)
 }
 
 /// First migration pass: normalize the raw persisted value to the #35 multi-project shape.
@@ -217,6 +303,9 @@ fn normalize_multiproject(raw: Value) -> Value {
         if let Some(v) = old.get(*key) {
             new.insert((*key).to_string(), v.clone());
         }
+    }
+    if let Some(cli_tools) = old.get("cliTools") {
+        new.insert("cliTools".to_string(), cli_tools.clone());
     }
 
     Value::Object(new)
@@ -723,13 +812,18 @@ pub fn load_validated<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResult
 
 /// Persists the configuration after validating filesystem-dependent fields.
 pub fn save<R: tauri::Runtime>(app: &tauri::AppHandle<R>, config: AppConfig) -> AppResult<()> {
-    super::model::validate(&config)?;
-    persist(app, &config)
+    save_db(app.state::<Database>().inner(), &config)
 }
 
-/// Writes `config` to the store (no validation). Private — the validating [`save`]
-/// and the lenient [`set_active_project`] both funnel through here so the
-/// store-write plumbing lives in one place.
+/// Database-level save funnel: validation completes before the existing row can be replaced.
+/// Keeping the order in one helper makes the no-partial-save property directly testable.
+fn save_db(db: &Database, config: &AppConfig) -> AppResult<()> {
+    super::model::validate(config)?;
+    persist_db(db, config)
+}
+
+/// Writes `config` to the store (no validation). Private — only the lenient
+/// [`set_active_project`] path uses this app-handle wrapper; full saves use [`save_db`].
 fn persist<R: tauri::Runtime>(app: &tauri::AppHandle<R>, config: &AppConfig) -> AppResult<()> {
     persist_db(app.state::<Database>().inner(), config)
 }
@@ -794,7 +888,23 @@ pub fn set_active_project<R: tauri::Runtime>(app: &tauri::AppHandle<R>, id: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, path::Path};
+
+    use crate::config::model::CliPath;
     use crate::model::NotificationKind;
+
+    #[cfg(unix)]
+    fn write_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::write(path, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn write_executable(path: &Path) {
+        fs::write(path, b"").unwrap();
+    }
 
     fn local_api_entrypoints(config: &AppConfig) -> Vec<&crate::config::model::RemoteEntrypoint> {
         config
@@ -828,6 +938,98 @@ mod tests {
         persist_db(&db, &config).expect("persist");
         let back = load_db(&db).expect("load");
         assert_eq!(back.webhook_port, 9123);
+    }
+
+    #[test]
+    fn save_db_rejects_invalid_custom_cli_without_overwriting_and_allows_auto() {
+        let db = Database::open_in_memory().expect("open db");
+        let baseline = AppConfig {
+            webhook_port: 9123,
+            ..Default::default()
+        };
+        save_db(&db, &baseline).expect("auto discovery does not require an installed CLI");
+
+        let root = std::env::temp_dir().join(format!(
+            "prmonitor-save-cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let gh = root.join(if cfg!(windows) { "gh.exe" } else { "gh" });
+
+        let mut draft = baseline.clone();
+        draft.webhook_port = 9456;
+        draft.cli_tools.gh_path = CliPath::try_from(gh.to_string_lossy().into_owned()).unwrap();
+        let missing = save_db(&db, &draft).expect_err("missing custom CLI must block save");
+        assert!(missing.message.contains("ghPath"), "{missing}");
+        assert!(
+            missing.message.contains(&gh.to_string_lossy().into_owned()),
+            "{missing}"
+        );
+        assert_eq!(
+            load_db(&db).unwrap().webhook_port,
+            9123,
+            "rejected draft must not overwrite the persisted config"
+        );
+
+        fs::create_dir(&gh).unwrap();
+        let directory = save_db(&db, &draft).expect_err("directory must not count as a CLI file");
+        assert!(directory.message.contains("ghPath"), "{directory}");
+        fs::remove_dir(&gh).unwrap();
+
+        #[cfg(unix)]
+        {
+            fs::write(&gh, b"#!/bin/sh\nexit 0\n").unwrap();
+            let not_executable =
+                save_db(&db, &draft).expect_err("non-executable file must block save");
+            assert!(
+                not_executable.message.contains("ghPath"),
+                "{not_executable}"
+            );
+            fs::remove_file(&gh).unwrap();
+        }
+
+        write_executable(&gh);
+        save_db(&db, &draft).expect("valid custom CLI saves");
+        let saved = load_db(&db).unwrap();
+        assert_eq!(saved.webhook_port, 9456);
+        assert_eq!(saved.cli_tools.gh_path.as_str(), gh.to_string_lossy());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_config_resolves_custom_cli_through_app_state() {
+        use tauri::Manager;
+
+        let root = std::env::temp_dir().join(format!(
+            "prmonitor-persisted-cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let gh = root.join("gh");
+        write_executable(&gh);
+
+        let app = tauri::test::mock_app();
+        assert!(app.manage(Database::open_in_memory().expect("open db")));
+        assert!(app.manage(crate::state::AppState::default()));
+        let mut config = AppConfig::default();
+        config.cli_tools.gh_path = CliPath::try_from(gh.to_string_lossy().into_owned()).unwrap();
+        save(app.handle(), config).expect("persist config");
+
+        let resolved = resolve_cli(app.handle(), CliTool::Gh, false).expect("resolve saved gh");
+        let command = resolved.command();
+        assert_eq!(command.as_std().get_program(), gh.as_os_str());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     // One-time legacy import (#70) of the highest-risk case: a pre-#35 FLAT `config.json`
@@ -1079,13 +1281,18 @@ mod tests {
 
     #[test]
     fn migrate_lifts_webhook_to_top_level() {
+        let legacy_cloudflared = if cfg!(windows) {
+            r"C:\Tools\cloudflared.exe"
+        } else {
+            "/usr/bin/cloudflared"
+        };
         let raw = json!({
             "repo": "octocat/hello",
             "repoRoot": "/tmp/hello",
             "webhookEnabled": true,
             "webhookPort": 9000,
             "webhookSecret": "super-secret-0123456789",
-            "cloudflaredBin": "/usr/bin/cloudflared",
+            "cloudflaredBin": legacy_cloudflared,
             "webhookTunnelMode": "command",
             "webhookTunnelCommand": "cloudflared tunnel run --url http://127.0.0.1:{port} t",
             "webhookPublicUrl": "https://example.com"
@@ -1097,7 +1304,10 @@ mod tests {
         assert_eq!(migrated["webhookEnabled"], true);
         assert_eq!(migrated["webhookPort"], 9000);
         assert_eq!(migrated["webhookSecret"], "super-secret-0123456789");
-        assert_eq!(migrated["cloudflaredBin"], "/usr/bin/cloudflared");
+        assert!(
+            migrated.get("cloudflaredBin").is_none(),
+            "removed field must not be migrated"
+        );
         assert_eq!(migrated["webhookTunnelMode"], "command");
         assert_eq!(
             migrated["webhookTunnelCommand"],
@@ -1116,6 +1326,94 @@ mod tests {
         assert!(config.webhook_enabled);
         assert_eq!(config.webhook_port, 9000);
         assert_eq!(config.webhook_public_url, "https://example.com");
+        assert_eq!(
+            config.cli_tools.cloudflared_path.as_str(),
+            legacy_cloudflared,
+            "legacy custom executable survives the schema upgrade"
+        );
+        assert!(
+            serde_json::to_value(config)
+                .unwrap()
+                .get("cloudflaredBin")
+                .is_none(),
+            "next save drops the unknown legacy key"
+        );
+    }
+
+    #[test]
+    fn migrate_cli_tools_table() {
+        let legacy_absolute = if cfg!(windows) {
+            r"C:\Tools\cloudflared.exe"
+        } else {
+            "/opt/cloudflare/cloudflared"
+        };
+        let configured_absolute = if cfg!(windows) {
+            r"D:\Managed\cloudflared.exe"
+        } else {
+            "/srv/managed/cloudflared"
+        };
+        let cases = [
+            (
+                "flat legacy absolute",
+                json!({
+                    "repo": "octocat/hello",
+                    "cloudflaredBin": legacy_absolute
+                }),
+                legacy_absolute,
+            ),
+            (
+                "projects legacy absolute",
+                json!({
+                    "projects": [],
+                    "activeProjectId": "",
+                    "cloudflaredBin": legacy_absolute
+                }),
+                legacy_absolute,
+            ),
+            (
+                "legacy default bare name becomes auto",
+                json!({
+                    "projects": [],
+                    "activeProjectId": "",
+                    "cloudflaredBin": "cloudflared"
+                }),
+                "",
+            ),
+            (
+                "new field presence wins",
+                json!({
+                    "projects": [],
+                    "activeProjectId": "",
+                    "cloudflaredBin": legacy_absolute,
+                    "cliTools": { "cloudflaredPath": configured_absolute }
+                }),
+                configured_absolute,
+            ),
+        ];
+
+        for (name, raw, expected_path) in cases {
+            let migrated = migrate_value(raw);
+            assert_eq!(
+                migrated["cliTools"]["cloudflaredPath"], expected_path,
+                "{name}"
+            );
+            assert!(
+                migrated.get("cloudflaredBin").is_none(),
+                "{name}: legacy key must be removed"
+            );
+            assert_eq!(
+                migrate_value(migrated.clone()),
+                migrated,
+                "{name}: second migration must be a no-op"
+            );
+            let config: AppConfig =
+                serde_json::from_value(migrated).expect("migrated config deserializes");
+            assert_eq!(
+                config.cli_tools.cloudflared_path.as_str(),
+                expected_path,
+                "{name}"
+            );
+        }
     }
 
     #[test]

@@ -185,6 +185,26 @@ watch(
   },
   { immediate: true },
 );
+
+// A successful config save replaces these values in the shared Pinia store without changing the
+// engine set. Re-probe the affected engine so a stale module-level status cannot survive a CLI path
+// change. The codex probe reads the resident lifecycle snapshot first, so this never kills or
+// restarts an already-running app-server; a cold manager uses the newly configured path.
+watch(
+  () => [
+    configStore.config?.cliTools.codexPath,
+    configStore.config?.cliTools.claudePath,
+  ] as const,
+  ([codexPath, claudePath], [previousCodexPath, previousClaudePath]) => {
+    const kinds = usedEngineKinds.value;
+    if (codexPath !== previousCodexPath && kinds.includes("codex")) {
+      void refreshCodexStatus();
+    }
+    if (claudePath !== previousClaudePath && kinds.includes("claude")) {
+      void refreshClaudeStatus();
+    }
+  },
+);
 </script>
 
 <template>

@@ -40,6 +40,8 @@ pub mod stream;
 pub mod terminal;
 pub mod workflow;
 
+#[cfg(test)]
+mod managed_cli_guard_test;
 /// Rust slice-boundary enforcement test (AB#1066 F1, Medium carrier) — test-only module.
 #[cfg(test)]
 mod slice_boundary_test;
@@ -58,6 +60,44 @@ use tauri::{Manager, Runtime};
 enum NotificationActionPayload {
     Delivery(model::NotificationDeliveryPayload),
     Legacy(model::Notification),
+}
+
+/// Composition-level CLI probe: config owns resolution, while only the root may aggregate active
+/// resident fingerprints from review/webhook/remote without creating sibling-slice coupling.
+#[tauri::command]
+fn probe_cli_tools(
+    state: tauri::State<'_, AppState>,
+    cli_tools: config::service::CliToolsConfig,
+    refresh_path: bool,
+) -> error::AppResult<Vec<config::service::CliToolProbeStatus>> {
+    Ok(composition::probe_cli_tools(
+        &state.cli_resolver,
+        &cli_tools,
+        refresh_path,
+        &composition::ActiveCliFingerprints {
+            codex: state.codex.active_fingerprint(),
+            webhook_cloudflared: state.webhook.active_cloudflared_fingerprint(),
+            remote_cloudflared: state.remote.active_cloudflared_fingerprints(),
+        },
+    ))
+}
+
+/// Resolve cloudflared only when Remote Access has an enabled Quick tunnel. Other
+/// modes do not depend on the managed CLI and therefore must not be degraded by an
+/// unrelated cloudflared configuration error.
+fn resolve_remote_cloudflared<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    remote_access: &config::model::RemoteAccessConfig,
+) -> error::AppResult<Option<config::service::ResolvedCli>> {
+    if remote_access
+        .tunnels
+        .iter()
+        .any(|tunnel| tunnel.enabled && tunnel.mode == config::model::RemoteTunnelMode::Quick)
+    {
+        config::service::resolve_cli(app, model::CliTool::Cloudflared, false).map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 fn parse_notification_action_payload(payload: &str) -> error::AppResult<NotificationActionPayload> {
@@ -834,9 +874,10 @@ fn build_app() {
             // the app. Reconciled again after each `set_config` save.
             match config::service::load(app.handle()) {
                 Ok(cfg) => {
+                    let cloudflared = resolve_remote_cloudflared(app.handle(), &cfg.remote_access);
                     state
                         .remote
-                        .reconcile(app.handle(), &cfg.remote_access, &cfg.cloudflared_bin)
+                        .reconcile(app.handle(), &cfg.remote_access, cloudflared)
                 }
                 Err(e) => eprintln!("Remote 监听运行时：读取配置失败，跳过初次 reconcile：{e}"),
             }
@@ -850,10 +891,11 @@ fn build_app() {
             state.config_saved.set_hook(Arc::new({
                 let app = app.handle().clone();
                 move |cfg: config::model::AppConfig| {
+                    let cloudflared = resolve_remote_cloudflared(&app, &cfg.remote_access);
                     app.state::<AppState>().remote.reconcile(
                         &app,
                         &cfg.remote_access,
-                        &cfg.cloudflared_bin,
+                        cloudflared,
                     );
                 }
             }));
@@ -889,6 +931,7 @@ fn build_app() {
             config::commands::app_version,
             config::commands::get_config,
             config::commands::set_config,
+            probe_cli_tools,
             notification_test_send,
             notification::send_notification,
             pr::commands::start_polling,

@@ -57,6 +57,35 @@ pub struct Candidate {
     pub kind: String,
 }
 
+/// Third-party executables managed by the config slice.
+///
+/// **Hard carrier (upstream):** this sealed enum is the only tool selector accepted by the CLI
+/// resolver. Every path lookup is an exhaustive `match`, so adding a managed executable without
+/// adding its config slot and canonical basename is a compile error. **Hard carrier (downstream):**
+/// the resolver returns only an opaque `ResolvedCli`, whose sole command builder injects the
+/// resolved program and enhanced `PATH`; consumers cannot construct a partially configured launch.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
+#[serde(rename_all = "camelCase")]
+pub enum CliTool {
+    Gh,
+    Az,
+    Codex,
+    Claude,
+    Cloudflared,
+}
+
+/// Provenance of a managed CLI resolution, exposed to diagnostics and the settings UI.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CliResolutionSource {
+    Custom,
+    ProcessPath,
+    LoginShellPath,
+    PlatformFallback,
+}
+
 /// Which backend owns a [`TerminalSession`] (#1372).
 ///
 /// **Hard carrier** (sealed enum): the command layer routes per-session ops through an

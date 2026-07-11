@@ -5,6 +5,7 @@
 //! engine implements the same [`ReviewEngine`] without touching the commands.
 
 use super::CodexManager;
+use crate::config::service::ResolvedCli;
 use crate::error::AppResult;
 use crate::review::engine::{ReviewEngine, SessionId, StartReviewOutcome};
 use crate::review::session::{self, CommentUrlContext, SessionInfo, SessionRegistry};
@@ -18,7 +19,7 @@ pub struct CodexEngine<'a, R: tauri::Runtime> {
     pub codex: &'a CodexManager,
     pub registry: &'a SessionRegistry,
     /// The codex binary name (PATH-resolved; matches `get_codex_status`).
-    pub codex_bin: &'a str,
+    pub codex_cli: &'a ResolvedCli,
     /// Owning project id (#35): scopes the registry reservation / dedup and stamps
     /// every streamed `ReviewEvent` so the frontend attributes it to the right
     /// project. The composition root (lib.rs) sets it from the project being acted on.
@@ -64,7 +65,7 @@ impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
             self.app,
             self.codex,
             self.registry,
-            self.codex_bin,
+            self.codex_cli,
             self.repo,
             self.repo_root,
             self.skill_abs_path,
@@ -82,14 +83,7 @@ impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
     }
 
     async fn stop(&self, session: &SessionId) -> AppResult<()> {
-        session::stop_review(
-            self.codex,
-            self.registry,
-            self.codex_bin,
-            self.repo_root,
-            session,
-        )
-        .await
+        session::stop_review(self.codex, self.registry, session).await
     }
 
     async fn send_message(
@@ -102,7 +96,7 @@ impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
             self.app,
             self.codex,
             self.registry,
-            self.codex_bin,
+            self.codex_cli,
             self.repo_root,
             self.codex_model,
             self.project_id,
