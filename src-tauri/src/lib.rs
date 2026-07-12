@@ -68,7 +68,7 @@ fn probe_cli_tools(
         refresh_path,
         &composition::ActiveCliFingerprints {
             codex: state.codex.active_fingerprint(),
-            cursor: state.cursor.active_fingerprint(),
+            agent: state.cursor.active_fingerprint(),
             webhook_cloudflared: state.webhook.active_cloudflared_fingerprint(),
             remote_cloudflared: state.remote.active_cloudflared_fingerprints(),
         },

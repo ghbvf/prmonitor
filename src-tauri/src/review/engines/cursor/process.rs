@@ -5,6 +5,7 @@
 //! `session_cancel`). The process is kept *resident* by
 //! [`super::manager::CursorManager`].
 
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,12 +47,20 @@ pub struct CursorProcess {
 
 impl CursorProcess {
     /// Spawn `agent acp` in `repo_root` and complete `initialize` + `authenticate`.
-    /// Empty `repo_root` fails closed — never inherits an arbitrary process cwd.
+    /// Empty / relative / non-directory `repo_root` fails closed — never inherits an
+    /// arbitrary process cwd.
     pub(super) async fn spawn(agent: &ResolvedCli, repo_root: &str) -> AppResult<Self> {
-        if repo_root.trim().is_empty() {
+        let repo_root = repo_root.trim();
+        if repo_root.is_empty() {
             return Err(AppError::new(
                 "cursor ACP 需要非空 repo_root（cwd）".to_string(),
             ));
+        }
+        let repo_path = Path::new(repo_root);
+        if !repo_path.is_absolute() || !repo_path.is_dir() {
+            return Err(AppError::new(format!(
+                "cursor ACP 需要绝对且存在的目录作为 repo_root（cwd）: {repo_root}"
+            )));
         }
         let mut cmd = agent.command();
         cmd.args(["acp"])
@@ -169,6 +178,11 @@ where
         .await?;
     let result: SessionNewResult = serde_json::from_value(raw)
         .map_err(|e| AppError::new(format!("解析 session/new 失败: {e}")))?;
+    if result.session_id.trim().is_empty() {
+        return Err(AppError::new(
+            "cursor ACP session/new 返回空 session_id".to_string(),
+        ));
+    }
     Ok(result.session_id)
 }
 
@@ -401,5 +415,131 @@ done
             Err(e) => e,
         };
         assert!(err_ws.message.contains("repo_root"));
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_relative_or_non_dir_repo_root() {
+        use crate::config::service::ResolvedCli;
+
+        let agent = ResolvedCli::for_test(std::env::temp_dir().join("prmonitor-no-such-agent"));
+        let err_rel = match CursorProcess::spawn(&agent, "relative/path").await {
+            Ok(_) => panic!("relative repo_root must fail closed"),
+            Err(e) => e,
+        };
+        assert!(
+            err_rel.message.contains("repo_root") || err_rel.message.contains("绝对"),
+            "unexpected error: {}",
+            err_rel.message
+        );
+
+        let missing = std::env::temp_dir().join(format!(
+            "prmonitor-cursor-missing-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let err_missing = match CursorProcess::spawn(&agent, missing.to_str().unwrap()).await {
+            Ok(_) => panic!("non-existent repo_root must fail closed"),
+            Err(e) => e,
+        };
+        assert!(
+            err_missing.message.contains("repo_root") || err_missing.message.contains("目录"),
+            "unexpected error: {}",
+            err_missing.message
+        );
+
+        // Absolute path that exists but is a file, not a directory.
+        let file_path = std::env::temp_dir().join(format!(
+            "prmonitor-cursor-not-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&file_path, b"x").unwrap();
+        let err_file = match CursorProcess::spawn(&agent, file_path.to_str().unwrap()).await {
+            Ok(_) => panic!("file repo_root must fail closed"),
+            Err(e) => e,
+        };
+        assert!(
+            err_file.message.contains("repo_root") || err_file.message.contains("目录"),
+            "unexpected error: {}",
+            err_file.message
+        );
+        let _ = std::fs::remove_file(&file_path);
+    }
+
+    #[tokio::test]
+    async fn session_new_rejects_empty_session_id() {
+        use tokio::io::AsyncBufReadExt;
+
+        let (client_w, server_r) = tokio::io::duplex(64 * 1024);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let client = RpcClient::connect(client_w, tokio::io::BufReader::new(client_r), 16);
+
+        let serve = tauri::async_runtime::spawn(async move {
+            let mut sr = tokio::io::BufReader::new(server_r);
+            let mut line = String::new();
+            sr.read_line(&mut line).await.unwrap();
+            let req: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            let id = req["id"].as_i64().unwrap();
+            let mut sw = server_w;
+            use tokio::io::AsyncWriteExt;
+            let resp = format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{"sessionId":"  "}}}}"#);
+            sw.write_all(resp.as_bytes()).await.unwrap();
+            sw.write_all(b"\n").await.unwrap();
+            sw.flush().await.unwrap();
+        });
+
+        let err = session_new(
+            &client,
+            SessionNewParams {
+                cwd: "/tmp".to_string(),
+                mcp_servers: vec![],
+            },
+        )
+        .await
+        .expect_err("empty session_id must fail closed");
+        assert!(
+            err.message.contains("session_id"),
+            "unexpected error: {}",
+            err.message
+        );
+        serve.await.unwrap();
+    }
+
+    /// Wire lock: `session_cancel` emits a JSON-RPC 2.0 notification with method
+    /// `session/cancel` (no response expected).
+    #[tokio::test]
+    async fn session_cancel_notify_uses_session_cancel_method() {
+        let (client_w, server_r) = tokio::io::duplex(8192);
+        let (server_w, client_r) = tokio::io::duplex(8192);
+
+        let server = tokio::spawn(async move {
+            let mut reader = BufReader::new(server_r).lines();
+            let line = reader
+                .next_line()
+                .await
+                .expect("read")
+                .expect("session/cancel line");
+            let v: serde_json::Value = serde_json::from_str(&line).expect("json");
+            assert_eq!(v["jsonrpc"], "2.0");
+            assert_eq!(v["method"], rpc_methods::SESSION_CANCEL);
+            assert!(v.get("id").is_none(), "cancel must be a notification");
+            assert_eq!(v["params"]["sessionId"], "sess_to_cancel");
+            drop(server_w);
+            line
+        });
+
+        let client = RpcClient::connect(client_w, BufReader::new(client_r), 16);
+        session_cancel(&client, "sess_to_cancel")
+            .await
+            .expect("session_cancel notify");
+        drop(client);
+        let seen = server.await.expect("server task");
+        assert!(seen.contains("session/cancel"));
     }
 }

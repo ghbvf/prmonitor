@@ -16,6 +16,7 @@ use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const STOPPED_MSG: &str = "cursor ACP 已停止";
 
 /// Owns the resident Cursor ACP connection. `&self` methods + interior mutability
 /// so it can live in `AppState` (which stays `Default`).
@@ -70,7 +71,7 @@ impl CursorManager {
         repo_root: &str,
     ) -> AppResult<Arc<RpcClient<ChildStdin>>> {
         if self.stopped.load(Ordering::SeqCst) {
-            return Err(AppError::new("cursor ACP 已停止".to_string()));
+            return Err(AppError::new(STOPPED_MSG.to_string()));
         }
         self.ensure_started(agent, repo_root).await?;
         let guard = self.inner.lock().unwrap();
@@ -106,7 +107,7 @@ impl CursorManager {
             return Some(CursorStatus {
                 available: false,
                 desired_running: false,
-                message: "cursor ACP 已停止".to_string(),
+                message: STOPPED_MSG.to_string(),
             });
         }
         self.live_info().map(|info| CursorStatus {
@@ -157,7 +158,7 @@ impl CursorManager {
         CursorStatus {
             available: false,
             desired_running: false,
-            message: "cursor ACP 已停止".to_string(),
+            message: STOPPED_MSG.to_string(),
         }
     }
 
@@ -192,10 +193,11 @@ mod tests {
         let resident = m.resident_status().expect("stopped resident snapshot");
         assert!(!resident.available);
         assert!(!resident.desired_running);
-        assert_eq!(resident.message, "cursor ACP 已停止");
+        assert_eq!(resident.message, STOPPED_MSG);
         let s = m.status(&missing_agent(), "").await;
         assert!(!s.available);
         assert!(!s.desired_running);
+        assert_eq!(s.message, STOPPED_MSG);
     }
 
     #[tokio::test]
@@ -232,11 +234,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn existing_client_does_not_clear_stopped() {
+        // Interrupt path must NOT revive a stopped server (parity with Codex PR #47 F2).
+        let m = CursorManager::default();
+        m.stop();
+        assert!(m.existing_client().is_none());
+        assert!(m.is_stopped());
+    }
+
+    #[tokio::test]
     async fn start_clears_stopped_then_attempts() {
         let m = CursorManager::default();
         m.stop();
         let s = m.start(&missing_agent(), "").await;
         assert!(s.desired_running);
         assert!(!s.available);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn changed_fingerprint_reuses_live_process_until_stop() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::{fs, path::Path};
+
+        fn fake_agent(path: &Path, protocol_version: u32) {
+            let script = format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":{protocol_version},"authMethods":[]}}}}'
+      ;;
+    *'"method":"authenticate"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{}}}}'
+      ;;
+  esac
+done
+"#
+            );
+            fs::write(path, script).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "prmonitor-cursor-manager-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let first_dir = root.join("first");
+        let second_dir = root.join("second");
+        let repo = root.join("repo");
+        fs::create_dir_all(&first_dir).unwrap();
+        fs::create_dir_all(&second_dir).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let first_path = first_dir.join("agent");
+        let second_path = second_dir.join("agent");
+        fake_agent(&first_path, 1);
+        fake_agent(&second_path, 2);
+        let first = ResolvedCli::for_test(first_path);
+        let second = ResolvedCli::for_test(second_path);
+        let manager = CursorManager::default();
+        let repo_root = repo.to_str().unwrap();
+
+        assert_eq!(
+            manager
+                .ensure_started(&first, repo_root)
+                .await
+                .unwrap()
+                .protocol_version,
+            1
+        );
+        assert_eq!(
+            manager.active_fingerprint().as_deref(),
+            Some(first.fingerprint())
+        );
+        assert_eq!(
+            manager
+                .ensure_started(&second, repo_root)
+                .await
+                .unwrap()
+                .protocol_version,
+            1,
+            "a config change must not kill or replace the live resident"
+        );
+        assert_eq!(
+            manager.active_fingerprint().as_deref(),
+            Some(first.fingerprint())
+        );
+        manager.shutdown();
+        let _ = fs::remove_dir_all(root);
     }
 }

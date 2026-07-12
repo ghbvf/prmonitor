@@ -294,7 +294,7 @@ mod tests {
 
         let mut sw = server_w;
         sw.write_all(
-            br#"{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"c1","kind":"execute"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}
+            br#"{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"c1","kind":"read"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}
 "#,
         )
         .await
@@ -309,6 +309,29 @@ mod tests {
         assert_eq!(v["id"], 99);
         assert_eq!(v["result"]["outcome"]["outcome"], "selected");
         assert_eq!(v["result"]["outcome"]["optionId"], "allow-once");
+    }
+
+    #[tokio::test]
+    async fn auto_rejects_execute_permission() {
+        let (client_w, server_r) = tokio::io::duplex(64 * 1024);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let _client = RpcClient::connect(client_w, tokio::io::BufReader::new(client_r), 16);
+
+        let mut sw = server_w;
+        sw.write_all(
+            br#"{"jsonrpc":"2.0","id":98,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"c1","kind":"execute"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}
+"#,
+        )
+        .await
+        .unwrap();
+        sw.flush().await.unwrap();
+
+        let mut sr = tokio::io::BufReader::new(server_r);
+        let mut line = String::new();
+        sr.read_line(&mut line).await.unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 98);
+        assert_eq!(v["result"]["outcome"]["optionId"], "reject-once");
     }
 
     #[tokio::test]

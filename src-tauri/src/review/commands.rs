@@ -287,7 +287,6 @@ impl ReviewStartCapability {
                     registry: &state.sessions,
                     agent_cli: &agent_cli,
                     project_id: &project.id,
-                    repo: &project.repo,
                     repo_root: &project.repo_root,
                     url_ctx,
                     pr_number: 0,
@@ -709,7 +708,6 @@ pub async fn send_review_message<R: tauri::Runtime>(
                 registry: &state.sessions,
                 agent_cli: &agent_cli,
                 project_id: &project.id,
-                repo: &project.repo,
                 repo_root: &project.repo_root,
                 url_ctx,
                 pr_number,
@@ -748,10 +746,10 @@ pub(crate) async fn start_review_authorized<R: tauri::Runtime>(
 /// Interrupt a running review session by its `threadId` (#718): the shared stop body behind the
 /// manual [`stop_review`] command AND the AB#1069 outbox `stop-review` action ([`stop_for_outbox`]).
 /// Prefer the session's persisted `engine_kind` when known; otherwise probe Claude's kill map,
-/// then fall through to Codex (legacy ownership probe). Cursor cancels via `session/cancel` on
-/// the resident ACP connection.
+/// then fall through to Codex (legacy ownership probe). Cursor stops through the same
+/// `begin_interrupt` → `session/cancel` → rollback state machine as Codex ([`stop_cursor_review`]).
 pub(crate) async fn stop_session_by_id<R: tauri::Runtime>(
-    _app: &tauri::AppHandle<R>,
+    app: &tauri::AppHandle<R>,
     state: &AppState,
     session_id: &str,
 ) -> AppResult<()> {
@@ -762,11 +760,13 @@ pub(crate) async fn stop_session_by_id<R: tauri::Runtime>(
                 return Ok(());
             }
             EngineKind::Cursor => {
-                if let Some(client) = state.cursor.existing_client() {
-                    crate::review::engines::cursor::process::session_cancel(&client, session_id)
-                        .await?;
-                }
-                return Ok(());
+                return crate::review::session::stop_cursor_review(
+                    app,
+                    &state.cursor,
+                    &state.sessions,
+                    session_id,
+                )
+                .await;
             }
             EngineKind::Codex => {
                 return crate::review::session::stop_review(
@@ -778,14 +778,12 @@ pub(crate) async fn stop_session_by_id<R: tauri::Runtime>(
             }
         }
     }
-    // Registry miss: try Cursor cancel before Claude/Codex ownership probes.
+    // Registry miss (F12): best-effort Cursor cancel must NOT claim success — without a
+    // known session there is no pump to emit `turnCompleted(interrupted)`, and Ok would
+    // leave `useReviewStore.running` stuck true. Fall through to Claude/Codex probes
+    // (Claude Ok only when it owns the id; Codex NotFound → Err clears the UI).
     if let Some(client) = state.cursor.existing_client() {
-        if crate::review::engines::cursor::process::session_cancel(&client, session_id)
-            .await
-            .is_ok()
-        {
-            return Ok(());
-        }
+        let _ = crate::review::engines::cursor::process::session_cancel(&client, session_id).await;
     }
     if state.claude.stop(session_id) {
         return Ok(());
@@ -939,6 +937,24 @@ mod tests {
     }
 
     #[test]
+    fn stopped_cursor_status_skips_failing_cold_start_resolution() {
+        let manager = crate::review::engines::cursor::CursorManager::default();
+        manager.stop();
+        let mut called = false;
+        let input = cursor_status_input(&manager, || -> AppResult<()> {
+            called = true;
+            Err(AppError::new("stale configured path"))
+        })
+        .expect("resident status must bypass cold resolution");
+        assert!(!called);
+        let CursorStatusInput::Resident(status) = input else {
+            panic!("stopped manager must return resident snapshot");
+        };
+        assert!(!status.available);
+        assert!(!status.desired_running);
+    }
+
+    #[test]
     fn github_comment_url_context_tolerates_missing_gh() {
         let gh =
             optional_comment_url_cli(SourceKind::Github, || Err(AppError::new("gh unavailable")));
@@ -1022,6 +1038,18 @@ mod tests {
             absorb_stop_toctou(Err(AppError::new("interrupt failed")), true).is_err(),
             "still-active session's stop error must propagate"
         );
+    }
+
+    /// F12: registry miss with no Claude/Codex owner must Err (not Ok). A prior Cursor
+    /// cancel-Ok short-circuit would claim success without `turnCompleted` and stick the UI.
+    #[tokio::test]
+    async fn stop_session_registry_miss_without_owners_errors() {
+        let app = tauri::test::mock_app();
+        let state = crate::state::AppState::default();
+        let err = stop_session_by_id(app.handle(), &state, "no-such-cursor-or-codex")
+            .await
+            .expect_err("miss with no owner must not claim stop success");
+        assert!(err.message.contains("未找到 review 会话"));
     }
 
     // ── AB#1204 cross-restart dedup: the replay-suppression decision ────────────────────────────

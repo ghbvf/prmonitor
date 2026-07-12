@@ -7,7 +7,8 @@ use strum::IntoEnumIterator;
 #[derive(Default)]
 pub(crate) struct ActiveCliFingerprints {
     pub codex: Option<String>,
-    pub cursor: Option<String>,
+    /// Resident Cursor ACP (`CliTool::Agent` / `agent acp`) fingerprint.
+    pub agent: Option<String>,
     pub webhook_cloudflared: Option<String>,
     pub remote_cloudflared: Vec<String>,
 }
@@ -31,7 +32,7 @@ pub(crate) fn probe_cli_tools(
                             .as_deref()
                             .is_some_and(|fingerprint| fingerprint != diagnostics.fingerprint),
                         CliTool::Agent => active
-                            .cursor
+                            .agent
                             .as_deref()
                             .is_some_and(|fingerprint| fingerprint != diagnostics.fingerprint),
                         CliTool::Cloudflared => active
@@ -59,7 +60,7 @@ pub(crate) fn probe_cli_tools(
                     let pending_restart = match tool {
                         CliTool::Gh | CliTool::Az | CliTool::Claude => false,
                         CliTool::Codex => active.codex.is_some(),
-                        CliTool::Agent => active.cursor.is_some(),
+                        CliTool::Agent => active.agent.is_some(),
                         CliTool::Cloudflared => {
                             active.webhook_cloudflared.is_some()
                                 || !active.remote_cloudflared.is_empty()
@@ -142,7 +143,7 @@ mod tests {
             false,
             &ActiveCliFingerprints {
                 codex: Some("different".to_string()),
-                cursor: Some("different-cursor".to_string()),
+                agent: Some("different-agent".to_string()),
                 webhook_cloudflared: Some("running-old-cloudflared".to_string()),
                 remote_cloudflared: Vec::new(),
             },
@@ -159,7 +160,7 @@ mod tests {
                 .find(|row| row.tool == CliTool::Agent)
                 .unwrap()
                 .pending_restart,
-            "Agent pending_restart when cursor fingerprint mismatches"
+            "Agent pending_restart when agent fingerprint mismatches"
         );
         let cloudflared = rows
             .iter()
@@ -187,7 +188,7 @@ mod tests {
             false,
             &ActiveCliFingerprints {
                 codex: None,
-                cursor: None,
+                agent: None,
                 webhook_cloudflared: None,
                 remote_cloudflared: vec![current_cloudflared, "old-remote".to_string()],
             },

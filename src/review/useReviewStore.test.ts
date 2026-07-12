@@ -453,6 +453,21 @@ describe("useReviewStore start()/stop()", () => {
     expect(api.getCursorStatus).toHaveBeenCalled();
   });
 
+  it("start failure on a cursor project still refreshes cursor status", async () => {
+    useProjects().projects.value = [
+      {
+        id: "p1",
+        name: "Cursor",
+        engineKind: "cursor",
+      } as never,
+    ];
+    vi.mocked(api.startReview).mockRejectedValueOnce({ message: "nope" });
+    const store = useReviewStore();
+    await store.start("p1", 7, "review");
+    expect(store.error.value).toBe("nope");
+    expect(api.getCursorStatus).toHaveBeenCalled();
+  });
+
   it("start on a non-cursor project does not refresh cursor status", async () => {
     useProjects().projects.value = [
       {

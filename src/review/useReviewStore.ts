@@ -322,12 +322,6 @@ async function start(projectId: string, prNumber: number, kind: string) {
   try {
     const id = await startReview(projectId, prNumber, kind);
     activeThreadId.value = id;
-    // Explicit start resumes a stopped Cursor ACP server; refresh so App/StatusBar
-    // banners flip off 「已停止」 without waiting for a manual re-probe.
-    const project = useProjects().projects.value.find((p) => p.id === projectId);
-    if (project?.engineKind === "cursor") {
-      void refreshCursorStatus();
-    }
     // Replay what arrived during the start; applyEvent now drops foreign sessions.
     const buffered = inFlightBuffer;
     inFlightBuffer = null;
@@ -337,6 +331,14 @@ async function start(projectId: string, prNumber: number, kind: string) {
     running.value = false;
     error.value = toMessage(err);
     console.error("启动 review 失败", err);
+  } finally {
+    // Explicit start resumes a stopped Cursor ACP server (success or fail after
+    // resume); refresh so App/StatusBar banners flip off 「已停止」 without waiting
+    // for a manual re-probe — including the failure path where start never returns.
+    const project = useProjects().projects.value.find((p) => p.id === projectId);
+    if (project?.engineKind === "cursor") {
+      void refreshCursorStatus();
+    }
   }
 }
 

@@ -81,7 +81,9 @@ fn to_line<T: Serialize>(frame: &T) -> AppResult<String> {
 }
 
 /// Classify one raw line into an [`Inbound`]. Blank → `Ok(None)`. Malformed JSON,
-/// missing `jsonrpc`, or neither `id` nor `method` → `Err`.
+/// missing `jsonrpc`, neither `id` nor `method`, or a present-but-unusable `id`
+/// (wrong type / non-digit string) → `Err`. JSON-RPC allows `id` as number **or**
+/// string; we normalize digit strings to `i64` so they match the pending map.
 pub(crate) fn decode_line(line: &str) -> AppResult<Option<Inbound>> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -102,16 +104,20 @@ pub(crate) fn decode_line(line: &str) -> AppResult<Option<Inbound>> {
         }
     }
 
-    let id = v.get("id").and_then(Value::as_i64);
     let method = v.get("method").and_then(Value::as_str);
+    let id_field = v.get("id");
 
-    match (id, method) {
-        (Some(id), Some(method)) => Ok(Some(Inbound::ServerRequest {
-            id,
-            method: method.to_string(),
-            params: v.get("params").cloned().unwrap_or(Value::Null),
-        })),
-        (Some(id), None) => {
+    match (id_field, method) {
+        (Some(id_val), Some(method)) => {
+            let id = parse_rpc_id(id_val)?;
+            Ok(Some(Inbound::ServerRequest {
+                id,
+                method: method.to_string(),
+                params: v.get("params").cloned().unwrap_or(Value::Null),
+            }))
+        }
+        (Some(id_val), None) => {
+            let id = parse_rpc_id(id_val)?;
             let payload = if let Some(err) = v.get("error") {
                 ResponsePayload::Err(
                     serde_json::from_value(err.clone())
@@ -129,6 +135,22 @@ pub(crate) fn decode_line(line: &str) -> AppResult<Option<Inbound>> {
         (None, None) => Err(AppError::new(
             "cursor ACP 帧既无 id 也无 method".to_string(),
         )),
+    }
+}
+
+/// Accept JSON-RPC `id` as `i64` or a digit string; reject other shapes fail-closed
+/// so a mistyped id + method never silently degrades to a Notification.
+fn parse_rpc_id(id: &Value) -> AppResult<i64> {
+    match id {
+        Value::Number(n) => n
+            .as_i64()
+            .ok_or_else(|| AppError::new(format!("cursor ACP 帧 id 无法表示为 i64: {id}"))),
+        Value::String(s) => s
+            .parse::<i64>()
+            .map_err(|_| AppError::new(format!("cursor ACP 帧 id 字符串无法解析为 i64: {s:?}"))),
+        other => Err(AppError::new(format!(
+            "cursor ACP 帧 id 类型无效（期望 number 或 string）: {other}"
+        ))),
     }
 }
 
@@ -312,5 +334,62 @@ mod tests {
     #[test]
     fn decode_neither_id_nor_method_is_err() {
         assert!(decode_line(r#"{"jsonrpc":"2.0","foo":1}"#).is_err());
+    }
+
+    #[test]
+    fn decode_string_id_server_request() {
+        match decode_line(
+            r#"{"jsonrpc":"2.0","id":"42","method":"session/request_permission","params":{}}"#,
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Inbound::ServerRequest { id, method, .. } => {
+                assert_eq!(id, 42);
+                assert_eq!(method, "session/request_permission");
+            }
+            other => panic!("expected server request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_string_id_response() {
+        match decode_line(r#"{"jsonrpc":"2.0","id":"3","result":{"ok":true}}"#)
+            .unwrap()
+            .unwrap()
+        {
+            Inbound::Response {
+                id,
+                payload: ResponsePayload::Ok(v),
+            } => {
+                assert_eq!(id, 3);
+                assert_eq!(v["ok"], true);
+            }
+            other => panic!("expected ok response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_invalid_id_shape_with_method_is_err_not_notification() {
+        // Object id + method must fail closed — never silently become Notification.
+        let err = decode_line(
+            r#"{"jsonrpc":"2.0","id":{"n":1},"method":"session/request_permission","params":{}}"#,
+        )
+        .expect_err("invalid id shape");
+        assert!(
+            err.message.contains("id"),
+            "unexpected error: {}",
+            err.message
+        );
+
+        let err_str = decode_line(
+            r#"{"jsonrpc":"2.0","id":"not-a-number","method":"session/update","params":{}}"#,
+        )
+        .expect_err("non-digit string id");
+        assert!(
+            err_str.message.contains("id"),
+            "unexpected error: {}",
+            err_str.message
+        );
     }
 }

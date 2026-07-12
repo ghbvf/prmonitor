@@ -20,5 +20,4 @@ pub mod rpc;
 
 pub use engine::CursorEngine;
 pub use manager::CursorManager;
-pub use process::{CursorProcess, CursorStatus};
-pub use rpc::{RpcClient, RpcError};
+pub use process::CursorStatus;

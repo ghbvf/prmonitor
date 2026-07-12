@@ -19,8 +19,12 @@ use crate::model::{EngineKind, ReviewKind};
 use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, StartReviewOutcome};
 use crate::review::history_store::{self, HistoryItemKind};
 use crate::review::session::{
-    commit_starting_session, CommentUrlContext, SessionInfo, SessionRegistry, SessionStatus,
+    commit_starting_session, CommentUrlContext, ReservationGuard, SessionInfo, SessionRegistry,
+    SessionStatus,
 };
+
+/// User-facing error when the pump falls behind the notification broadcast (F1).
+const LAGGED_ABORT_MESSAGE: &str = "cursor ACP 输出流滞后，已中止";
 
 /// Per-request engine handle. Borrows long-lived `AppState` plus the request's
 /// `AppHandle`; constructed fresh by each command/dispatch.
@@ -30,7 +34,6 @@ pub struct CursorEngine<'a, R: tauri::Runtime> {
     pub registry: &'a SessionRegistry,
     pub agent_cli: &'a ResolvedCli,
     pub project_id: &'a str,
-    pub repo: &'a str,
     pub repo_root: &'a str,
     pub(crate) url_ctx: CommentUrlContext,
     /// FOLLOW-UP path only — `start` takes `pr_number` as a method arg.
@@ -324,7 +327,24 @@ async fn pump<R: tauri::Runtime>(
                         }
                         _ => {}
                     },
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // Mirror Codex pump: lag means stream deltas (and possibly the
+                    // terminal) were dropped — fail-close rather than risk a stuck
+                    // Running or a silently incomplete "completed" turn (F1).
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        eprintln!("cursor review pump（{session_id}）滞后，丢弃 {n} 条通知");
+                        finish(
+                            &registry,
+                            &app,
+                            &project_id,
+                            pr_number,
+                            &session_id,
+                            SessionStatus::Failed,
+                            "failed",
+                            Some(LAGGED_ABORT_MESSAGE.to_string()),
+                        )
+                        .await;
+                        break;
+                    }
                     Err(broadcast::error::RecvError::Closed) => {
                         finish(
                             &registry,
@@ -453,29 +473,6 @@ fn persist_session<R: tauri::Runtime>(
     Ok(())
 }
 
-struct ReservationGuard<'a> {
-    registry: &'a SessionRegistry,
-    project_id: String,
-    pr_number: u64,
-    kind: ReviewKind,
-    armed: bool,
-}
-
-impl ReservationGuard<'_> {
-    fn disarm(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ReservationGuard<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.registry
-                .release_pair(&self.project_id, self.pr_number, self.kind);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +488,15 @@ mod tests {
     #[test]
     fn map_stop_reason_end_turn_camel_alias_is_completed() {
         let (s, w, e) = map_stop_reason("endTurn");
+        assert_eq!(s, SessionStatus::Done);
+        assert_eq!(w, "completed");
+        assert!(e.is_none());
+    }
+
+    #[test]
+    fn map_stop_reason_empty_is_completed() {
+        // Empty stopReason is treated as a normal completion (ACP omits / blanks it).
+        let (s, w, e) = map_stop_reason("");
         assert_eq!(s, SessionStatus::Done);
         assert_eq!(w, "completed");
         assert!(e.is_none());
@@ -518,5 +524,11 @@ mod tests {
         assert_eq!(s, SessionStatus::Failed);
         assert_eq!(w, "failed");
         assert!(e.unwrap().contains("max_tokens"));
+    }
+
+    #[test]
+    fn lagged_abort_message_matches_fail_close_contract() {
+        // F1: pump Lagged must fail-close with this user-facing message (not silent continue).
+        assert_eq!(LAGGED_ABORT_MESSAGE, "cursor ACP 输出流滞后，已中止");
     }
 }
