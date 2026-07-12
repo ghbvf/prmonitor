@@ -6,24 +6,35 @@ on:
   pull_request:
     branches: [develop, main]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  PNPM_VERSION: "11"
 
 jobs:
   frontend:
     name: Frontend (vue-tsc + build)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
-          version: 11
-      - uses: actions/setup-node@v4
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - name: Check release versions are consistent
+        run: node scripts/check-release-version.mjs
+      - name: Test release version checker
+        run: node --test scripts/check-release-version.test.mjs
       - run: pnpm build
       # #1504: validate the web-terminal SPA bundle here (fast frontend job) too — not only in the
       # slower Rust job — so Vite-bundle errors surface early. Mirrors beforeBuildCommand's coverage.
@@ -34,7 +45,7 @@ jobs:
     name: Rust (fmt + clippy + build)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Tauri system dependencies
         run: |
           sudo apt-get update
@@ -52,12 +63,12 @@ jobs:
         with:
           workspaces: src-tauri
       # Frontend dist is required by tauri-build (frontendDist points at ../dist).
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
-          version: 11
-      - uses: actions/setup-node@v4
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
@@ -86,17 +97,17 @@ jobs:
             os: macos-latest
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         with:
-          version: 11
-      - uses: actions/setup-node@v4
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v6
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       # tauri-build requires the configured frontendDist even for the resolver unit tests.

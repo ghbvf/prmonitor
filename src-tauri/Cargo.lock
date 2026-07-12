@@ -3159,7 +3159,7 @@ dependencies = [
 
 [[package]]
 name = "prmonitor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "alloc-no-stdlib",

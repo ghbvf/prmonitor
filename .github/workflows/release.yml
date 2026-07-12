@@ -1,0 +1,380 @@
+name: Release desktop apps
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的版本标签，例如 v0.1.0"
+        required: true
+        type: string
+      publish:
+        description: "构建成功后创建或更新 GitHub Release"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22"
+  PNPM_VERSION: "11"
+
+jobs:
+  prepare:
+    name: Validate release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      publish: ${{ steps.meta.outputs.publish }}
+    steps:
+      - name: Resolve and validate tag
+        id: meta
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          REQUESTED_PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
+        run: |
+          set -euo pipefail
+
+          tag="${REQUESTED_TAG}"
+          # Shape only: must start with v and have a non-empty remainder.
+          # SemVer validity is the single source in scripts/check-release-version.mjs.
+          if [[ "${tag}" != v?* ]]; then
+            echo "Invalid tag '${tag}'. Expected vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-prerelease." >&2
+            exit 1
+          fi
+
+          version="${tag#v}"
+          if [[ -z "${version}" ]]; then
+            echo "Invalid tag '${tag}'. Missing version after 'v'." >&2
+            exit 1
+          fi
+
+          prerelease=false
+          if [[ "${version}" == *-* ]]; then
+            prerelease=true
+          fi
+
+          publish=false
+          if [[ "${REQUESTED_PUBLISH}" == "true" ]]; then
+            publish=true
+          fi
+
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "prerelease=${prerelease}"
+            echo "publish=${publish}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.meta.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Check versions match the tag
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: node scripts/check-release-version.mjs "${RELEASE_VERSION}"
+
+  build-macos:
+    name: macOS universal ad-hoc (.app + .dmg)
+    needs: prepare
+    runs-on: macos-latest
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      # No Apple account or certificate is required. "-" asks Tauri/codesign
+      # to use an anonymous ad-hoc signature, which is suitable for CI builds
+      # but is not Apple Developer ID signing or notarization.
+      APPLE_SIGNING_IDENTITY: "-"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build universal macOS bundles with ad-hoc signature
+        shell: bash
+        run: |
+          echo "::warning title=macOS ad-hoc build::No Apple Developer ID or notarization is used. Gatekeeper may require users to allow the app manually."
+          pnpm tauri build --target universal-apple-darwin --bundles app,dmg
+
+      - name: Verify and collect macOS artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bundle_root="src-tauri/target/universal-apple-darwin/release/bundle"
+          [[ -d "${bundle_root}/macos" ]] || { echo "Missing macOS bundle directory" >&2; exit 1; }
+          [[ -d "${bundle_root}/dmg" ]] || { echo "Missing DMG bundle directory" >&2; exit 1; }
+
+          app_path="$(find "${bundle_root}/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          dmg_path="$(find "${bundle_root}/dmg" -maxdepth 1 -type f -name '*.dmg' -print -quit)"
+          [[ -n "${app_path}" && -d "${app_path}" ]] || { echo "No .app bundle found" >&2; exit 1; }
+          [[ -n "${dmg_path}" && -f "${dmg_path}" ]] || { echo "No .dmg bundle found" >&2; exit 1; }
+
+          executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${app_path}/Contents/Info.plist")"
+          lipo -verify_arch x86_64 arm64 "${app_path}/Contents/MacOS/${executable_name}"
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          signature_info="$(codesign -dv --verbose=4 "${app_path}" 2>&1)"
+          printf '%s\n' "${signature_info}"
+          grep -Fq 'Signature=adhoc' <<< "${signature_info}" || {
+            echo "Expected an ad-hoc macOS signature, but codesign reported a different signature." >&2
+            exit 1
+          }
+
+          mkdir -p release-assets
+          ditto -c -k --sequesterRsrc --keepParent \
+            "${app_path}" \
+            "release-assets/prmonitor_${VERSION}_macos_universal_adhoc.app.zip"
+          cp "${dmg_path}" "release-assets/prmonitor_${VERSION}_macos_universal_adhoc.dmg"
+
+          cat > release-assets/MACOS_INSTALL_NOTICE.zh-CN.txt <<'EOF'
+          prmonitor macOS 安装说明（无 Apple ID / ad-hoc 构建）
+
+          此 .app/.dmg 没有 Developer ID 身份，也未经过 Apple notarization。
+          首次启动时，macOS Gatekeeper 可能阻止应用打开。
+
+          建议步骤：
+          1. 先按 SHA256SUMS.txt（GitHub Release）或 SHA256SUMS-macos.txt（Actions Artifact）核对下载文件的 SHA-256。
+          2. 将 prmonitor.app 拖到 /Applications。
+          3. 在 Finder 中按住 Control 点击（或右键）prmonitor.app，选择“打开”，再确认一次。
+          4. 若仍被拦截：系统设置 -> 隐私与安全性 -> 安全性 -> “仍要打开”。
+
+          仅在确认文件来自本仓库且 SHA-256 一致时，才使用下面的终端命令移除隔离标记：
+
+          xattr -dr com.apple.quarantine /Applications/prmonitor.app
+
+          此构建使用 APPLE_SIGNING_IDENTITY=- 的匿名 ad-hoc 签名。
+          它不是 Apple Developer ID 签名，也不能提供 Apple 公证或开发者身份验证。
+          EOF
+
+          (
+            cd release-assets
+            shasum -a 256 \
+              "prmonitor_${VERSION}_macos_universal_adhoc.app.zip" \
+              "prmonitor_${VERSION}_macos_universal_adhoc.dmg" \
+              MACOS_INSTALL_NOTICE.zh-CN.txt \
+              > SHA256SUMS-macos.txt
+          )
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-macos-${{ needs.prepare.outputs.version }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-windows:
+    name: Windows x64 portable (.zip)
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "src-tauri -> target"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Windows portable binary (no installer)
+        run: pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle
+
+      - name: Collect Windows portable zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $releaseDir = "src-tauri/target/x86_64-pc-windows-msvc/release"
+          $exePath = Join-Path $releaseDir "prmonitor.exe"
+          if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
+            throw "Expected portable binary not found: $exePath"
+          }
+
+          $stageDir = Join-Path $env:RUNNER_TEMP "prmonitor-portable-stage"
+          if (Test-Path -LiteralPath $stageDir) {
+            Remove-Item -LiteralPath $stageDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+          Copy-Item -LiteralPath $exePath -Destination (Join-Path $stageDir "prmonitor.exe")
+
+          # --no-bundle skips tauri-bundler, so target/.../release/resources/ is usually absent.
+          # Keep a best-effort copy if a future build step materializes it beside the exe.
+          $resourcesDir = Join-Path $releaseDir "resources"
+          if (Test-Path -LiteralPath $resourcesDir -PathType Container) {
+            Copy-Item -LiteralPath $resourcesDir -Destination (Join-Path $stageDir "resources") -Recurse
+          }
+
+          @"
+          prmonitor Windows 使用说明（portable / 无安装器）
+
+          此 zip 内是解压即用的 prmonitor.exe，未做 Authenticode 签名。
+          首次运行可能出现 SmartScreen「Windows 已保护你的电脑」提示：
+          1. 先按 SHA256SUMS.txt（GitHub Release）或 SHA256SUMS-windows.txt 核对下载文件。
+          2. 解压 zip，双击 prmonitor.exe。
+          3. 若被 SmartScreen 拦截：点击「更多信息」→「仍要运行」。
+          4. 若文件属性带「解除锁定」：勾选后确定；或在 PowerShell 执行 Unblock-File .\prmonitor.exe。
+
+          需要本机已安装 WebView2 Runtime。本包不含安装向导。
+          "@ | Set-Content -Path (Join-Path $stageDir "WINDOWS_INSTALL_NOTICE.zh-CN.txt") -Encoding utf8
+
+          New-Item -ItemType Directory -Force -Path "release-assets" | Out-Null
+          $zipName = "prmonitor_${env:VERSION}_windows_x64_portable.zip"
+          $zipPath = Join-Path "release-assets" $zipName
+          if (Test-Path -LiteralPath $zipPath) {
+            Remove-Item -LiteralPath $zipPath -Force
+          }
+          Compress-Archive -Path (Join-Path $stageDir "*") -DestinationPath $zipPath -Force
+
+          Copy-Item -LiteralPath (Join-Path $stageDir "WINDOWS_INSTALL_NOTICE.zh-CN.txt") `
+            -Destination "release-assets/WINDOWS_INSTALL_NOTICE.zh-CN.txt"
+
+          $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $zipName" | Set-Content -Path "release-assets/SHA256SUMS-windows.txt" -Encoding ascii
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-windows-${{ needs.prepare.outputs.version }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    if: needs.prepare.outputs.publish == 'true'
+    needs:
+      - prepare
+      - build-macos
+      - build-windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create combined checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          mapfile -d '' payloads < <(
+            find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -print0 | sort -z
+          )
+          (( ${#payloads[@]} > 0 )) || { echo "No release payloads found" >&2; exit 1; }
+          sha256sum "${payloads[@]}" | sed 's#  \./#  #' > SHA256SUMS.txt
+          ls -lah
+
+      - name: Create or update release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -d '' files < <(find release-assets -maxdepth 1 -type f -print0 | sort -z)
+          (( ${#files[@]} > 0 )) || { echo "No release files found" >&2; exit 1; }
+
+          release_notice="$(cat <<'EOF'
+          > [!WARNING]
+          > macOS 资产使用匿名 **ad-hoc** 签名，未经过 Apple notarization。首次启动可能需要在 Finder 中右键“打开”，或在“系统设置 → 隐私与安全性”中选择“仍要打开”。请先核对 `SHA256SUMS.txt`。Windows 为 **portable zip**（解压运行 `prmonitor.exe`，无安装器），未做 Authenticode 签名；需本机已安装 WebView2。首次运行可能出现 SmartScreen「Windows 已保护你的电脑」，点击「更多信息」→「仍要运行」。详见 `MACOS_INSTALL_NOTICE.zh-CN.txt` / `WINDOWS_INSTALL_NOTICE.zh-CN.txt`。
+          EOF
+          )"
+
+          prepend_warning() {
+            local body="$1"
+            local marker='> [!WARNING]'
+            if [[ "${body}" == "${marker}"* ]]; then
+              # Drop a previous leading WARNING block (through the first blank line).
+              body="$(printf '%s\n' "${body}" | awk '
+                BEGIN { skip=1 }
+                skip && $0 ~ /^> \[!WARNING\]/ { next }
+                skip && $0 ~ /^>/ { next }
+                skip && NF == 0 { skip=0; next }
+                { skip=0; print }
+              ')"
+            fi
+            if [[ -n "${body}" ]]; then
+              printf '%s\n\n%s\n' "${release_notice}" "${body}"
+            else
+              printf '%s\n' "${release_notice}"
+            fi
+          }
+
+          if ! gh release view "${TAG}" >/dev/null 2>&1; then
+            create_args=(
+              "${TAG}"
+              --verify-tag
+              --title "prmonitor ${TAG}"
+              --generate-notes
+            )
+            if [[ "${PRERELEASE}" == "true" ]]; then
+              create_args+=(--prerelease)
+            fi
+            gh release create "${create_args[@]}"
+          fi
+
+          existing_body="$(gh release view "${TAG}" --json body --jq .body)"
+          notes="$(prepend_warning "${existing_body}")"
+          gh release edit "${TAG}" --notes "${notes}"
+          gh release upload "${TAG}" "${files[@]}" --clobber

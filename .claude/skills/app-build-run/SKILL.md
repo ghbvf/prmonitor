@@ -1,6 +1,6 @@
 ---
 name: app-build-run
-description: "prmonitor Tauri App 本地启动与打包：启动开发版桌面 app，编译 Apple/macOS app/dmg，交叉编译 Windows x64 exe/NSIS installer，处理 cargo-xwin/makensis/llvm 等构建依赖与常见失败。"
+description: "prmonitor Tauri App 本地启动与打包：启动开发版桌面 app，编译 Apple/macOS app/dmg，交叉编译 Windows x64 exe；正式发版 Windows 为 portable zip（见 release.yml --no-bundle），本地交叉编仍可能涉及 cargo-xwin/makensis。"
 argument-hint: "<dev | apple | windows-x64>"
 allowed-tools: [Read, Grep, Bash]
 ---
@@ -113,23 +113,24 @@ codesign --verify --deep --strict --verbose=4 src-tauri/target/release/bundle/ma
 
 ## 编译 Windows x64 App
 
-推荐：正式发版用 Windows runner/Windows VM 构建并签名。macOS 交叉编译可以用于本地验证，Tauri 会提示 cross-platform compilation is experimental。
+推荐：正式发版由 GitHub Actions `windows-latest` 执行 `pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle`，产物为 portable zip（见 `.github/workflows/release.yml` / `docs/BUILD_RELEASE.zh-CN.md`）。本地交叉编译仅用于验证二进制。
 
-Windows runner 上：
+Windows runner 上（本地验证 / 非发版）：
 
 ```powershell
 pnpm install --frozen-lockfile
 rustup target add x86_64-pc-windows-msvc
-pnpm tauri build --target x86_64-pc-windows-msvc
+pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle
 ```
 
-macOS 交叉编译 Windows x64：
+macOS 交叉编译 Windows x64（实验性，非正式发版路径）：
 
 ```bash
 rustup target add x86_64-pc-windows-msvc
 cargo install --locked cargo-xwin
-brew install makensis llvm
-PATH="/opt/homebrew/opt/llvm/bin:$PATH" pnpm tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc
+brew install llvm
+# 若仍要本地试 NSIS：另装 makensis，并去掉 --no-bundle、改回 --bundles nsis
+PATH="/opt/homebrew/opt/llvm/bin:$PATH" pnpm tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --no-bundle
 ```
 
 不要写成 `pnpm tauri build -- --runner ...`；多余的 `--` 会把 `--runner` 传给 Cargo，导致 `unexpected argument '--runner'`。
@@ -137,8 +138,10 @@ PATH="/opt/homebrew/opt/llvm/bin:$PATH" pnpm tauri build --runner cargo-xwin --t
 常见产物：
 
 ```text
+# 发版 / --no-bundle
 src-tauri/target/x86_64-pc-windows-msvc/release/prmonitor.exe
-src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/prmonitor_<version>_x64-setup.exe
+# GitHub Release 资产名
+prmonitor_<version>_windows_x64_portable.zip
 ```
 
 验证 Windows x64：
@@ -156,7 +159,7 @@ PE32+ executable (GUI) x86-64, for MS Windows
 ## 常见失败
 
 - `failed to find tool "llvm-lib"`：安装 `llvm`，并在构建命令前加 `PATH="/opt/homebrew/opt/llvm/bin:$PATH"`。
-- 找不到 `makensis`：`brew install makensis`。
+- 本地仍尝试 NSIS 时找不到 `makensis`：`brew install makensis`（正式发版不需要）。
 - GitHub 下载 `nsis_tauri_utils.dll` 返回 `http status: 500`：通常是 GitHub release asset 临时/CDN 问题，直接重试；如果手动验证，用 `curl -L -H 'Accept: application/octet-stream' <url>`。
-- `Warn ignoring msi`：macOS 交叉编 Windows 时 MSI 不可用，NSIS installer 仍可产出。
-- 签名被跳过：非 Windows host 默认不会签 Windows 安装包；正式发布在 Windows runner 上配置签名。
+- `Warn ignoring msi`：macOS 交叉编 Windows 时 MSI 不可用。
+- 签名被跳过：非 Windows host 默认不会签 Windows 包；正式发布若需 Authenticode，在 Windows runner 上配置签名。

@@ -1,6 +1,6 @@
 [package]
 name = "prmonitor"
-version = "0.1.0"
+version = "0.1.1"
 description = "Desktop app that monitors GitHub PRs and streams codex pr-review via codex app-server"
 authors = ["ghbvf"]
 edition = "2021"
