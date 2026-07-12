@@ -318,8 +318,10 @@ mod tests {
         let _client = RpcClient::connect(client_w, tokio::io::BufReader::new(client_r), 16);
 
         let mut sw = server_w;
-        sw.write_all(br#"{"jsonrpc":"2.0","id":7,"method":"cursor/ask_question","params":{}}
-"#)
+        sw.write_all(
+            br#"{"jsonrpc":"2.0","id":7,"method":"cursor/ask_question","params":{}}
+"#,
+        )
         .await
         .unwrap();
         sw.flush().await.unwrap();
@@ -339,8 +341,10 @@ mod tests {
         let _client = RpcClient::connect(client_w, tokio::io::BufReader::new(client_r), 16);
 
         let mut sw = server_w;
-        sw.write_all(br#"{"jsonrpc":"2.0","id":8,"method":"cursor/create_plan","params":{}}
-"#)
+        sw.write_all(
+            br#"{"jsonrpc":"2.0","id":8,"method":"cursor/create_plan","params":{}}
+"#,
+        )
         .await
         .unwrap();
         sw.flush().await.unwrap();

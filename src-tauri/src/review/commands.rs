@@ -11,7 +11,7 @@ use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, Star
 use crate::review::engines::claude::process::{claude_availability, ClaudeStatus};
 use crate::review::engines::claude::ClaudeEngine;
 use crate::review::engines::codex::{CodexEngine, CodexStatus};
-use crate::review::engines::cursor::CursorEngine;
+use crate::review::engines::cursor::{CursorEngine, CursorStatus};
 use crate::review::history_store::{self, HistoryItem};
 use crate::review::session::{CommentUrlContext, SessionInfo, SessionStatus, StopTarget};
 use crate::state::AppState;
@@ -88,6 +88,41 @@ pub async fn get_claude_status<R: tauri::Runtime>(
     Ok(claude_availability(&claude).await)
 }
 
+enum CursorStatusInput<T> {
+    Resident(CursorStatus),
+    Cold(T),
+}
+
+fn cursor_status_input<T>(
+    manager: &crate::review::engines::cursor::CursorManager,
+    cold: impl FnOnce() -> AppResult<T>,
+) -> AppResult<CursorStatusInput<T>> {
+    match manager.resident_status() {
+        Some(status) => Ok(CursorStatusInput::Resident(status)),
+        None => cold().map(CursorStatusInput::Cold),
+    }
+}
+
+/// Reports Cursor ACP (`agent acp`) availability for the StatusBar. Ensures the resident
+/// connection (lazy start) like codex; failures map to a status struct.
+#[tauri::command]
+pub async fn get_cursor_status<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<CursorStatus> {
+    match cursor_status_input(&state.cursor, || {
+        Ok((
+            config_service::resolve_cli(&app, CliTool::Agent, false)?,
+            config_service::active_repo_root(&app)?,
+        ))
+    })? {
+        CursorStatusInput::Resident(status) => Ok(status),
+        CursorStatusInput::Cold((agent, repo_root)) => {
+            Ok(state.cursor.status(&agent, &repo_root).await)
+        }
+    }
+}
+
 /// 显式启动常驻 codex app-server（清除「已停止」标记并拉起握手）。返回最新状态。
 /// 全局单例 codex 的握手 cwd 取「活动项目」的 `repo_root`（#35）；每轮 review 的实际工作目录由 per-turn `cwd` 覆盖。
 #[tauri::command]
@@ -107,6 +142,25 @@ pub async fn start_codex<R: tauri::Runtime>(
 #[tauri::command]
 pub fn stop_codex(state: tauri::State<'_, AppState>) -> AppResult<CodexStatus> {
     Ok(state.codex.stop())
+}
+
+/// 显式启动常驻 Cursor ACP（清除「已停止」标记并拉起握手）。
+#[tauri::command]
+pub async fn start_cursor<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<CursorStatus> {
+    let repo_root = config_service::active_repo_root(&app)?;
+    let agent = config_service::resolve_cli(&app, CliTool::Agent, false)?;
+    let status = state.cursor.start(&agent, &repo_root).await;
+    state.review_resume.fire()?;
+    Ok(status)
+}
+
+/// 显式停止常驻 Cursor ACP（设「已停止」标记 + 杀进程）。
+#[tauri::command]
+pub fn stop_cursor(state: tauri::State<'_, AppState>) -> AppResult<CursorStatus> {
+    Ok(state.cursor.stop())
 }
 
 /// Whether a review start is an EXPLICIT user action or an AUTOMATIC one (AB#1069). The distinction

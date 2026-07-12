@@ -178,10 +178,7 @@ pub fn auto_response(method: &str) -> ApprovalReply {
 #[derive(Debug, Clone)]
 pub enum ServerNotification {
     /// `session/update` with `agent_message_chunk` → assistant text.
-    AgentMessageChunk {
-        session_id: String,
-        text: String,
-    },
+    AgentMessageChunk { session_id: String, text: String },
     /// Synthetic: reader exit (EOF / IO error / oversized frame).
     ConnectionClosed,
     /// Any other notification — method + raw params preserved.

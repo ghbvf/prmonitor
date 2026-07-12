@@ -98,9 +98,7 @@ pub(crate) fn decode_line(line: &str) -> AppResult<Option<Inbound>> {
             )));
         }
         None => {
-            return Err(AppError::new(
-                "cursor ACP 帧缺少 jsonrpc 字段".to_string(),
-            ));
+            return Err(AppError::new("cursor ACP 帧缺少 jsonrpc 字段".to_string()));
         }
     }
 

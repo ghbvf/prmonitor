@@ -372,9 +372,13 @@ fn emit_and_persist<R: tauri::Runtime>(
     };
     crate::stream::emit(app, StreamEvent::Review(event));
     let db = app.state::<crate::db::Database>();
-    if let Err(e) =
-        history_store::append_item(db.inner(), session_id, item_id, HistoryItemKind::Message, &text)
-    {
+    if let Err(e) = history_store::append_item(
+        db.inner(),
+        session_id,
+        item_id,
+        HistoryItemKind::Message,
+        &text,
+    ) {
         eprintln!(
             "cursor review history 持久化失败（{session_id}/{item_id}）：{}",
             e.message

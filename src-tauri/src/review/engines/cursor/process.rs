@@ -185,8 +185,7 @@ where
             SESSION_PROMPT_TIMEOUT,
         )
         .await?;
-    serde_json::from_value(raw)
-        .map_err(|e| AppError::new(format!("解析 session/prompt 失败: {e}")))
+    serde_json::from_value(raw).map_err(|e| AppError::new(format!("解析 session/prompt 失败: {e}")))
 }
 
 /// Cancel a running prompt (fire-and-forget notification).

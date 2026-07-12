@@ -104,7 +104,7 @@ impl CliToolsConfig {
     }
 
     /// Validate only the selected probe row. Persisting still calls [`Self::validate`] and checks
-    /// all five rows; a draft error in one row must not hide the probe result for its siblings.
+    /// all managed CLI rows; a draft error in one row must not hide the probe result for its siblings.
     pub(super) fn validate_tool(&self, tool: CliTool) -> AppResult<()> {
         let path = self.path(tool);
         if path.is_auto() {
@@ -2439,7 +2439,11 @@ mod tests {
         assert_eq!(v["cliTools"]["azPath"], "");
         assert_eq!(v["cliTools"]["codexPath"], "");
         assert_eq!(v["cliTools"]["claudePath"], "");
+        assert_eq!(v["cliTools"]["agentPath"], "");
         assert_eq!(v["cliTools"]["cloudflaredPath"], "");
+        // Cursor ACP auth is CLI/env only — no app-stored API key / model fields.
+        assert!(v.get("cursorApiKey").is_none());
+        assert!(v.get("cursorModel").is_none());
         assert!(v.get("cloudflaredBin").is_none());
         assert!(v.get("webhookTunnelMode").is_some());
         assert_eq!(v["webhookTunnelMode"], "quick");
@@ -2847,6 +2851,9 @@ mod tests {
         assert_eq!(v["claudeModel"], "claude-opus-4-1");
         assert_eq!(v["codexReasoningEffort"], "high");
         assert_eq!(v["claudeEffort"], "max");
+        // Cursor ACP: no per-project model/API key fields (CLI default + env auth only).
+        assert!(v.get("cursorModel").is_none());
+        assert!(v.get("cursorApiKey").is_none());
         assert!(v.get("autoReview").is_none());
         // #818: the new data-source-mode fields.
         assert!(v.get("updateMode").is_some());

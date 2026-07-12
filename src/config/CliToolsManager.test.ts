@@ -53,7 +53,7 @@ describe("CliToolsManager", () => {
     const wrapper = mount(CliToolsManager, { props: { draft: config } });
     await flushPromises();
 
-    expect(wrapper.findAll(".tool-row")).toHaveLength(5);
+    expect(wrapper.findAll(".tool-row")).toHaveLength(6);
     await wrapper.get("#cli-path-gh").setValue("bin/gh");
     await wrapper.get("button").trigger("click");
 
