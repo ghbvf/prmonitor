@@ -68,6 +68,7 @@ fn probe_cli_tools(
         refresh_path,
         &composition::ActiveCliFingerprints {
             codex: state.codex.active_fingerprint(),
+            cursor: state.cursor.active_fingerprint(),
             webhook_cloudflared: state.webhook.active_cloudflared_fingerprint(),
             remote_cloudflared: state.remote.active_cloudflared_fingerprints(),
         },
@@ -959,6 +960,9 @@ fn build_app() {
                 // `kill_on_drop` child → SIGKILL), so no review subprocess outlives the
                 // app — same "软件关闭时一起关闭" contract as codex (#718).
                 state.claude.shutdown();
+                // Kill the resident Cursor ACP (`agent acp`) child so it never outlives
+                // the app — same "软件关闭时一起关闭" contract as codex.
+                state.cursor.shutdown();
                 // Kill the cloudflared tunnel + abort the receiver so neither outlives
                 // the app (same "软件关闭时一起关闭" contract as codex).
                 state.webhook.shutdown();
@@ -1155,9 +1159,18 @@ async fn run_review_action(
             observed_resume_generation,
         });
     }
+    if project.engine_kind == model::EngineKind::Cursor && state.cursor.is_stopped() && !explicit {
+        return Ok(model::ActionExecutionResult::Blocked {
+            message: "Cursor ACP 已由用户停止，等待显式恢复".to_string(),
+            observed_resume_generation,
+        });
+    }
     if explicit && project.engine_kind == model::EngineKind::Codex {
         state.codex.resume();
         state.review_resume.fire()?;
+    }
+    if explicit && project.engine_kind == model::EngineKind::Cursor {
+        state.cursor.resume();
     }
     // SAFETY: the durable outbox executor is the composition root's authorized replay ingress.
     let capability = unsafe { review::engine::ReviewStartCapability::new_composition_root() };

@@ -66,6 +66,7 @@ pub struct CliToolsConfig {
     pub az_path: CliPath,
     pub codex_path: CliPath,
     pub claude_path: CliPath,
+    pub agent_path: CliPath,
     pub cloudflared_path: CliPath,
 }
 
@@ -90,6 +91,7 @@ impl CliToolsConfig {
             CliTool::Az => &self.az_path,
             CliTool::Codex => &self.codex_path,
             CliTool::Claude => &self.claude_path,
+            CliTool::Agent => &self.agent_path,
             CliTool::Cloudflared => &self.cloudflared_path,
         }
     }
@@ -135,6 +137,7 @@ impl CliToolsConfig {
             CliTool::Az => self.az_path = path,
             CliTool::Codex => self.codex_path = path,
             CliTool::Claude => self.claude_path = path,
+            CliTool::Agent => self.agent_path = path,
             CliTool::Cloudflared => self.cloudflared_path = path,
         }
     }
@@ -146,6 +149,7 @@ pub(super) const fn canonical_cli_name(tool: CliTool) -> &'static str {
         CliTool::Az => "az",
         CliTool::Codex => "codex",
         CliTool::Claude => "claude",
+        CliTool::Agent => "agent",
         CliTool::Cloudflared => "cloudflared",
     }
 }

@@ -11,6 +11,7 @@ use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, Star
 use crate::review::engines::claude::process::{claude_availability, ClaudeStatus};
 use crate::review::engines::claude::ClaudeEngine;
 use crate::review::engines::codex::{CodexEngine, CodexStatus};
+use crate::review::engines::cursor::CursorEngine;
 use crate::review::history_store::{self, HistoryItem};
 use crate::review::session::{CommentUrlContext, SessionInfo, SessionStatus, StopTarget};
 use crate::state::AppState;
@@ -215,6 +216,27 @@ impl ReviewStartCapability {
                     pr_number: 0,
                     session_info: None,
                     // AB#1204: `Some(outbox_id)` on the outbox path → claim breadcrumb at thread/start.
+                    outbox_claim_id,
+                };
+                engine.start(self, pr_number, kind).await
+            }
+            EngineKind::Cursor => {
+                // Explicit trigger overrides a prior cursor stop (parity with Codex).
+                if trigger == StartTrigger::Explicit {
+                    state.cursor.resume();
+                }
+                let agent_cli = config_service::resolve_cli(app, CliTool::Agent, false)?;
+                let engine = CursorEngine {
+                    app,
+                    cursor: &state.cursor,
+                    registry: &state.sessions,
+                    agent_cli: &agent_cli,
+                    project_id: &project.id,
+                    repo: &project.repo,
+                    repo_root: &project.repo_root,
+                    url_ctx,
+                    pr_number: 0,
+                    session_info: None,
                     outbox_claim_id,
                 };
                 engine.start(self, pr_number, kind).await
@@ -622,6 +644,26 @@ pub async fn send_review_message<R: tauri::Runtime>(
                 .send_message(&thread_id, &message, &user_item_id)
                 .await
         }
+        EngineKind::Cursor => {
+            state.cursor.resume();
+            let agent_cli = config_service::resolve_cli(&app, CliTool::Agent, false)?;
+            let engine = CursorEngine {
+                app: &app,
+                cursor: &state.cursor,
+                registry: &state.sessions,
+                agent_cli: &agent_cli,
+                project_id: &project.id,
+                repo: &project.repo,
+                repo_root: &project.repo_root,
+                url_ctx,
+                pr_number,
+                session_info: Some(session_info.clone()),
+                outbox_claim_id: None,
+            };
+            engine
+                .send_message(&thread_id, &message, &user_item_id)
+                .await
+        }
     }
 }
 
@@ -649,17 +691,37 @@ pub(crate) async fn start_review_authorized<R: tauri::Runtime>(
 
 /// Interrupt a running review session by its `threadId` (#718): the shared stop body behind the
 /// manual [`stop_review`] command AND the AB#1069 outbox `stop-review` action ([`stop_for_outbox`]).
-/// Stop-engine resolution WITHOUT an engine field on the persisted `SessionInfo`: a session id is
-/// globally unique, so whichever manager holds its kill handle definitively OWNS the session. Try
-/// claude first — `stop` returns true iff the ClaudeManager owned this session (and just aborted its
-/// pump → killed `claude -p`). Deterministic, not a guess; if false, the session is codex's (or
-/// already gone) → fall through to the codex interrupt path. `pub(crate)` so the composition root
-/// (`lib.rs`) reuses it for the outbox action — names only review-internal / config types.
+/// Prefer the session's persisted `engine_kind` when known; otherwise probe Claude's kill map,
+/// then fall through to Codex (legacy ownership probe). Cursor cancels via `session/cancel` on
+/// the resident ACP connection.
 pub(crate) async fn stop_session_by_id<R: tauri::Runtime>(
     _app: &tauri::AppHandle<R>,
     state: &AppState,
     session_id: &str,
 ) -> AppResult<()> {
+    if let Some(info) = state.sessions.get(session_id) {
+        match info.engine_kind {
+            EngineKind::Claude => {
+                let _ = state.claude.stop(session_id);
+                return Ok(());
+            }
+            EngineKind::Cursor => {
+                if let Some(client) = state.cursor.existing_client() {
+                    crate::review::engines::cursor::process::session_cancel(&client, session_id)
+                        .await?;
+                }
+                return Ok(());
+            }
+            EngineKind::Codex => {
+                return crate::review::session::stop_review(
+                    &state.codex,
+                    &state.sessions,
+                    session_id,
+                )
+                .await;
+            }
+        }
+    }
     if state.claude.stop(session_id) {
         return Ok(());
     }

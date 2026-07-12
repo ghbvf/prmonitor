@@ -351,6 +351,8 @@ pub enum CliTool {
     Az,
     Codex,
     Claude,
+    /// Cursor CLI (`agent`) — ACP review engine binary.
+    Agent,
     Cloudflared,
 }
 
@@ -528,10 +530,10 @@ pub enum UpdateMode {
 /// **Hard carrier** (sealed enum): engine selection is wired through exhaustive
 /// `match EngineKind { ... }` in the review start funnel (`commands.rs::start_via_engine`), so
 /// adding a variant without handling it is a compile error — the missing arm cannot be expressed.
-/// Now load-bearing (#718): `Claude` is available alongside `Codex`.
+/// Load-bearing: `Codex`, `Claude`, and `Cursor` (ACP via `agent acp`).
 ///
 /// Wire strings are a cross-agent contract the frontend mirrors (`ENGINE_KINDS`
-/// in `src/types.ts`): `Codex → "codex"`, `Claude → "claude"`. The serde golden
+/// in `src/types.ts`): `Codex → "codex"`, `Claude → "claude"`, `Cursor → "cursor"`. The serde golden
 /// test below (`discriminator_enums_serialize_to_pinned_wire_strings`) is the
 /// **Medium** carrier locking those strings against a `rename_all` / variant drift.
 #[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
@@ -542,6 +544,8 @@ pub enum EngineKind {
     Codex,
     /// `claude -p` headless (Claude Code) review engine (#718).
     Claude,
+    /// Cursor CLI ACP (`agent acp`) review engine.
+    Cursor,
 }
 
 /// Per-turn reasoning effort accepted by the Codex app-server protocol.
@@ -2158,6 +2162,12 @@ mod tests {
         assert_eq!(
             serde_json::to_value(EngineKind::Claude).expect("EngineKind serializes"),
             "claude"
+        );
+        // Cursor ACP review engine pins to "cursor" (frontend `ENGINE_KINDS`);
+        // Medium carrier against rename_all / variant drift.
+        assert_eq!(
+            serde_json::to_value(EngineKind::Cursor).expect("EngineKind serializes"),
+            "cursor"
         );
         // AB#717: per-project label source. camelCase wire strings the frontend mirrors;
         // a variant rename or `rename_all` change surfaces here. Default is `Native`

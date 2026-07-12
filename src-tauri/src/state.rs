@@ -216,6 +216,9 @@ pub struct AppState {
     /// only each live review's pump-task abort handle for `stop`/shutdown. Methods
     /// take `&self`.
     pub claude: crate::review::engines::claude::ClaudeManager,
+    /// The resident Cursor ACP (`agent acp`) connection. Lazily started, kept alive
+    /// so reviews start fast; killed on app shutdown. Methods take `&self`.
+    pub cursor: crate::review::engines::cursor::CursorManager,
     /// Review sessions keyed by `threadId` (PR6). Shared (`Arc` inside) with each
     /// session's streaming pump task; methods take `&self`.
     pub sessions: crate::review::session::SessionRegistry,
