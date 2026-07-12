@@ -1,7 +1,13 @@
 import { getTransport } from "../transport";
 import type { SubscribeOptions } from "../transport";
 import type { PrEvent, ReviewEvent, TrackedPrView } from "../types";
-import type { ClaudeStatus, CodexStatus, ReviewSession, StreamItem } from "../review/types";
+import type {
+  ClaudeStatus,
+  CodexStatus,
+  CursorStatus,
+  ReviewSession,
+  StreamItem,
+} from "../review/types";
 import type {
   EngineKind,
   ExternalRequestId,
@@ -183,6 +189,10 @@ export function getRemoteCodexStatus(): Promise<CodexStatus> {
 
 export function getRemoteClaudeStatus(): Promise<ClaudeStatus> {
   return getTransport().request<ClaudeStatus>("get_claude_status");
+}
+
+export function getRemoteCursorStatus(): Promise<CursorStatus> {
+  return getTransport().request<CursorStatus>("get_cursor_status");
 }
 
 export function createExternalRequestId(): ExternalRequestId {

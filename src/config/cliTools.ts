@@ -12,6 +12,7 @@ export const CLI_TOOL_META: Record<CliTool, CliToolMeta> = {
   az: { label: "Azure CLI (az)", pathKey: "azPath" },
   codex: { label: "Codex CLI", pathKey: "codexPath" },
   claude: { label: "Claude CLI", pathKey: "claudePath" },
+  agent: { label: "Cursor Agent (agent)", pathKey: "agentPath" },
   cloudflared: { label: "Cloudflare Tunnel (cloudflared)", pathKey: "cloudflaredPath" },
 };
 

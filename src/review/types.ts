@@ -1,5 +1,16 @@
+import type { EngineKind } from "../types";
+
 // Review 切片私有 wire 型，镜像 src-tauri 的 CodexStatus（不进 src/types.ts —— 对标 src/pr/types.ts 的 GhStatus）。
 export interface CodexStatus {
+  available: boolean;
+  // 用户意图运行态：false=用户已显式停止（StatusBar 显示「启动」按钮 + idle 点），true=意图运行（available 反映实际连通）。
+  desiredRunning: boolean;
+  message: string;
+}
+
+// Review 切片私有 wire 型，镜像 src-tauri 的 CursorStatus（不进 src/types.ts —— 对标 CodexStatus）。
+// Cursor ACP 与 codex 一样是常驻 server：有 desiredRunning / 启动停止。
+export interface CursorStatus {
   available: boolean;
   // 用户意图运行态：false=用户已显式停止（StatusBar 显示「启动」按钮 + idle 点），true=意图运行（available 反映实际连通）。
   desiredRunning: boolean;
@@ -32,7 +43,7 @@ export interface ReviewSession {
   kind: string;
   // Engine that created this session. Follow-up chat routes by this durable value, not
   // by the project's current engine setting.
-  engineKind: "codex" | "claude";
+  engineKind: EngineKind;
   status: SessionStatus;
   // Wall-clock epoch seconds the session was created (#70, review F10): the newest-first
   // sort key for the session list. Mirrors `SessionInfo.created_at_epoch` (Rust) — a UUID

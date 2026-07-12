@@ -20,6 +20,7 @@ describe("CLI tool metadata", () => {
       "azPath",
       "codexPath",
       "claudePath",
+      "agentPath",
       "cloudflaredPath",
     ]);
   });
@@ -39,6 +40,7 @@ describe("CLI tool metadata", () => {
       azPath: "",
       codexPath: "",
       claudePath: "",
+      agentPath: "",
       cloudflaredPath: "",
     });
     expect("cloudflaredBin" in DEFAULT_CLI_TOOLS_CONFIG).toBe(false);

@@ -59,7 +59,7 @@ const { activeProjectId } = useProjects();
 // `dispatchError` is the session-less auto-trigger notice (#8): the backend dispatcher
 // emits it on a bad config / start failure / ledger-write failure, so the same banner that
 // warns "auto review paused" also reports "auto review failed".
-const { codex, claude, dispatchError, clearDispatchError, clearFocus } =
+const { codex, claude, cursor, dispatchError, clearDispatchError, clearFocus } =
   useReviewStore();
 const activeProject = computed(
   () =>
@@ -101,8 +101,16 @@ const claudeBlocked = computed(
     activeProject.value?.engineKind === "claude" &&
     claude.value?.available === false,
 );
+const cursorBlocked = computed(
+  () =>
+    activeEnabled.value &&
+    activeProject.value?.engineKind === "cursor" &&
+    cursor.value?.available === false,
+);
 const sourceBlocked = computed(() => ghBlocked.value || azBlocked.value);
-const engineBlocked = computed(() => codexBlocked.value || claudeBlocked.value);
+const engineBlocked = computed(
+  () => codexBlocked.value || claudeBlocked.value || cursorBlocked.value,
+);
 const showPrompt = computed(() => sourceBlocked.value || engineBlocked.value);
 // dispatchError is keyed per project (#35): show the active project's notice.
 const activeDispatchError = computed(
@@ -412,6 +420,9 @@ watch(selectedNumber, (n) => {
             </template>
             <template v-if="claudeBlocked">
               claude 不可用（{{ claude?.message }}）
+            </template>
+            <template v-if="cursorBlocked">
+              cursor 不可用（{{ cursor?.message }}）
             </template>
           </p>
           <p v-if="activeDispatchError" class="line dispatch-error">

@@ -12,15 +12,19 @@ import StatusBar from "./StatusBar.vue";
 const probes = vi.hoisted(() => ({
   refreshCodexStatus: vi.fn(),
   refreshClaudeStatus: vi.fn(),
+  refreshCursorStatus: vi.fn(),
   startCodexServer: vi.fn(),
   stopCodexServer: vi.fn(),
+  startCursorServer: vi.fn(),
+  stopCursorServer: vi.fn(),
 }));
 
 vi.mock("./review/useReviewStore", async () => {
   const { ref } = await import("vue");
   const codex = ref({ available: true, desiredRunning: true, message: "codex ok" });
   const claude = ref({ available: true, message: "claude ok" });
-  return { useReviewStore: () => ({ codex, claude, ...probes }) };
+  const cursor = ref({ available: true, desiredRunning: true, message: "cursor ok" });
+  return { useReviewStore: () => ({ codex, claude, cursor, ...probes }) };
 });
 
 function config(): AppConfig {
@@ -43,6 +47,14 @@ function config(): AppConfig {
         repoRoot: "/other",
         engineKind: "claude",
       },
+      {
+        id: "cursor-project",
+        name: "Cursor",
+        ...NEW_PROJECT_DEFAULTS,
+        repo: "owner/cursor",
+        repoRoot: "/cursor",
+        engineKind: "cursor",
+      },
     ],
   } as AppConfig;
 }
@@ -60,6 +72,7 @@ describe("StatusBar CLI path invalidation", () => {
     await flushPromises();
     expect(probes.refreshCodexStatus).not.toHaveBeenCalled();
     expect(probes.refreshClaudeStatus).not.toHaveBeenCalled();
+    expect(probes.refreshCursorStatus).not.toHaveBeenCalled();
 
     configStore.config.cliTools.codexPath = "/new/codex";
     await nextTick();
@@ -69,5 +82,10 @@ describe("StatusBar CLI path invalidation", () => {
     configStore.config.cliTools.claudePath = "/new/claude";
     await nextTick();
     expect(probes.refreshClaudeStatus).toHaveBeenCalledOnce();
+
+    configStore.config.cliTools.agentPath = "/new/agent";
+    await nextTick();
+    expect(probes.refreshCursorStatus).toHaveBeenCalledOnce();
+    expect(probes.stopCursorServer).not.toHaveBeenCalled();
   });
 });

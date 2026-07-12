@@ -79,8 +79,10 @@ describe("remote console api", () => {
   it("checks engine statuses", async () => {
     await api.getRemoteCodexStatus();
     await api.getRemoteClaudeStatus();
+    await api.getRemoteCursorStatus();
     expect(request).toHaveBeenNthCalledWith(1, "get_codex_status");
     expect(request).toHaveBeenNthCalledWith(2, "get_claude_status");
+    expect(request).toHaveBeenNthCalledWith(3, "get_cursor_status");
   });
 
   it("submits review and check as idempotent external requests", async () => {

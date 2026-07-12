@@ -248,8 +248,12 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         // Single-sourced from ENGINE_KINDS (#718) — type & options can't drift; Chinese
         // display via optionLabels (ConfigField emits the raw camelCase wire value).
         options: ENGINE_KINDS,
-        optionLabels: { codex: "Codex", claude: "Claude (claude -p)" },
-        hint: "codex=codex app-server；claude=claude -p（Claude Code headless，复用 claude CLI 登录）",
+        optionLabels: {
+          codex: "Codex",
+          claude: "Claude (claude -p)",
+          cursor: "Cursor (ACP)",
+        },
+        hint: "codex=codex app-server；claude=claude -p（Claude Code headless，复用 claude CLI 登录）；cursor=Cursor Agent ACP（agent acp，复用 agent CLI）",
       },
       {
         key: "claudeModel",

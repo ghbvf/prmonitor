@@ -2,7 +2,13 @@
 // commands, and the streamed `review:event` Tauri event.
 import { getTransport } from "../transport";
 import type { ReviewEvent } from "../types";
-import type { ClaudeStatus, CodexStatus, ReviewSession, StreamItem } from "./types";
+import type {
+  ClaudeStatus,
+  CodexStatus,
+  CursorStatus,
+  ReviewSession,
+  StreamItem,
+} from "./types";
 
 // Mirrors `src-tauri/src/events.rs::REVIEW_EVENT` (pinned by a Rust test).
 const REVIEW_EVENT = "review:event" as const;
@@ -17,6 +23,10 @@ export function getClaudeStatus(): Promise<ClaudeStatus> {
   return getTransport().request<ClaudeStatus>("get_claude_status");
 }
 
+export function getCursorStatus(): Promise<CursorStatus> {
+  return getTransport().request<CursorStatus>("get_cursor_status");
+}
+
 // Explicitly start the resident codex app-server (clears the user-stop flag).
 export function startCodex(): Promise<CodexStatus> {
   return getTransport().request<CodexStatus>("start_codex");
@@ -25,6 +35,16 @@ export function startCodex(): Promise<CodexStatus> {
 // Explicitly stop the resident codex app-server (passive probes won't revive it).
 export function stopCodex(): Promise<CodexStatus> {
   return getTransport().request<CodexStatus>("stop_codex");
+}
+
+// Explicitly start the resident Cursor ACP server (clears the user-stop flag).
+export function startCursor(): Promise<CursorStatus> {
+  return getTransport().request<CursorStatus>("start_cursor");
+}
+
+// Explicitly stop the resident Cursor ACP server (passive probes won't revive it).
+export function stopCursor(): Promise<CursorStatus> {
+  return getTransport().request<CursorStatus>("stop_cursor");
 }
 
 // Starts a review for a PR in the given project (#35); resolves with the session
