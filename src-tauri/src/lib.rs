@@ -1156,24 +1156,32 @@ async fn run_review_action(
     let state = app.state::<AppState>();
     let project = config::service::project_validated(app, action.project_id())?;
     let observed_resume_generation = state.review_resume.generation();
-    if project.engine_kind == model::EngineKind::Codex && state.codex.is_stopped() && !explicit {
-        return Ok(model::ActionExecutionResult::Blocked {
-            message: "Codex 已由用户停止，等待显式恢复".to_string(),
-            observed_resume_generation,
-        });
-    }
-    if project.engine_kind == model::EngineKind::Cursor && state.cursor.is_stopped() && !explicit {
-        return Ok(model::ActionExecutionResult::Blocked {
-            message: "Cursor ACP 已由用户停止，等待显式恢复".to_string(),
-            observed_resume_generation,
-        });
-    }
-    if explicit && project.engine_kind == model::EngineKind::Codex {
-        state.codex.resume();
-        state.review_resume.fire()?;
-    }
-    if explicit && project.engine_kind == model::EngineKind::Cursor {
-        state.cursor.resume();
+    match project.engine_kind {
+        model::EngineKind::Codex => {
+            if state.codex.is_stopped() && !explicit {
+                return Ok(model::ActionExecutionResult::Blocked {
+                    message: "Codex 已由用户停止，等待显式恢复".to_string(),
+                    observed_resume_generation,
+                });
+            }
+            if explicit {
+                state.codex.resume();
+                state.review_resume.fire()?;
+            }
+        }
+        model::EngineKind::Cursor => {
+            if state.cursor.is_stopped() && !explicit {
+                return Ok(model::ActionExecutionResult::Blocked {
+                    message: "Cursor ACP 已由用户停止，等待显式恢复".to_string(),
+                    observed_resume_generation,
+                });
+            }
+            if explicit {
+                state.cursor.resume();
+                state.review_resume.fire()?;
+            }
+        }
+        model::EngineKind::Claude => {}
     }
     // SAFETY: the durable outbox executor is the composition root's authorized replay ingress.
     let capability = unsafe { review::engine::ReviewStartCapability::new_composition_root() };

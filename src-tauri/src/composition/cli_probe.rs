@@ -142,7 +142,7 @@ mod tests {
             false,
             &ActiveCliFingerprints {
                 codex: Some("different".to_string()),
-                cursor: None,
+                cursor: Some("different-cursor".to_string()),
                 webhook_cloudflared: Some("running-old-cloudflared".to_string()),
                 remote_cloudflared: Vec::new(),
             },
@@ -153,6 +153,13 @@ mod tests {
                 .find(|row| row.tool == CliTool::Codex)
                 .unwrap()
                 .pending_restart
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.tool == CliTool::Agent)
+                .unwrap()
+                .pending_restart,
+            "Agent pending_restart when cursor fingerprint mismatches"
         );
         let cloudflared = rows
             .iter()

@@ -223,6 +223,46 @@ mod tests {
     }
 
     #[test]
+    fn decode_classifies_error_response() {
+        match decode_line(
+            r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"not found"}}"#,
+        )
+        .unwrap()
+        .unwrap()
+        {
+            Inbound::Response {
+                id,
+                payload: ResponsePayload::Err(e),
+            } => {
+                assert_eq!(id, 4);
+                assert_eq!(e.code, -32601);
+                assert_eq!(e.message, "not found");
+            }
+            other => panic!("expected error response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_error_includes_jsonrpc() {
+        let line = encode_error_response(9, -32601, "method not handled by client").unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["error"]["code"], -32601);
+        assert!(v.get("result").is_none());
+    }
+
+    #[test]
+    fn decode_wrong_jsonrpc_version_is_err() {
+        let err = decode_line(r#"{"jsonrpc":"1.0","id":1,"result":{}}"#).expect_err("version");
+        assert!(
+            err.message.contains("jsonrpc"),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn decode_classifies_server_request() {
         match decode_line(
             r#"{"jsonrpc":"2.0","id":5,"method":"session/request_permission","params":{}}"#,

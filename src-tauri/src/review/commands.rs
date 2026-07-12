@@ -278,6 +278,7 @@ impl ReviewStartCapability {
                 // Explicit trigger overrides a prior cursor stop (parity with Codex).
                 if trigger == StartTrigger::Explicit {
                     state.cursor.resume();
+                    state.review_resume.fire()?;
                 }
                 let agent_cli = config_service::resolve_cli(app, CliTool::Agent, false)?;
                 let engine = CursorEngine {
@@ -700,6 +701,7 @@ pub async fn send_review_message<R: tauri::Runtime>(
         }
         EngineKind::Cursor => {
             state.cursor.resume();
+            state.review_resume.fire()?;
             let agent_cli = config_service::resolve_cli(&app, CliTool::Agent, false)?;
             let engine = CursorEngine {
                 app: &app,
@@ -774,6 +776,15 @@ pub(crate) async fn stop_session_by_id<R: tauri::Runtime>(
                 )
                 .await;
             }
+        }
+    }
+    // Registry miss: try Cursor cancel before Claude/Codex ownership probes.
+    if let Some(client) = state.cursor.existing_client() {
+        if crate::review::engines::cursor::process::session_cancel(&client, session_id)
+            .await
+            .is_ok()
+        {
+            return Ok(());
         }
     }
     if state.claude.stop(session_id) {

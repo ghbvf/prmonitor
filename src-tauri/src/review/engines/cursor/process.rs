@@ -46,17 +46,20 @@ pub struct CursorProcess {
 
 impl CursorProcess {
     /// Spawn `agent acp` in `repo_root` and complete `initialize` + `authenticate`.
-    /// An empty `repo_root` leaves the child's cwd at the process default.
+    /// Empty `repo_root` fails closed — never inherits an arbitrary process cwd.
     pub(super) async fn spawn(agent: &ResolvedCli, repo_root: &str) -> AppResult<Self> {
+        if repo_root.trim().is_empty() {
+            return Err(AppError::new(
+                "cursor ACP 需要非空 repo_root（cwd）".to_string(),
+            ));
+        }
         let mut cmd = agent.command();
         cmd.args(["acp"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        if !repo_root.trim().is_empty() {
-            cmd.current_dir(repo_root);
-        }
+            .kill_on_drop(true)
+            .current_dir(repo_root);
 
         let mut child = cmd.spawn().map_err(|e| {
             AppError::new(format!(
@@ -377,5 +380,26 @@ done
 
         proc.kill_and_reap();
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_empty_repo_root() {
+        use crate::config::service::ResolvedCli;
+
+        let agent = ResolvedCli::for_test(std::env::temp_dir().join("prmonitor-no-such-agent"));
+        let err = match CursorProcess::spawn(&agent, "").await {
+            Ok(_) => panic!("empty repo_root must fail closed"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message.contains("repo_root"),
+            "unexpected error: {}",
+            err.message
+        );
+        let err_ws = match CursorProcess::spawn(&agent, "   ").await {
+            Ok(_) => panic!("whitespace-only repo_root must fail closed"),
+            Err(e) => e,
+        };
+        assert!(err_ws.message.contains("repo_root"));
     }
 }

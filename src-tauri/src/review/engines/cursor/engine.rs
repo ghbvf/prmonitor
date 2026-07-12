@@ -489,8 +489,24 @@ mod tests {
     }
 
     #[test]
+    fn map_stop_reason_end_turn_camel_alias_is_completed() {
+        let (s, w, e) = map_stop_reason("endTurn");
+        assert_eq!(s, SessionStatus::Done);
+        assert_eq!(w, "completed");
+        assert!(e.is_none());
+    }
+
+    #[test]
     fn map_stop_reason_cancelled_is_interrupted() {
         let (s, w, e) = map_stop_reason("cancelled");
+        assert_eq!(s, SessionStatus::Done);
+        assert_eq!(w, "interrupted");
+        assert!(e.is_none());
+    }
+
+    #[test]
+    fn map_stop_reason_canceled_alias_is_interrupted() {
+        let (s, w, e) = map_stop_reason("canceled");
         assert_eq!(s, SessionStatus::Done);
         assert_eq!(w, "interrupted");
         assert!(e.is_none());

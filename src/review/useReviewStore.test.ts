@@ -440,6 +440,32 @@ describe("useReviewStore start()/stop()", () => {
     expect(store.error.value).toBe("nope");
   });
 
+  it("start on a cursor project refreshes cursor status after success", async () => {
+    useProjects().projects.value = [
+      {
+        id: "p1",
+        name: "Cursor",
+        engineKind: "cursor",
+      } as never,
+    ];
+    const store = useReviewStore();
+    await store.start("p1", 7, "review");
+    expect(api.getCursorStatus).toHaveBeenCalled();
+  });
+
+  it("start on a non-cursor project does not refresh cursor status", async () => {
+    useProjects().projects.value = [
+      {
+        id: "p1",
+        name: "Codex",
+        engineKind: "codex",
+      } as never,
+    ];
+    const store = useReviewStore();
+    await store.start("p1", 7, "review");
+    expect(api.getCursorStatus).not.toHaveBeenCalled();
+  });
+
   it("stop interrupts the active session by id", async () => {
     const store = useReviewStore();
     store.activeThreadId.value = "th_1";

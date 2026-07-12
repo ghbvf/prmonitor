@@ -260,11 +260,11 @@ async fn auto_answer_server_request<W>(
     writer: &SharedWriter<W>,
     id: i64,
     method: &str,
-    _params: Value,
+    params: Value,
 ) where
     W: AsyncWrite + Unpin,
 {
-    let line = match super::protocol::auto_response(method).result() {
+    let line = match super::protocol::auto_response(method, &params).result() {
         Some(result) => codec::encode_response(id, &result),
         None => {
             eprintln!("cursor ACP 反向请求 {method}（id={id}）无自动应答，回 error");
@@ -294,7 +294,7 @@ mod tests {
 
         let mut sw = server_w;
         sw.write_all(
-            br#"{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{}}
+            br#"{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"c1","kind":"execute"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}
 "#,
         )
         .await
@@ -309,6 +309,53 @@ mod tests {
         assert_eq!(v["id"], 99);
         assert_eq!(v["result"]["outcome"]["outcome"], "selected");
         assert_eq!(v["result"]["outcome"]["optionId"], "allow-once");
+    }
+
+    #[tokio::test]
+    async fn auto_rejects_switch_mode_permission() {
+        let (client_w, server_r) = tokio::io::duplex(64 * 1024);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let _client = RpcClient::connect(client_w, tokio::io::BufReader::new(client_r), 16);
+
+        let mut sw = server_w;
+        sw.write_all(
+            br#"{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"toolCall":{"kind":"switch_mode"},"options":[{"optionId":"allow-once","kind":"allow_once"},{"optionId":"reject-once","kind":"reject_once"}]}}
+"#,
+        )
+        .await
+        .unwrap();
+        sw.flush().await.unwrap();
+
+        let mut sr = tokio::io::BufReader::new(server_r);
+        let mut line = String::new();
+        sr.read_line(&mut line).await.unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 100);
+        assert_eq!(v["result"]["outcome"]["optionId"], "reject-once");
+    }
+
+    #[tokio::test]
+    async fn permission_without_allow_once_errors() {
+        let (client_w, server_r) = tokio::io::duplex(64 * 1024);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let _client = RpcClient::connect(client_w, tokio::io::BufReader::new(client_r), 16);
+
+        let mut sw = server_w;
+        sw.write_all(
+            br#"{"jsonrpc":"2.0","id":101,"method":"session/request_permission","params":{}}
+"#,
+        )
+        .await
+        .unwrap();
+        sw.flush().await.unwrap();
+
+        let mut sr = tokio::io::BufReader::new(server_r);
+        let mut line = String::new();
+        sr.read_line(&mut line).await.unwrap();
+        let v: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["id"], 101);
+        assert!(v.get("error").is_some());
+        assert!(v.get("result").is_none());
     }
 
     #[tokio::test]
@@ -422,5 +469,34 @@ mod tests {
         assert_eq!(v["jsonrpc"], "2.0");
         assert_eq!(v["method"], "initialize");
         req.abort();
+    }
+
+    /// A frame that fills the cap with no closing newline tears the connection
+    /// down (parity with Codex): reader stops, pending drains, request fails fast.
+    #[tokio::test]
+    async fn oversized_frame_tears_down_connection() {
+        let (client_w, _server_r) = tokio::io::duplex(64 * 1024);
+        let (server_w, client_r) = tokio::io::duplex(64 * 1024);
+        let max = 1024usize;
+        let client = RpcClient::connect_with_max_frame(
+            client_w,
+            tokio::io::BufReader::new(client_r),
+            16,
+            max,
+        );
+
+        let mut sw = server_w;
+        sw.write_all(&vec![b'x'; max * 2]).await.unwrap();
+        sw.flush().await.unwrap();
+
+        let res = client.request("initialize", serde_json::json!({})).await;
+        assert!(
+            res.is_err(),
+            "oversized frame must close the reader and fail the request"
+        );
+        assert!(
+            !client.is_connected(),
+            "is_connected flips false once the cap is hit"
+        );
     }
 }

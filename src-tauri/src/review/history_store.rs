@@ -753,6 +753,15 @@ mod tests {
             "unexpected error: {}",
             err.message
         );
+        let list_err =
+            get_pr_sessions(&db, "alpha", 1).expect_err("unknown engine must fail list too");
+        assert!(
+            list_err.message.contains("not-an-engine")
+                || list_err.message.to_lowercase().contains("invalid")
+                || list_err.message.contains("engine"),
+            "unexpected list error: {}",
+            list_err.message
+        );
     }
 
     // FK to `review_session` was dropped (review F2): a best-effort `append_item` must

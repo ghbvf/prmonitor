@@ -88,4 +88,42 @@ describe("StatusBar CLI path invalidation", () => {
     expect(probes.refreshCursorStatus).toHaveBeenCalledOnce();
     expect(probes.stopCursorServer).not.toHaveBeenCalled();
   });
+
+  it("cursor engine button toggles start/stop via onEngineButton", async () => {
+    const { useReviewStore } = await import("./review/useReviewStore");
+    const store = useReviewStore() as {
+      cursor: { value: { available: boolean; desiredRunning: boolean; message: string } };
+      codex: { value: { available: boolean; desiredRunning: boolean; message: string } };
+    };
+    // Only cursor is running so the sole 「停止」 button is cursor's.
+    store.codex.value = {
+      available: false,
+      desiredRunning: false,
+      message: "codex app-server 已停止",
+    };
+    const configStore = useConfigStore();
+    configStore.config = config();
+    const wrapper = mount(StatusBar);
+    await flushPromises();
+
+    const cursorItem = wrapper
+      .findAll(".item")
+      .find((el) => el.text().includes("cursor —"));
+    expect(cursorItem).toBeTruthy();
+    const stopBtn = cursorItem!.find("button");
+    expect(stopBtn.text()).toBe("停止");
+    await stopBtn.trigger("click");
+    expect(probes.stopCursorServer).toHaveBeenCalledOnce();
+
+    store.cursor.value = {
+      available: false,
+      desiredRunning: false,
+      message: "cursor ACP 已停止",
+    };
+    await nextTick();
+    const startBtn = cursorItem!.find("button");
+    expect(startBtn.text()).toBe("启动");
+    await startBtn.trigger("click");
+    expect(probes.startCursorServer).toHaveBeenCalledOnce();
+  });
 });

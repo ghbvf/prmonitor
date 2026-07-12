@@ -132,8 +132,10 @@ pub struct SessionCancelParams {
 
 /// What to reply to a server→client request so an unattended review never stalls.
 pub enum ApprovalReply {
-    /// `session/request_permission` → selected `allow-once` (Cursor docs).
+    /// `session/request_permission` → selected `allow-once` (when offered).
     AllowOnce,
+    /// `session/request_permission` → selected `reject-once` (switch_mode / no allow).
+    RejectOnce,
     /// `cursor/ask_question` → skipped.
     Skipped,
     /// `cursor/create_plan` → rejected.
@@ -148,6 +150,9 @@ impl ApprovalReply {
             Self::AllowOnce => Some(serde_json::json!({
                 "outcome": { "outcome": "selected", "optionId": "allow-once" }
             })),
+            Self::RejectOnce => Some(serde_json::json!({
+                "outcome": { "outcome": "selected", "optionId": "reject-once" }
+            })),
             Self::Skipped => Some(serde_json::json!({
                 "outcome": { "outcome": "skipped" }
             })),
@@ -159,14 +164,46 @@ impl ApprovalReply {
     }
 }
 
-/// Map a server→client request method to its auto-response.
+/// Map a server→client request method (+ params) to its auto-response.
 /// **Medium** carrier: wrong tokens stall unattended reviews — locked by unit tests.
-pub fn auto_response(method: &str) -> ApprovalReply {
+///
+/// Permission is **not** blind-allow: `switch_mode` and missing `allow-once` reject.
+pub fn auto_response(method: &str, params: &Value) -> ApprovalReply {
     match method {
-        server_methods::SESSION_REQUEST_PERMISSION => ApprovalReply::AllowOnce,
+        server_methods::SESSION_REQUEST_PERMISSION => permission_reply(params),
         server_methods::CURSOR_ASK_QUESTION => ApprovalReply::Skipped,
         server_methods::CURSOR_CREATE_PLAN => ApprovalReply::Rejected,
         _ => ApprovalReply::Unhandled,
+    }
+}
+
+/// Decide allow-once vs reject-once from `session/request_permission` params.
+fn permission_reply(params: &Value) -> ApprovalReply {
+    let tool_kind = params
+        .pointer("/toolCall/kind")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if tool_kind == "switch_mode" {
+        return ApprovalReply::RejectOnce;
+    }
+
+    let options = params.get("options").and_then(Value::as_array);
+    let has_option = |option_id: &str| {
+        options
+            .map(|opts| {
+                opts.iter()
+                    .any(|o| o.get("optionId").and_then(Value::as_str) == Some(option_id))
+            })
+            .unwrap_or(false)
+    };
+
+    if has_option("allow-once") {
+        ApprovalReply::AllowOnce
+    } else if has_option("reject-once") {
+        ApprovalReply::RejectOnce
+    } else {
+        // No usable option advertised — fail closed with a JSON-RPC error.
+        ApprovalReply::Unhandled
     }
 }
 
@@ -338,25 +375,70 @@ mod tests {
     #[test]
     fn auto_response_locks_permission_and_cursor_extensions() {
         // Medium golden: unattended reviews depend on these exact outcome shapes.
+        let allow_params = serde_json::json!({
+            "sessionId": "s1",
+            "toolCall": { "toolCallId": "c1", "kind": "execute" },
+            "options": [
+                { "optionId": "allow-once", "name": "Allow once", "kind": "allow_once" },
+                { "optionId": "reject-once", "name": "Reject", "kind": "reject_once" }
+            ]
+        });
         assert_eq!(
-            auto_response(server_methods::SESSION_REQUEST_PERMISSION).result(),
+            auto_response(server_methods::SESSION_REQUEST_PERMISSION, &allow_params).result(),
             Some(serde_json::json!({
                 "outcome": { "outcome": "selected", "optionId": "allow-once" }
             }))
         );
+
+        let switch_mode = serde_json::json!({
+            "sessionId": "s1",
+            "toolCall": { "toolCallId": "c2", "kind": "switch_mode" },
+            "options": [
+                { "optionId": "allow-once", "name": "Allow once", "kind": "allow_once" },
+                { "optionId": "reject-once", "name": "Reject", "kind": "reject_once" }
+            ]
+        });
         assert_eq!(
-            auto_response(server_methods::CURSOR_ASK_QUESTION).result(),
+            auto_response(server_methods::SESSION_REQUEST_PERMISSION, &switch_mode).result(),
+            Some(serde_json::json!({
+                "outcome": { "outcome": "selected", "optionId": "reject-once" }
+            }))
+        );
+
+        let no_allow = serde_json::json!({
+            "sessionId": "s1",
+            "toolCall": { "toolCallId": "c3", "kind": "edit" },
+            "options": [
+                { "optionId": "reject-once", "name": "Reject", "kind": "reject_once" }
+            ]
+        });
+        assert_eq!(
+            auto_response(server_methods::SESSION_REQUEST_PERMISSION, &no_allow).result(),
+            Some(serde_json::json!({
+                "outcome": { "outcome": "selected", "optionId": "reject-once" }
+            }))
+        );
+
+        assert!(auto_response(
+            server_methods::SESSION_REQUEST_PERMISSION,
+            &serde_json::json!({})
+        )
+        .result()
+        .is_none());
+
+        assert_eq!(
+            auto_response(server_methods::CURSOR_ASK_QUESTION, &Value::Null).result(),
             Some(serde_json::json!({
                 "outcome": { "outcome": "skipped" }
             }))
         );
         assert_eq!(
-            auto_response(server_methods::CURSOR_CREATE_PLAN).result(),
+            auto_response(server_methods::CURSOR_CREATE_PLAN, &Value::Null).result(),
             Some(serde_json::json!({
                 "outcome": { "outcome": "rejected" }
             }))
         );
-        assert!(auto_response("mcpServer/elicitation/request")
+        assert!(auto_response("mcpServer/elicitation/request", &Value::Null)
             .result()
             .is_none());
     }
