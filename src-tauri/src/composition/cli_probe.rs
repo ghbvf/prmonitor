@@ -7,6 +7,8 @@ use strum::IntoEnumIterator;
 #[derive(Default)]
 pub(crate) struct ActiveCliFingerprints {
     pub codex: Option<String>,
+    /// Resident Cursor ACP (`CliTool::Agent` / `agent acp`) fingerprint.
+    pub agent: Option<String>,
     pub webhook_cloudflared: Option<String>,
     pub remote_cloudflared: Vec<String>,
 }
@@ -27,6 +29,10 @@ pub(crate) fn probe_cli_tools(
                         CliTool::Gh | CliTool::Az | CliTool::Claude => false,
                         CliTool::Codex => active
                             .codex
+                            .as_deref()
+                            .is_some_and(|fingerprint| fingerprint != diagnostics.fingerprint),
+                        CliTool::Agent => active
+                            .agent
                             .as_deref()
                             .is_some_and(|fingerprint| fingerprint != diagnostics.fingerprint),
                         CliTool::Cloudflared => active
@@ -54,6 +60,7 @@ pub(crate) fn probe_cli_tools(
                     let pending_restart = match tool {
                         CliTool::Gh | CliTool::Az | CliTool::Claude => false,
                         CliTool::Codex => active.codex.is_some(),
+                        CliTool::Agent => active.agent.is_some(),
                         CliTool::Cloudflared => {
                             active.webhook_cloudflared.is_some()
                                 || !active.remote_cloudflared.is_empty()
@@ -115,7 +122,7 @@ mod tests {
                 tool.to_string()
             }
         };
-        for tool in ["gh", "az", "codex", "claude"] {
+        for tool in ["gh", "az", "codex", "claude", "agent"] {
             executable(&root.join(name(tool)));
         }
         let path = |tool: &str| {
@@ -126,6 +133,7 @@ mod tests {
             az_path: path("az"),
             codex_path: path("codex"),
             claude_path: path("claude"),
+            agent_path: path("agent"),
             // Correct basename but deliberately absent: this row alone must be unavailable.
             cloudflared_path: path("cloudflared"),
         };
@@ -135,16 +143,24 @@ mod tests {
             false,
             &ActiveCliFingerprints {
                 codex: Some("different".to_string()),
+                agent: Some("different-agent".to_string()),
                 webhook_cloudflared: Some("running-old-cloudflared".to_string()),
                 remote_cloudflared: Vec::new(),
             },
         );
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 6);
         assert!(
             rows.iter()
                 .find(|row| row.tool == CliTool::Codex)
                 .unwrap()
                 .pending_restart
+        );
+        assert!(
+            rows.iter()
+                .find(|row| row.tool == CliTool::Agent)
+                .unwrap()
+                .pending_restart,
+            "Agent pending_restart when agent fingerprint mismatches"
         );
         let cloudflared = rows
             .iter()
@@ -172,6 +188,7 @@ mod tests {
             false,
             &ActiveCliFingerprints {
                 codex: None,
+                agent: None,
                 webhook_cloudflared: None,
                 remote_cloudflared: vec![current_cloudflared, "old-remote".to_string()],
             },

@@ -24,6 +24,7 @@ const CLI_TOOLS_CONFIG_FIXTURE = {
   azPath: "",
   codexPath: "",
   claudePath: "",
+  agentPath: "",
   cloudflaredPath: "",
 };
 

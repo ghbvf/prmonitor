@@ -24,7 +24,12 @@ import { useReviewStore } from "./review/useReviewStore";
 import { reschedule, startPolling } from "./pr/api";
 import { useAppView } from "./useAppView";
 import { useProjects } from "./projects";
-import { autoReviewSourceCli, periodicPollEligible } from "./types";
+import {
+  autoReviewSourceCli,
+  assertNever,
+  periodicPollEligible,
+  type EngineKind,
+} from "./types";
 
 const version = ref("");
 // Gate view selection until the config load resolves, so a first-launch user never
@@ -59,7 +64,7 @@ const { activeProjectId } = useProjects();
 // `dispatchError` is the session-less auto-trigger notice (#8): the backend dispatcher
 // emits it on a bad config / start failure / ledger-write failure, so the same banner that
 // warns "auto review paused" also reports "auto review failed".
-const { codex, claude, dispatchError, clearDispatchError, clearFocus } =
+const { codex, claude, cursor, dispatchError, clearDispatchError, clearFocus } =
   useReviewStore();
 const activeProject = computed(
   () =>
@@ -86,23 +91,46 @@ const ghBlocked = computed(
 const azBlocked = computed(
   () => activeSourceCli.value === "az" && prStore.az?.authenticated === false,
 );
-// Engine half — gate on the ACTIVE project's SELECTED engine (so codex's state never
-// blocks a claude project, and vice versa) AND on `enabled` (a disabled project doesn't
-// auto-review). Null-safe (`?.`) so a cold start (status still null) shows no false warn.
-const codexBlocked = computed(
-  () =>
-    activeEnabled.value &&
-    activeProject.value?.engineKind === "codex" &&
-    codex.value?.available === false,
-);
-const claudeBlocked = computed(
-  () =>
-    activeEnabled.value &&
-    activeProject.value?.engineKind === "claude" &&
-    claude.value?.available === false,
-);
 const sourceBlocked = computed(() => ghBlocked.value || azBlocked.value);
-const engineBlocked = computed(() => codexBlocked.value || claudeBlocked.value);
+// Exhaustive over the active project's engineKind (Medium — assertNever 穷尽): a new
+// engine forces a banner decision here instead of an OR-chain of three booleans.
+const engineBlock = computed<{ kind: EngineKind; message: string } | null>(() => {
+  if (!activeEnabled.value) return null;
+  const kind = activeProject.value?.engineKind;
+  if (!kind) return null;
+  switch (kind) {
+    case "codex":
+      if (codex.value?.available === false) {
+        return {
+          kind,
+          message: `codex 不可用（${codex.value.message}）`,
+        };
+      }
+      return null;
+    case "claude":
+      if (claude.value?.available === false) {
+        return {
+          kind,
+          message: `claude 不可用（${claude.value.message}）`,
+        };
+      }
+      return null;
+    case "cursor":
+      if (cursor.value?.available === false) {
+        // User-stopped → 「已停止」; install/handshake failure → 「不可用」.
+        const label =
+          cursor.value.desiredRunning === false ? "cursor 已停止" : "cursor 不可用";
+        return {
+          kind,
+          message: `${label}（${cursor.value.message}）`,
+        };
+      }
+      return null;
+    default:
+      return assertNever(kind);
+  }
+});
+const engineBlocked = computed(() => engineBlock.value != null);
 const showPrompt = computed(() => sourceBlocked.value || engineBlocked.value);
 // dispatchError is keyed per project (#35): show the active project's notice.
 const activeDispatchError = computed(
@@ -407,12 +435,7 @@ watch(selectedNumber, (n) => {
               az 未登录，请运行 <code>az login</code>
             </template>
             <template v-if="sourceBlocked && engineBlocked"> ；</template>
-            <template v-if="codexBlocked">
-              codex 不可用（{{ codex?.message }}）
-            </template>
-            <template v-if="claudeBlocked">
-              claude 不可用（{{ claude?.message }}）
-            </template>
+            <template v-if="engineBlock">{{ engineBlock.message }}</template>
           </p>
           <p v-if="activeDispatchError" class="line dispatch-error">
             <span>⚠ 自动 review 异常：{{ activeDispatchError }}</span>

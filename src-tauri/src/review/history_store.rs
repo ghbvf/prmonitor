@@ -104,7 +104,7 @@ fn status_from_wire(s: &str) -> SessionStatus {
 }
 
 /// [`EngineKind`] → pinned DB wire string. The DB stores the same serde wire value the
-/// frontend mirrors (`"codex"` / `"claude"`).
+/// frontend mirrors (`"codex"` / `"claude"` / `"cursor"`).
 fn engine_kind_wire(engine_kind: EngineKind) -> String {
     serde_json::to_value(engine_kind)
         .ok()
@@ -112,10 +112,17 @@ fn engine_kind_wire(engine_kind: EngineKind) -> String {
         .expect("EngineKind serializes to a JSON string (unit enum, known variants)")
 }
 
-/// Wire string → [`EngineKind`]. Unknown/corrupt rows fail closed to Codex, the only
-/// historical engine before this column existed.
-fn engine_kind_from_wire(s: &str) -> EngineKind {
-    serde_json::from_value(serde_json::Value::String(s.to_string())).unwrap_or(EngineKind::Codex)
+/// DB wire string → [`EngineKind`]. Unknown/corrupt rows fail the read (same contract as
+/// [`review_kind_from_wire`]) — silently mapping to Codex would route follow-up to the wrong
+/// engine once more than one engine exists.
+fn engine_kind_from_wire(column: usize, value: String) -> rusqlite::Result<EngineKind> {
+    serde_json::from_value(serde_json::Value::String(value)).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(err),
+        )
+    })
 }
 
 /// DB wire string → [`ReviewKind`]. Unlike historical lenient fallbacks, a corrupt kind fails the
@@ -355,7 +362,7 @@ pub fn get_pr_sessions(
                 created_at_epoch: r.get::<_, i64>(6)? as u64,
                 // AB#1042: NULL (no comment) → None; a resolved terminal URL → Some.
                 comment_url: r.get::<_, Option<String>>(7)?,
-                engine_kind: engine_kind_from_wire(&engine_kind),
+                engine_kind: engine_kind_from_wire(8, engine_kind)?,
             })
         })?;
         rows.collect()
@@ -388,7 +395,7 @@ pub fn get_session(db: &Database, thread_id: &str) -> AppResult<Option<SessionIn
                 created_at_epoch: r.get::<_, i64>(6)? as u64,
                 // AB#1042: NULL (no comment) → None; a resolved terminal URL → Some.
                 comment_url: r.get::<_, Option<String>>(7)?,
-                engine_kind: engine_kind_from_wire(&engine_kind),
+                engine_kind: engine_kind_from_wire(8, engine_kind)?,
             })
         })?;
         rows.next().transpose()
@@ -717,6 +724,44 @@ mod tests {
 
         let listed = get_pr_sessions(&db, "alpha", 12).expect("list");
         assert_eq!(listed[0].engine_kind, EngineKind::Claude);
+
+        let mut cursor = info("cursor-session", 13, SessionStatus::Done);
+        cursor.engine_kind = EngineKind::Cursor;
+        upsert_session(&db, &cursor).expect("upsert cursor");
+        let got_cursor = get_session(&db, "cursor-session")
+            .expect("read")
+            .expect("session exists");
+        assert_eq!(got_cursor.engine_kind, EngineKind::Cursor);
+    }
+
+    #[test]
+    fn unknown_engine_kind_wire_fails_read() {
+        let db = Database::open_in_memory().expect("open db");
+        upsert_session(&db, &info("bad-engine", 1, SessionStatus::Done)).expect("upsert");
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE review_session SET engine_kind = 'not-an-engine' WHERE thread_id = 'bad-engine'",
+                [],
+            )
+        })
+        .expect("corrupt wire");
+        let err = get_session(&db, "bad-engine").expect_err("unknown engine must fail closed");
+        assert!(
+            err.message.contains("not-an-engine")
+                || err.message.to_lowercase().contains("invalid")
+                || err.message.contains("engine"),
+            "unexpected error: {}",
+            err.message
+        );
+        let list_err =
+            get_pr_sessions(&db, "alpha", 1).expect_err("unknown engine must fail list too");
+        assert!(
+            list_err.message.contains("not-an-engine")
+                || list_err.message.to_lowercase().contains("invalid")
+                || list_err.message.contains("engine"),
+            "unexpected list error: {}",
+            list_err.message
+        );
     }
 
     // FK to `review_session` was dropped (review F2): a best-effort `append_item` must

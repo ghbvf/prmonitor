@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // App-shell status strip (composition layer, sibling of App.vue): surfaces the
 // status of every source/engine tool the ENABLED projects actually use — gh / az
-// (pr store) and codex / claude (review store) — deduped across projects. Living at
+// (pr store) and codex / claude / cursor (review store) — deduped across projects. Living at
 // the shell layer (not inside a slice) is what makes reading across both slices
 // legitimate, exactly as App.vue does its cross-slice wiring. "选了什么显示什么": a tool
 // appears only when an enabled project selects it.
@@ -19,15 +19,19 @@ const configStore = useConfigStore();
 const {
   codex,
   claude,
+  cursor,
   refreshCodexStatus,
   refreshClaudeStatus,
+  refreshCursorStatus,
   startCodexServer,
   stopCodexServer,
+  startCursorServer,
+  stopCursorServer,
 } = useReviewStore();
 
 type DotClass = "ok" | "warn" | "idle";
 
-// Shared placeholder text + status-dot helpers so the gh/az and codex/claude items
+// Shared placeholder text + status-dot helpers so the gh/az and engine items
 // can't drift in wording or color logic.
 const CHECKING = "检查中… / checking";
 const STARTING = "初始化中… / starting";
@@ -96,33 +100,41 @@ interface EngineItem {
   label: string;
   dot: DotClass;
   text: string;
-  // codex is a resident server with a 启动/停止 toggle; the label reflects the user
-  // intent (desiredRunning). claude is one-shot (no server) → no button (null).
+  // codex / cursor are resident servers with a 启动/停止 toggle; the label reflects the
+  // user intent (desiredRunning). claude is one-shot (no server) → no button (null).
   buttonLabel: string | null;
+}
+
+function residentEngineItem(
+  kind: "codex" | "cursor",
+  label: string,
+  s: { available: boolean; desiredRunning: boolean; message: string } | null,
+): EngineItem {
+  // idle when null OR user-stopped (desiredRunning false); else ok/warn by reach.
+  const dot: DotClass =
+    s == null
+      ? "idle"
+      : s.desiredRunning === false
+        ? "idle"
+        : s.available
+          ? "ok"
+          : "warn";
+  return {
+    kind,
+    label,
+    dot,
+    text: s == null ? STARTING : s.message,
+    buttonLabel: s == null ? null : s.desiredRunning === false ? "启动" : "停止",
+  };
 }
 
 const engineItems = computed<EngineItem[]>(() =>
   usedEngineKinds.value.map((kind) => {
     switch (kind) {
-      case "codex": {
-        const s = codex.value;
-        // idle when null OR user-stopped (desiredRunning false); else ok/warn by reach.
-        const dot: DotClass =
-          s == null
-            ? "idle"
-            : s.desiredRunning === false
-              ? "idle"
-              : s.available
-                ? "ok"
-                : "warn";
-        return {
-          kind,
-          label: "codex",
-          dot,
-          text: s == null ? STARTING : s.message,
-          buttonLabel: s == null ? null : s.desiredRunning === false ? "启动" : "停止",
-        };
-      }
+      case "codex":
+        return residentEngineItem(kind, "codex", codex.value);
+      case "cursor":
+        return residentEngineItem(kind, "cursor", cursor.value);
       case "claude": {
         const s = claude.value;
         return {
@@ -139,35 +151,57 @@ const engineItems = computed<EngineItem[]>(() =>
   }),
 );
 
-// Toggle the resident codex app-server from its status item's button. Reads the LIVE
+// Toggle a resident engine server from its status item's button. Reads the LIVE
 // desired-running intent (not a captured flag) so it can't act on a stale label.
 function onEngineButton(kind: EngineKind) {
-  if (kind !== "codex") return; // only codex has a resident server to start/stop
-  if (codex.value?.desiredRunning === false) startCodexServer();
-  else stopCodexServer();
+  switch (kind) {
+    case "codex":
+      if (codex.value?.desiredRunning === false) startCodexServer();
+      else stopCodexServer();
+      return;
+    case "cursor":
+      if (cursor.value?.desiredRunning === false) startCursorServer();
+      else stopCursorServer();
+      return;
+    case "claude":
+      return; // one-shot; no resident server
+    default:
+      return assertNever(kind);
+  }
 }
 
 // Manually re-probe a tool's status (the status items are clickable). The watcher only
 // fires when the used-set changes, so after the user fixes auth/install externally (e.g.
 // `az login`, install/login claude) this is how a stale failure gets re-checked without
-// an app restart. codex's passive probe returns "已停止" without spawning when the user
-// explicitly stopped it, so a re-probe is safe.
+// an app restart. Resident engines' passive probes return "已停止" without spawning when
+// the user explicitly stopped them, so a re-probe is safe.
 function retrySource(tool: SourceTool) {
   if (tool === "gh") void store.refreshGhStatus();
   else if (tool === "az") void store.refreshAzStatus();
   // bitbucket has no live probe (retriable=false; not clickable in the template)
 }
 function retryEngine(kind: EngineKind) {
-  if (kind === "codex") void refreshCodexStatus();
-  else if (kind === "claude") void refreshClaudeStatus();
+  switch (kind) {
+    case "codex":
+      void refreshCodexStatus();
+      return;
+    case "claude":
+      void refreshClaudeStatus();
+      return;
+    case "cursor":
+      void refreshCursorStatus();
+      return;
+    default:
+      return assertNever(kind);
+  }
 }
 
 // Probe only the tools actually in use, and re-probe when the used set changes (e.g.
 // a config save flips a project's source/engine). Mirrors the old `ghRequired` watch.
-// Probing codex ONLY when a codex project is enabled is deliberate: a passive
-// `get_codex_status` lazily SPAWNS the resident codex app-server, so a claude-only
-// config must never trigger it. gh/az re-probe freely (the store's loading guard
-// coalesces); codex/claude probe only when still null, so a user's 启动/停止 result (or
+// Probing a resident engine ONLY when that engine's project is enabled is deliberate:
+// a passive `get_*_status` lazily SPAWNS the resident server, so a claude-only config
+// must never trigger codex/cursor. gh/az re-probe freely (the store's loading guard
+// coalesces); engines probe only when still null, so a user's 启动/停止 result (or
 // another updater) is never clobbered.
 watch(
   usedSourceTools,
@@ -182,26 +216,32 @@ watch(
   (kinds) => {
     if (kinds.includes("codex") && codex.value == null) void refreshCodexStatus();
     if (kinds.includes("claude") && claude.value == null) void refreshClaudeStatus();
+    if (kinds.includes("cursor") && cursor.value == null) void refreshCursorStatus();
   },
   { immediate: true },
 );
 
 // A successful config save replaces these values in the shared Pinia store without changing the
 // engine set. Re-probe the affected engine so a stale module-level status cannot survive a CLI path
-// change. The codex probe reads the resident lifecycle snapshot first, so this never kills or
+// change. The resident-engine probe reads the lifecycle snapshot first, so this never kills or
 // restarts an already-running app-server; a cold manager uses the newly configured path.
 watch(
-  () => [
-    configStore.config?.cliTools.codexPath,
-    configStore.config?.cliTools.claudePath,
-  ] as const,
-  ([codexPath, claudePath], [previousCodexPath, previousClaudePath]) => {
+  () =>
+    [
+      configStore.config?.cliTools.codexPath,
+      configStore.config?.cliTools.claudePath,
+      configStore.config?.cliTools.agentPath,
+    ] as const,
+  ([codexPath, claudePath, agentPath], [previousCodexPath, previousClaudePath, previousAgentPath]) => {
     const kinds = usedEngineKinds.value;
     if (codexPath !== previousCodexPath && kinds.includes("codex")) {
       void refreshCodexStatus();
     }
     if (claudePath !== previousClaudePath && kinds.includes("claude")) {
       void refreshClaudeStatus();
+    }
+    if (agentPath !== previousAgentPath && kinds.includes("cursor")) {
+      void refreshCursorStatus();
     }
   },
 );
@@ -245,7 +285,7 @@ watch(
 <style scoped>
 .status-bar {
   display: flex;
-  flex-wrap: wrap; /* up to 5 tool items (gh/az/bitbucket + codex/claude) wrap on a narrow window instead of overflowing; `gap` supplies the row gap */
+  flex-wrap: wrap; /* up to 6 tool items (gh/az/bitbucket + codex/claude/cursor) wrap on a narrow window instead of overflowing; `gap` supplies the row gap */
   align-items: center;
   gap: var(--space-3) var(--space-8);
   padding: var(--space-3) var(--space-8);

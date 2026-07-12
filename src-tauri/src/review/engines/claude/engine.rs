@@ -20,7 +20,8 @@ use crate::model::{ClaudeEffort, EngineKind, ReviewKind};
 use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, StartReviewOutcome};
 use crate::review::history_store::{self, HistoryItemKind};
 use crate::review::session::{
-    commit_starting_session, CommentUrlContext, SessionInfo, SessionRegistry, SessionStatus,
+    commit_starting_session, CommentUrlContext, ReservationGuard, SessionInfo, SessionRegistry,
+    SessionStatus,
 };
 
 /// Per-request engine handle. Borrows the long-lived state from `AppState` plus the
@@ -791,34 +792,6 @@ fn persist_session<R: tauri::Runtime>(
         return Err(e);
     }
     Ok(())
-}
-
-/// RAII release of a `(pr, kind)` reservation taken by `try_reserve_pair`. An undisarmed
-/// guard releases on drop, so NO early `?` / error between the reserve and the session
-/// insert can leak a reservation — leak-on-failure is unrepresentable, not hand-avoided
-/// (the same discipline codex's `ReservationGuard` enforces; this one is claude-local).
-struct ReservationGuard<'a> {
-    registry: &'a SessionRegistry,
-    project_id: String,
-    pr_number: u64,
-    kind: ReviewKind,
-    armed: bool,
-}
-
-impl ReservationGuard<'_> {
-    /// The reservation has been handed to a `Starting` session — stop owning it.
-    fn disarm(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ReservationGuard<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.registry
-                .release_pair(&self.project_id, self.pr_number, self.kind);
-        }
-    }
 }
 
 #[cfg(test)]

@@ -113,6 +113,20 @@ const finalLabel = computed(() => {
   }
 });
 
+// Distinguish start-time failures (never got a session / stream) from mid-run
+// errors (had a thread, streamed items, or a prior finalStatus). Shown only when
+// `error` is set and `finalStatus` is absent (see status line template order).
+const errorStatusLabel = computed(() => {
+  if (
+    activeThreadId.value != null ||
+    items.value.length > 0 ||
+    finalStatus.value != null
+  ) {
+    return "运行失败 / 会话出错";
+  }
+  return "启动失败 / failed";
+});
+
 // Attach the streamed-event listener for the panel's lifetime. Mirrors PollControls'
 // mount/unmount pattern. Codex/claude availability is probed by the always-mounted
 // StatusBar (gated to the engines actually in use), so this panel no longer probes
@@ -151,7 +165,7 @@ function onStart() {
         PR #{{ activePr }} —
         <span v-if="running">运行中… / running</span>
         <span v-else-if="finalStatus">已结束 / {{ finalLabel }}</span>
-        <span v-else-if="error">启动失败 / failed</span>
+        <span v-else-if="error">{{ errorStatusLabel }}</span>
         <span v-else>未开始</span>
       </template>
       <span v-else-if="selectedPr">

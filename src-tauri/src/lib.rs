@@ -68,6 +68,7 @@ fn probe_cli_tools(
         refresh_path,
         &composition::ActiveCliFingerprints {
             codex: state.codex.active_fingerprint(),
+            agent: state.cursor.active_fingerprint(),
             webhook_cloudflared: state.webhook.active_cloudflared_fingerprint(),
             remote_cloudflared: state.remote.active_cloudflared_fingerprints(),
         },
@@ -922,8 +923,11 @@ fn build_app() {
             rule::commands::rule_matches_for_inbox,
             review::commands::get_codex_status,
             review::commands::get_claude_status,
+            review::commands::get_cursor_status,
             review::commands::start_codex,
             review::commands::stop_codex,
+            review::commands::start_cursor,
+            review::commands::stop_cursor,
             start_review,
             review::commands::stop_review,
             review::commands::send_review_message,
@@ -959,6 +963,9 @@ fn build_app() {
                 // `kill_on_drop` child → SIGKILL), so no review subprocess outlives the
                 // app — same "软件关闭时一起关闭" contract as codex (#718).
                 state.claude.shutdown();
+                // Kill the resident Cursor ACP (`agent acp`) child so it never outlives
+                // the app — same "软件关闭时一起关闭" contract as codex.
+                state.cursor.shutdown();
                 // Kill the cloudflared tunnel + abort the receiver so neither outlives
                 // the app (same "软件关闭时一起关闭" contract as codex).
                 state.webhook.shutdown();
@@ -1149,15 +1156,32 @@ async fn run_review_action(
     let state = app.state::<AppState>();
     let project = config::service::project_validated(app, action.project_id())?;
     let observed_resume_generation = state.review_resume.generation();
-    if project.engine_kind == model::EngineKind::Codex && state.codex.is_stopped() && !explicit {
-        return Ok(model::ActionExecutionResult::Blocked {
-            message: "Codex 已由用户停止，等待显式恢复".to_string(),
-            observed_resume_generation,
-        });
-    }
-    if explicit && project.engine_kind == model::EngineKind::Codex {
-        state.codex.resume();
-        state.review_resume.fire()?;
+    match project.engine_kind {
+        model::EngineKind::Codex => {
+            if state.codex.is_stopped() && !explicit {
+                return Ok(model::ActionExecutionResult::Blocked {
+                    message: "Codex 已由用户停止，等待显式恢复".to_string(),
+                    observed_resume_generation,
+                });
+            }
+            if explicit {
+                state.codex.resume();
+                state.review_resume.fire()?;
+            }
+        }
+        model::EngineKind::Cursor => {
+            if state.cursor.is_stopped() && !explicit {
+                return Ok(model::ActionExecutionResult::Blocked {
+                    message: "Cursor ACP 已由用户停止，等待显式恢复".to_string(),
+                    observed_resume_generation,
+                });
+            }
+            if explicit {
+                state.cursor.resume();
+                state.review_resume.fire()?;
+            }
+        }
+        model::EngineKind::Claude => {}
     }
     // SAFETY: the durable outbox executor is the composition root's authorized replay ingress.
     let capability = unsafe { review::engine::ReviewStartCapability::new_composition_root() };

@@ -12,19 +12,23 @@ import type { ReviewEvent } from "../types";
 import {
   getClaudeStatus,
   getCodexStatus,
+  getCursorStatus,
   getSessionHistory,
   listReviewSessions,
   onReviewEvent,
   sendReviewMessage,
   startCodex,
+  startCursor,
   startReview,
   stopCodex,
+  stopCursor,
   stopReview,
 } from "./api";
 import { useProjects } from "../projects";
 import type {
   ClaudeStatus,
   CodexStatus,
+  CursorStatus,
   ReviewSession,
   SessionStatus,
   StreamItem,
@@ -38,6 +42,7 @@ function toMessage(err: unknown): string {
 
 const codex = ref<CodexStatus | null>(null);
 const claude = ref<ClaudeStatus | null>(null);
+const cursor = ref<CursorStatus | null>(null);
 
 // All review sessions the backend currently tracks (#8 auto-trigger can run
 // several concurrently). Drives the ReviewSessions list; refreshed event-driven
@@ -115,6 +120,23 @@ async function refreshClaudeStatus() {
   }
 }
 
+// Hydrate cursor ACP availability. Tolerates a rejected command by surfacing an
+// unavailable status rather than throwing (mirrors refreshCodexStatus).
+async function refreshCursorStatus() {
+  try {
+    cursor.value = await getCursorStatus();
+  } catch (err) {
+    const message = toMessage(err);
+    console.error("cursor 状态获取失败", err);
+    // A failed probe doesn't mean the user stopped it: keep desiredRunning true.
+    cursor.value = {
+      available: false,
+      desiredRunning: true,
+      message: message || "cursor 状态获取失败",
+    };
+  }
+}
+
 // Explicitly (re)start the resident codex app-server, reflecting the result in
 // `codex` (drives the StatusBar dot + 启动/停止 button). Tolerates a rejected
 // command by surfacing an intent-to-run failure status.
@@ -140,6 +162,35 @@ async function stopCodexServer() {
       available: false,
       desiredRunning: false,
       message: toMessage(err) || "codex 停止失败",
+    };
+  }
+}
+
+// Explicitly (re)start the resident Cursor ACP server, reflecting the result in
+// `cursor` (drives the StatusBar dot + 启动/停止 button). Tolerates a rejected
+// command by surfacing an intent-to-run failure status.
+async function startCursorServer() {
+  try {
+    cursor.value = await startCursor();
+  } catch (err) {
+    cursor.value = {
+      available: false,
+      desiredRunning: true,
+      message: toMessage(err) || "cursor 启动失败",
+    };
+  }
+}
+
+// Explicitly stop the resident Cursor ACP server. On failure still mark it stopped
+// (the user's intent) so the StatusBar offers a 启动 action to retry.
+async function stopCursorServer() {
+  try {
+    cursor.value = await stopCursor();
+  } catch (err) {
+    cursor.value = {
+      available: false,
+      desiredRunning: false,
+      message: toMessage(err) || "cursor 停止失败",
     };
   }
 }
@@ -280,6 +331,14 @@ async function start(projectId: string, prNumber: number, kind: string) {
     running.value = false;
     error.value = toMessage(err);
     console.error("启动 review 失败", err);
+  } finally {
+    // Explicit start resumes a stopped Cursor ACP server (success or fail after
+    // resume); refresh so App/StatusBar banners flip off 「已停止」 without waiting
+    // for a manual re-probe — including the failure path where start never returns.
+    const project = useProjects().projects.value.find((p) => p.id === projectId);
+    if (project?.engineKind === "cursor") {
+      void refreshCursorStatus();
+    }
   }
 }
 
@@ -475,8 +534,12 @@ export function useReviewStore() {
     refreshCodexStatus,
     claude,
     refreshClaudeStatus,
+    cursor,
+    refreshCursorStatus,
     startCodexServer,
     stopCodexServer,
+    startCursorServer,
+    stopCursorServer,
     sessions,
     refreshSessions,
     dispatchError,

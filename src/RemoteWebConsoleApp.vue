@@ -12,6 +12,7 @@ import type { UnlistenFn } from "./transport";
 import {
   getRemoteClaudeStatus,
   getRemoteCodexStatus,
+  getRemoteCursorStatus,
   getRemoteReviewReceipt,
   getRemotePrs,
   getRemotePrSessions,
@@ -44,6 +45,7 @@ const busy = ref(false);
 const error = ref<string | null>(null);
 const codexStatus = ref("");
 const claudeStatus = ref("");
+const cursorStatus = ref("");
 const receipt = ref<ReviewReceiptSnapshot | null>(null);
 const activeReceiptId = ref<ReviewReceiptId | null>(null);
 const receiptPollingStopped = ref(false);
@@ -52,21 +54,34 @@ let receiptTimer: ReturnType<typeof setTimeout> | null = null;
 const MAX_RECEIPT_POLL_FAILURES = 5;
 const requestIds = new RequestIdLifecycle(createExternalRequestId);
 
-const receiptStatusLabels: Record<ReviewReceiptStatus, string> = {
+const projects = computed(() => snapshot.value?.projects ?? []);
+const activeProject = computed(
+  () => projects.value.find((p) => p.id === activeProjectId.value) ?? projects.value[0] ?? null,
+);
+
+function blockedResumeLabel(engineKind: string | undefined): string {
+  switch (engineKind) {
+    case "cursor":
+      return "Blocked — resume Cursor to continue";
+    case "claude":
+      return "Blocked — resume Claude to continue";
+    case "codex":
+      return "Blocked — resume Codex to continue";
+    default:
+      return "Blocked — resume review engine to continue";
+  }
+}
+
+const receiptStatusLabels = computed<Record<ReviewReceiptStatus, string>>(() => ({
   received: "Received",
   queued: "Queued",
-  blocked: "Blocked — resume Codex to continue",
+  blocked: blockedResumeLabel(activeProject.value?.engineKind),
   starting: "Starting",
   running: "Running",
   interrupting: "Interrupting",
   done: "Done",
   failed: "Failed",
-};
-
-const projects = computed(() => snapshot.value?.projects ?? []);
-const activeProject = computed(
-  () => projects.value.find((p) => p.id === activeProjectId.value) ?? projects.value[0] ?? null,
-);
+}));
 const activePrs = computed(() => prs.value[activeProject.value?.id ?? ""] ?? []);
 const selectedPr = computed(
   () => activePrs.value.find((pr) => pr.number === selectedPrNumber.value) ?? activePrs.value[0] ?? null,
@@ -93,14 +108,28 @@ function setError(err: unknown) {
 }
 
 async function refreshStatuses() {
-  const [codex, claude] = await Promise.allSettled([
+  const [codex, claude, cursor] = await Promise.allSettled([
     getRemoteCodexStatus(),
     getRemoteClaudeStatus(),
+    getRemoteCursorStatus(),
   ]);
   codexStatus.value =
-    codex.status === "fulfilled" ? codex.value.message : toMessage(codex.reason);
+    codex.status === "fulfilled" ? formatResident(codex.value) : toMessage(codex.reason);
   claudeStatus.value =
     claude.status === "fulfilled" ? claude.value.message : toMessage(claude.reason);
+  cursorStatus.value =
+    cursor.status === "fulfilled" ? formatResident(cursor.value) : toMessage(cursor.reason);
+}
+
+/** Codex / Cursor resident status: message plus desiredRunning + available. */
+function formatResident(status: {
+  available: boolean;
+  desiredRunning: boolean;
+  message: string;
+}): string {
+  const intent = status.desiredRunning ? "desired" : "stopped";
+  const reach = status.available ? "available" : "unavailable";
+  return `${status.message} · ${intent}/${reach}`;
 }
 
 async function refreshProject(projectId: string) {
@@ -395,6 +424,7 @@ onUnmounted(() => {
       <div class="status">
         <span>Codex: {{ codexStatus || "unknown" }}</span>
         <span>Claude: {{ claudeStatus || "unknown" }}</span>
+        <span>Cursor: {{ cursorStatus || "unknown" }}</span>
       </div>
     </header>
 

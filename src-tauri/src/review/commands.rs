@@ -11,6 +11,7 @@ use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, Star
 use crate::review::engines::claude::process::{claude_availability, ClaudeStatus};
 use crate::review::engines::claude::ClaudeEngine;
 use crate::review::engines::codex::{CodexEngine, CodexStatus};
+use crate::review::engines::cursor::{CursorEngine, CursorStatus};
 use crate::review::history_store::{self, HistoryItem};
 use crate::review::session::{CommentUrlContext, SessionInfo, SessionStatus, StopTarget};
 use crate::state::AppState;
@@ -87,6 +88,41 @@ pub async fn get_claude_status<R: tauri::Runtime>(
     Ok(claude_availability(&claude).await)
 }
 
+enum CursorStatusInput<T> {
+    Resident(CursorStatus),
+    Cold(T),
+}
+
+fn cursor_status_input<T>(
+    manager: &crate::review::engines::cursor::CursorManager,
+    cold: impl FnOnce() -> AppResult<T>,
+) -> AppResult<CursorStatusInput<T>> {
+    match manager.resident_status() {
+        Some(status) => Ok(CursorStatusInput::Resident(status)),
+        None => cold().map(CursorStatusInput::Cold),
+    }
+}
+
+/// Reports Cursor ACP (`agent acp`) availability for the StatusBar. Ensures the resident
+/// connection (lazy start) like codex; failures map to a status struct.
+#[tauri::command]
+pub async fn get_cursor_status<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<CursorStatus> {
+    match cursor_status_input(&state.cursor, || {
+        Ok((
+            config_service::resolve_cli(&app, CliTool::Agent, false)?,
+            config_service::active_repo_root(&app)?,
+        ))
+    })? {
+        CursorStatusInput::Resident(status) => Ok(status),
+        CursorStatusInput::Cold((agent, repo_root)) => {
+            Ok(state.cursor.status(&agent, &repo_root).await)
+        }
+    }
+}
+
 /// 显式启动常驻 codex app-server（清除「已停止」标记并拉起握手）。返回最新状态。
 /// 全局单例 codex 的握手 cwd 取「活动项目」的 `repo_root`（#35）；每轮 review 的实际工作目录由 per-turn `cwd` 覆盖。
 #[tauri::command]
@@ -106,6 +142,25 @@ pub async fn start_codex<R: tauri::Runtime>(
 #[tauri::command]
 pub fn stop_codex(state: tauri::State<'_, AppState>) -> AppResult<CodexStatus> {
     Ok(state.codex.stop())
+}
+
+/// 显式启动常驻 Cursor ACP（清除「已停止」标记并拉起握手）。
+#[tauri::command]
+pub async fn start_cursor<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> AppResult<CursorStatus> {
+    let repo_root = config_service::active_repo_root(&app)?;
+    let agent = config_service::resolve_cli(&app, CliTool::Agent, false)?;
+    let status = state.cursor.start(&agent, &repo_root).await;
+    state.review_resume.fire()?;
+    Ok(status)
+}
+
+/// 显式停止常驻 Cursor ACP（设「已停止」标记 + 杀进程）。
+#[tauri::command]
+pub fn stop_cursor(state: tauri::State<'_, AppState>) -> AppResult<CursorStatus> {
+    Ok(state.cursor.stop())
 }
 
 /// Whether a review start is an EXPLICIT user action or an AUTOMATIC one (AB#1069). The distinction
@@ -215,6 +270,27 @@ impl ReviewStartCapability {
                     pr_number: 0,
                     session_info: None,
                     // AB#1204: `Some(outbox_id)` on the outbox path → claim breadcrumb at thread/start.
+                    outbox_claim_id,
+                };
+                engine.start(self, pr_number, kind).await
+            }
+            EngineKind::Cursor => {
+                // Explicit trigger overrides a prior cursor stop (parity with Codex).
+                if trigger == StartTrigger::Explicit {
+                    state.cursor.resume();
+                    state.review_resume.fire()?;
+                }
+                let agent_cli = config_service::resolve_cli(app, CliTool::Agent, false)?;
+                let engine = CursorEngine {
+                    app,
+                    cursor: &state.cursor,
+                    registry: &state.sessions,
+                    agent_cli: &agent_cli,
+                    project_id: &project.id,
+                    repo_root: &project.repo_root,
+                    url_ctx,
+                    pr_number: 0,
+                    session_info: None,
                     outbox_claim_id,
                 };
                 engine.start(self, pr_number, kind).await
@@ -622,6 +698,26 @@ pub async fn send_review_message<R: tauri::Runtime>(
                 .send_message(&thread_id, &message, &user_item_id)
                 .await
         }
+        EngineKind::Cursor => {
+            state.cursor.resume();
+            state.review_resume.fire()?;
+            let agent_cli = config_service::resolve_cli(&app, CliTool::Agent, false)?;
+            let engine = CursorEngine {
+                app: &app,
+                cursor: &state.cursor,
+                registry: &state.sessions,
+                agent_cli: &agent_cli,
+                project_id: &project.id,
+                repo_root: &project.repo_root,
+                url_ctx,
+                pr_number,
+                session_info: Some(session_info.clone()),
+                outbox_claim_id: None,
+            };
+            engine
+                .send_message(&thread_id, &message, &user_item_id)
+                .await
+        }
     }
 }
 
@@ -649,17 +745,46 @@ pub(crate) async fn start_review_authorized<R: tauri::Runtime>(
 
 /// Interrupt a running review session by its `threadId` (#718): the shared stop body behind the
 /// manual [`stop_review`] command AND the AB#1069 outbox `stop-review` action ([`stop_for_outbox`]).
-/// Stop-engine resolution WITHOUT an engine field on the persisted `SessionInfo`: a session id is
-/// globally unique, so whichever manager holds its kill handle definitively OWNS the session. Try
-/// claude first — `stop` returns true iff the ClaudeManager owned this session (and just aborted its
-/// pump → killed `claude -p`). Deterministic, not a guess; if false, the session is codex's (or
-/// already gone) → fall through to the codex interrupt path. `pub(crate)` so the composition root
-/// (`lib.rs`) reuses it for the outbox action — names only review-internal / config types.
+/// Prefer the session's persisted `engine_kind` when known; otherwise probe Claude's kill map,
+/// then fall through to Codex (legacy ownership probe). Cursor stops through the same
+/// `begin_interrupt` → `session/cancel` → rollback state machine as Codex ([`stop_cursor_review`]).
 pub(crate) async fn stop_session_by_id<R: tauri::Runtime>(
-    _app: &tauri::AppHandle<R>,
+    app: &tauri::AppHandle<R>,
     state: &AppState,
     session_id: &str,
 ) -> AppResult<()> {
+    if let Some(info) = state.sessions.get(session_id) {
+        match info.engine_kind {
+            EngineKind::Claude => {
+                let _ = state.claude.stop(session_id);
+                return Ok(());
+            }
+            EngineKind::Cursor => {
+                return crate::review::session::stop_cursor_review(
+                    app,
+                    &state.cursor,
+                    &state.sessions,
+                    session_id,
+                )
+                .await;
+            }
+            EngineKind::Codex => {
+                return crate::review::session::stop_review(
+                    &state.codex,
+                    &state.sessions,
+                    session_id,
+                )
+                .await;
+            }
+        }
+    }
+    // Registry miss (F12): best-effort Cursor cancel must NOT claim success — without a
+    // known session there is no pump to emit `turnCompleted(interrupted)`, and Ok would
+    // leave `useReviewStore.running` stuck true. Fall through to Claude/Codex probes
+    // (Claude Ok only when it owns the id; Codex NotFound → Err clears the UI).
+    if let Some(client) = state.cursor.existing_client() {
+        let _ = crate::review::engines::cursor::process::session_cancel(&client, session_id).await;
+    }
     if state.claude.stop(session_id) {
         return Ok(());
     }
@@ -812,6 +937,24 @@ mod tests {
     }
 
     #[test]
+    fn stopped_cursor_status_skips_failing_cold_start_resolution() {
+        let manager = crate::review::engines::cursor::CursorManager::default();
+        manager.stop();
+        let mut called = false;
+        let input = cursor_status_input(&manager, || -> AppResult<()> {
+            called = true;
+            Err(AppError::new("stale configured path"))
+        })
+        .expect("resident status must bypass cold resolution");
+        assert!(!called);
+        let CursorStatusInput::Resident(status) = input else {
+            panic!("stopped manager must return resident snapshot");
+        };
+        assert!(!status.available);
+        assert!(!status.desired_running);
+    }
+
+    #[test]
     fn github_comment_url_context_tolerates_missing_gh() {
         let gh =
             optional_comment_url_cli(SourceKind::Github, || Err(AppError::new("gh unavailable")));
@@ -895,6 +1038,18 @@ mod tests {
             absorb_stop_toctou(Err(AppError::new("interrupt failed")), true).is_err(),
             "still-active session's stop error must propagate"
         );
+    }
+
+    /// F12: registry miss with no Claude/Codex owner must Err (not Ok). A prior Cursor
+    /// cancel-Ok short-circuit would claim success without `turnCompleted` and stick the UI.
+    #[tokio::test]
+    async fn stop_session_registry_miss_without_owners_errors() {
+        let app = tauri::test::mock_app();
+        let state = crate::state::AppState::default();
+        let err = stop_session_by_id(app.handle(), &state, "no-such-cursor-or-codex")
+            .await
+            .expect_err("miss with no owner must not claim stop success");
+        assert!(err.message.contains("未找到 review 会话"));
     }
 
     // ── AB#1204 cross-restart dedup: the replay-suppression decision ────────────────────────────

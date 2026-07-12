@@ -12,6 +12,9 @@ vi.mock("./api", () => ({
   getClaudeStatus: vi.fn(() =>
     Promise.resolve({ available: true, message: "ok" }),
   ),
+  getCursorStatus: vi.fn(() =>
+    Promise.resolve({ available: true, desiredRunning: true, message: "ok" }),
+  ),
   startCodex: vi.fn(() =>
     Promise.resolve({ available: true, desiredRunning: true, message: "ok" }),
   ),
@@ -20,6 +23,16 @@ vi.mock("./api", () => ({
       available: false,
       desiredRunning: false,
       message: "codex app-server 已停止",
+    }),
+  ),
+  startCursor: vi.fn(() =>
+    Promise.resolve({ available: true, desiredRunning: true, message: "ok" }),
+  ),
+  stopCursor: vi.fn(() =>
+    Promise.resolve({
+      available: false,
+      desiredRunning: false,
+      message: "cursor ACP 已停止",
     }),
   ),
   startReview: vi.fn(() => Promise.resolve("th_1")),
@@ -46,6 +59,11 @@ beforeEach(() => {
     available: true,
     message: "ok",
   });
+  vi.mocked(api.getCursorStatus).mockResolvedValue({
+    available: true,
+    desiredRunning: true,
+    message: "ok",
+  });
   vi.mocked(api.startReview).mockResolvedValue("th_1");
   vi.mocked(api.stopReview).mockResolvedValue();
   vi.mocked(api.listReviewSessions).mockResolvedValue([]);
@@ -55,6 +73,7 @@ beforeEach(() => {
   const s = useReviewStore();
   s.codex.value = null;
   s.claude.value = null;
+  s.cursor.value = null;
   s.sessions.value = [];
   s.items.value = [];
   s.running.value = false;
@@ -133,6 +152,33 @@ describe("useReviewStore refreshClaudeStatus()", () => {
   });
 });
 
+describe("useReviewStore refreshCursorStatus()", () => {
+  it("writes cursor.value from getCursorStatus on success", async () => {
+    const store = useReviewStore();
+    expect(store.cursor.value).toBeNull();
+
+    await store.refreshCursorStatus();
+
+    expect(api.getCursorStatus).toHaveBeenCalledOnce();
+    expect(store.cursor.value).toEqual({
+      available: true,
+      desiredRunning: true,
+      message: "ok",
+    });
+  });
+
+  it("on a rejected invoke sets an unavailable cursor status", async () => {
+    vi.mocked(api.getCursorStatus).mockRejectedValueOnce({ message: "boom" });
+    const store = useReviewStore();
+
+    await store.refreshCursorStatus();
+
+    expect(store.cursor.value?.available).toBe(false);
+    expect(store.cursor.value?.desiredRunning).toBe(true);
+    expect(store.cursor.value?.message).toBe("boom");
+  });
+});
+
 describe("useReviewStore startCodexServer()/stopCodexServer()", () => {
   it("startCodexServer writes a running codex status from startCodex", async () => {
     const store = useReviewStore();
@@ -177,6 +223,53 @@ describe("useReviewStore startCodexServer()/stopCodexServer()", () => {
     expect(store.codex.value?.available).toBe(false);
     expect(store.codex.value?.desiredRunning).toBe(false);
     expect(store.codex.value?.message).toBe("gone");
+  });
+});
+
+describe("useReviewStore startCursorServer()/stopCursorServer()", () => {
+  it("startCursorServer writes a running cursor status from startCursor", async () => {
+    const store = useReviewStore();
+
+    await store.startCursorServer();
+
+    expect(api.startCursor).toHaveBeenCalledOnce();
+    expect(store.cursor.value).toEqual({
+      available: true,
+      desiredRunning: true,
+      message: "ok",
+    });
+  });
+
+  it("startCursorServer on a rejected invoke marks intent-to-run unavailable", async () => {
+    vi.mocked(api.startCursor).mockRejectedValueOnce({ message: "boom" });
+    const store = useReviewStore();
+
+    await store.startCursorServer();
+
+    expect(store.cursor.value?.available).toBe(false);
+    expect(store.cursor.value?.desiredRunning).toBe(true);
+    expect(store.cursor.value?.message).toBe("boom");
+  });
+
+  it("stopCursorServer writes a stopped cursor status from stopCursor", async () => {
+    const store = useReviewStore();
+
+    await store.stopCursorServer();
+
+    expect(api.stopCursor).toHaveBeenCalledOnce();
+    expect(store.cursor.value?.available).toBe(false);
+    expect(store.cursor.value?.desiredRunning).toBe(false);
+  });
+
+  it("stopCursorServer on a rejected invoke still marks it stopped", async () => {
+    vi.mocked(api.stopCursor).mockRejectedValueOnce({ message: "gone" });
+    const store = useReviewStore();
+
+    await store.stopCursorServer();
+
+    expect(store.cursor.value?.available).toBe(false);
+    expect(store.cursor.value?.desiredRunning).toBe(false);
+    expect(store.cursor.value?.message).toBe("gone");
   });
 });
 
@@ -345,6 +438,47 @@ describe("useReviewStore start()/stop()", () => {
 
     expect(store.running.value).toBe(false);
     expect(store.error.value).toBe("nope");
+  });
+
+  it("start on a cursor project refreshes cursor status after success", async () => {
+    useProjects().projects.value = [
+      {
+        id: "p1",
+        name: "Cursor",
+        engineKind: "cursor",
+      } as never,
+    ];
+    const store = useReviewStore();
+    await store.start("p1", 7, "review");
+    expect(api.getCursorStatus).toHaveBeenCalled();
+  });
+
+  it("start failure on a cursor project still refreshes cursor status", async () => {
+    useProjects().projects.value = [
+      {
+        id: "p1",
+        name: "Cursor",
+        engineKind: "cursor",
+      } as never,
+    ];
+    vi.mocked(api.startReview).mockRejectedValueOnce({ message: "nope" });
+    const store = useReviewStore();
+    await store.start("p1", 7, "review");
+    expect(store.error.value).toBe("nope");
+    expect(api.getCursorStatus).toHaveBeenCalled();
+  });
+
+  it("start on a non-cursor project does not refresh cursor status", async () => {
+    useProjects().projects.value = [
+      {
+        id: "p1",
+        name: "Codex",
+        engineKind: "codex",
+      } as never,
+    ];
+    const store = useReviewStore();
+    await store.start("p1", 7, "review");
+    expect(api.getCursorStatus).not.toHaveBeenCalled();
   });
 
   it("stop interrupts the active session by id", async () => {

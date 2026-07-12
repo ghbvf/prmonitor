@@ -23,6 +23,8 @@ use super::engines::codex::protocol::{
     TurnInterruptParams, TurnStartParams, UserInput,
 };
 use super::engines::codex::CodexManager;
+use super::engines::cursor::process as cursor_process;
+use super::engines::cursor::CursorManager;
 use super::history_store::HistoryItemKind;
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
@@ -310,7 +312,7 @@ impl SessionRegistry {
     /// session via [`Self::promote_reservation`], so the happy path never calls this.
     /// Idempotent (a missing triple is a no-op). Keyed by the full
     /// `(project_id, pr, kind)` so it frees exactly the triple `try_reserve_pair` took.
-    /// `pub(super)` so the claude orchestration's [`ReservationGuard`] analogue can
+    /// `pub(super)` so [`ReservationGuard`] (shared by codex / Claude / Cursor) can
     /// release on an early failure (#718).
     pub(super) fn release_pair(&self, project_id: &str, pr_number: u64, kind: ReviewKind) {
         self.inner
@@ -555,17 +557,19 @@ impl SessionRegistry {
 /// an UNdisarmed guard releases on drop, so NO early `?` / error / panic between the
 /// reserve and the insert can leak a reservation — leak-on-failure is made
 /// unrepresentable, not merely hand-avoided on each return path.
-struct ReservationGuard<'a> {
-    registry: &'a SessionRegistry,
-    project_id: String,
-    pr_number: u64,
-    kind: ReviewKind,
-    armed: bool,
+///
+/// Shared by codex (`session`), Claude, and Cursor engines — single Drop semantics.
+pub(crate) struct ReservationGuard<'a> {
+    pub(crate) registry: &'a SessionRegistry,
+    pub(crate) project_id: String,
+    pub(crate) pr_number: u64,
+    pub(crate) kind: ReviewKind,
+    pub(crate) armed: bool,
 }
 
 impl ReservationGuard<'_> {
     /// The reservation has been handed to a `Starting` session — stop owning it.
-    fn disarm(mut self) {
+    pub(crate) fn disarm(mut self) {
         self.armed = false;
     }
 }
@@ -985,6 +989,57 @@ pub async fn stop_review(
     )
     .await
     {
+        registry.rollback_interrupt(session_id);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Interrupt a running Cursor ACP review session (F2): same
+/// [`SessionRegistry::begin_interrupt`] → cancel → [`SessionRegistry::rollback_interrupt`]
+/// state machine as [`stop_review`], adapted for `session/cancel`.
+///
+/// On cancel Ok the session stays [`SessionStatus::Interrupting`] until the pump's
+/// `session/prompt` returns `cancelled` and [`finalize_turn`]s `interrupted`. On
+/// cancel Err we roll back to [`SessionStatus::Running`] so a retry can proceed.
+///
+/// When there is no live ACP client, Cursor cannot rely on a pump
+/// `ConnectionClosed` the way Codex can after a dead transport — finalize
+/// `interrupted` here so `useReviewStore.stop` still receives `turnCompleted`.
+pub async fn stop_cursor_review<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    cursor: &CursorManager,
+    registry: &SessionRegistry,
+    session_id: &str,
+) -> AppResult<()> {
+    match registry.begin_interrupt(session_id) {
+        BeginInterrupt::Proceed(_) => {}
+        BeginInterrupt::AlreadyHandled => return Ok(()),
+        BeginInterrupt::NotFound => {
+            return Err(AppError::new(format!("未找到 review 会话: {session_id}")))
+        }
+    }
+
+    let Some(client) = cursor.existing_client() else {
+        let Some(info) = registry.get(session_id) else {
+            registry.rollback_interrupt(session_id);
+            return Err(AppError::new(format!("未找到 review 会话: {session_id}")));
+        };
+        finalize_turn(
+            app,
+            registry,
+            &info.project_id,
+            info.pr_number,
+            session_id,
+            SessionStatus::Done,
+            "interrupted",
+            None,
+        )
+        .await;
+        return Ok(());
+    };
+
+    if let Err(e) = cursor_process::session_cancel(&client, session_id).await {
         registry.rollback_interrupt(session_id);
         return Err(e);
     }
@@ -2401,5 +2456,96 @@ mod tests {
         }
         // `terminal_status("interrupted")` is Done — a user stop signals Done, not Failed.
         assert_eq!(terminal_status("interrupted"), SessionStatus::Done);
+    }
+
+    // ── Cursor stop (F2 / F12): begin_interrupt → cancel / finalize interrupted ──
+
+    #[tokio::test]
+    async fn stop_cursor_review_not_found_errors() {
+        let app = tauri::test::mock_app();
+        let cursor = CursorManager::default();
+        let reg = SessionRegistry::default();
+        let err = stop_cursor_review(app.handle(), &cursor, &reg, "missing")
+            .await
+            .expect_err("unknown id must error");
+        assert!(err.message.contains("未找到 review 会话"));
+    }
+
+    #[tokio::test]
+    async fn stop_cursor_review_already_handled_is_idempotent() {
+        let app = tauri::test::mock_app();
+        let cursor = CursorManager::default();
+        let reg = SessionRegistry::default();
+        reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
+            thread_id: "c1".to_string(),
+            turn_id: "c1".to_string(),
+            pr_number: 7,
+            kind: ReviewKind::Review,
+            engine_kind: EngineKind::Cursor,
+            status: SessionStatus::Done,
+            created_at_epoch: 0,
+            comment_url: None,
+        });
+        stop_cursor_review(app.handle(), &cursor, &reg, "c1")
+            .await
+            .expect("terminal session stop is a no-op");
+        assert_eq!(reg.get("c1").unwrap().status, SessionStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn stop_cursor_review_without_client_finalizes_interrupted() {
+        // F2: no live ACP client → finalize interrupted (UI gets turnCompleted), do NOT
+        // leave Running / Interrupting forever.
+        let app = tauri::test::mock_app();
+        app.handle()
+            .manage(crate::db::Database::open_in_memory().expect("open db"));
+        app.handle().manage(crate::state::AppState::default());
+
+        let cursor = CursorManager::default();
+        assert!(cursor.existing_client().is_none());
+
+        let reg = SessionRegistry::default();
+        reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
+            thread_id: "c-run".to_string(),
+            turn_id: "c-run".to_string(),
+            pr_number: 42,
+            kind: ReviewKind::Review,
+            engine_kind: EngineKind::Cursor,
+            status: SessionStatus::Running,
+            created_at_epoch: 0,
+            comment_url: None,
+        });
+
+        stop_cursor_review(app.handle(), &cursor, &reg, "c-run")
+            .await
+            .expect("no-client stop finalizes");
+        let info = reg.get("c-run").expect("session retained");
+        assert_eq!(info.status, SessionStatus::Done);
+    }
+
+    #[test]
+    fn begin_interrupt_then_cancel_err_rolls_back_like_codex() {
+        // Mirrors stop_cursor_review's cancel-Err path: Interrupting → Running so retry works.
+        let reg = SessionRegistry::default();
+        reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
+            thread_id: "c2".to_string(),
+            turn_id: "c2".to_string(),
+            pr_number: 7,
+            kind: ReviewKind::Review,
+            engine_kind: EngineKind::Cursor,
+            status: SessionStatus::Running,
+            created_at_epoch: 0,
+            comment_url: None,
+        });
+        assert!(matches!(
+            reg.begin_interrupt("c2"),
+            BeginInterrupt::Proceed(_)
+        ));
+        assert_eq!(reg.get("c2").unwrap().status, SessionStatus::Interrupting);
+        reg.rollback_interrupt("c2");
+        assert_eq!(reg.get("c2").unwrap().status, SessionStatus::Running);
     }
 }
