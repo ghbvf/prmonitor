@@ -588,8 +588,8 @@ struct WebhookRuntime {
     /// status poll. For `command`/`listener` the URL is from config and never changes.
     public_url: Arc<StdMutex<Option<String>>>,
     /// The tunnel mode this runtime was started with (Copy off `TunnelSpec`). Held so
-    /// `status` is mode-aware: only `Quick` owns/depends on cloudflared, so only `Quick`
-    /// runs the install probe + renders cloudflared-specific crash/install text.
+    /// `status` is mode-aware: managed cloudflared ownership is `Quick`, or `Command`
+    /// with a bare `cloudflared` program token (install probe / fingerprint / nag text).
     mode: WebhookTunnelMode,
     cloudflared_fingerprint: Option<String>,
 }
@@ -3152,21 +3152,25 @@ mod tests {
         mgr.stop().await;
     }
 
-    /// G2/G3 (stopped path): a non-quick `configured_mode` on a STOPPED manager skips the
-    /// cloudflared probe (reports `cloudflared_installed: true` despite a bogus bin) and
-    /// gives a neutral "未运行" — no "brew install cloudflared" nag for a mode that
-    /// doesn't use cloudflared. The quick branch's nag is still covered by the running
-    /// install-state assertions elsewhere; here we lock the mode gating.
+    /// G2/G3 (stopped path): modes that do NOT own managed cloudflared skip the
+    /// install probe (reports `cloudflared_installed: true`) and give a neutral
+    /// "未运行". Command+bare ownership is covered by
+    /// [`status_stopped_command_bare_cloudflared_runs_probe_and_nags`].
     #[tokio::test]
-    async fn status_stopped_non_quick_skips_probe_and_neutral_message() {
+    async fn status_stopped_non_managed_skips_probe_and_neutral_message() {
         let mgr = WebhookManager::default();
-        // No runtime → stopped; the bogus bin would make a real probe report false.
-        for mode in [WebhookTunnelMode::Command, WebhookTunnelMode::Listener] {
-            let st = mgr.status(Ok(None), mode, "").await;
+        for (mode, command) in [
+            (
+                WebhookTunnelMode::Command,
+                "/opt/homebrew/bin/cloudflared tunnel run",
+            ),
+            (WebhookTunnelMode::Listener, ""),
+        ] {
+            let st = mgr.status(Ok(None), mode, command).await;
             assert!(!st.running);
             assert!(
                 st.cloudflared_installed,
-                "non-quick stopped status skips the probe → reports installed: true"
+                "non-managed stopped status skips the probe → reports installed: true"
             );
             assert_eq!(
                 st.message, "未运行",
@@ -3182,6 +3186,28 @@ mod tests {
         assert!(
             st.message.contains("cloudflared"),
             "quick + missing → brew nag: {}",
+            st.message
+        );
+    }
+
+    #[tokio::test]
+    async fn status_stopped_command_bare_cloudflared_runs_probe_and_nags() {
+        let mgr = WebhookManager::default();
+        let st = mgr
+            .status(
+                Ok(None),
+                WebhookTunnelMode::Command,
+                "cloudflared tunnel run --token x",
+            )
+            .await;
+        assert!(!st.running);
+        assert!(
+            !st.cloudflared_installed,
+            "command+bare must run the install probe"
+        );
+        assert!(
+            st.message.contains("cloudflared"),
+            "command+bare stopped status must nag about cloudflared, got: {}",
             st.message
         );
     }

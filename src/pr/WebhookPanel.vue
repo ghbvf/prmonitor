@@ -83,10 +83,10 @@ const enabled = computed(
 const mode = computed(() => props.savedConfig?.webhookTunnelMode ?? "quick");
 const port = computed(() => props.savedConfig?.webhookPort ?? null);
 
-// cloudflared is only App's concern in quick mode; command/listener manage tunnels
-// externally, so don't nag about a missing cloudflared there.
+// Trust backend ownership: non-managed modes already report cloudflaredInstalled=true,
+// so a false value means this mode needs the managed CLI (quick, or command+bare).
 const showCloudflaredWarn = computed(
-  () => mode.value === "quick" && status.value !== null && !status.value.cloudflaredInstalled,
+  () => status.value !== null && !status.value.cloudflaredInstalled,
 );
 
 // Action label per mode (start), and the running-state header noun.

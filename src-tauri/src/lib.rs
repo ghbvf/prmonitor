@@ -75,22 +75,27 @@ fn probe_cli_tools(
     ))
 }
 
-/// Resolve cloudflared only when Remote Access has an enabled Quick tunnel. Other
-/// modes do not depend on the managed CLI and therefore must not be degraded by an
-/// unrelated cloudflared configuration error.
+/// Resolve cloudflared when Remote Access has an enabled tunnel that needs the managed
+/// CLI: `Quick`, or `Command` whose program token is the bare `cloudflared` name.
+/// Other modes/commands must not be degraded by an unrelated cloudflared config error.
 fn resolve_remote_cloudflared<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     remote_access: &config::model::RemoteAccessConfig,
 ) -> error::AppResult<Option<config::service::ResolvedCli>> {
-    if remote_access
-        .tunnels
-        .iter()
-        .any(|tunnel| tunnel.enabled && tunnel.mode == config::model::RemoteTunnelMode::Quick)
-    {
+    if remote_tunnels_need_cloudflared(remote_access) {
         config::service::resolve_cli(app, model::CliTool::Cloudflared, false).map(Some)
     } else {
         Ok(None)
     }
+}
+
+fn remote_tunnels_need_cloudflared(remote_access: &config::model::RemoteAccessConfig) -> bool {
+    remote_access.tunnels.iter().any(|tunnel| {
+        tunnel.enabled
+            && (tunnel.mode == config::model::RemoteTunnelMode::Quick
+                || (tunnel.mode == config::model::RemoteTunnelMode::Command
+                    && config::service::tunnel_command_uses_bare_cloudflared(&tunnel.command)))
+    })
 }
 
 struct MessagingActionsImpl;
@@ -1442,6 +1447,32 @@ fn emit_dispatch_error<R: tauri::Runtime>(
 mod tests {
     use super::*;
     use crate::db::Database;
+
+    #[test]
+    fn remote_tunnels_need_cloudflared_for_quick_or_bare_command() {
+        use config::model::{RemoteAccessConfig, RemoteTunnel, RemoteTunnelMode};
+
+        let mut remote = RemoteAccessConfig {
+            entrypoints: Vec::new(),
+            tunnels: vec![RemoteTunnel {
+                enabled: true,
+                mode: RemoteTunnelMode::Command,
+                command: "cloudflared tunnel run --token x".to_string(),
+                ..RemoteTunnel::default()
+            }],
+        };
+        assert!(remote_tunnels_need_cloudflared(&remote));
+
+        remote.tunnels[0].command = "/opt/homebrew/bin/cloudflared tunnel run".to_string();
+        assert!(!remote_tunnels_need_cloudflared(&remote));
+
+        remote.tunnels[0].mode = RemoteTunnelMode::Quick;
+        remote.tunnels[0].command.clear();
+        assert!(remote_tunnels_need_cloudflared(&remote));
+
+        remote.tunnels[0].enabled = false;
+        assert!(!remote_tunnels_need_cloudflared(&remote));
+    }
 
     #[test]
     fn startup_reconcile_returns_blocked_review_to_claimable_pending_state() {
