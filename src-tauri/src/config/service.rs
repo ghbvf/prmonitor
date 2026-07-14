@@ -16,7 +16,9 @@ use crate::error::{AppError, AppResult};
 use crate::model::{CliTool, NotificationDeliveryChannel};
 
 pub use super::cli::{
-    CliProbeDiagnostics, CliResolutionDiagnostics, CliResolver, ManagedCommand, ResolvedCli,
+    is_bare_cloudflared_program, managed_cloudflared_for_program,
+    tunnel_command_uses_bare_cloudflared, CliProbeDiagnostics, CliResolutionDiagnostics,
+    CliResolver, ManagedCommand, ResolvedCli,
 };
 
 /// Re-export the project domain type THROUGH the config public service surface (#35,

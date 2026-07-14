@@ -28,6 +28,50 @@ use crate::{
     model::{CliResolutionSource, CliTool},
 };
 
+/// Bare program token for the managed `cloudflared` CLI (no directory components).
+///
+/// Tunnel `command` mode must route this token through [`ResolvedCli`] (same funnel as
+/// `quick`), not `Command::new("cloudflared")` — desktop apps often lack Homebrew on PATH.
+pub fn is_bare_cloudflared_program(program: &str) -> bool {
+    if Path::new(program).components().count() != 1 {
+        return false;
+    }
+    let canonical = canonical_cli_name(CliTool::Cloudflared);
+    #[cfg(windows)]
+    {
+        program.eq_ignore_ascii_case(canonical) || program.eq_ignore_ascii_case("cloudflared.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        program == canonical
+    }
+}
+
+/// True when a tunnel command string's first token is the bare managed `cloudflared` name.
+pub fn tunnel_command_uses_bare_cloudflared(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .next()
+        .is_some_and(is_bare_cloudflared_program)
+}
+
+/// When `program` is the bare managed `cloudflared` name, require a resolved launch capability.
+/// Otherwise return `None` so callers exec the token as an explicit path / other binary.
+pub fn managed_cloudflared_for_program<'a>(
+    program: &str,
+    cloudflared: Option<&'a ResolvedCli>,
+) -> AppResult<Option<&'a ResolvedCli>> {
+    if !is_bare_cloudflared_program(program) {
+        return Ok(None);
+    }
+    match cloudflared {
+        Some(cli) => Ok(Some(cli)),
+        None => Err(AppError::new(
+            "未找到 cloudflared，请在「第三方 CLI」配置 cloudflaredPath".to_string(),
+        )),
+    }
+}
+
 #[cfg(unix)]
 const LOGIN_SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
@@ -1302,5 +1346,40 @@ mod tests {
                 "{suffix}"
             );
         }
+    }
+
+    #[test]
+    fn bare_cloudflared_program_token_is_managed_not_path() {
+        assert!(is_bare_cloudflared_program("cloudflared"));
+        assert!(tunnel_command_uses_bare_cloudflared(
+            "cloudflared tunnel run --token x"
+        ));
+        assert!(!is_bare_cloudflared_program(
+            "/opt/homebrew/bin/cloudflared"
+        ));
+        assert!(!tunnel_command_uses_bare_cloudflared(
+            "/opt/homebrew/bin/cloudflared tunnel run"
+        ));
+        assert!(!is_bare_cloudflared_program("ngrok"));
+        #[cfg(windows)]
+        {
+            assert!(is_bare_cloudflared_program("cloudflared.exe"));
+            assert!(is_bare_cloudflared_program("Cloudflared.EXE"));
+        }
+    }
+
+    #[test]
+    fn managed_cloudflared_for_bare_program_requires_resolved_cli() {
+        let err = managed_cloudflared_for_program("cloudflared", None).unwrap_err();
+        assert!(
+            err.message.contains("cloudflaredPath"),
+            "missing resolver must point at CLI settings: {}",
+            err.message
+        );
+        assert!(
+            managed_cloudflared_for_program("/usr/bin/cloudflared", None)
+                .unwrap()
+                .is_none()
+        );
     }
 }
