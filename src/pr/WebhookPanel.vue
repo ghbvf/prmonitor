@@ -264,7 +264,9 @@ async function copyUrl() {
     <p v-else class="hint">Webhook 配置已保存，可启动隧道。</p>
 
     <p v-if="showCloudflaredWarn" class="warn">
-      未检测到 cloudflared，请先 <code>brew install cloudflared</code>。
+      未检测到可用的 cloudflared。请到「第三方 CLI」配置 <code>cloudflaredPath</code>（例如
+      <code>/opt/homebrew/bin/cloudflared</code>），或安装后重试：
+      <code>brew install cloudflared</code>。
     </p>
 
     <div class="actions">

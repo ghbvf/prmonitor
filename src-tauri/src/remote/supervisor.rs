@@ -23,7 +23,9 @@ use crate::config::model::{
     normalize_route_path, route_paths_conflict, terminal_auth_token_is_strong, RemoteAccessConfig,
     RemoteCapability, RemoteEntrypoint, RemoteTunnel, RemoteTunnelMode, SourcePolicyMode,
 };
-use crate::config::service::{managed_cloudflared_for_program, ResolvedCli};
+use crate::config::service::{
+    managed_cloudflared_for_program, tunnel_command_uses_bare_cloudflared, ResolvedCli,
+};
 use crate::db::Database;
 use crate::messaging::local_api::build_router as build_messaging_local_api_router;
 use crate::review::local_api::build_router as build_review_local_api_router;
@@ -87,9 +89,10 @@ pub struct BoundTunnel {
     public_url: Arc<StdMutex<Option<String>>>,
     state: Arc<StdMutex<TunnelLifecycleState>>,
     logs: Arc<StdMutex<VecDeque<String>>>,
-    /// Present only for a successfully spawned Quick tunnel. Keeping the launch
-    /// credential on the runtime (instead of the supervisor) lets old and new CLI
-    /// paths coexist until each individual child exits or is restarted.
+    /// Present when a managed cloudflared child was spawned successfully (`Quick`, or
+    /// `Command` with a bare `cloudflared` program token). Keeping the launch credential on
+    /// the runtime (instead of the supervisor) lets old and new CLI paths coexist until each
+    /// individual child exits or is restarted.
     cloudflared_fingerprint: Option<String>,
 }
 
@@ -1119,6 +1122,15 @@ impl BoundTunnel {
                 }
             }
             RemoteTunnelMode::Command => {
+                if tunnel_command_uses_bare_cloudflared(&desired.command) && cloudflared.is_none() {
+                    let message = cloudflared_resolution_error
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            "未找到 cloudflared，请在「第三方 CLI」配置 cloudflaredPath".to_string()
+                        });
+                    push_log(&logs, &message);
+                    return failed_tunnel(desired, logs, message);
+                }
                 let (child, drain_task, fingerprint) = match tauri::async_runtime::block_on(async {
                     spawn_custom_tunnel(
                         &desired.command,
@@ -1839,6 +1851,52 @@ mod tests {
             "command-mode cloudflared child must be killed during teardown"
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reconcile_command_tunnel_preserves_cloudflared_resolution_error() {
+        use crate::error::AppError;
+
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let remote_access = RemoteAccessConfig {
+            entrypoints: vec![RemoteEntrypoint {
+                port,
+                routes: Vec::new(),
+                ..entrypoint()
+            }],
+            tunnels: vec![RemoteTunnel {
+                id: "command".to_string(),
+                name: "Command".to_string(),
+                mode: RemoteTunnelMode::Command,
+                target_entrypoint_id: "ep".to_string(),
+                enabled: true,
+                command: "cloudflared tunnel run --token test-token".to_string(),
+                public_url: "https://prmonitor.example.com".to_string(),
+                ..RemoteTunnel::default()
+            }],
+        };
+        let app = tauri::test::mock_app();
+        let supervisor = ListenerSupervisor::default();
+        let resolution = "未找到 cloudflared：path missing: /bad/cloudflared";
+
+        supervisor.reconcile(
+            app.handle(),
+            &remote_access,
+            Err(AppError::new(resolution.to_string())),
+        );
+
+        let status = supervisor.status_snapshot(&remote_access, true);
+        assert_eq!(status.tunnels.len(), 1);
+        assert_eq!(status.tunnels[0].state, RemoteTunnelState::Error);
+        assert_eq!(
+            status.tunnels[0].message, resolution,
+            "command+bare must surface resolve diagnostics, not a generic fallback"
+        );
+        supervisor.shutdown();
     }
 
     #[test]
