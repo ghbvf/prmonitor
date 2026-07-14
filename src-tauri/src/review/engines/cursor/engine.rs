@@ -7,7 +7,7 @@ use tauri::Manager;
 use tokio::process::ChildStdin;
 use tokio::sync::broadcast;
 
-use super::manager::CursorManager;
+use super::manager::{CursorManager, CURSOR_ACP_MODEL_BUSY_MSG, CURSOR_ACP_UNAVAILABLE};
 use super::process::{self, review_prompt, text_prompt};
 use super::protocol::ServerNotification;
 use super::protocol::{SessionNewParams, SessionPromptResult};
@@ -20,7 +20,7 @@ use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, Star
 use crate::review::history_store::{self, HistoryItemKind};
 use crate::review::session::{
     commit_starting_session, CommentUrlContext, ReservationGuard, SessionInfo, SessionRegistry,
-    SessionStatus,
+    SessionStatus, CURSOR_ACP_STALE_SESSION_MSG,
 };
 
 /// User-facing error when the pump falls behind the notification broadcast (F1).
@@ -35,6 +35,8 @@ pub struct CursorEngine<'a, R: tauri::Runtime> {
     pub agent_cli: &'a ResolvedCli,
     pub project_id: &'a str,
     pub repo_root: &'a str,
+    /// Per-project Cursor ACP `--model` (blank → CLI default). Bound at spawn.
+    pub cursor_model: &'a str,
     pub(crate) url_ctx: CommentUrlContext,
     /// FOLLOW-UP path only — `start` takes `pr_number` as a method arg.
     pub pr_number: u64,
@@ -56,6 +58,7 @@ impl<R: tauri::Runtime> ReviewEngine for CursorEngine<'_, R> {
             self.agent_cli,
             self.project_id,
             self.repo_root,
+            self.cursor_model,
             pr_number,
             kind,
             self.url_ctx.clone(),
@@ -74,9 +77,8 @@ impl<R: tauri::Runtime> ReviewEngine for CursorEngine<'_, R> {
             self.app,
             self.cursor,
             self.registry,
-            self.agent_cli,
             self.project_id,
-            self.repo_root,
+            self.cursor_model,
             self.pr_number,
             self.session_info
                 .as_ref()
@@ -98,6 +100,7 @@ async fn start_review<R: tauri::Runtime>(
     agent_cli: &ResolvedCli,
     project_id: &str,
     repo_root: &str,
+    cursor_model: &str,
     pr_number: u64,
     kind: ReviewKind,
     url_ctx: CommentUrlContext,
@@ -114,7 +117,20 @@ async fn start_review<R: tauri::Runtime>(
         armed: true,
     };
 
-    let client = cursor.connection(agent_cli, repo_root).await?;
+    // F5: refuse model switch while another Cursor review is in flight (before connection).
+    let desired = cursor_model.trim();
+    let busy = registry.has_in_flight_cursor();
+    if busy && cursor.has_live() {
+        if let Some(live) = cursor.active_spawn_model() {
+            if !desired.is_empty() && live != desired {
+                return Err(AppError::new(CURSOR_ACP_MODEL_BUSY_MSG.to_string()));
+            }
+        }
+    }
+
+    let (client, gen) = cursor
+        .connection(agent_cli, repo_root, cursor_model, busy)
+        .await?;
     let cwd = if repo_root.trim().is_empty() {
         String::new()
     } else {
@@ -145,6 +161,8 @@ async fn start_review<R: tauri::Runtime>(
     reservation.disarm();
 
     registry.set_running(&session_id, session_id.clone());
+    // Bind the generation returned with this client install (F4) — not a separate read.
+    registry.bind_cursor_generation(&session_id, gen);
     let _ = persist_session(
         app,
         &SessionInfo {
@@ -174,9 +192,8 @@ async fn resume_review<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     cursor: &CursorManager,
     registry: &SessionRegistry,
-    agent_cli: &ResolvedCli,
     project_id: &str,
-    repo_root: &str,
+    cursor_model: &str,
     pr_number: u64,
     durable_info: &SessionInfo,
     thread_id: &str,
@@ -201,22 +218,43 @@ async fn resume_review<R: tauri::Runtime>(
         }
     }
 
-    let client = match cursor.connection(agent_cli, repo_root).await {
-        Ok(c) => c,
-        Err(e) => {
-            registry.set_status(thread_id, SessionStatus::Failed);
-            persist_session_status(
-                app,
-                registry,
-                project_id,
-                thread_id,
-                pr_number,
-                durable_info,
-                SessionStatus::Failed,
-            );
-            let _ = registry.take_url_context(thread_id);
-            return Err(e);
-        }
+    // Fail-closed: stamped generation must match the live resident process.
+    if let Err(e) = registry.require_cursor_generation(thread_id, cursor.active_generation()) {
+        return resume_fail_closed(
+            app,
+            registry,
+            project_id,
+            thread_id,
+            pr_number,
+            durable_info,
+            e,
+        );
+    }
+
+    // Non-empty desired model must match the live spawn_model — never respawn on resume.
+    if let Err(e) = cursor_resume_model_ok(cursor_model, cursor.active_spawn_model().as_deref()) {
+        return resume_fail_closed(
+            app,
+            registry,
+            project_id,
+            thread_id,
+            pr_number,
+            durable_info,
+            e,
+        );
+    }
+
+    // Resume uses the existing client only — never connection() (no shutdown+respawn).
+    let Some(client) = cursor.existing_client() else {
+        return resume_fail_closed(
+            app,
+            registry,
+            project_id,
+            thread_id,
+            pr_number,
+            durable_info,
+            AppError::new(CURSOR_ACP_UNAVAILABLE.to_string()),
+        );
     };
 
     crate::review::session::persist_user_message(app, project_id, thread_id, user_item_id, message);
@@ -303,6 +341,10 @@ async fn pump<R: tauri::Runtime>(
                             session_id: sid,
                             text,
                         } if sid == &session_id && !text.is_empty() => {
+                            // F4: never emit messageDelta after the turn is already terminal.
+                            if registry.is_terminal(&session_id) {
+                                continue;
+                            }
                             emit_and_persist(
                                 &app,
                                 &project_id,
@@ -374,6 +416,21 @@ fn map_stop_reason(stop_reason: &str) -> (SessionStatus, &'static str, Option<St
             "failed",
             Some(format!("cursor ACP stopReason={other}")),
         ),
+    }
+}
+
+/// Fail-closed resume gate: non-empty desired model must match live spawn_model (F6).
+pub(crate) fn cursor_resume_model_ok(
+    desired: &str,
+    live_spawn_model: Option<&str>,
+) -> AppResult<()> {
+    let desired = desired.trim();
+    if desired.is_empty() {
+        return Ok(());
+    }
+    match live_spawn_model {
+        Some(live) if live == desired => Ok(()),
+        _ => Err(AppError::new(CURSOR_ACP_STALE_SESSION_MSG.to_string())),
     }
 }
 
@@ -457,6 +514,31 @@ fn persist_session_status<R: tauri::Runtime>(
     let _ = persist_session(app, &info);
 }
 
+/// Mark Failed + drain resume contexts; return the gate error (F1 fail-closed).
+fn resume_fail_closed<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    registry: &SessionRegistry,
+    project_id: &str,
+    thread_id: &str,
+    pr_number: u64,
+    durable_info: &SessionInfo,
+    err: AppError,
+) -> AppResult<()> {
+    registry.set_status(thread_id, SessionStatus::Failed);
+    persist_session_status(
+        app,
+        registry,
+        project_id,
+        thread_id,
+        pr_number,
+        durable_info,
+        SessionStatus::Failed,
+    );
+    let _ = registry.take_url_context(thread_id);
+    let _ = registry.take_cursor_generation(thread_id);
+    Err(err)
+}
+
 fn persist_session<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     info: &SessionInfo,
@@ -530,5 +612,23 @@ mod tests {
     fn lagged_abort_message_matches_fail_close_contract() {
         // F1: pump Lagged must fail-close with this user-facing message (not silent continue).
         assert_eq!(LAGGED_ABORT_MESSAGE, "cursor ACP 输出流滞后，已中止");
+    }
+
+    #[test]
+    fn resume_model_mismatch_returns_stale_message() {
+        // F6: live spawn_model ≠ desired non-empty → STALE (never silent respawn).
+        let err =
+            cursor_resume_model_ok("composer-2", Some("composer-2-fast")).expect_err("mismatch");
+        assert_eq!(err.message, CURSOR_ACP_STALE_SESSION_MSG);
+        let err_none = cursor_resume_model_ok("composer-2", None).expect_err("no live");
+        assert_eq!(err_none.message, CURSOR_ACP_STALE_SESSION_MSG);
+        assert!(cursor_resume_model_ok("composer-2", Some("composer-2")).is_ok());
+        assert!(cursor_resume_model_ok("", Some("composer-2-fast")).is_ok());
+        assert!(cursor_resume_model_ok("  ", None).is_ok());
+    }
+
+    #[test]
+    fn unavailable_constant_is_shared() {
+        assert_eq!(CURSOR_ACP_UNAVAILABLE, "cursor ACP 连接不可用");
     }
 }

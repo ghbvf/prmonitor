@@ -273,6 +273,13 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         visibleWhen: (p) => p.engineKind === "claude",
       },
       {
+        key: "cursorModel",
+        label: "Cursor 模型",
+        kind: "text",
+        hint: "agent --model …；留空=CLI 默认（进程级，改模型将在下次 review 重启 ACP）",
+        visibleWhen: (p) => p.engineKind === "cursor",
+      },
+      {
         key: "codexModel",
         label: "Codex 模型",
         kind: "text",

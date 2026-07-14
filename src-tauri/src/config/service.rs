@@ -816,6 +816,18 @@ pub fn active_repo_root<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResu
         .unwrap_or_default())
 }
 
+/// Returns the active project's `cursor_model`, or `""` when there is no active project
+/// (mirrors [`active_repo_root`] for Cursor StatusBar / start).
+pub fn active_cursor_model<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppResult<String> {
+    let config = load(app)?;
+    Ok(config
+        .projects
+        .iter()
+        .find(|p| p.id == config.active_project_id)
+        .map(|p| p.cursor_model.clone())
+        .unwrap_or_default())
+}
+
 /// Loads the persisted config and validates its filesystem-dependent fields, for
 /// callers that will *use* those paths (e.g. the review slice attaching the skill
 /// path to a codex turn). Keeps validation inside the config slice so callers

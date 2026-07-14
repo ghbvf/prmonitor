@@ -258,6 +258,10 @@ pub struct Project {
     /// 手填的 claude 模型名（仅 [`EngineKind::Claude`] 用）。非空时作为 `claude -p` 的
     /// `--model` 参数；留空=claude CLI 默认。自由文本不校验。
     pub claude_model: String,
+    /// 手填的 Cursor Agent 模型名（仅 [`EngineKind::Cursor`] 用）。非空时作为
+    /// `agent --model <name> acp` 的启动参数；留空=agent CLI 默认。自由文本不校验。
+    /// 进程级：常驻 ACP 一次只能带一个模型，启 review 时若与 live spawn 模型不同会重启进程。
+    pub cursor_model: String,
     /// Codex `turn/start.effort`; `default` omits the protocol field.
     pub codex_reasoning_effort: CodexReasoningEffort,
     /// Claude CLI `--effort`; `default` omits the argument.
@@ -305,6 +309,7 @@ impl Default for Project {
             // 模型留空 = 各引擎用自身默认（不注入 --model / turn model）。
             codex_model: String::new(),
             claude_model: String::new(),
+            cursor_model: String::new(),
             codex_reasoning_effort: CodexReasoningEffort::default(),
             claude_effort: ClaudeEffort::default(),
             // #818: boot defaults to webhook-only — NO automatic CLI polling at startup
@@ -2441,7 +2446,7 @@ mod tests {
         assert_eq!(v["cliTools"]["claudePath"], "");
         assert_eq!(v["cliTools"]["agentPath"], "");
         assert_eq!(v["cliTools"]["cloudflaredPath"], "");
-        // Cursor ACP auth is CLI/env only — no app-stored API key / model fields.
+        // Cursor ACP auth is CLI/env only — no app-stored API key; model is per-project cursorModel.
         assert!(v.get("cursorApiKey").is_none());
         assert!(v.get("cursorModel").is_none());
         assert!(v.get("cloudflaredBin").is_none());
@@ -2817,6 +2822,7 @@ mod tests {
             engine_kind: EngineKind::default(),
             codex_model: "gpt-5.1-codex".to_string(),
             claude_model: "claude-opus-4-1".to_string(),
+            cursor_model: "composer-2-fast".to_string(),
             codex_reasoning_effort: crate::model::CodexReasoningEffort::High,
             claude_effort: crate::model::ClaudeEffort::Max,
             update_mode: UpdateMode::WebhookOnly,
@@ -2849,10 +2855,10 @@ mod tests {
         // 手填模型字段 wire camelCase + 值（Medium 载体；与 engineKind 的值断言风格一致）。
         assert_eq!(v["codexModel"], "gpt-5.1-codex");
         assert_eq!(v["claudeModel"], "claude-opus-4-1");
+        assert_eq!(v["cursorModel"], "composer-2-fast");
         assert_eq!(v["codexReasoningEffort"], "high");
         assert_eq!(v["claudeEffort"], "max");
-        // Cursor ACP: no per-project model/API key fields (CLI default + env auth only).
-        assert!(v.get("cursorModel").is_none());
+        // Cursor ACP: per-project model only — no app-stored API key (env auth).
         assert!(v.get("cursorApiKey").is_none());
         assert!(v.get("autoReview").is_none());
         // #818: the new data-source-mode fields.
@@ -2878,6 +2884,7 @@ mod tests {
         assert!(v.get("engine_kind").is_none());
         assert!(v.get("codex_model").is_none());
         assert!(v.get("claude_model").is_none());
+        assert!(v.get("cursor_model").is_none());
         assert!(v.get("codex_reasoning_effort").is_none());
         assert!(v.get("claude_effort").is_none());
         assert!(v.get("auto_review").is_none());

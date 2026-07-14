@@ -152,6 +152,12 @@ codexModel: string,
  */
 claudeModel: string,
 /**
+ * 手填的 Cursor Agent 模型名（仅 [`EngineKind::Cursor`] 用）。非空时作为
+ * `agent --model <name> acp` 的启动参数；留空=agent CLI 默认。自由文本不校验。
+ * 进程级：常驻 ACP 一次只能带一个模型，启 review 时若与 live spawn 模型不同会重启进程。
+ */
+cursorModel: string,
+/**
  * Codex `turn/start.effort`; `default` omits the protocol field.
  */
 codexReasoningEffort: CodexReasoningEffort,
@@ -197,7 +203,7 @@ bitbucketProject: string,
  * `Authorization: Bearer <token>`。无 CLI 登录，故凭据存配置。其余源留空。
  */
 bitbucketToken: string, };
-export const DEFAULT_PROJECT: Project = {"id":"","name":"","enabled":true,"repo":"ghbvf/gocell","repoRoot":"","pollIntervalSecs":120,"authors":[],"skillRelPath":".codex/skills/pr-review/SKILL.md","prCooldownSeconds":1800,"sourceKind":"github","engineKind":"codex","codexModel":"","claudeModel":"","codexReasoningEffort":"default","claudeEffort":"default","updateMode":"webhook-only","azureOrg":"","azureProject":"","labelSource":"native","bitbucketHost":"","bitbucketProject":"","bitbucketToken":""};
+export const DEFAULT_PROJECT: Project = {"id":"","name":"","enabled":true,"repo":"ghbvf/gocell","repoRoot":"","pollIntervalSecs":120,"authors":[],"skillRelPath":".codex/skills/pr-review/SKILL.md","prCooldownSeconds":1800,"sourceKind":"github","engineKind":"codex","codexModel":"","claudeModel":"","cursorModel":"","codexReasoningEffort":"default","claudeEffort":"default","updateMode":"webhook-only","azureOrg":"","azureProject":"","labelSource":"native","bitbucketHost":"","bitbucketProject":"","bitbucketToken":""};
 
 export type AppConfig = {
 /**

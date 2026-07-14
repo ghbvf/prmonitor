@@ -51,6 +51,7 @@ function validProject(): Project {
     engineKind: "codex",
     codexModel: "",
     claudeModel: "",
+    cursorModel: "",
     codexReasoningEffort: "default",
     claudeEffort: "default",
   };
@@ -175,8 +176,9 @@ describe("PROJECT_GROUPS", () => {
   it("only the source fields and per-engine settings carry a visibleWhen predicate", () => {
     // sourceKind, repo, updateMode, labelSource, etc. must NOT be conditionally hidden —
     // only the per-source connection fields (gated on sourceKind), skillRelPath +
-    // codexModel (gated on engineKind === codex, #718), and claudeModel (gated on
-    // engineKind === claude) carry a predicate.
+    // codexModel (gated on engineKind === codex, #718), claudeModel (gated on
+    // engineKind === claude), and cursorModel (gated on engineKind === cursor) carry a
+    // predicate.
     const conditional = PROJECT_GROUPS.flatMap((g) => g.fields)
       .filter((f) => f.visibleWhen)
       .map((f) => f.key)
@@ -191,6 +193,7 @@ describe("PROJECT_GROUPS", () => {
       "claudeModel",
       "codexModel",
       "codexReasoningEffort",
+      "cursorModel",
       "skillRelPath",
     ]);
   });
@@ -384,6 +387,24 @@ describe("skillRelPath field is codex-only (#718)", () => {
     expect(field?.visibleWhen?.({ ...validProject(), engineKind: "codex" })).toBe(
       true,
     );
+    expect(
+      field?.visibleWhen?.({ ...validProject(), engineKind: "claude" }),
+    ).toBe(false);
+  });
+});
+
+describe("cursorModel field is cursor-only", () => {
+  it("is visible when engineKind===cursor, hidden otherwise", () => {
+    const field = PROJECT_GROUPS.flatMap((g) => g.fields).find(
+      (f) => f.key === "cursorModel",
+    );
+    expect(field?.visibleWhen).toBeDefined();
+    expect(
+      field?.visibleWhen?.({ ...validProject(), engineKind: "cursor" }),
+    ).toBe(true);
+    expect(
+      field?.visibleWhen?.({ ...validProject(), engineKind: "codex" }),
+    ).toBe(false);
     expect(
       field?.visibleWhen?.({ ...validProject(), engineKind: "claude" }),
     ).toBe(false);

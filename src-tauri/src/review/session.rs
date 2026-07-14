@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
@@ -34,6 +35,10 @@ use crate::review::engine::StartReviewOutcome;
 
 /// A review session is identified by its codex `threadId`.
 pub type ThreadId = String;
+
+/// Cursor ACP session is bound to a process generation that no longer matches (resume gate).
+pub(crate) const CURSOR_ACP_STALE_SESSION_MSG: &str =
+    "cursor ACP 进程已重启，会话已失效，请新开 review";
 
 /// The result of resolving a `(project, pr, kind)` for a stop-review action (AB#1069 F4): the
 /// three states an interrupt must tell apart, so a stop is never silently dropped.
@@ -195,6 +200,11 @@ struct RegistryState {
     /// return), which bounds the map and pins that the URL is resolved against the project the
     /// review STARTED against, never a config that changed mid-review. In-memory only.
     url_contexts: HashMap<ThreadId, CommentUrlContext>,
+    /// Cursor ACP process generation bound at `session/new` (AB#1754). Memory-only;
+    /// mirrors `url_contexts` — not DB/wire. Session/process-scoped: cleared only on
+    /// fail-closed discard (`take_cursor_generation`), never on a successful turn terminal
+    /// (follow-up resume still needs the stamp).
+    cursor_generations: HashMap<ThreadId, u64>,
 }
 
 /// Outcome of [`SessionRegistry::begin_interrupt`] — the atomic guard that makes
@@ -349,6 +359,87 @@ impl SessionRegistry {
     /// session that never captured one) yields `None`. Synchronous (no `.await` under the lock).
     pub(super) fn take_url_context(&self, thread_id: &str) -> Option<CommentUrlContext> {
         self.inner.lock().unwrap().url_contexts.remove(thread_id)
+    }
+
+    /// Bind the live Cursor ACP process generation at `session/new` (AB#1754).
+    pub(crate) fn bind_cursor_generation(&self, thread_id: &str, generation: u64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .cursor_generations
+            .insert(thread_id.to_string(), generation);
+    }
+
+    /// Remove and return this session's bound Cursor ACP generation (fail-closed discard
+    /// only — resume mismatch / no live client). Successful turn terminals must NOT take.
+    pub(crate) fn take_cursor_generation(&self, thread_id: &str) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .cursor_generations
+            .remove(thread_id)
+    }
+
+    /// Fail-closed resume gate. Ok only when stamped gen matches live `Some(gen)`.
+    pub(crate) fn require_cursor_generation(
+        &self,
+        thread_id: &str,
+        live: Option<u64>,
+    ) -> AppResult<()> {
+        let Some(live_gen) = live else {
+            return Err(AppError::new(CURSOR_ACP_STALE_SESSION_MSG.to_string()));
+        };
+        let stamped = self
+            .inner
+            .lock()
+            .unwrap()
+            .cursor_generations
+            .get(thread_id)
+            .copied();
+        match stamped {
+            Some(g) if g == live_gen => Ok(()),
+            _ => Err(AppError::new(CURSOR_ACP_STALE_SESSION_MSG.to_string())),
+        }
+    }
+
+    /// Lock-internal terminal CAS (AB#1753 F2): if status is Starting|Running|Interrupting,
+    /// set to `terminal` (Done/Failed) and return true. Already Done/Failed / missing → false.
+    /// Only the winner of [`finalize_turn`] continues emit/persist/signal.
+    pub(crate) fn try_begin_terminal(&self, thread_id: &str, terminal: SessionStatus) -> bool {
+        debug_assert!(
+            matches!(terminal, SessionStatus::Done | SessionStatus::Failed),
+            "try_begin_terminal requires Done|Failed"
+        );
+        let mut st = self.inner.lock().unwrap();
+        let Some(info) = st.sessions.get_mut(thread_id) else {
+            return false;
+        };
+        match info.status {
+            SessionStatus::Starting | SessionStatus::Running | SessionStatus::Interrupting => {
+                info.status = terminal;
+                true
+            }
+            SessionStatus::Done | SessionStatus::Failed => false,
+        }
+    }
+
+    /// Whether this session is already Done/Failed (pump skips late messageDelta).
+    pub(crate) fn is_terminal(&self, thread_id: &str) -> bool {
+        matches!(
+            self.get(thread_id).map(|s| s.status),
+            Some(SessionStatus::Done | SessionStatus::Failed)
+        )
+    }
+
+    /// Any Cursor session still Starting|Running|Interrupting (busy for model switch).
+    pub(crate) fn has_in_flight_cursor(&self) -> bool {
+        self.inner.lock().unwrap().sessions.values().any(|s| {
+            s.engine_kind == EngineKind::Cursor
+                && matches!(
+                    s.status,
+                    SessionStatus::Starting | SessionStatus::Running | SessionStatus::Interrupting
+                )
+        })
     }
 
     /// Atomically begin an interrupt. Only a [`SessionStatus::Running`] session
@@ -1006,6 +1097,42 @@ pub async fn stop_review(
 /// When there is no live ACP client, Cursor cannot rely on a pump
 /// `ConnectionClosed` the way Codex can after a dead transport — finalize
 /// `interrupted` here so `useReviewStore.stop` still receives `turnCompleted`.
+///
+/// After a successful cancel, a watchdog finalizes `interrupted` if the pump has
+/// not already terminalized within [`CURSOR_CANCEL_TIMEOUT`] (AB#1753).
+const CURSOR_CANCEL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Arm a cancel watchdog: after `timeout`, if the session is still non-terminal,
+/// finalize `interrupted` via the same CAS path as the pump (AB#1753 F2).
+fn arm_cursor_cancel_watchdog<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    registry: SessionRegistry,
+    session_id: String,
+    project_id: String,
+    pr_number: u64,
+    timeout: Duration,
+) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(timeout).await;
+        if registry.is_terminal(&session_id) {
+            return;
+        }
+        eprintln!("cursor ACP cancel 超时，强制 interrupted（{session_id}）");
+        finalize_turn(
+            &app,
+            &registry,
+            &project_id,
+            pr_number,
+            &session_id,
+            SessionStatus::Done,
+            "interrupted",
+            None,
+        )
+        .await;
+    });
+}
+
+/// Interrupt a running Cursor ACP review session (F2 / AB#1753).
 pub async fn stop_cursor_review<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     cursor: &CursorManager,
@@ -1043,6 +1170,19 @@ pub async fn stop_cursor_review<R: tauri::Runtime>(
         registry.rollback_interrupt(session_id);
         return Err(e);
     }
+
+    // Capture project/pr while still Interrupting — needed if the watchdog fires.
+    let Some(info) = registry.get(session_id) else {
+        return Ok(());
+    };
+    arm_cursor_cancel_watchdog(
+        app.clone(),
+        registry.clone(),
+        session_id.to_string(),
+        info.project_id,
+        info.pr_number,
+        CURSOR_CANCEL_TIMEOUT,
+    );
     Ok(())
 }
 
@@ -1338,11 +1478,11 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
     wire_status: &str,
     error: Option<String>,
 ) {
-    // 1. Resolve the comment URL only on a successful completion, against the IMMUTABLE
-    // context captured at session start (NOT the live config) so a mid-review config edit
-    // can't yield a wrong/None URL. Take it unconditionally (remove-on-read bounds the map);
-    // a missing context or a non-`completed` terminal both yield None. Any resolve failure
-    // also degrades to None — the funnel never fails.
+    // Lock-internal CAS: only one of pump ∥ watchdog wins emit/persist/signal (AB#1753 F2).
+    // Generation stays bound across a successful terminal — follow-up resume needs it (F1).
+    if !registry.try_begin_terminal(thread_id, terminal) {
+        return;
+    }
     let comment_url = match registry.take_url_context(thread_id) {
         Some(ctx) if should_resolve_url(wire_status) => {
             super::comment_url::resolve_comment_url(
@@ -1358,7 +1498,7 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
         _ => None,
     };
 
-    // 2. In-memory terminal status + the resolved URL.
+    // 2. In-memory terminal status + the resolved URL (status already CAS'd; fold URL in).
     registry.set_status_and_comment_url(thread_id, terminal, comment_url.clone());
 
     // 3. Durable terminal status + URL (best-effort; one-time notice on failure).
@@ -2547,5 +2687,278 @@ mod tests {
         assert_eq!(reg.get("c2").unwrap().status, SessionStatus::Interrupting);
         reg.rollback_interrupt("c2");
         assert_eq!(reg.get("c2").unwrap().status, SessionStatus::Running);
+    }
+
+    #[test]
+    fn require_cursor_generation_match_ok() {
+        let reg = SessionRegistry::default();
+        reg.bind_cursor_generation("t1", 3);
+        assert!(reg.require_cursor_generation("t1", Some(3)).is_ok());
+    }
+
+    #[test]
+    fn require_cursor_generation_mismatch_err() {
+        let reg = SessionRegistry::default();
+        reg.bind_cursor_generation("t1", 3);
+        let err = reg
+            .require_cursor_generation("t1", Some(4))
+            .expect_err("mismatch");
+        assert_eq!(err.message, CURSOR_ACP_STALE_SESSION_MSG);
+    }
+
+    #[test]
+    fn require_cursor_generation_missing_stamp_err() {
+        let reg = SessionRegistry::default();
+        let err = reg
+            .require_cursor_generation("t1", Some(1))
+            .expect_err("no stamp");
+        assert_eq!(err.message, CURSOR_ACP_STALE_SESSION_MSG);
+    }
+
+    #[test]
+    fn require_cursor_generation_no_live_err() {
+        let reg = SessionRegistry::default();
+        reg.bind_cursor_generation("t1", 1);
+        let err = reg
+            .require_cursor_generation("t1", None)
+            .expect_err("no live");
+        assert_eq!(err.message, CURSOR_ACP_STALE_SESSION_MSG);
+    }
+
+    #[test]
+    fn try_begin_terminal_cas_true_only_once() {
+        let reg = SessionRegistry::default();
+        assert!(
+            !reg.try_begin_terminal("missing", SessionStatus::Done),
+            "missing → false"
+        );
+
+        reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
+            thread_id: "t-run".to_string(),
+            turn_id: "t-run".to_string(),
+            pr_number: 1,
+            kind: ReviewKind::Review,
+            engine_kind: EngineKind::Cursor,
+            status: SessionStatus::Running,
+            created_at_epoch: 0,
+            comment_url: None,
+        });
+        assert!(
+            reg.try_begin_terminal("t-run", SessionStatus::Done),
+            "Running → first CAS true"
+        );
+        assert_eq!(reg.get("t-run").unwrap().status, SessionStatus::Done);
+        assert!(
+            !reg.try_begin_terminal("t-run", SessionStatus::Failed),
+            "already Done → second CAS false"
+        );
+        assert_eq!(
+            reg.get("t-run").unwrap().status,
+            SessionStatus::Done,
+            "loser must not overwrite terminal"
+        );
+
+        reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
+            thread_id: "t-int".to_string(),
+            turn_id: "t-int".to_string(),
+            pr_number: 2,
+            kind: ReviewKind::Review,
+            engine_kind: EngineKind::Cursor,
+            status: SessionStatus::Interrupting,
+            created_at_epoch: 0,
+            comment_url: None,
+        });
+        assert!(reg.try_begin_terminal("t-int", SessionStatus::Done));
+        assert!(!reg.try_begin_terminal("t-int", SessionStatus::Done));
+    }
+
+    #[tokio::test]
+    async fn finalize_turn_keeps_generation_and_second_call_is_noop() {
+        // F1: successful Done must NOT take_cursor_generation (follow-up resume needs it).
+        // F2: second finalize_turn loses CAS → early return (no second completion signal).
+        let app = tauri::test::mock_app();
+        app.handle()
+            .manage(crate::db::Database::open_in_memory().expect("open db"));
+        app.handle().manage(crate::state::AppState::default());
+
+        let reg = SessionRegistry::default();
+        reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
+            thread_id: "gen-keep".to_string(),
+            turn_id: "gen-keep".to_string(),
+            pr_number: 3,
+            kind: ReviewKind::Review,
+            engine_kind: EngineKind::Cursor,
+            status: SessionStatus::Running,
+            created_at_epoch: 0,
+            comment_url: None,
+        });
+        reg.bind_cursor_generation("gen-keep", 7);
+        let mut rx = reg.subscribe_completion("gen-keep");
+
+        finalize_turn(
+            app.handle(),
+            &reg,
+            "p1",
+            3,
+            "gen-keep",
+            SessionStatus::Done,
+            "completed",
+            None,
+        )
+        .await;
+
+        assert_eq!(reg.get("gen-keep").unwrap().status, SessionStatus::Done);
+        assert!(
+            reg.require_cursor_generation("gen-keep", Some(7)).is_ok(),
+            "generation must survive successful finalize"
+        );
+        assert!(
+            rx.borrow_and_update().is_some(),
+            "winner must signal completion"
+        );
+
+        finalize_turn(
+            app.handle(),
+            &reg,
+            "p1",
+            3,
+            "gen-keep",
+            SessionStatus::Failed,
+            "failed",
+            Some("should not emit".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            reg.get("gen-keep").unwrap().status,
+            SessionStatus::Done,
+            "loser must not flip terminal"
+        );
+        assert!(
+            reg.require_cursor_generation("gen-keep", Some(7)).is_ok(),
+            "generation still live after loser finalize"
+        );
+        // watch does not change again — still the first outcome.
+        assert_eq!(
+            rx.borrow().as_ref().map(|o| o.wire_status.as_str()),
+            Some("completed")
+        );
+    }
+
+    #[test]
+    fn has_in_flight_cursor_detects_running_and_ignores_codex() {
+        let reg = SessionRegistry::default();
+        assert!(!reg.has_in_flight_cursor());
+        reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
+            thread_id: "c-done".to_string(),
+            turn_id: "c-done".to_string(),
+            pr_number: 1,
+            kind: ReviewKind::Review,
+            engine_kind: EngineKind::Cursor,
+            status: SessionStatus::Done,
+            created_at_epoch: 0,
+            comment_url: None,
+        });
+        assert!(!reg.has_in_flight_cursor());
+        reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
+            thread_id: "codex-run".to_string(),
+            turn_id: "codex-run".to_string(),
+            pr_number: 2,
+            kind: ReviewKind::Review,
+            engine_kind: EngineKind::Codex,
+            status: SessionStatus::Running,
+            created_at_epoch: 0,
+            comment_url: None,
+        });
+        assert!(!reg.has_in_flight_cursor());
+        reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
+            thread_id: "c-run".to_string(),
+            turn_id: "c-run".to_string(),
+            pr_number: 3,
+            kind: ReviewKind::Review,
+            engine_kind: EngineKind::Cursor,
+            status: SessionStatus::Running,
+            created_at_epoch: 0,
+            comment_url: None,
+        });
+        assert!(reg.has_in_flight_cursor());
+    }
+
+    #[tokio::test]
+    async fn arm_cursor_cancel_watchdog_finalizes_when_still_interrupting() {
+        let app = tauri::test::mock_app();
+        app.handle()
+            .manage(crate::db::Database::open_in_memory().expect("open db"));
+        app.handle().manage(crate::state::AppState::default());
+
+        let reg = SessionRegistry::default();
+        reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
+            thread_id: "watch-1".to_string(),
+            turn_id: "watch-1".to_string(),
+            pr_number: 9,
+            kind: ReviewKind::Review,
+            engine_kind: EngineKind::Cursor,
+            status: SessionStatus::Interrupting,
+            created_at_epoch: 0,
+            comment_url: None,
+        });
+
+        arm_cursor_cancel_watchdog(
+            app.handle().clone(),
+            reg.clone(),
+            "watch-1".to_string(),
+            "p1".to_string(),
+            9,
+            Duration::from_millis(50),
+        );
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            reg.get("watch-1").unwrap().status,
+            SessionStatus::Done,
+            "watchdog must finalize interrupted"
+        );
+    }
+
+    #[tokio::test]
+    async fn arm_cursor_cancel_watchdog_noop_when_already_terminal() {
+        let app = tauri::test::mock_app();
+        app.handle()
+            .manage(crate::db::Database::open_in_memory().expect("open db"));
+        app.handle().manage(crate::state::AppState::default());
+
+        let reg = SessionRegistry::default();
+        reg.insert(SessionInfo {
+            project_id: "p1".to_string(),
+            thread_id: "watch-2".to_string(),
+            turn_id: "watch-2".to_string(),
+            pr_number: 9,
+            kind: ReviewKind::Review,
+            engine_kind: EngineKind::Cursor,
+            status: SessionStatus::Done,
+            created_at_epoch: 0,
+            comment_url: None,
+        });
+
+        arm_cursor_cancel_watchdog(
+            app.handle().clone(),
+            reg.clone(),
+            "watch-2".to_string(),
+            "p1".to_string(),
+            9,
+            Duration::from_millis(50),
+        );
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            reg.get("watch-2").unwrap().status,
+            SessionStatus::Done,
+            "already terminal — watchdog no-op"
+        );
     }
 }

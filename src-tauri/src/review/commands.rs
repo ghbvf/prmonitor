@@ -114,11 +114,16 @@ pub async fn get_cursor_status<R: tauri::Runtime>(
         Ok((
             config_service::resolve_cli(&app, CliTool::Agent, false)?,
             config_service::active_repo_root(&app)?,
+            config_service::active_cursor_model(&app)?,
         ))
     })? {
         CursorStatusInput::Resident(status) => Ok(status),
-        CursorStatusInput::Cold((agent, repo_root)) => {
-            Ok(state.cursor.status(&agent, &repo_root).await)
+        CursorStatusInput::Cold((agent, repo_root, cursor_model)) => {
+            let busy = state.sessions.has_in_flight_cursor();
+            Ok(state
+                .cursor
+                .status(&agent, &repo_root, &cursor_model, busy)
+                .await)
         }
     }
 }
@@ -151,8 +156,13 @@ pub async fn start_cursor<R: tauri::Runtime>(
     state: tauri::State<'_, AppState>,
 ) -> AppResult<CursorStatus> {
     let repo_root = config_service::active_repo_root(&app)?;
+    let cursor_model = config_service::active_cursor_model(&app)?;
     let agent = config_service::resolve_cli(&app, CliTool::Agent, false)?;
-    let status = state.cursor.start(&agent, &repo_root).await;
+    let busy = state.sessions.has_in_flight_cursor();
+    let status = state
+        .cursor
+        .start(&agent, &repo_root, &cursor_model, busy)
+        .await;
     state.review_resume.fire()?;
     Ok(status)
 }
@@ -288,6 +298,7 @@ impl ReviewStartCapability {
                     agent_cli: &agent_cli,
                     project_id: &project.id,
                     repo_root: &project.repo_root,
+                    cursor_model: &project.cursor_model,
                     url_ctx,
                     pr_number: 0,
                     session_info: None,
@@ -709,6 +720,7 @@ pub async fn send_review_message<R: tauri::Runtime>(
                 agent_cli: &agent_cli,
                 project_id: &project.id,
                 repo_root: &project.repo_root,
+                cursor_model: &project.cursor_model,
                 url_ctx,
                 pr_number,
                 session_info: Some(session_info.clone()),

@@ -37,19 +37,40 @@ pub struct CursorStatus {
     pub message: String,
 }
 
+/// Build `agent … acp` argv. Blank/whitespace `model` → just `["acp"]`;
+/// non-blank → `["--model", trimmed, "acp"]`.
+pub(super) fn cursor_acp_args(model: &str) -> Vec<String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        vec!["acp".to_string()]
+    } else {
+        vec![
+            "--model".to_string(),
+            trimmed.to_string(),
+            "acp".to_string(),
+        ]
+    }
+}
+
 /// A live, handshaken connection to an `agent acp` child.
 pub struct CursorProcess {
     child: Child,
     client: Arc<RpcClient<ChildStdin>>,
     pub info: InitializeResult,
     fingerprint: String,
+    /// Trimmed model passed at spawn (empty if blank / omitted `--model`).
+    spawn_model: String,
 }
 
 impl CursorProcess {
     /// Spawn `agent acp` in `repo_root` and complete `initialize` + `authenticate`.
     /// Empty / relative / non-directory `repo_root` fails closed — never inherits an
     /// arbitrary process cwd.
-    pub(super) async fn spawn(agent: &ResolvedCli, repo_root: &str) -> AppResult<Self> {
+    pub(super) async fn spawn(
+        agent: &ResolvedCli,
+        repo_root: &str,
+        model: &str,
+    ) -> AppResult<Self> {
         let repo_root = repo_root.trim();
         if repo_root.is_empty() {
             return Err(AppError::new(
@@ -62,8 +83,9 @@ impl CursorProcess {
                 "cursor ACP 需要绝对且存在的目录作为 repo_root（cwd）: {repo_root}"
             )));
         }
+        let spawn_model = model.trim().to_string();
         let mut cmd = agent.command();
-        cmd.args(["acp"])
+        cmd.args(cursor_acp_args(model))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -98,6 +120,7 @@ impl CursorProcess {
             client: Arc::new(client),
             info,
             fingerprint: agent.fingerprint().to_string(),
+            spawn_model,
         })
     }
 
@@ -154,6 +177,10 @@ impl CursorProcess {
 
     pub(super) fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+
+    pub(super) fn spawn_model(&self) -> &str {
+        &self.spawn_model
     }
 
     pub fn kill_and_reap(mut self) {
@@ -289,6 +316,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cursor_acp_args_omit_model_when_blank() {
+        assert_eq!(cursor_acp_args(""), vec!["acp".to_string()]);
+        assert_eq!(cursor_acp_args("   "), vec!["acp".to_string()]);
+        assert_eq!(cursor_acp_args("\t\n"), vec!["acp".to_string()]);
+    }
+
+    #[test]
+    fn cursor_acp_args_append_model_when_set() {
+        assert_eq!(
+            cursor_acp_args("composer-2-fast"),
+            vec![
+                "--model".to_string(),
+                "composer-2-fast".to_string(),
+                "acp".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_acp_args_trim_padded_model_name() {
+        assert_eq!(
+            cursor_acp_args("  composer-2-fast  "),
+            vec![
+                "--model".to_string(),
+                "composer-2-fast".to_string(),
+                "acp".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn cursor_status_wire_shape_is_camel_case() {
         let v = serde_json::to_value(CursorStatus {
             available: true,
@@ -379,10 +437,11 @@ done
         let resolved =
             resolve_cli_from(&CliResolver::default(), &tools, CliTool::Agent, false).unwrap();
 
-        let proc = CursorProcess::spawn(&resolved, repo.to_str().unwrap())
+        let proc = CursorProcess::spawn(&resolved, repo.to_str().unwrap(), "")
             .await
             .expect("spawn + handshake");
         assert_eq!(proc.info.protocol_version, 1);
+        assert_eq!(proc.spawn_model(), "");
 
         let args = fs::read_to_string(root.join("args")).unwrap();
         assert_eq!(args.trim(), "acp");
@@ -396,12 +455,94 @@ done
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_with_model_passes_model_flag_in_argv() {
+        // F7: non-empty model → argv includes `--model`, name, `acp`; spawn_model() stamps it.
+        use std::os::unix::fs::PermissionsExt;
+        use std::{fs, path::PathBuf};
+
+        use crate::{
+            config::service::{resolve_cli_from, CliResolver, CliToolsConfig},
+            model::CliTool,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "prmonitor-cursor-spawn-model-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let agent: PathBuf = root.join("agent");
+        fs::write(
+            &agent,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$@" > '{0}/args'
+printf '%s\n' "$PWD" > '{0}/cwd'
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"authMethods":[]}}}}'
+      ;;
+    *'"method":"authenticate"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{}}}}'
+      ;;
+  esac
+done
+"#,
+                root.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let tools: CliToolsConfig = serde_json::from_value(serde_json::json!({
+            "ghPath": "",
+            "azPath": "",
+            "codexPath": "",
+            "claudePath": "",
+            "agentPath": agent,
+            "cloudflaredPath": ""
+        }))
+        .unwrap();
+        let resolved =
+            resolve_cli_from(&CliResolver::default(), &tools, CliTool::Agent, false).unwrap();
+
+        let proc = CursorProcess::spawn(&resolved, repo.to_str().unwrap(), "composer-2-fast")
+            .await
+            .expect("spawn + handshake with model");
+        assert_eq!(proc.spawn_model(), "composer-2-fast");
+
+        let args: Vec<String> = fs::read_to_string(root.join("args"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--model".to_string(),
+                "composer-2-fast".to_string(),
+                "acp".to_string()
+            ]
+        );
+
+        proc.kill_and_reap();
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn spawn_rejects_empty_repo_root() {
         use crate::config::service::ResolvedCli;
 
         let agent = ResolvedCli::for_test(std::env::temp_dir().join("prmonitor-no-such-agent"));
-        let err = match CursorProcess::spawn(&agent, "").await {
+        let err = match CursorProcess::spawn(&agent, "", "").await {
             Ok(_) => panic!("empty repo_root must fail closed"),
             Err(e) => e,
         };
@@ -410,7 +551,7 @@ done
             "unexpected error: {}",
             err.message
         );
-        let err_ws = match CursorProcess::spawn(&agent, "   ").await {
+        let err_ws = match CursorProcess::spawn(&agent, "   ", "").await {
             Ok(_) => panic!("whitespace-only repo_root must fail closed"),
             Err(e) => e,
         };
@@ -422,7 +563,7 @@ done
         use crate::config::service::ResolvedCli;
 
         let agent = ResolvedCli::for_test(std::env::temp_dir().join("prmonitor-no-such-agent"));
-        let err_rel = match CursorProcess::spawn(&agent, "relative/path").await {
+        let err_rel = match CursorProcess::spawn(&agent, "relative/path", "").await {
             Ok(_) => panic!("relative repo_root must fail closed"),
             Err(e) => e,
         };
@@ -440,7 +581,7 @@ done
                 .unwrap()
                 .as_nanos()
         ));
-        let err_missing = match CursorProcess::spawn(&agent, missing.to_str().unwrap()).await {
+        let err_missing = match CursorProcess::spawn(&agent, missing.to_str().unwrap(), "").await {
             Ok(_) => panic!("non-existent repo_root must fail closed"),
             Err(e) => e,
         };
@@ -460,7 +601,7 @@ done
                 .as_nanos()
         ));
         std::fs::write(&file_path, b"x").unwrap();
-        let err_file = match CursorProcess::spawn(&agent, file_path.to_str().unwrap()).await {
+        let err_file = match CursorProcess::spawn(&agent, file_path.to_str().unwrap(), "").await {
             Ok(_) => panic!("file repo_root must fail closed"),
             Err(e) => e,
         };

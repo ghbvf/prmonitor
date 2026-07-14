@@ -38,6 +38,7 @@ function githubProject(): Project {
     engineKind: "codex",
     codexModel: "",
     claudeModel: "",
+    cursorModel: "",
     codexReasoningEffort: "default",
     claudeEffort: "default",
   };
@@ -114,6 +115,7 @@ describe("generated project defaults and onboarding hydration", () => {
       ...githubProject(),
       codexModel: "gpt-5-codex",
       claudeModel: "opus",
+      cursorModel: "",
       codexReasoningEffort: "ultra",
       claudeEffort: "max",
       authors: ["octocat"],

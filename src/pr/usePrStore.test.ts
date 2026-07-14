@@ -130,6 +130,7 @@ const project = (id: string): Project => ({
   engineKind: "codex",
   codexModel: "",
   claudeModel: "",
+  cursorModel: "",
   codexReasoningEffort: "default",
   claudeEffort: "default",
 });
