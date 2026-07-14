@@ -838,8 +838,12 @@ fn webhook_route_eligible(mode: UpdateMode) -> bool {
 fn resolve_webhook_cloudflared<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     mode: crate::model::WebhookTunnelMode,
+    tunnel_command: &str,
 ) -> AppResult<Option<config_service::ResolvedCli>> {
-    if mode == crate::model::WebhookTunnelMode::Quick {
+    let needs_cloudflared = mode == crate::model::WebhookTunnelMode::Quick
+        || (mode == crate::model::WebhookTunnelMode::Command
+            && config_service::tunnel_command_uses_bare_cloudflared(tunnel_command));
+    if needs_cloudflared {
         config_service::resolve_cli(app, CliTool::Cloudflared, false).map(Some)
     } else {
         Ok(None)
@@ -908,7 +912,8 @@ pub async fn start_webhook<R: tauri::Runtime>(
             label_source: p.label_source,
         })
         .collect();
-    let cloudflared = resolve_webhook_cloudflared(&app, cfg.webhook_tunnel_mode);
+    let cloudflared =
+        resolve_webhook_cloudflared(&app, cfg.webhook_tunnel_mode, &cfg.webhook_tunnel_command);
     state
         .webhook
         .start(
@@ -934,10 +939,15 @@ pub async fn stop_webhook<R: tauri::Runtime>(
 ) -> AppResult<WebhookStatus> {
     state.webhook.stop().await;
     let cfg = config_service::load(&app)?;
-    let cloudflared = resolve_webhook_cloudflared(&app, cfg.webhook_tunnel_mode);
+    let cloudflared =
+        resolve_webhook_cloudflared(&app, cfg.webhook_tunnel_mode, &cfg.webhook_tunnel_command);
     Ok(state
         .webhook
-        .status(cloudflared, cfg.webhook_tunnel_mode)
+        .status(
+            cloudflared,
+            cfg.webhook_tunnel_mode,
+            &cfg.webhook_tunnel_command,
+        )
         .await)
 }
 
@@ -949,10 +959,15 @@ pub async fn webhook_status<R: tauri::Runtime>(
     state: tauri::State<'_, crate::state::AppState>,
 ) -> AppResult<WebhookStatus> {
     let cfg = config_service::load(&app)?;
-    let cloudflared = resolve_webhook_cloudflared(&app, cfg.webhook_tunnel_mode);
+    let cloudflared =
+        resolve_webhook_cloudflared(&app, cfg.webhook_tunnel_mode, &cfg.webhook_tunnel_command);
     Ok(state
         .webhook
-        .status(cloudflared, cfg.webhook_tunnel_mode)
+        .status(
+            cloudflared,
+            cfg.webhook_tunnel_mode,
+            &cfg.webhook_tunnel_command,
+        )
         .await)
 }
 

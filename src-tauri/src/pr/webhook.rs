@@ -965,19 +965,18 @@ impl WebhookManager {
     ///
     /// Mode is taken from the live `runtime.mode` when running; when stopped there is no
     /// runtime to read it from, so the caller passes `configured_mode` (the persisted
-    /// `webhook_tunnel_mode`). Only `Quick` owns cloudflared, so:
-    /// - the `cloudflared_installed` probe (a ~5s subprocess) runs ONLY for `Quick` —
-    ///   `command` / `listener` report `cloudflared_installed: true` unconditionally
-    ///   (their tunnel is the user command / fully external; the panel filters this field
-    ///   per mode anyway, so this only saves the probe + suppresses a spurious "install
-    ///   cloudflared" prompt for a mode that doesn't need it);
-    /// - the crash message names cloudflared only for `Quick`; `command` mode says
-    ///   "自定义隧道进程已退出" (`listener` never crashes — no child);
-    /// - the not-running install nag ("brew install cloudflared") fires only for `Quick`.
+    /// `webhook_tunnel_mode`) and `tunnel_command` (persisted command, used to detect a
+    /// bare managed `cloudflared` token in `command` mode). Managed cloudflared ownership:
+    /// - install probe + resolution-error surfacing run for `Quick`, and for `Command`
+    ///   when the program token is bare `cloudflared`;
+    /// - crash text names cloudflared for `Quick`; `command` keeps the generic child text
+    ///   (the child may still be cloudflared, but the panel already shows command mode);
+    /// - `listener` never has a child.
     pub async fn status(
         &self,
         cloudflared: AppResult<Option<ResolvedCli>>,
         configured_mode: WebhookTunnelMode,
+        tunnel_command: &str,
     ) -> WebhookStatus {
         let (cloudflared, resolution_error) = match cloudflared {
             Ok(cloudflared) => (cloudflared, None),
@@ -1014,9 +1013,10 @@ impl WebhookManager {
                 None => (false, None, configured_mode),
             }
         };
-        // Only `Quick` owns cloudflared, so only `Quick` pays for the install probe; the
-        // other modes report `true` (no nag for a mode that doesn't use cloudflared).
-        let installed = if mode == WebhookTunnelMode::Quick {
+        let owns_cloudflared = mode == WebhookTunnelMode::Quick
+            || (mode == WebhookTunnelMode::Command
+                && tunnel_command_uses_bare_cloudflared(tunnel_command));
+        let installed = if owns_cloudflared {
             match cloudflared.as_ref() {
                 Some(cli) => cloudflared_installed(cli).await,
                 None => false,
@@ -1030,7 +1030,7 @@ impl WebhookManager {
                 None => "运行中（公网 URL 尚未解析）".to_string(),
             }
         } else if crashed {
-            // Crash text is mode-specific: only `Quick`'s child is cloudflared.
+            // Crash text is mode-specific: only `Quick`'s child is always cloudflared.
             match mode {
                 WebhookTunnelMode::Quick => {
                     "隧道已退出（cloudflared 进程已退出），请重新启动 Webhook".to_string()
@@ -1042,14 +1042,14 @@ impl WebhookManager {
                 // neutral message keeps the match exhaustive without nagging cloudflared.
                 WebhookTunnelMode::Listener => "隧道已退出，请重新启动 Webhook".to_string(),
             }
-        } else if mode == WebhookTunnelMode::Quick && !installed {
+        } else if owns_cloudflared && !installed {
             resolution_error.clone().unwrap_or_else(|| {
                 "未运行；未检测到 cloudflared（brew install cloudflared）".to_string()
             })
         } else {
             "未运行".to_string()
         };
-        if running && mode == WebhookTunnelMode::Quick {
+        if running && owns_cloudflared {
             if let Some(error) = resolution_error {
                 message.push_str("；当前 cloudflared 配置错误：");
                 message.push_str(&error);
@@ -1812,12 +1812,9 @@ async fn spawn_quick_tunnel(
 /// literal `{port}` placeholder in EACH token with the actual listen `port`.
 ///
 /// Splits on ASCII whitespace (so quoting / shell metacharacters carry NO meaning):
-/// the result is exec'd directly via [`Command::new`] in [`spawn_custom_tunnel`], never
-/// handed to a shell, so a token can't word-split further or inject (`command` mode
-/// keeps the same anti-injection property `spawn_quick_tunnel` has for `bin`). Returns
-/// `None` when the command is blank (no program token) — the caller turns that into an
-/// `AppError` (defense in depth; `validate` rejects an empty command for this mode
-/// upstream). Pure — unit-tested.
+/// the result is handed to [`spawn_custom_tunnel`], which launches a bare `cloudflared`
+/// token via [`ResolvedCli`] and other tokens via `Command::new` — never a shell.
+/// Returns `None` when the command is blank (no program token). Pure — unit-tested.
 fn build_tunnel_command_argv(command: &str, port: u16) -> Option<(String, Vec<String>)> {
     let port = port.to_string();
     let mut tokens = command
@@ -2617,7 +2614,7 @@ mod tests {
 
         // Bogus install bin → the probe returns false fast (no real cloudflared in CI);
         // the assertion is the self-heal flip, independent of install state.
-        let s = mgr.status(Ok(None), WebhookTunnelMode::Quick).await;
+        let s = mgr.status(Ok(None), WebhookTunnelMode::Quick, "").await;
         assert!(!s.running, "a dead tunnel child must flip running → false");
         assert!(s.public_url.is_none());
         assert!(s.payload_url.is_none());
@@ -2839,7 +2836,7 @@ mod tests {
         assert_eq!(start_error.message, expected);
 
         let status = mgr
-            .status(Err(resolve().unwrap_err()), WebhookTunnelMode::Quick)
+            .status(Err(resolve().unwrap_err()), WebhookTunnelMode::Quick, "")
             .await;
         assert_eq!(status.message, expected);
     }
@@ -2930,7 +2927,7 @@ mod tests {
         // status() re-reports the configured URL while the child is alive (no self-heal).
         // The configured_mode arg is unused here (a live runtime carries its own mode);
         // pass Command to keep the call honest.
-        let s2 = mgr.status(Ok(None), WebhookTunnelMode::Command).await;
+        let s2 = mgr.status(Ok(None), WebhookTunnelMode::Command, "").await;
         assert!(s2.running);
         assert_eq!(s2.public_url.as_deref(), Some("https://my.example.com"));
 
@@ -2969,13 +2966,13 @@ mod tests {
         // a separate `true`+wait as a timing proxy, which flaked on CI). Poll status until
         // the self-heal observes the exit — bounded so a genuine hang fails instead of
         // looping. The child WILL exit, so this converges deterministically.
-        let mut s2 = mgr.status(Ok(None), WebhookTunnelMode::Command).await;
+        let mut s2 = mgr.status(Ok(None), WebhookTunnelMode::Command, "").await;
         for _ in 0..200 {
             if !s2.running {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
-            s2 = mgr.status(Ok(None), WebhookTunnelMode::Command).await;
+            s2 = mgr.status(Ok(None), WebhookTunnelMode::Command, "").await;
         }
         assert!(
             !s2.running,
@@ -3031,7 +3028,7 @@ mod tests {
 
         // Probe repeatedly: a childless runtime never self-heals to not-running.
         for _ in 0..3 {
-            let st = mgr.status(Ok(None), WebhookTunnelMode::Listener).await;
+            let st = mgr.status(Ok(None), WebhookTunnelMode::Listener, "").await;
             assert!(st.running, "listener mode stays running across probes");
             assert_eq!(
                 st.public_url.as_deref(),
@@ -3142,7 +3139,7 @@ mod tests {
         assert!(s.payload_url.is_none(), "no public_url → no payload_url");
 
         // status() agrees: running, but no URL.
-        let st = mgr.status(Ok(None), WebhookTunnelMode::Listener).await;
+        let st = mgr.status(Ok(None), WebhookTunnelMode::Listener, "").await;
         assert!(st.running);
         assert!(st.public_url.is_none());
         assert!(st.payload_url.is_none());
@@ -3165,7 +3162,7 @@ mod tests {
         let mgr = WebhookManager::default();
         // No runtime → stopped; the bogus bin would make a real probe report false.
         for mode in [WebhookTunnelMode::Command, WebhookTunnelMode::Listener] {
-            let st = mgr.status(Ok(None), mode).await;
+            let st = mgr.status(Ok(None), mode, "").await;
             assert!(!st.running);
             assert!(
                 st.cloudflared_installed,
@@ -3179,7 +3176,7 @@ mod tests {
 
         // Quick + missing cloudflared → the install nag DOES fire (probe runs, bogus bin
         // → false), proving the gating is mode-conditional and not a blanket skip.
-        let st = mgr.status(Ok(None), WebhookTunnelMode::Quick).await;
+        let st = mgr.status(Ok(None), WebhookTunnelMode::Quick, "").await;
         assert!(!st.running);
         assert!(!st.cloudflared_installed, "quick mode runs the probe");
         assert!(
