@@ -25,7 +25,11 @@ use crate::error::{AppError, AppResult};
 use crate::messaging::human_input::{self, HumanAnswer, HumanAnswerSource, HumanInputBroker};
 use crate::messaging::provider::MessagingProvider;
 use crate::messaging::{
-    feishu::{build_feishu_http_client, FeishuProvider},
+    feishu::{
+        build_feishu_http_client, human_input_choice_field_name, human_input_custom_field_name,
+        human_input_option_value, FeishuProvider, HUMAN_INPUT_CUSTOM_OPTION,
+        HUMAN_INPUT_FORM_SUBMIT,
+    },
     service, store,
 };
 use crate::model::{FeishuConnectionState, FeishuConnectionStatus, MessagingProviderKind};
@@ -683,10 +687,12 @@ fn persist_delivery<R: tauri::Runtime>(
     service::validate_current_feishu_long_connection(app, integration)?;
     match delivery_route(kind, payload)? {
         DeliveryRoute::CardAction => {
-            handle_card(app, integration, payload)?;
-            // The official SDK returns an empty CardActionTriggerResponse. Its JSON bytes are
-            // encoded as the `data` field in the WebSocket ACK ("{}" -> "e30=").
-            Ok(Some(b"{}".to_vec()))
+            match handle_card(app, integration, payload) {
+                Ok(()) => Ok(Some(b"{}".to_vec())),
+                // Validation / answer failures stay non-terminal: ACK 200 + Feishu toast so the user
+                // can retry. Transport stays healthy; see CardActionTriggerResponse toast contract.
+                Err(error) => Ok(Some(card_action_error_toast(&error.message))),
+            }
         }
         DeliveryRoute::Event => {
             let event = FeishuProvider.parse_event(payload, integration, store::now_epoch())?;
@@ -747,23 +753,24 @@ fn handle_card<R: tauri::Runtime>(
 ) -> AppResult<()> {
     let value: serde_json::Value = serde_json::from_slice(payload)
         .map_err(|e| AppError::new(format!("飞书卡片回调 JSON 损坏: {e}")))?;
-    let action = value
-        .pointer("/event/action/value")
-        .or_else(|| value.pointer("/action/value"))
+    let callback_action = value
+        .pointer("/event/action")
+        .or_else(|| value.get("action"))
         .unwrap_or(&value);
-    let request_id = action
+    let action_value = callback_action.get("value").unwrap_or(callback_action);
+    let request_id = action_value
         .get("requestId")
-        .or_else(|| action.get("request_id"))
+        .or_else(|| action_value.get("request_id"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::new("飞书卡片回调缺少 requestId"))?;
-    let question_id = action
+    let question_id = action_value
         .get("questionId")
-        .or_else(|| action.get("question_id"))
+        .or_else(|| action_value.get("question_id"))
         .and_then(|v| v.as_str())
         .unwrap_or("q1");
-    let answer_value = action
+    let answer_value = action_value
         .get("answer")
-        .or_else(|| action.get("value"))
+        .or_else(|| action_value.get("value"))
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     let db = app.state::<Database>();
@@ -777,19 +784,106 @@ fn handle_card<R: tauri::Runtime>(
     if question_id == "__cancel__" || answer_value == "__cancel__" {
         human_input::cancel(db.inner(), broker.inner(), request_id, store::now_epoch())?;
     } else {
+        let answers = card_answers(callback_action, action_value, &request)?;
         human_input::answer(
             db.inner(),
             broker.inner(),
             request_id,
-            &[HumanAnswer {
-                question_id: question_id.into(),
-                answer: answer_value.into(),
-            }],
+            &answers,
             HumanAnswerSource::Feishu,
             store::now_epoch(),
         )?;
     }
     Ok(())
+}
+
+fn card_answers(
+    callback_action: &serde_json::Value,
+    action_value: &serde_json::Value,
+    request: &human_input::HumanInputRequest,
+) -> AppResult<Vec<HumanAnswer>> {
+    let is_form_submit = callback_action.get("name").and_then(|value| value.as_str())
+        == Some(HUMAN_INPUT_FORM_SUBMIT)
+        || action_value.get("action").and_then(|value| value.as_str()) == Some("submit");
+    if is_form_submit {
+        let values = callback_action
+            .get("form_value")
+            .and_then(|value| value.as_object())
+            .ok_or_else(|| AppError::new("飞书表单回调缺少 form_value"))?;
+        return request
+            .questions
+            .iter()
+            .enumerate()
+            .map(|(index, question)| {
+                let custom_field = human_input_custom_field_name(index);
+                let custom_answer = || {
+                    values
+                        .get(&custom_field)
+                        .and_then(|value| value.as_str())
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            AppError::new(format!("飞书表单回调缺少自定义答案 {custom_field}"))
+                        })
+                };
+                let answer = if question.options.is_empty() {
+                    custom_answer()?
+                } else {
+                    let choice_field = human_input_choice_field_name(index);
+                    let choice = values
+                        .get(&choice_field)
+                        .and_then(|value| value.as_str())
+                        .ok_or_else(|| {
+                            AppError::new(format!("飞书表单回调缺少字段 {choice_field}"))
+                        })?;
+                    if choice == HUMAN_INPUT_CUSTOM_OPTION {
+                        custom_answer()?
+                    } else {
+                        question
+                            .options
+                            .iter()
+                            .enumerate()
+                            .find(|(option_index, _)| {
+                                choice == human_input_option_value(*option_index)
+                            })
+                            .map(|(_, option)| option.clone())
+                            .ok_or_else(|| {
+                                AppError::new(format!("飞书表单选项非法: {choice_field}"))
+                            })?
+                    }
+                };
+                Ok(HumanAnswer {
+                    question_id: question.id.clone(),
+                    answer,
+                })
+            })
+            .collect();
+    }
+
+    let question_id = action_value
+        .get("questionId")
+        .or_else(|| action_value.get("question_id"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| AppError::new("飞书卡片回调缺少 questionId"))?;
+    let answer = action_value
+        .get("answer")
+        .or_else(|| action_value.get("value"))
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| AppError::new("飞书卡片回调缺少 answer"))?;
+    Ok(vec![HumanAnswer {
+        question_id: question_id.to_string(),
+        answer: answer.to_string(),
+    }])
+}
+
+fn card_action_error_toast(message: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "toast": {
+            "type": "error",
+            "content": message,
+        }
+    }))
+    .expect("card action toast serializes")
 }
 
 fn validate_callback_conversation(value: &serde_json::Value, expected: &str) -> AppResult<()> {
@@ -1122,6 +1216,128 @@ mod tests {
     }
 
     #[test]
+    fn card_action_validation_failure_acks_with_error_toast() {
+        let toast = card_action_error_toast("飞书表单回调缺少 form_value");
+        let outcome = delivery_ack(&Ok(Some(toast.clone())));
+        assert_eq!(outcome.code, 200);
+        assert!(outcome.business_error.is_none());
+        let decoded = general_purpose::STANDARD
+            .decode(outcome.data.as_deref().expect("toast data"))
+            .expect("base64");
+        assert_eq!(decoded, toast);
+        let body: serde_json::Value = serde_json::from_slice(&decoded).expect("json");
+        assert_eq!(body["toast"]["type"], "error");
+        assert_eq!(body["toast"]["content"], "飞书表单回调缺少 form_value");
+    }
+
+    #[test]
+    fn card_answers_covers_empty_options_and_rejects_bad_form_or_legacy() {
+        let open = human_input::HumanInputRequest {
+            id: "Q-open".into(),
+            integration_id: "fs".into(),
+            conversation_id: "oc".into(),
+            purpose: "q".into(),
+            title: "t".into(),
+            message: "m".into(),
+            questions: vec![human_input::HumanQuestion {
+                id: "open".into(),
+                question: "补充？".into(),
+                options: vec![],
+            }],
+            context: json!({}),
+            status: human_input::HumanInputStatus::Pending,
+            answer: None,
+            answer_source: None,
+            card_message_id: None,
+            created_at_epoch: 1,
+            expires_at_epoch: 2,
+            answered_at_epoch: None,
+        };
+        let choice = human_input::HumanInputRequest {
+            questions: vec![human_input::HumanQuestion {
+                id: "decision".into(),
+                question: "选？".into(),
+                options: vec!["通过".into(), "拒绝".into()],
+            }],
+            ..open.clone()
+        };
+
+        let empty_ok = card_answers(
+            &json!({
+                "name": HUMAN_INPUT_FORM_SUBMIT,
+                "form_value": {"q_0_custom": "自由填写"}
+            }),
+            &json!({"action": "submit"}),
+            &open,
+        )
+        .expect("empty-options custom answer");
+        assert_eq!(empty_ok.len(), 1);
+        assert_eq!(empty_ok[0].question_id, "open");
+        assert_eq!(empty_ok[0].answer, "自由填写");
+
+        assert!(card_answers(
+            &json!({"name": HUMAN_INPUT_FORM_SUBMIT}),
+            &json!({"action": "submit"}),
+            &open
+        )
+        .expect_err("missing form_value")
+        .message
+        .contains("form_value"));
+
+        assert!(card_answers(
+            &json!({
+                "name": HUMAN_INPUT_FORM_SUBMIT,
+                "form_value": {"q_0_choice": "o_9"}
+            }),
+            &json!({"action": "submit"}),
+            &choice
+        )
+        .expect_err("illegal option")
+        .message
+        .contains("非法"));
+
+        assert!(card_answers(
+            &json!({
+                "name": HUMAN_INPUT_FORM_SUBMIT,
+                "form_value": {
+                    "q_0_choice": HUMAN_INPUT_CUSTOM_OPTION,
+                    "q_0_custom": "   "
+                }
+            }),
+            &json!({"action": "submit"}),
+            &choice
+        )
+        .expect_err("empty custom")
+        .message
+        .contains("自定义答案"));
+
+        let custom_ok = card_answers(
+            &json!({
+                "name": HUMAN_INPUT_FORM_SUBMIT,
+                "form_value": {
+                    "q_0_choice": HUMAN_INPUT_CUSTOM_OPTION,
+                    "q_0_custom": "人工填写"
+                }
+            }),
+            &json!({"action": "submit"}),
+            &choice,
+        )
+        .expect("custom path");
+        assert_eq!(custom_ok[0].answer, "人工填写");
+
+        assert!(card_answers(&json!({}), &json!({}), &choice)
+            .expect_err("legacy missing fields")
+            .message
+            .contains("questionId"));
+        assert!(
+            card_answers(&json!({}), &json!({"questionId": "decision"}), &choice)
+                .expect_err("legacy missing answer")
+                .message
+                .contains("answer")
+        );
+    }
+
+    #[test]
     fn official_event_frame_persists_card_answer_and_builds_success_ack() {
         let app = tauri::test::mock_app();
         let db = Database::open_in_memory().expect("open test db");
@@ -1208,5 +1424,110 @@ mod tests {
         assert_eq!(stored.status, human_input::HumanInputStatus::Answered);
         assert_eq!(stored.answer_source, Some(HumanAnswerSource::Feishu));
         assert_eq!(stored.answer.expect("answers")[0].answer, "通过");
+    }
+
+    #[test]
+    fn form_callback_persists_all_question_answers_atomically() {
+        let app = tauri::test::mock_app();
+        let db = Database::open_in_memory().expect("open test db");
+        let broker = HumanInputBroker::default();
+        let integration = MessagingIntegration {
+            id: "feishu-form-test".into(),
+            enabled: true,
+            app_id: "cli_form_test".into(),
+            app_secret: "test-secret".into(),
+            allowed_conversation_ids: vec!["oc-form-1".into()],
+            ..MessagingIntegration::feishu_default()
+        };
+
+        let mut config = crate::config::service::load_db(&db).expect("load config");
+        config.messaging.integrations = vec![integration.clone()];
+        crate::config::service::persist_db(&db, &config).expect("persist config");
+
+        let now = store::now_epoch();
+        let request = human_input::HumanInputRequest {
+            id: "Q-form-1".into(),
+            integration_id: integration.id.clone(),
+            conversation_id: "oc-form-1".into(),
+            purpose: "plan".into(),
+            title: "Choose both".into(),
+            message: "Complete the form".into(),
+            questions: vec![
+                human_input::HumanQuestion {
+                    id: "provenance_fix".into(),
+                    question: "How should provenance be fixed?".into(),
+                    options: vec!["current".into(), "later".into()],
+                },
+                human_input::HumanQuestion {
+                    id: "discovery_boundary".into(),
+                    question: "Where is discovery bounded?".into(),
+                    options: vec!["generated".into(), "canonical".into()],
+                },
+            ],
+            context: json!({}),
+            status: human_input::HumanInputStatus::Pending,
+            answer: None,
+            answer_source: None,
+            card_message_id: Some("om-form-1".into()),
+            created_at_epoch: now,
+            expires_at_epoch: now + 60,
+            answered_at_epoch: None,
+        };
+        human_input::create(&db, &request).expect("create request");
+        app.manage(db);
+        app.manage(broker);
+
+        let payload = serde_json::to_vec(&json!({
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt-form-1",
+                "event_type": "card.action.trigger"
+            },
+            "event": {
+                "context": {
+                    "open_message_id": "om-form-1",
+                    "open_chat_id": "oc-form-1"
+                },
+                "action": {
+                    "value": {
+                        "requestId": request.id,
+                        "action": "submit"
+                    },
+                    "tag": "button",
+                    "name": "human_input_submit",
+                    "form_value": {
+                        "q_0_choice": "custom",
+                        "q_0_custom": "custom policy",
+                        "q_1_choice": "o_0",
+                        "q_1_custom": ""
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let generations = Arc::new(Mutex::new(HashMap::from([(integration.id.clone(), 1)])));
+        let cancel = CancellationToken::new();
+
+        let result = persist_delivery(
+            app.handle(),
+            &integration,
+            "event",
+            &payload,
+            &generations,
+            1,
+            &cancel,
+        );
+        assert!(result.is_ok(), "form callback failed: {result:?}");
+        let stored = human_input::get(app.state::<Database>().inner(), "Q-form-1")
+            .expect("load request")
+            .expect("request exists");
+        assert_eq!(stored.status, human_input::HumanInputStatus::Answered);
+        assert_eq!(stored.answer_source, Some(HumanAnswerSource::Feishu));
+        let answers = stored.answer.expect("answers");
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0].question_id, "provenance_fix");
+        assert_eq!(answers[0].answer, "custom policy");
+        assert_eq!(answers[1].question_id, "discovery_boundary");
+        assert_eq!(answers[1].answer, "generated");
     }
 }

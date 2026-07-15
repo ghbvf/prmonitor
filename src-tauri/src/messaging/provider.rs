@@ -9,7 +9,7 @@ use crate::config::service::MessagingIntegration;
 use crate::error::AppResult;
 use crate::model::{
     ActionExecutionResult, MessagingEvent, MessagingProviderCapability, MessagingProviderKind,
-    MessagingReplyTarget,
+    MessagingReplyTarget, MessagingSendContent,
 };
 
 pub type ProviderFuture<'a> =
@@ -46,6 +46,6 @@ pub trait MessagingProvider: Send + Sync {
         &'a self,
         integration: &'a MessagingIntegration,
         conversation_id: &'a str,
-        text: &'a str,
+        content: &'a MessagingSendContent,
     ) -> ProviderFuture<'a>;
 }

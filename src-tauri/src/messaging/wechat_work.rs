@@ -17,7 +17,7 @@ use crate::messaging::provider::{MessagingProvider, ProviderFuture, Verification
 use crate::messaging::redact_raw_summary;
 use crate::model::{
     ActionExecutionResult, MessagingEvent, MessagingProviderCapability, MessagingProviderKind,
-    MessagingReplyTarget,
+    MessagingReplyTarget, MessagingSendContent,
 };
 
 pub struct WeChatWorkProvider;
@@ -35,6 +35,7 @@ impl MessagingProvider for WeChatWorkProvider {
             provider: MessagingProviderKind::WeChatWork,
             supports_reply: true,
             supports_send: true,
+            supports_information_card: false,
             requires_allowed_conversations: true,
         }
     }
@@ -104,9 +105,22 @@ impl MessagingProvider for WeChatWorkProvider {
         &'a self,
         integration: &'a MessagingIntegration,
         conversation_id: &'a str,
-        text: &'a str,
+        content: &'a MessagingSendContent,
     ) -> ProviderFuture<'a> {
-        Box::pin(async move { send_text(integration, conversation_id, text).await })
+        Box::pin(async move {
+            match content {
+                MessagingSendContent::Text { text } => {
+                    send_text(integration, conversation_id, text).await
+                }
+                MessagingSendContent::Card { .. } => Ok(ActionExecutionResult::Dead {
+                    message: format!(
+                        "信息卡片仅支持 Feishu，消息集成「{}」是 {}",
+                        integration.name,
+                        integration.kind.as_wire()
+                    ),
+                }),
+            }
+        })
     }
 }
 

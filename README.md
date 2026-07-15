@@ -102,8 +102,26 @@ enabled = true
 
 `ask_via_feishu` creates one durable request, sends a Feishu card, and opens a Codex elicitation.
 The first valid answer wins through a SQLite compare-and-set. Text fallbacks are
-`/answer Q-id <answer>` (multiple answers: `q1=A;q2=B`) and `/cancel Q-id`. Tool/sandbox
-permissions remain native Codex approvals and are never delegated to Feishu.
+`/answer Q-id <answer>` (multiple answers: `q1=A;q2=B`) and `/cancel Q-id`. Feishu renders all
+questions as one form; suggested options always include a final custom-input choice, and the
+complete form is committed atomically on submit. Tool/sandbox permissions remain native Codex
+approvals and are never delegated to Feishu.
+
+Display-only notifications can use a Feishu information card without buttons or answer handling:
+
+```bash
+prmonitor message send-card \
+  --integration-id feishu-main \
+  --conversation-id oc_example \
+  --title "Task stopped" \
+  --text "**Status:** done" \
+  --template grey \
+  --json
+```
+
+`--template` accepts `blue`, `orange`, or `grey`. Information cards are rejected before enqueue
+for WeChat Work and DingTalk; their existing `prmonitor message send --text ...` path remains a
+plain-text send. Both commands use the configured Local API and never accept provider credentials.
 
 ## Default branch
 

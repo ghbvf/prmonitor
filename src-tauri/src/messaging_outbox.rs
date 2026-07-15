@@ -11,6 +11,9 @@ use crate::messaging;
 use crate::model::{ActionKind, SendMessagingRequest};
 use crate::outbox;
 
+#[cfg(test)]
+use crate::model::MessagingSendContent;
+
 pub(crate) const MESSAGING_OUTBOX_SCOPE: &str = "__messaging__";
 
 pub(crate) fn enqueue_send_once_after_in_tx(
@@ -77,7 +80,9 @@ mod tests {
         let request = SendMessagingRequest {
             integration_id: "fs".to_string(),
             conversation_id: "chat".to_string(),
-            text: "hello".to_string(),
+            content: MessagingSendContent::Text {
+                text: "hello".to_string(),
+            },
             request_id: "req-1".to_string(),
         };
         let first = db

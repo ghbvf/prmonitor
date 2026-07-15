@@ -174,14 +174,14 @@ describe("useMessagingStore send logs", () => {
     await store.send({
       integrationId: "feishu-main",
       conversationId: "oc_123",
-      text: "hello",
+      content: { kind: "text", text: "hello" },
       requestId: "req-1",
     });
 
     expect(api.messagingSend).toHaveBeenCalledWith({
       integrationId: "feishu-main",
       conversationId: "oc_123",
-      text: "hello",
+      content: { kind: "text", text: "hello" },
       requestId: "req-1",
     });
     expect(store.sends.map((item) => item.id)).toEqual([9]);
@@ -196,7 +196,7 @@ describe("useMessagingStore send logs", () => {
     await store.send({
       integrationId: "feishu-main",
       conversationId: "oc_123",
-      text: "hello",
+      content: { kind: "text", text: "hello" },
       requestId: "req-1",
     });
 

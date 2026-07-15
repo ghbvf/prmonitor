@@ -34,6 +34,8 @@ const MAX_QUESTION_ID_BYTES: usize = 64;
 const MAX_QUESTION_BYTES: usize = 1_024;
 const MAX_OPTIONS: usize = 20;
 const MAX_OPTION_BYTES: usize = 256;
+/// Free-form answers (Feishu custom / Codex / `/answer`) share one bound with options, plus headroom.
+const MAX_ANSWER_BYTES: usize = 1_024;
 const MAX_CONTEXT_BYTES: usize = 16 * 1024;
 const MAX_TOTAL_PAYLOAD_BYTES: usize = 32 * 1024;
 
@@ -421,15 +423,15 @@ fn validate_answers(
         if question_id.is_empty() || !seen.insert(question_id) {
             return Err(AppError::new("answer questionId 必须非空且唯一"));
         }
-        let question = questions
+        questions
             .get(question_id)
             .ok_or_else(|| AppError::new(format!("未知 questionId: {question_id}")))?;
         if value.is_empty() {
             return Err(AppError::new(format!("问题 {question_id} 的答案不能为空")));
         }
-        if !question.options.is_empty() && !question.options.iter().any(|option| option == value) {
+        if value.len() > MAX_ANSWER_BYTES || value.chars().any(|character| character == '\0') {
             return Err(AppError::new(format!(
-                "问题 {question_id} 的答案不在允许选项中"
+                "问题 {question_id} 的答案非法或超过 {MAX_ANSWER_BYTES} 字节上限"
             )));
         }
         normalized.push(HumanAnswer {
@@ -729,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_incomplete_unknown_empty_and_out_of_option_answers() {
+    fn rejects_incomplete_unknown_and_empty_answers() {
         let db = Database::open_in_memory().unwrap();
         let broker = HumanInputBroker::default();
         let mut request = pending("Q-valid");
@@ -750,16 +752,6 @@ mod tests {
                 question_id: "q1".into(),
                 answer: " ".into(),
             }],
-            vec![
-                HumanAnswer {
-                    question_id: "q1".into(),
-                    answer: "A".into(),
-                },
-                HumanAnswer {
-                    question_id: "q2".into(),
-                    answer: "maybe".into(),
-                },
-            ],
         ] {
             assert!(answer(
                 &db,
@@ -775,6 +767,53 @@ mod tests {
                 HumanInputStatus::Pending
             );
         }
+
+        let oversized = "x".repeat(MAX_ANSWER_BYTES + 1);
+        assert!(answer(
+            &db,
+            &broker,
+            "Q-valid",
+            &[
+                HumanAnswer {
+                    question_id: "q1".into(),
+                    answer: oversized.clone(),
+                },
+                HumanAnswer {
+                    question_id: "q2".into(),
+                    answer: "yes".into(),
+                },
+            ],
+            HumanAnswerSource::Feishu,
+            20,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn accepts_custom_answer_outside_suggested_options() {
+        let db = Database::open_in_memory().unwrap();
+        let broker = HumanInputBroker::default();
+        create(&db, &pending("Q-custom")).unwrap();
+
+        assert_eq!(
+            answer(
+                &db,
+                &broker,
+                "Q-custom",
+                &[HumanAnswer {
+                    question_id: "q1".into(),
+                    answer: "user supplied answer".into(),
+                }],
+                HumanAnswerSource::Feishu,
+                20,
+            )
+            .unwrap(),
+            AnswerOutcome::Won
+        );
+        assert_eq!(
+            get(&db, "Q-custom").unwrap().unwrap().answer.unwrap()[0].answer,
+            "user supplied answer"
+        );
     }
 
     #[test]

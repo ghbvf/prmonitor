@@ -9,8 +9,8 @@ use crate::config;
 use crate::error::{AppError, AppResult};
 use crate::messaging;
 use crate::model::{
-    NotificationLevel, ReviewLifecycleDispatch, ReviewLifecycleEvent, SendMessagingRequest,
-    SendNotificationRequest,
+    MessagingSendContent, NotificationLevel, ReviewLifecycleDispatch, ReviewLifecycleEvent,
+    SendMessagingRequest, SendNotificationRequest,
 };
 use crate::notification;
 use crate::outbox;
@@ -75,7 +75,7 @@ pub(super) fn enqueue<R: Runtime>(
                 let request = SendMessagingRequest {
                     integration_id,
                     conversation_id,
-                    text,
+                    content: MessagingSendContent::Text { text },
                     request_id,
                 };
                 if let Err(e) = messaging::service::enqueue_send_once_after(

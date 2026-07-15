@@ -26,8 +26,9 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 use crate::config::service as config_service;
 use crate::db::Database;
 use crate::model::{
-    ExternalRequestId, MessagingEventEntry, NotificationLevel, OutboxEntry, ReviewReceiptStatus,
-    SendMessagingRequest, SendMessagingResponse, SendNotificationRequest, SendNotificationResponse,
+    ExternalRequestId, MessagingCardTemplate, MessagingEventEntry, MessagingSendContent,
+    NotificationLevel, OutboxEntry, ReviewReceiptStatus, SendMessagingRequest,
+    SendMessagingResponse, SendNotificationRequest, SendNotificationResponse,
 };
 use crate::review::local_api::{
     ErrorBody, ReviewReceiptAccepted, ReviewRequestBody, StatusResponse,
@@ -147,6 +148,8 @@ pub struct MessageArgs {
 pub enum MessageCommand {
     /// Enqueue an active messaging send.
     Send(MessageSendArgs),
+    /// Enqueue a non-interactive Feishu information card.
+    SendCard(MessageSendCardArgs),
     /// List received messaging events.
     Events(MessageLogArgs),
     /// List messaging send/reply outbox rows.
@@ -161,6 +164,27 @@ pub struct MessageSendArgs {
     pub conversation_id: String,
     #[arg(long)]
     pub text: String,
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    pub json: Option<String>,
+    #[arg(long)]
+    pub port: Option<u16>,
+    #[arg(long)]
+    pub token: Option<String>,
+}
+
+#[derive(Args, Clone)]
+pub struct MessageSendCardArgs {
+    #[arg(long = "integration-id")]
+    pub integration_id: String,
+    #[arg(long = "conversation-id")]
+    pub conversation_id: String,
+    #[arg(long)]
+    pub title: String,
+    /// Markdown card body.
+    #[arg(long)]
+    pub text: String,
+    #[arg(long, value_parser = parse_messaging_card_template)]
+    pub template: MessagingCardTemplate,
     #[arg(long, num_args = 0..=1, default_missing_value = "")]
     pub json: Option<String>,
     #[arg(long)]
@@ -231,13 +255,34 @@ impl MessageSendArgs {
         SendMessagingRequest {
             integration_id: self.integration_id.clone(),
             conversation_id: self.conversation_id.clone(),
-            text: self.text.clone(),
+            content: MessagingSendContent::Text {
+                text: self.text.clone(),
+            },
+            request_id: new_request_id().into_inner(),
+        }
+    }
+}
+
+impl MessageSendCardArgs {
+    fn send_request(&self) -> SendMessagingRequest {
+        SendMessagingRequest {
+            integration_id: self.integration_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            content: MessagingSendContent::Card {
+                title: self.title.clone(),
+                text: self.text.clone(),
+                template: self.template,
+            },
             request_id: new_request_id().into_inner(),
         }
     }
 }
 
 fn parse_notification_level(value: &str) -> Result<NotificationLevel, String> {
+    value.parse()
+}
+
+fn parse_messaging_card_template(value: &str) -> Result<MessagingCardTemplate, String> {
     value.parse()
 }
 
@@ -293,6 +338,21 @@ impl std::fmt::Debug for MessageSendArgs {
     }
 }
 
+impl std::fmt::Debug for MessageSendCardArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessageSendCardArgs")
+            .field("integration_id", &self.integration_id)
+            .field("conversation_id", &self.conversation_id)
+            .field("title", &"[REDACTED]")
+            .field("text", &"[REDACTED]")
+            .field("template", &self.template)
+            .field("json", &self.json)
+            .field("port", &self.port)
+            .field("token", &self.token.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for MessageLogArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MessageLogArgs")
@@ -308,6 +368,7 @@ impl std::fmt::Debug for MessageCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             MessageCommand::Send(args) => f.debug_tuple("Send").field(args).finish(),
+            MessageCommand::SendCard(args) => f.debug_tuple("SendCard").field(args).finish(),
             MessageCommand::Events(args) => f.debug_tuple("Events").field(args).finish(),
             MessageCommand::Sends(args) => f.debug_tuple("Sends").field(args).finish(),
         }
@@ -550,13 +611,39 @@ async fn run_notify_client(args: &NotifyArgs) -> i32 {
 async fn run_message_client(args: &MessageArgs) -> i32 {
     match &args.command {
         MessageCommand::Send(send) => run_message_send_client(send).await,
+        MessageCommand::SendCard(send) => run_message_send_card_client(send).await,
         MessageCommand::Events(logs) => run_message_events_client(logs).await,
         MessageCommand::Sends(logs) => run_message_sends_client(logs).await,
     }
 }
 
 async fn run_message_send_client(args: &MessageSendArgs) -> i32 {
-    let endpoint = resolve_endpoint(args.port, args.token.clone());
+    run_message_send_request(
+        args.send_request(),
+        args.port,
+        args.token.clone(),
+        &args.json,
+    )
+    .await
+}
+
+async fn run_message_send_card_client(args: &MessageSendCardArgs) -> i32 {
+    run_message_send_request(
+        args.send_request(),
+        args.port,
+        args.token.clone(),
+        &args.json,
+    )
+    .await
+}
+
+async fn run_message_send_request(
+    request: SendMessagingRequest,
+    port: Option<u16>,
+    token: Option<String>,
+    json: &Option<String>,
+) -> i32 {
+    let endpoint = resolve_endpoint(port, token);
     if endpoint.port == 0 {
         eprintln!("本地 API 已禁用（端口为 0）；请在「设置 → 远程访问」中为 local-api 监听器设置端口并启用后重试");
         return 1;
@@ -566,13 +653,12 @@ async fn run_message_send_client(args: &MessageSendArgs) -> i32 {
         Err(code) => return code,
     };
     let base = endpoint.base_url();
-    let request = args.send_request();
     match with_message_cold_start(|| post_message_send(&client, &base, &endpoint.token, &request))
         .await
     {
         Ok(response) => {
             let value = serde_json::to_value(&response).unwrap_or(serde_json::Value::Null);
-            emit(&args.json, &value, || {
+            emit(json, &value, || {
                 format!("message 已入队：{}", response.outbox_id)
             });
             0
@@ -1337,7 +1423,12 @@ mod tests {
         let request = send.send_request();
         assert_eq!(request.integration_id, "wx");
         assert_eq!(request.conversation_id, "c1");
-        assert_eq!(request.text, "secret message");
+        assert_eq!(
+            request.content,
+            MessagingSendContent::Text {
+                text: "secret message".to_string()
+            }
+        );
         assert_eq!(request.request_id.len(), 32);
         assert!(request
             .request_id
@@ -1347,6 +1438,64 @@ mod tests {
         assert!(!debug.contains("secret message"));
         assert!(!debug.contains("local-token"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn parses_message_send_card_contract_and_redacts_debug() {
+        let args = parse_message(&[
+            "prmonitor",
+            "message",
+            "send-card",
+            "--integration-id",
+            "fs",
+            "--conversation-id",
+            "oc_123",
+            "--title",
+            "Task stopped",
+            "--text",
+            "private markdown body",
+            "--template",
+            "orange",
+            "--json",
+            "--token",
+            "local-token",
+        ])
+        .expect("valid");
+        let MessageCommand::SendCard(send) = args.command else {
+            panic!("expected send-card");
+        };
+        let request = send.send_request();
+        assert_eq!(
+            request.content,
+            MessagingSendContent::Card {
+                title: "Task stopped".to_string(),
+                text: "private markdown body".to_string(),
+                template: MessagingCardTemplate::Orange,
+            }
+        );
+        assert_eq!(send.json.as_deref(), Some(""));
+        let debug = format!("{send:?}");
+        assert!(!debug.contains("Task stopped"));
+        assert!(!debug.contains("private markdown body"));
+        assert!(!debug.contains("local-token"));
+        assert!(debug.contains("[REDACTED]"));
+
+        assert!(parse_message(&[
+            "prmonitor",
+            "message",
+            "send-card",
+            "--integration-id",
+            "fs",
+            "--conversation-id",
+            "oc_123",
+            "--title",
+            "title",
+            "--text",
+            "body",
+            "--template",
+            "red",
+        ])
+        .is_err());
     }
 
     #[test]

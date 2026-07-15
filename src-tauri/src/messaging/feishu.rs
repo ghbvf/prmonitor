@@ -11,14 +11,28 @@ use crate::error::{AppError, AppResult};
 use crate::messaging::provider::{MessagingProvider, ProviderFuture, Verification};
 use crate::messaging::redact_raw_summary;
 use crate::model::{
-    ActionExecutionResult, MessagingEvent, MessagingProviderCapability, MessagingProviderKind,
-    MessagingReplyTarget,
+    ActionExecutionResult, MessagingCardTemplate, MessagingEvent, MessagingProviderCapability,
+    MessagingProviderKind, MessagingReplyTarget, MessagingSendContent,
 };
 
 pub struct FeishuProvider;
 
 const MAX_SIGNATURE_AGE_SECS: i64 = 5 * 60;
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn";
+pub(crate) const HUMAN_INPUT_FORM_SUBMIT: &str = "human_input_submit";
+pub(crate) const HUMAN_INPUT_CUSTOM_OPTION: &str = "custom";
+
+pub(crate) fn human_input_choice_field_name(index: usize) -> String {
+    format!("q_{index}_choice")
+}
+
+pub(crate) fn human_input_custom_field_name(index: usize) -> String {
+    format!("q_{index}_custom")
+}
+
+pub(crate) fn human_input_option_value(index: usize) -> String {
+    format!("o_{index}")
+}
 
 pub(crate) fn build_feishu_http_client(
     integration: &MessagingIntegration,
@@ -114,6 +128,7 @@ impl MessagingProvider for FeishuProvider {
             provider: MessagingProviderKind::Feishu,
             supports_reply: true,
             supports_send: true,
+            supports_information_card: true,
             requires_allowed_conversations: true,
         }
     }
@@ -198,9 +213,23 @@ impl MessagingProvider for FeishuProvider {
         &'a self,
         integration: &'a MessagingIntegration,
         conversation_id: &'a str,
-        text: &'a str,
+        content: &'a MessagingSendContent,
     ) -> ProviderFuture<'a> {
-        Box::pin(async move { send_message(integration, conversation_id, text).await })
+        Box::pin(async move {
+            match content {
+                MessagingSendContent::Text { text } => {
+                    send_message(integration, conversation_id, text).await
+                }
+                MessagingSendContent::Card {
+                    title,
+                    text,
+                    template,
+                } => {
+                    send_information_card(integration, conversation_id, title, text, *template)
+                        .await
+                }
+            }
+        })
     }
 }
 
@@ -284,6 +313,51 @@ async fn send_message(
         .await
         .map_err(|e| AppError::new(format!("飞书发送消息请求失败: {e}")))?;
     classify_feishu_response(resp, "飞书发送消息").await
+}
+
+/// Sends a display-only Feishu card. It deliberately has no action/button elements.
+pub(crate) async fn send_information_card(
+    integration: &MessagingIntegration,
+    conversation_id: &str,
+    title: &str,
+    text: &str,
+    template: MessagingCardTemplate,
+) -> AppResult<ActionExecutionResult> {
+    let api = FeishuApiClient::authenticate(integration).await?;
+    let resp = api
+        .post("/open-apis/im/v1/messages")
+        .query(&[("receive_id_type", "chat_id")])
+        .json(&information_card_request(
+            conversation_id,
+            title,
+            text,
+            template,
+        ))
+        .send()
+        .await
+        .map_err(|e| AppError::new(format!("飞书发送信息卡片请求失败: {e}")))?;
+    classify_feishu_response(resp, "飞书发送信息卡片").await
+}
+
+fn information_card_request(
+    conversation_id: &str,
+    title: &str,
+    text: &str,
+    template: MessagingCardTemplate,
+) -> Value {
+    let card = json!({
+        "config": { "wide_screen_mode": true },
+        "header": {
+            "template": template.as_wire(),
+            "title": { "tag": "plain_text", "content": title }
+        },
+        "elements": [{ "tag": "markdown", "content": text }]
+    });
+    json!({
+        "receive_id": conversation_id,
+        "msg_type": "interactive",
+        "content": serde_json::to_string(&card).expect("information card serializes")
+    })
 }
 
 /// Sends an interactive human-input card and returns Feishu's message id so the winner can close
@@ -374,33 +448,75 @@ fn human_input_card(
     if terminal {
         elements.push(json!({"tag":"note", "elements":[{"tag":"plain_text", "content": format!("已结束：{}", request.answer_source.as_deref().unwrap_or(&request.status))}]}));
     } else {
-        for question in &request.questions {
-            elements
-                .push(json!({"tag":"markdown", "content": format!("**{}**", question.question)}));
-            if question.options.is_empty() || request.questions.len() > 1 {
-                let option_hint = if question.options.is_empty() {
-                    String::new()
-                } else {
-                    format!(" 可选：{}。", question.options.join(" / "))
-                };
-                let answer_syntax = request
-                    .questions
-                    .iter()
-                    .map(|item| format!("{}=<答案>", item.id))
-                    .collect::<Vec<_>>()
-                    .join(";");
-                elements.push(json!({"tag":"note", "elements":[{"tag":"plain_text", "content": format!("回复 /answer {} {}", request.id, answer_syntax)}]}));
-                if !option_hint.is_empty() {
-                    elements.push(json!({"tag":"note", "elements":[{"tag":"plain_text", "content": option_hint}]}));
-                }
-            } else {
-                let actions = question.options.iter().map(|option| json!({"tag":"button", "text":{"tag":"plain_text","content":option}, "type":"primary", "value":{"requestId":request.id,"questionId":question.id,"answer":option}})).collect::<Vec<_>>();
-                elements.push(json!({"tag":"action", "actions":actions}));
-            }
-        }
-        elements.push(json!({"tag":"action", "actions":[{"tag":"button","text":{"tag":"plain_text","content":"取消"},"type":"danger","value":{"requestId":request.id,"questionId":"__cancel__","answer":"__cancel__"}}]}));
+        elements.push(human_input_form(request));
+        elements.push(json!({"tag":"note", "elements":[{"tag":"plain_text", "content": "也可回复 /answer <答案> 作答"}]}));
+        elements.push(cancel_human_input_action(request));
     }
     json!({"config":{"wide_screen_mode":true,"update_multi":true}, "header":{"template": if terminal {"grey"} else {"blue"}, "title":{"tag":"plain_text","content":request.title}}, "elements":elements})
+}
+
+fn human_input_form(request: &crate::messaging::human_input::HumanInputRequest) -> Value {
+    let mut elements = Vec::with_capacity(request.questions.len() * 3 + 1);
+    for (index, question) in request.questions.iter().enumerate() {
+        elements.push(json!({
+            "tag": "markdown",
+            "content": format!("**{}**", question.question)
+        }));
+        if question.options.is_empty() {
+            elements.push(json!({
+                "tag": "input",
+                "name": human_input_custom_field_name(index),
+                "required": true,
+                "placeholder": {"tag": "plain_text", "content": "请输入答案"}
+            }));
+        } else {
+            let mut options = question
+                .options
+                .iter()
+                .enumerate()
+                .map(|(option_index, option)| {
+                    json!({
+                        "text": {"tag": "plain_text", "content": option},
+                        "value": human_input_option_value(option_index)
+                    })
+                })
+                .collect::<Vec<_>>();
+            options.push(json!({
+                "text": {"tag": "plain_text", "content": "自定义输入"},
+                "value": HUMAN_INPUT_CUSTOM_OPTION
+            }));
+            elements.push(json!({
+                "tag": "select_static",
+                "name": human_input_choice_field_name(index),
+                "required": true,
+                "placeholder": {"tag": "plain_text", "content": "请选择"},
+                "options": options
+            }));
+            elements.push(json!({
+                "tag": "input",
+                "name": human_input_custom_field_name(index),
+                "required": false,
+                "placeholder": {"tag": "plain_text", "content": "选择“自定义输入”时填写"}
+            }));
+        }
+    }
+    elements.push(json!({
+        "tag": "button",
+        "name": HUMAN_INPUT_FORM_SUBMIT,
+        "text": {"tag": "plain_text", "content": "提交答案"},
+        "type": "primary",
+        "action_type": "form_submit",
+        "value": {"requestId": request.id, "action": "submit"}
+    }));
+    json!({
+        "tag": "form",
+        "name": "human_input_form",
+        "elements": elements
+    })
+}
+
+fn cancel_human_input_action(request: &crate::messaging::human_input::HumanInputRequest) -> Value {
+    json!({"tag":"action", "actions":[{"tag":"button","text":{"tag":"plain_text","content":"取消"},"type":"danger","value":{"requestId":request.id,"questionId":"__cancel__","answer":"__cancel__"}}]})
 }
 
 async fn tenant_access_token(
@@ -765,6 +881,109 @@ mod tests {
             .expect("terminal elements")
             .iter()
             .all(|element| element["tag"] != "action"));
+    }
+
+    #[test]
+    fn multi_question_card_renders_required_form_controls_and_submit() {
+        let mut request = human_request(HumanInputStatus::Pending);
+        request.questions.push(HumanQuestion {
+            id: "scope".to_string(),
+            question: "发现边界放在哪里？".to_string(),
+            options: vec!["当前任务".to_string(), "后续任务".to_string()],
+        });
+
+        let card = human_input_card(&request, false);
+        let form = card["elements"]
+            .as_array()
+            .expect("card elements")
+            .iter()
+            .find(|element| element["tag"] == "form")
+            .expect("multi-question card must contain a form");
+        let controls = form["elements"].as_array().expect("form elements");
+        let selects = controls
+            .iter()
+            .filter(|element| element["tag"] == "select_static")
+            .collect::<Vec<_>>();
+        assert_eq!(selects.len(), 2);
+        assert_eq!(selects[0]["name"], "q_0_choice");
+        assert_eq!(selects[1]["name"], "q_1_choice");
+        assert!(selects.iter().all(|element| element["required"] == true));
+        for select in selects {
+            let custom_option = select["options"]
+                .as_array()
+                .expect("select options")
+                .last()
+                .expect("forced custom option");
+            assert_eq!(custom_option["text"]["content"], "自定义输入");
+            assert_eq!(custom_option["value"], "custom");
+        }
+        let inputs = controls
+            .iter()
+            .filter(|element| element["tag"] == "input")
+            .collect::<Vec<_>>();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0]["name"], "q_0_custom");
+        assert_eq!(inputs[1]["name"], "q_1_custom");
+        assert!(inputs.iter().all(|element| element["required"] == false));
+        let submit = controls
+            .iter()
+            .find(|element| element["action_type"] == "form_submit")
+            .expect("form submit button");
+        assert_eq!(submit["tag"], "button");
+        assert_eq!(submit["name"], "human_input_submit");
+        assert_eq!(submit["value"]["requestId"], request.id);
+        assert!(serde_json::to_string(&card)
+            .expect("serialize card")
+            .contains("回复 /answer"));
+    }
+
+    #[test]
+    fn empty_options_question_renders_required_free_text_input() {
+        let mut request = human_request(HumanInputStatus::Pending);
+        request.questions = vec![HumanQuestion {
+            id: "open".to_string(),
+            question: "还有补充吗？".to_string(),
+            options: vec![],
+        }];
+        let card = human_input_card(&request, false);
+        let form = card["elements"]
+            .as_array()
+            .expect("card elements")
+            .iter()
+            .find(|element| element["tag"] == "form")
+            .expect("empty-options card must contain a form");
+        let controls = form["elements"].as_array().expect("form elements");
+        assert!(controls
+            .iter()
+            .all(|element| element["tag"] != "select_static"));
+        let input = controls
+            .iter()
+            .find(|element| element["tag"] == "input")
+            .expect("empty-options question uses a required input");
+        assert_eq!(input["name"], "q_0_custom");
+        assert_eq!(input["required"], true);
+    }
+
+    #[test]
+    fn information_card_is_interactive_markdown_without_actions() {
+        let request = information_card_request(
+            "oc_123",
+            "Task stopped",
+            "**status:** done",
+            MessagingCardTemplate::Grey,
+        );
+        assert_eq!(request["receive_id"], "oc_123");
+        assert_eq!(request["msg_type"], "interactive");
+        let card: Value =
+            serde_json::from_str(request["content"].as_str().expect("content string"))
+                .expect("card content");
+        assert_eq!(card["header"]["template"], "grey");
+        assert_eq!(card["header"]["title"]["content"], "Task stopped");
+        assert_eq!(card["elements"][0]["tag"], "markdown");
+        assert_eq!(card["elements"][0]["content"], "**status:** done");
+        let serialized = serde_json::to_string(&card).expect("serialize card");
+        assert!(!serialized.contains("action"));
+        assert!(!serialized.contains("button"));
     }
 
     #[test]

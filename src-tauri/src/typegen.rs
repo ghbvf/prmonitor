@@ -22,13 +22,13 @@ use crate::{
         ActionStatus, ClaudeEffort, CliResolutionSource, CliTool, CodexReasoningEffort, EngineKind,
         EventEnvelope, EventPayload, EventSubject, EventType, ExternalRequestId,
         ExternalTriggerOrigin, FeishuConnectionState, FeishuConnectionStatus, InboxDedupeKey,
-        InboxEventId, LabelSource, MessagingEvent, MessagingEventEntry, MessagingEventStatus,
-        MessagingIntegrationOption, MessagingProviderCapability, MessagingProviderKind,
-        MessagingReplyAudit, NotificationKind, NotificationLevel, OutboxProducerKey,
-        PullRequestView, ReviewActionKey, ReviewKind, ReviewLifecycleEvent, ReviewReceiptId,
-        ReviewReceiptSnapshot, ReviewReceiptStatus, SendMessagingRequest, SendMessagingResponse,
-        SendNotificationRequest, SendNotificationResponse, SourceKind, UpdateMode,
-        WebhookTunnelMode,
+        InboxEventId, LabelSource, MessagingCardTemplate, MessagingEvent, MessagingEventEntry,
+        MessagingEventStatus, MessagingIntegrationOption, MessagingProviderCapability,
+        MessagingProviderKind, MessagingReplyAudit, MessagingSendContent, NotificationKind,
+        NotificationLevel, OutboxProducerKey, PullRequestView, ReviewActionKey, ReviewKind,
+        ReviewLifecycleEvent, ReviewReceiptId, ReviewReceiptSnapshot, ReviewReceiptStatus,
+        SendMessagingRequest, SendMessagingResponse, SendNotificationRequest,
+        SendNotificationResponse, SourceKind, UpdateMode, WebhookTunnelMode,
     },
     remote::status::{
         RemoteAccessRuntimeStatus, RemoteEntrypointRuntimeStatus, RemoteEntrypointState,
@@ -249,6 +249,13 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push_str(&declaration::<SendNotificationRequest>(&cfg));
     shared.push('\n');
     shared.push_str(&declaration::<SendNotificationResponse>(&cfg));
+    shared.push('\n');
+    shared.push_str(&declaration::<MessagingCardTemplate>(&cfg));
+    shared.push_str(&option_array::<MessagingCardTemplate>(
+        "MESSAGING_CARD_TEMPLATES",
+    ));
+    shared.push('\n');
+    shared.push_str(&declaration::<MessagingSendContent>(&cfg));
     shared.push('\n');
     shared.push_str(&declaration::<SendMessagingRequest>(&cfg));
     shared.push('\n');

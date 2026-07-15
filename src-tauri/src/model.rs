@@ -1242,6 +1242,7 @@ pub struct MessagingProviderCapability {
     pub provider: MessagingProviderKind,
     pub supports_reply: bool,
     pub supports_send: bool,
+    pub supports_information_card: bool,
     pub requires_allowed_conversations: bool,
 }
 
@@ -1386,13 +1387,181 @@ pub struct MessagingReplyPayload {
 /// provider reply target, while active sends address a configured conversation directly. Keeping
 /// this as a separate payload is the Hard channel-separation carrier with
 /// [`ActionKind::MessagingSend`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessagingSendPayload {
     pub integration_id: String,
     pub provider: MessagingProviderKind,
     pub conversation_id: String,
-    pub text: String,
+    pub content: MessagingSendContent,
+}
+
+/// Header color supported by non-interactive Feishu information cards.
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MessagingCardTemplate {
+    Blue,
+    Orange,
+    Grey,
+}
+
+impl MessagingCardTemplate {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Blue => "blue",
+            Self::Orange => "orange",
+            Self::Grey => "grey",
+        }
+    }
+}
+
+impl std::str::FromStr for MessagingCardTemplate {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "blue" => Ok(Self::Blue),
+            "orange" => Ok(Self::Orange),
+            "grey" => Ok(Self::Grey),
+            _ => Err(format!(
+                "无效卡片模板 {value:?}；可选值：blue、orange、grey"
+            )),
+        }
+    }
+}
+
+/// Typed active-send body. The sealed enum makes a text/card field mixture unrepresentable.
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MessagingSendContent {
+    Text {
+        text: String,
+    },
+    Card {
+        title: String,
+        text: String,
+        template: MessagingCardTemplate,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+enum StrictMessagingSendContentWire {
+    Text {
+        text: String,
+    },
+    Card {
+        title: String,
+        text: String,
+        template: MessagingCardTemplate,
+    },
+}
+
+impl<'de> Deserialize<'de> for MessagingSendContent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(
+            match StrictMessagingSendContentWire::deserialize(deserializer)? {
+                StrictMessagingSendContentWire::Text { text } => Self::Text { text },
+                StrictMessagingSendContentWire::Card {
+                    title,
+                    text,
+                    template,
+                } => Self::Card {
+                    title,
+                    text,
+                    template,
+                },
+            },
+        )
+    }
+}
+
+/// Sealed Current wire (`content`). Prefer this for all new writers.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CurrentMessagingSendPayloadWire {
+    integration_id: String,
+    provider: MessagingProviderKind,
+    conversation_id: String,
+    content: MessagingSendContent,
+}
+
+/// Legacy flat `text` read path for older outbox / callers.
+///
+/// Sunset: migrate remaining readers to `content`, then delete this struct (no new Legacy writers;
+/// target window = next messaging epic after #531).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyMessagingSendPayloadWire {
+    integration_id: String,
+    provider: MessagingProviderKind,
+    conversation_id: String,
+    text: String,
+}
+
+impl<'de> Deserialize<'de> for MessagingSendPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        // Route by sealed `content` vs legacy `text` so Current deny_unknown stays Hard without
+        // treating Legacy's `text` as an unknown Current field.
+        if value.get("content").is_some() {
+            let wire = CurrentMessagingSendPayloadWire::deserialize(&value)
+                .map_err(serde::de::Error::custom)?;
+            return Ok(Self {
+                integration_id: wire.integration_id,
+                provider: wire.provider,
+                conversation_id: wire.conversation_id,
+                content: wire.content,
+            });
+        }
+        if value.get("text").is_some() {
+            let wire = LegacyMessagingSendPayloadWire::deserialize(&value)
+                .map_err(serde::de::Error::custom)?;
+            return Ok(Self {
+                integration_id: wire.integration_id,
+                provider: wire.provider,
+                conversation_id: wire.conversation_id,
+                content: MessagingSendContent::Text { text: wire.text },
+            });
+        }
+        Err(CurrentMessagingSendPayloadWire::deserialize(&value)
+            .err()
+            .map(serde::de::Error::custom)
+            .expect("missing content and text cannot deserialize as Current wire"))
+    }
+}
+
+impl std::fmt::Debug for MessagingSendContent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text { .. } => f.debug_struct("Text").field("text", &"[REDACTED]").finish(),
+            Self::Card { template, .. } => f
+                .debug_struct("Card")
+                .field("title", &"[REDACTED]")
+                .field("text", &"[REDACTED]")
+                .field("template", template)
+                .finish(),
+        }
+    }
+}
+
+impl std::fmt::Debug for MessagingSendPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MessagingSendPayload")
+            .field("integration_id", &self.integration_id)
+            .field("provider", &self.provider)
+            .field("conversation_id", &self.conversation_id)
+            .field("content", &self.content)
+            .finish()
+    }
 }
 
 /// Transport-agnostic request to enqueue one active messaging send.
@@ -1401,13 +1570,78 @@ pub struct MessagingSendPayload {
 /// the request funnel. Credentials are always live-loaded from the referenced integration at
 /// execution time.
 #[cfg_attr(test, derive(ts_rs::TS))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SendMessagingRequest {
     pub integration_id: String,
     pub conversation_id: String,
-    pub text: String,
+    pub content: MessagingSendContent,
     pub request_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CurrentSendMessagingRequestWire {
+    integration_id: String,
+    conversation_id: String,
+    content: MessagingSendContent,
+    request_id: String,
+}
+
+/// Legacy flat `text` request wire. Sunset with [`LegacyMessagingSendPayloadWire`].
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacySendMessagingRequestWire {
+    integration_id: String,
+    conversation_id: String,
+    text: String,
+    request_id: String,
+}
+
+impl<'de> Deserialize<'de> for SendMessagingRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        // Route by sealed `content` vs legacy `text` so Current deny_unknown stays Hard without
+        // treating Legacy's `text` as an unknown Current field.
+        if value.get("content").is_some() {
+            let wire = CurrentSendMessagingRequestWire::deserialize(&value)
+                .map_err(serde::de::Error::custom)?;
+            return Ok(Self {
+                integration_id: wire.integration_id,
+                conversation_id: wire.conversation_id,
+                content: wire.content,
+                request_id: wire.request_id,
+            });
+        }
+        if value.get("text").is_some() {
+            let wire = LegacySendMessagingRequestWire::deserialize(&value)
+                .map_err(serde::de::Error::custom)?;
+            return Ok(Self {
+                integration_id: wire.integration_id,
+                conversation_id: wire.conversation_id,
+                content: MessagingSendContent::Text { text: wire.text },
+                request_id: wire.request_id,
+            });
+        }
+        Err(CurrentSendMessagingRequestWire::deserialize(&value)
+            .err()
+            .map(serde::de::Error::custom)
+            .expect("missing content and text cannot deserialize as Current wire"))
+    }
+}
+
+impl std::fmt::Debug for SendMessagingRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendMessagingRequest")
+            .field("integration_id", &self.integration_id)
+            .field("conversation_id", &self.conversation_id)
+            .field("content", &self.content)
+            .field("request_id", &self.request_id)
+            .finish()
+    }
 }
 
 #[cfg_attr(test, derive(ts_rs::TS))]
@@ -2642,31 +2876,43 @@ mod tests {
         let req = SendMessagingRequest {
             integration_id: "feishu-main".to_string(),
             conversation_id: "oc_123".to_string(),
-            text: "hello".to_string(),
+            content: MessagingSendContent::Card {
+                title: "Build complete".to_string(),
+                text: "hello".to_string(),
+                template: MessagingCardTemplate::Blue,
+            },
             request_id: "req-1".to_string(),
         };
         let v = serde_json::to_value(&req).expect("SendMessagingRequest serializes");
         assert_eq!(v["integrationId"], "feishu-main");
         assert_eq!(v["conversationId"], "oc_123");
-        assert_eq!(v["text"], "hello");
+        assert_eq!(v["content"]["kind"], "card");
+        assert_eq!(v["content"]["title"], "Build complete");
+        assert_eq!(v["content"]["text"], "hello");
+        assert_eq!(v["content"]["template"], "blue");
         assert_eq!(v["requestId"], "req-1");
         assert!(v.get("integration_id").is_none());
 
         let err = serde_json::from_value::<SendMessagingRequest>(serde_json::json!({
             "integrationId": "feishu-main",
             "conversationId": "oc_123",
-            "text": "hello",
+            "content": {"kind": "text", "text": "hello"},
             "requestId": "req-1",
             "webhookUrl": "https://secret.example/hook"
         }))
         .expect_err("unknown secret-looking fields are rejected");
-        assert!(err.to_string().contains("unknown field"), "{err}");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "Current wire deny_unknown must surface, got: {err}"
+        );
 
         let payload = MessagingSendPayload {
             integration_id: "feishu-main".to_string(),
             provider: MessagingProviderKind::Feishu,
             conversation_id: "oc_123".to_string(),
-            text: "hello".to_string(),
+            content: MessagingSendContent::Text {
+                text: "hello".to_string(),
+            },
         };
         let json = serde_json::to_string(&payload).expect("payload serializes");
         for denied in [
@@ -2686,6 +2932,140 @@ mod tests {
         let rv = serde_json::to_value(&response).expect("SendMessagingResponse serializes");
         assert_eq!(rv["outboxId"], serde_json::json!(7));
         assert!(rv.get("outbox_id").is_none());
+    }
+
+    #[test]
+    fn messaging_send_debug_redacts_text_and_card_body() {
+        let text = SendMessagingRequest {
+            integration_id: "feishu-main".to_string(),
+            conversation_id: "oc_123".to_string(),
+            content: MessagingSendContent::Text {
+                text: "private text".to_string(),
+            },
+            request_id: "req-1".to_string(),
+        };
+        let card = MessagingSendPayload {
+            integration_id: "feishu-main".to_string(),
+            provider: MessagingProviderKind::Feishu,
+            conversation_id: "oc_123".to_string(),
+            content: MessagingSendContent::Card {
+                title: "private title".to_string(),
+                text: "private markdown".to_string(),
+                template: MessagingCardTemplate::Orange,
+            },
+        };
+        let debug = format!("{text:?} {card:?}");
+        assert!(!debug.contains("private text"));
+        assert!(!debug.contains("private title"));
+        assert!(!debug.contains("private markdown"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn messaging_send_legacy_wire_is_read_compatible_but_rewrites_to_sealed_content() {
+        let request: SendMessagingRequest = serde_json::from_value(serde_json::json!({
+            "integrationId": "feishu-main",
+            "conversationId": "oc_123",
+            "text": "legacy request",
+            "requestId": "req-legacy"
+        }))
+        .expect("legacy request deserializes");
+        assert_eq!(
+            request.content,
+            MessagingSendContent::Text {
+                text: "legacy request".to_string()
+            }
+        );
+        let request_wire = serde_json::to_value(&request).expect("request reserializes");
+        assert_eq!(request_wire["content"]["kind"], "text");
+        assert_eq!(request_wire["content"]["text"], "legacy request");
+        assert!(request_wire.get("text").is_none());
+
+        let payload: MessagingSendPayload = serde_json::from_value(serde_json::json!({
+            "integrationId": "feishu-main",
+            "provider": "feishu",
+            "conversationId": "oc_123",
+            "text": "legacy persisted payload"
+        }))
+        .expect("legacy persisted outbox payload deserializes");
+        assert_eq!(
+            payload.content,
+            MessagingSendContent::Text {
+                text: "legacy persisted payload".to_string()
+            }
+        );
+        let payload_wire = serde_json::to_value(&payload).expect("payload reserializes");
+        assert_eq!(payload_wire["content"]["kind"], "text");
+        assert_eq!(payload_wire["content"]["text"], "legacy persisted payload");
+        assert!(payload_wire.get("text").is_none());
+    }
+
+    #[test]
+    fn messaging_send_wire_rejects_mixed_missing_outer_and_nested_extra_fields() {
+        let valid_request = serde_json::json!({
+            "integrationId": "feishu-main",
+            "conversationId": "oc_123",
+            "content": {"kind": "text", "text": "hello"},
+            "requestId": "req-1"
+        });
+        for invalid in [
+            serde_json::json!({
+                "integrationId": "feishu-main", "conversationId": "oc_123",
+                "content": {"kind": "text", "text": "hello"},
+                "text": "legacy", "requestId": "req-1"
+            }),
+            serde_json::json!({
+                "integrationId": "feishu-main", "conversationId": "oc_123",
+                "requestId": "req-1"
+            }),
+            serde_json::json!({
+                "integrationId": "feishu-main", "conversationId": "oc_123",
+                "content": {"kind": "text", "text": "hello"},
+                "requestId": "req-1", "appSecret": "secret"
+            }),
+        ] {
+            assert!(serde_json::from_value::<SendMessagingRequest>(invalid).is_err());
+        }
+
+        for content in [
+            serde_json::json!({"kind": "text", "text": "hello", "title": "mixed"}),
+            serde_json::json!({"kind": "text", "text": "hello", "token": "secret"}),
+            serde_json::json!({
+                "kind": "card", "title": "title", "text": "body", "template": "blue",
+                "webhookUrl": "https://secret.example"
+            }),
+            serde_json::json!({
+                "kind": "card", "title": "title", "text": "body", "template": "blue",
+                "legacyText": "mixed"
+            }),
+        ] {
+            let mut request = valid_request.clone();
+            request["content"] = content;
+            assert!(serde_json::from_value::<SendMessagingRequest>(request).is_err());
+        }
+
+        for invalid in [
+            serde_json::json!({
+                "integrationId": "feishu-main", "provider": "feishu",
+                "conversationId": "oc_123", "content": {"kind": "text", "text": "new"},
+                "text": "legacy"
+            }),
+            serde_json::json!({
+                "integrationId": "feishu-main", "provider": "feishu",
+                "conversationId": "oc_123"
+            }),
+            serde_json::json!({
+                "integrationId": "feishu-main", "provider": "feishu",
+                "conversationId": "oc_123", "text": "legacy", "token": "secret"
+            }),
+            serde_json::json!({
+                "integrationId": "feishu-main", "provider": "feishu",
+                "conversationId": "oc_123",
+                "content": {"kind": "text", "text": "new", "appSecret": "secret"}
+            }),
+        ] {
+            assert!(serde_json::from_value::<MessagingSendPayload>(invalid).is_err());
+        }
     }
 
     #[test]

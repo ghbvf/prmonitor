@@ -3,8 +3,8 @@ use crate::config::service::{
 };
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    ActionKind, Candidate, EventEnvelope, NotificationLevel, ReviewActionPayload, ReviewKind,
-    SendMessagingRequest, SendNotificationRequest,
+    ActionKind, Candidate, EventEnvelope, MessagingSendContent, NotificationLevel,
+    ReviewActionPayload, ReviewKind, SendMessagingRequest, SendNotificationRequest,
 };
 
 pub fn matches(rule: &RuleConfig, event: &EventEnvelope) -> bool {
@@ -268,7 +268,7 @@ fn plan_notification(
                     request: SendMessagingRequest {
                         integration_id: integration_id.clone(),
                         conversation_id: conversation_id.clone(),
-                        text,
+                        content: MessagingSendContent::Text { text },
                         request_id: dedupe_key.clone(),
                     },
                 },
@@ -520,7 +520,10 @@ mod tests {
             RuleActionDispatch::Messaging { request } => {
                 assert_eq!(request.integration_id, "feishu-main");
                 assert_eq!(request.conversation_id, "oc_123");
-                assert!(request.text.contains("action:message"));
+                assert!(matches!(
+                    &request.content,
+                    MessagingSendContent::Text { text } if text.contains("action:message")
+                ));
                 assert_eq!(request.request_id, "rule:r1:k:notify");
             }
             RuleActionDispatch::Outbox { .. } | RuleActionDispatch::Notification { .. } => {

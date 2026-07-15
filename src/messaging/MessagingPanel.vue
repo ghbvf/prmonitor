@@ -92,7 +92,7 @@ function sendTest() {
   void store.send({
     integrationId: sendDraft.value.integrationId.trim(),
     conversationId: normalizedConversationId.value,
-    text: sendDraft.value.text.trim(),
+    content: { kind: "text", text: sendDraft.value.text.trim() },
     requestId: crypto.randomUUID(),
   });
 }

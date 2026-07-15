@@ -16,10 +16,14 @@ use crate::messaging::store;
 use crate::messaging::{dingtalk::DingTalkProvider, wechat_work::WeChatWorkProvider};
 use crate::model::{
     ActionExecutionResult, ActionKind, ExternalRequestId, MessagingEvent, MessagingEventStatus,
-    MessagingProviderKind, MessagingReplyPayload, MessagingReplyTarget, MessagingSendPayload,
-    OutboxEntry, ReviewKind, ReviewReceiptId, SendMessagingRequest, SendMessagingResponse,
+    MessagingProviderKind, MessagingReplyPayload, MessagingReplyTarget, MessagingSendContent,
+    MessagingSendPayload, OutboxEntry, ReviewKind, ReviewReceiptId, SendMessagingRequest,
+    SendMessagingResponse,
 };
 use crate::state::AppState;
+
+#[cfg(test)]
+use crate::model::MessagingCardTemplate;
 
 pub trait MessagingActions<R: Runtime>: Send + Sync + 'static {
     fn enqueue_reply(
@@ -480,24 +484,64 @@ pub(crate) fn prepare_send(
             integration.name
         )));
     }
-    let text = request.text.trim();
-    if text.is_empty() {
-        return Err(AppError::new("消息正文不能为空"));
-    }
     let request_id = request.request_id.trim();
     if request_id.is_empty() {
         return Err(AppError::new("messaging requestId 不能为空"));
     }
+    let content = match request.content {
+        MessagingSendContent::Text { text } => {
+            let text = text.trim();
+            if text.is_empty() {
+                return Err(AppError::new("消息正文不能为空"));
+            }
+            MessagingSendContent::Text {
+                text: crate::messaging::truncate_utf8_boundary(text, MAX_SEND_TEXT_BYTES),
+            }
+        }
+        MessagingSendContent::Card {
+            title,
+            text,
+            template,
+        } => {
+            if !provider_for(integration.kind)
+                .capability()
+                .supports_information_card
+            {
+                return Err(AppError::new(format!(
+                    "信息卡片仅支持 Feishu，消息集成「{}」是 {}",
+                    integration.name,
+                    integration.kind.as_wire()
+                )));
+            }
+            let title = title.trim();
+            if title.is_empty() {
+                return Err(AppError::new("卡片标题不能为空"));
+            }
+            let text = text.trim();
+            if text.is_empty() {
+                return Err(AppError::new("卡片正文不能为空"));
+            }
+            MessagingSendContent::Card {
+                title: crate::messaging::truncate_utf8_boundary(title, MAX_SEND_CARD_TITLE_BYTES),
+                text: crate::messaging::truncate_utf8_boundary(text, MAX_SEND_TEXT_BYTES),
+                template,
+            }
+        }
+    };
     let payload = MessagingSendPayload {
         integration_id: integration.id.clone(),
         provider: integration.kind,
         conversation_id: conversation_id.to_string(),
-        text: crate::messaging::truncate_utf8_boundary(text, MAX_SEND_TEXT_BYTES),
+        content,
     };
     let payload_json = serde_json::to_string(&payload)
         .map_err(|e| AppError::new(format!("messaging send payload 序列化失败: {e}")))?;
+    let send_kind = match payload.content {
+        MessagingSendContent::Text { .. } => "text",
+        MessagingSendContent::Card { .. } => "card",
+    };
     let summary = format!(
-        "Messaging send {} → {}",
+        "Messaging {send_kind} {} → {}",
         payload.provider.as_wire(),
         payload.conversation_id
     );
@@ -547,7 +591,7 @@ pub async fn execute_send<R: Runtime>(
         });
     }
     provider_for(integration.kind)
-        .send(&integration, &payload.conversation_id, &payload.text)
+        .send(&integration, &payload.conversation_id, &payload.content)
         .await
 }
 
@@ -964,6 +1008,7 @@ fn enqueue_reply<R: Runtime>(
 }
 
 const MAX_SEND_TEXT_BYTES: usize = 4096;
+const MAX_SEND_CARD_TITLE_BYTES: usize = 128;
 
 #[cfg(test)]
 mod tests {
@@ -1464,7 +1509,9 @@ mod tests {
             SendMessagingRequest {
                 integration_id: "fs".to_string(),
                 conversation_id: " chat ".to_string(),
-                text: " hello ".to_string(),
+                content: MessagingSendContent::Text {
+                    text: " hello ".to_string(),
+                },
                 request_id: "req-123".to_string(),
             },
         )
@@ -1475,5 +1522,104 @@ mod tests {
             actions.dedupe_key.lock().expect("lock").as_deref(),
             Some("messaging-send:fs:req-123")
         );
+    }
+
+    #[test]
+    fn prepare_send_accepts_feishu_card_and_truncates_utf8_boundaries() {
+        let integration = MessagingIntegration {
+            id: "fs".to_string(),
+            name: "Feishu".to_string(),
+            allowed_conversation_ids: vec!["chat".to_string()],
+            enabled: true,
+            ..MessagingIntegration::feishu_default()
+        };
+        let prepared = prepare_send(
+            &integration,
+            SendMessagingRequest {
+                integration_id: "fs".to_string(),
+                conversation_id: "chat".to_string(),
+                content: MessagingSendContent::Card {
+                    title: "标".repeat(100),
+                    text: "文".repeat(2000),
+                    template: MessagingCardTemplate::Blue,
+                },
+                request_id: "req-card".to_string(),
+            },
+        )
+        .expect("prepare card");
+        let payload: MessagingSendPayload =
+            serde_json::from_str(&prepared.payload_json).expect("payload");
+        let MessagingSendContent::Card { title, text, .. } = payload.content else {
+            panic!("expected card");
+        };
+        assert!(title.len() <= MAX_SEND_CARD_TITLE_BYTES);
+        assert!(text.len() <= MAX_SEND_TEXT_BYTES);
+        assert!(title.is_char_boundary(title.len()));
+        assert!(text.is_char_boundary(text.len()));
+    }
+
+    #[test]
+    fn prepare_send_rejects_cards_for_non_feishu_and_empty_fields() {
+        for kind in [
+            MessagingProviderKind::WeChatWork,
+            MessagingProviderKind::DingTalk,
+        ] {
+            let integration = MessagingIntegration {
+                id: kind.as_wire().to_string(),
+                name: kind.as_wire().to_string(),
+                kind,
+                allowed_conversation_ids: vec!["chat".to_string()],
+                enabled: true,
+                ..MessagingIntegration::feishu_default()
+            };
+            let error = match prepare_send(
+                &integration,
+                SendMessagingRequest {
+                    integration_id: integration.id.clone(),
+                    conversation_id: "chat".to_string(),
+                    content: MessagingSendContent::Card {
+                        title: "title".to_string(),
+                        text: "body".to_string(),
+                        template: MessagingCardTemplate::Blue,
+                    },
+                    request_id: "req-card".to_string(),
+                },
+            ) {
+                Ok(_) => panic!("non-Feishu cards must fail before enqueue"),
+                Err(error) => error,
+            };
+            assert!(error.message.contains("仅支持 Feishu"), "{}", error.message);
+        }
+
+        let integration = MessagingIntegration {
+            id: "fs".to_string(),
+            name: "Feishu".to_string(),
+            allowed_conversation_ids: vec!["chat".to_string()],
+            enabled: true,
+            ..MessagingIntegration::feishu_default()
+        };
+        for content in [
+            MessagingSendContent::Card {
+                title: " ".to_string(),
+                text: "body".to_string(),
+                template: MessagingCardTemplate::Blue,
+            },
+            MessagingSendContent::Card {
+                title: "title".to_string(),
+                text: " \n ".to_string(),
+                template: MessagingCardTemplate::Blue,
+            },
+        ] {
+            assert!(prepare_send(
+                &integration,
+                SendMessagingRequest {
+                    integration_id: "fs".to_string(),
+                    conversation_id: "chat".to_string(),
+                    content,
+                    request_id: "req-card".to_string(),
+                },
+            )
+            .is_err());
+        }
     }
 }

@@ -96,7 +96,7 @@ export const MESSAGING_EVENT_STATUSES = ["received","processed","failed"] as con
 export type ActionStatus = "pending" | "blocked" | "done" | "dead";
 export const ACTION_STATUSES = ["pending","blocked","done","dead"] as const;
 
-export type MessagingProviderCapability = { provider: MessagingProviderKind, supportsReply: boolean, supportsSend: boolean, requiresAllowedConversations: boolean, };
+export type MessagingProviderCapability = { provider: MessagingProviderKind, supportsReply: boolean, supportsSend: boolean, supportsInformationCard: boolean, requiresAllowedConversations: boolean, };
 
 export type MessagingIntegrationOption = { id: string, name: string, kind: MessagingProviderKind, allowedConversationIds: Array<string>, };
 
@@ -118,7 +118,12 @@ export type SendNotificationRequest = { level?: NotificationLevel | null, title:
 
 export type SendNotificationResponse = { outboxIds: Array<number>, };
 
-export type SendMessagingRequest = { integrationId: string, conversationId: string, text: string, requestId: string, };
+export type MessagingCardTemplate = "blue" | "orange" | "grey";
+export const MESSAGING_CARD_TEMPLATES = ["blue","orange","grey"] as const;
+
+export type MessagingSendContent = { "kind": "text", text: string, } | { "kind": "card", title: string, text: string, template: MessagingCardTemplate, };
+
+export type SendMessagingRequest = { integrationId: string, conversationId: string, content: MessagingSendContent, requestId: string, };
 
 export type SendMessagingResponse = { outboxId: number, };
 
