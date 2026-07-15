@@ -1,6 +1,7 @@
 import { getTransport } from "../transport";
 import type { OutboxEntry } from "../types";
 import type {
+  FeishuConnectionStatus,
   MessagingEventEntry,
   MessagingIntegrationOption,
   SendMessagingRequest,
@@ -29,4 +30,8 @@ export function messagingSendsList(integrationId?: string): Promise<OutboxEntry[
 
 export function messagingIntegrationsList(): Promise<MessagingIntegrationOption[]> {
   return getTransport().request<MessagingIntegrationOption[]>("messaging_integrations_list");
+}
+
+export function messagingConnectionStatusesList(): Promise<FeishuConnectionStatus[]> {
+  return getTransport().request<FeishuConnectionStatus[]>("messaging_connection_statuses_list");
 }

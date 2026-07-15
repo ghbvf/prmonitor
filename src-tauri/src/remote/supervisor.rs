@@ -48,6 +48,7 @@ struct EntrypointDesired {
     port: u16,
     signature: String,
     entrypoint: RemoteEntrypoint,
+    mcp_mount: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -178,6 +179,7 @@ impl ListenerSupervisor {
                 desired.port,
                 desired.entrypoint.clone(),
                 desired.signature.clone(),
+                desired.mcp_mount,
             ) {
                 started.push((id, bound));
             }
@@ -479,18 +481,38 @@ fn desired_entrypoints(remote_access: &RemoteAccessConfig) -> HashMap<String, En
         .filter(|entrypoint| entrypoint.enabled && entrypoint.port != 0)
         .filter_map(|entrypoint| {
             runtime_checked_entrypoint(entrypoint).map(|entrypoint| {
+                let mcp_mount = mcp_mount_allowed(remote_access, &entrypoint);
                 (
                     entrypoint.id.clone(),
                     EntrypointDesired {
                         bind_host: entrypoint.bind_host.clone(),
                         port: entrypoint.port,
-                        signature: entrypoint_signature(&entrypoint),
+                        signature: format!(
+                            "{}\nmcp={mcp_mount}",
+                            entrypoint_signature(&entrypoint)
+                        ),
                         entrypoint,
+                        mcp_mount,
                     },
                 )
             })
         })
         .collect()
+}
+
+fn mcp_mount_allowed(remote_access: &RemoteAccessConfig, entrypoint: &RemoteEntrypoint) -> bool {
+    entrypoint
+        .bind_host
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+        && entrypoint
+            .routes
+            .iter()
+            .any(|route| route.enabled && route.capability == RemoteCapability::LocalApi)
+        && !remote_access
+            .tunnels
+            .iter()
+            .any(|tunnel| tunnel.enabled && tunnel.target_entrypoint_id == entrypoint.id)
 }
 
 fn runtime_checked_entrypoint(entrypoint: &RemoteEntrypoint) -> Option<RemoteEntrypoint> {
@@ -540,6 +562,7 @@ fn build_entrypoint_router<R: tauri::Runtime>(
     port: u16,
     entrypoint: RemoteEntrypoint,
     extra_allowed_hosts: Vec<String>,
+    mcp_mount: bool,
 ) -> Router {
     let gate_state = Arc::new(EntrypointGateState {
         app: app.clone(),
@@ -561,9 +584,8 @@ fn build_entrypoint_router<R: tauri::Runtime>(
                     },
                 )),
             ),
-            RemoteCapability::LocalApi => router.nest(
-                route.path.as_str(),
-                build_review_local_api_router(Arc::new(crate::make_local_api_ctx(
+            RemoteCapability::LocalApi => {
+                let local_api = build_review_local_api_router(Arc::new(crate::make_local_api_ctx(
                     app.clone(),
                     port,
                     route.path.clone(),
@@ -575,8 +597,14 @@ fn build_entrypoint_router<R: tauri::Runtime>(
                         port,
                         Some(entrypoint.id.clone()),
                     ),
-                ))),
-            ),
+                )));
+                let local_api = if mcp_mount {
+                    local_api.merge(crate::messaging::mcp::build_router(app.clone()))
+                } else {
+                    local_api
+                };
+                router.nest(route.path.as_str(), local_api)
+            }
             RemoteCapability::Messaging => router.nest(
                 route.path.as_str(),
                 crate::messaging::commands::build_router(Arc::new(
@@ -1030,8 +1058,17 @@ fn bind_entrypoint<R: tauri::Runtime>(
     port: u16,
     entrypoint: RemoteEntrypoint,
     signature: String,
+    mcp_mount: bool,
 ) -> Option<BoundEntrypoint> {
-    bind_entrypoint_with_extra_hosts(app, bind_host, port, entrypoint, signature, Vec::new())
+    bind_entrypoint_with_extra_hosts(
+        app,
+        bind_host,
+        port,
+        entrypoint,
+        signature,
+        Vec::new(),
+        mcp_mount,
+    )
 }
 
 fn bind_std_with_retry(bind_host: &str, port: u16) -> Option<std::net::TcpListener> {
@@ -1090,6 +1127,7 @@ impl BoundTunnel {
                     desired.entrypoint.clone(),
                     desired.signature.clone(),
                     vec![desired.lan_bind_host.clone()],
+                    false,
                 ) else {
                     let message = format!(
                         "LAN 隧道绑定失败：{}:{}",
@@ -1504,6 +1542,7 @@ fn bind_entrypoint_with_extra_hosts<R: tauri::Runtime>(
     entrypoint: RemoteEntrypoint,
     signature: String,
     extra_allowed_hosts: Vec<String>,
+    mcp_mount: bool,
 ) -> Option<BoundEntrypoint> {
     let std_listener = bind_std_with_retry(bind_host, port)?;
     if let Err(e) = std_listener.set_nonblocking(true) {
@@ -1530,7 +1569,7 @@ fn bind_entrypoint_with_extra_hosts<R: tauri::Runtime>(
     let bind_host = bind_host.to_string();
     let bind_host_for_task = bind_host.clone();
     let server_task = spawn(async move {
-        let router = build_entrypoint_router(app, port, entrypoint, extra_allowed_hosts);
+        let router = build_entrypoint_router(app, port, entrypoint, extra_allowed_hosts, mcp_mount);
         if let Err(e) = axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -2404,5 +2443,25 @@ mod tests {
         let long = sanitize_log_line(&"x".repeat(TUNNEL_LOG_LINE_LIMIT + 100));
         assert_eq!(long.len(), TUNNEL_LOG_LINE_LIMIT);
         assert!(long.ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn mcp_mount_requires_untunneled_loopback_local_api_entrypoint() {
+        let mut access = RemoteAccessConfig::default();
+        let entrypoint = access.entrypoints[0].clone();
+        assert!(mcp_mount_allowed(&access, &entrypoint));
+
+        access.tunnels.push(RemoteTunnel {
+            id: "public".into(),
+            enabled: true,
+            target_entrypoint_id: entrypoint.id.clone(),
+            ..RemoteTunnel::default()
+        });
+        assert!(!mcp_mount_allowed(&access, &entrypoint));
+
+        access.tunnels.clear();
+        let mut lan = entrypoint;
+        lan.bind_host = "0.0.0.0".into();
+        assert!(!mcp_mount_allowed(&access, &lan));
     }
 }

@@ -44,6 +44,13 @@ async fn handle_provider<R: tauri::Runtime>(
         Ok(provider) => provider,
         Err(e) => return (StatusCode::NOT_FOUND, e.message).into_response(),
     };
+    if provider == MessagingProviderKind::Feishu {
+        return (
+            StatusCode::GONE,
+            "飞书 HTTP 回调已禁用；请在飞书开放平台启用官方长连接",
+        )
+            .into_response();
+    }
     merge_provider_query_headers(provider, &mut headers, uri.query());
     let runtime = ctx.app.state::<service::MessagingRuntime<R>>();
     match service::ingest(
@@ -165,6 +172,14 @@ pub fn messaging_integrations_list<R: tauri::Runtime>(
             allowed_conversation_ids: integration.allowed_conversation_ids,
         })
         .collect())
+}
+
+#[tauri::command]
+pub fn messaging_connection_statuses_list<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Vec<crate::model::FeishuConnectionStatus> {
+    app.state::<crate::messaging::feishu_long_connection::FeishuConnectionManager>()
+        .statuses()
 }
 
 #[cfg(test)]

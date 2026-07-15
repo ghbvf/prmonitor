@@ -1,11 +1,21 @@
 <script setup lang="ts">
+import { computed, onMounted, ref } from "vue";
 import type { AppConfig, MessagingIntegration } from "./types";
+import type { FeishuConnectionStatus } from "../types.generated";
 import { MESSAGING_PROVIDER_KINDS, type MessagingProviderKind } from "../types.generated";
 import { DEFAULT_MESSAGING_INTEGRATION } from "./defaults";
 import { normalizeStringList } from "./remoteAccessOps";
+import { getFeishuConnectionStatuses } from "./api";
+import FeishuConnectionStatusList from "../FeishuConnectionStatusList.vue";
 
 const props = defineProps<{ draft: AppConfig }>();
 const emit = defineEmits<{ edit: [] }>();
+const connectionStatuses = ref<FeishuConnectionStatus[]>([]);
+const connectionStatusesLoading = ref(false);
+const connectionStatusesError = ref<string | null>(null);
+const connectionStatusesStale = ref(false);
+const connectionStatusesLastUpdatedAt = ref<number | null>(null);
+const hasFeishu = computed(() => props.draft.messaging.integrations.some((item) => item.kind === "feishu"));
 
 const KIND_META: Record<MessagingProviderKind, { label: string; form: "feishu" | "weChatWork" | "dingTalk" }> = {
   feishu: { label: "飞书", form: "feishu" },
@@ -36,6 +46,7 @@ function newIntegration(kind: MessagingProviderKind = "feishu"): MessagingIntegr
 function addIntegration() {
   props.draft.messaging.integrations.push(newIntegration());
   emit("edit");
+  void refreshConnectionStatuses();
 }
 
 function removeIntegration(id: string) {
@@ -48,9 +59,46 @@ function onKind(integration: MessagingIntegration, event: Event) {
   const nextKind = (event.target as HTMLSelectElement).value as MessagingProviderKind;
   const shouldSyncName = !integration.name.trim() || integration.name.trim() === oldDefaultName;
   integration.kind = nextKind;
+  clearObsoleteFeishuCredentials(integration);
   if (shouldSyncName) integration.name = KIND_META[nextKind].label;
   emit("edit");
+  if (nextKind === "feishu") void refreshConnectionStatuses();
 }
+
+function clearObsoleteFeishuCredentials(integration: MessagingIntegration): boolean {
+  if (integration.kind !== "feishu") return false;
+  const changed = Boolean(integration.verificationToken || integration.encryptKey);
+  integration.verificationToken = "";
+  integration.encryptKey = "";
+  return changed;
+}
+
+async function refreshConnectionStatuses() {
+  connectionStatusesLoading.value = true;
+  connectionStatusesError.value = null;
+  try {
+    connectionStatuses.value = await getFeishuConnectionStatuses();
+    connectionStatusesStale.value = false;
+    connectionStatusesLastUpdatedAt.value = Date.now();
+  } catch (error) {
+    connectionStatusesError.value = error instanceof Error ? error.message : String(error);
+    connectionStatusesStale.value = connectionStatuses.value.length > 0;
+  } finally {
+    connectionStatusesLoading.value = false;
+  }
+}
+
+let clearedObsoleteCredentials = false;
+for (const integration of props.draft.messaging.integrations) {
+  clearedObsoleteCredentials = clearObsoleteFeishuCredentials(integration) || clearedObsoleteCredentials;
+}
+if (clearedObsoleteCredentials) {
+  emit("edit");
+}
+
+onMounted(() => {
+  if (hasFeishu.value) void refreshConnectionStatuses();
+});
 
 function setText(integration: MessagingIntegration, key: keyof MessagingIntegration, event: Event) {
   (integration as Record<string, unknown>)[key] = (event.target as HTMLInputElement).value;
@@ -88,6 +136,16 @@ function setAllowed(integration: MessagingIntegration, event: Event) {
     <div v-if="draft.messaging.integrations.length === 0" class="empty">
       暂无消息集成
     </div>
+
+    <FeishuConnectionStatusList
+      v-if="hasFeishu"
+      :statuses="connectionStatuses"
+      :loading="connectionStatusesLoading"
+      :error="connectionStatusesError"
+      :stale="connectionStatusesStale"
+      :last-updated-at="connectionStatusesLastUpdatedAt"
+      @refresh="refreshConnectionStatuses"
+    />
 
     <section
       v-for="integration in draft.messaging.integrations"
@@ -138,14 +196,6 @@ function setAllowed(integration: MessagingIntegration, event: Event) {
         </label>
 
         <template v-if="KIND_META[integration.kind].form === 'feishu'">
-          <label>
-            <span>Verification Token</span>
-            <input type="password" :value="integration.verificationToken" @input="setText(integration, 'verificationToken', $event)" />
-          </label>
-          <label>
-            <span>Encrypt Key</span>
-            <input type="password" :value="integration.encryptKey" @input="setText(integration, 'encryptKey', $event)" />
-          </label>
           <label>
             <span>App ID</span>
             <input type="password" :value="integration.appId" @input="setText(integration, 'appId', $event)" />

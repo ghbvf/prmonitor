@@ -28,6 +28,7 @@ quick-xml = "0.39"
 # its own `tokio::runtime` to drive the `reqwest` trigger/poll BEFORE any Tauri (and its runtime)
 # exists. The GUI path keeps using `tauri::async_runtime`.
 tokio = { version = "1", features = ["rt", "time", "sync", "macros", "process", "io-util", "net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 # Local webhook receiver (#9): a single `POST /webhook` endpoint bound to
 # 127.0.0.1, reached from the public internet via a Cloudflare Quick Tunnel
 # (`cloudflared` subprocess). axum is the idiomatic tokio HTTP server — its async
@@ -35,6 +36,9 @@ tokio = { version = "1", features = ["rt", "time", "sync", "macros", "process", 
 # sync→async bridging. `json` feature is unused (we read the raw body via the
 # `Bytes` extractor to HMAC-verify the GitHub `X-Hub-Signature-256` before parsing).
 axum = { version = "0.7", default-features = false, features = ["tokio", "http1"] }
+# Enforce the MCP request cap at the HTTP body layer. Axum's `DefaultBodyLimit` only affects
+# extractors and does not constrain rmcp's nested service when it calls `body.collect()` directly.
+tower-http = { version = "0.6", features = ["limit"] }
 # GitHub webhook HMAC-SHA256 signature verification (`X-Hub-Signature-256`).
 # `hmac::Mac::verify_slice` is constant-time. `hex` decodes the `sha256=<hex>` header.
 hmac = "0.12"
@@ -74,6 +78,13 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # `default-features = false` drops the default native-tls stack. Reuses the existing
 # tokio runtime (async reqwest), mirroring how gh/az run on tokio::process.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Feishu's official long-connection protocol is binary WebSocket frames encoded with protobuf.
+# These versions mirror the protocol/lifecycle implemented by larksuite/oapi-sdk-go ws/client.go.
+tokio-tungstenite = { version = "=0.30.0", features = ["rustls-tls-native-roots"] }
+prost = "=0.14.4"
+# The resident loopback MCP endpoint uses the official Rust SDK's Streamable HTTP transport.
+rmcp = { version = "=2.2.0", features = ["server", "schemars", "elicitation", "transport-streamable-http-server"] }
+schemars = "1"
 # Parse RFC-compliant HTTP-date `Retry-After` values for notification webhook backoff.
 httpdate = "1"
 # SMTP email notification adapter (AB#1459). Use tokio + rustls instead of native-tls/OpenSSL.

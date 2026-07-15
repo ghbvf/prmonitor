@@ -51,6 +51,60 @@ the change as pending until that resident process is stopped/restarted, exits na
 restarts. The removed `cloudflaredBin` setting is intentionally not migrated—configure
 `cliTools.cloudflaredPath` or leave it empty for automatic discovery.
 
+## Feishu long connection and Codex MCP
+
+Feishu inbound messages use the official long connection; no public callback URL or tunnel is
+required. Configure an enabled Feishu messaging integration with App ID, App Secret and at least
+one allowed conversation. In the Feishu developer console, enable the bot and subscribe to
+`im.message.receive_v1` plus the current `card.action.trigger` event. Do not run the development
+build and an installed build with the same Feishu credentials at the same time: Feishu distributes
+events across connections instead of broadcasting them.
+
+The settings and Messaging views show `disabled`, `connecting`, `connected`, `reconnecting`,
+`error`, or `stopped`, together with the last connection/event/error and reconnect count. The old
+Feishu HTTP webhook route returns `410 Gone`; WeCom and DingTalk continue using their HTTP inbound
+routes.
+
+The existing loopback Local API also serves a Streamable HTTP MCP endpoint at
+`http://127.0.0.1:8788/api/mcp`. The route is mounted only when the Local API entrypoint binds to a
+loopback address and no enabled tunnel targets that entrypoint. It uses the existing
+`localApiToken` bearer token, rejects non-loopback Host/Origin values, and is optional for Codex
+startup. A Codex user configuration can define it once and leave it disabled by default:
+
+```toml
+[mcp_servers.prmonitor_human]
+url = "http://127.0.0.1:8788/api/mcp"
+bearer_token_env_var = "PRMONITOR_LOCAL_API_TOKEN"
+enabled = false
+required = false
+startup_timeout_sec = 5
+tool_timeout_sec = 3900
+enabled_tools = ["ask_via_feishu"]
+default_tools_approval_mode = "approve"
+
+[mcp_servers.prmonitor_human.tools.ask_via_feishu]
+approval_mode = "approve"
+```
+
+Set `PRMONITOR_LOCAL_API_TOKEN` in the environment that launches Codex to the current
+prmonitor `localApiToken`. If an older configuration contains an `Authorization` entry in
+`http_headers`, remove that entry after migrating to `bearer_token_env_var`; do not print the
+token in shell history, logs, or diagnostic output. To rotate the credential, update
+`localApiToken`, update the launch environment, and restart prmonitor and Codex so neither process
+continues using the previous value.
+
+A trusted repository enables the inherited server with:
+
+```toml
+[mcp_servers.prmonitor_human]
+enabled = true
+```
+
+`ask_via_feishu` creates one durable request, sends a Feishu card, and opens a Codex elicitation.
+The first valid answer wins through a SQLite compare-and-set. Text fallbacks are
+`/answer Q-id <answer>` (multiple answers: `q1=A;q2=B`) and `/cancel Q-id`. Tool/sandbox
+permissions remain native Codex approvals and are never delegated to Feishu.
+
 ## Default branch
 
 The default branch is `develop`. Open PRs against `develop`.

@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from "vue";
 import { assertNever, outboxKindLabel, outboxStatusLabel } from "../types";
 import type { MessagingEventStatus } from "../types.generated";
 import { useMessagingStore } from "./useMessagingStore";
+import FeishuConnectionStatusList from "../FeishuConnectionStatusList.vue";
 
 const store = useMessagingStore();
 const rawOpen = ref<Set<number>>(new Set());
@@ -66,6 +67,7 @@ function replayDisabled(entry: { id: number; status: MessagingEventStatus }): bo
 
 onMounted(() => {
   void store.refreshIntegrations();
+  void store.refreshConnectionStatuses();
   void store.refresh();
   void store.refreshSends();
 });
@@ -112,6 +114,15 @@ function sendTest() {
       <span>{{ store.error }}</span>
       <button type="button" class="dismiss" aria-label="关闭 / dismiss" @click="store.error = null">x</button>
     </p>
+
+    <FeishuConnectionStatusList
+      :statuses="store.connectionStatuses"
+      :loading="store.connectionStatusesLoading"
+      :error="store.connectionStatusesError"
+      :stale="store.connectionStatusesStale"
+      :last-updated-at="store.connectionStatusesLastUpdatedAt"
+      @refresh="store.refreshConnectionStatuses()"
+    />
 
     <form class="send-form" @submit.prevent="sendTest">
       <select v-model="sendDraft.integrationId">

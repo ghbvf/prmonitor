@@ -21,13 +21,14 @@ use crate::{
     model::{
         ActionStatus, ClaudeEffort, CliResolutionSource, CliTool, CodexReasoningEffort, EngineKind,
         EventEnvelope, EventPayload, EventSubject, EventType, ExternalRequestId,
-        ExternalTriggerOrigin, InboxDedupeKey, InboxEventId, LabelSource, MessagingEvent,
-        MessagingEventEntry, MessagingEventStatus, MessagingIntegrationOption,
-        MessagingProviderCapability, MessagingProviderKind, MessagingReplyAudit, NotificationKind,
-        NotificationLevel, OutboxProducerKey, PullRequestView, ReviewActionKey, ReviewKind,
-        ReviewLifecycleEvent, ReviewReceiptId, ReviewReceiptSnapshot, ReviewReceiptStatus,
-        SendMessagingRequest, SendMessagingResponse, SendNotificationRequest,
-        SendNotificationResponse, SourceKind, UpdateMode, WebhookTunnelMode,
+        ExternalTriggerOrigin, FeishuConnectionState, FeishuConnectionStatus, InboxDedupeKey,
+        InboxEventId, LabelSource, MessagingEvent, MessagingEventEntry, MessagingEventStatus,
+        MessagingIntegrationOption, MessagingProviderCapability, MessagingProviderKind,
+        MessagingReplyAudit, NotificationKind, NotificationLevel, OutboxProducerKey,
+        PullRequestView, ReviewActionKey, ReviewKind, ReviewLifecycleEvent, ReviewReceiptId,
+        ReviewReceiptSnapshot, ReviewReceiptStatus, SendMessagingRequest, SendMessagingResponse,
+        SendNotificationRequest, SendNotificationResponse, SourceKind, UpdateMode,
+        WebhookTunnelMode,
     },
     remote::status::{
         RemoteAccessRuntimeStatus, RemoteEntrypointRuntimeStatus, RemoteEntrypointState,
@@ -228,6 +229,13 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push_str(&declaration::<MessagingProviderCapability>(&cfg));
     shared.push('\n');
     shared.push_str(&declaration::<MessagingIntegrationOption>(&cfg));
+    shared.push('\n');
+    shared.push_str(&declaration::<FeishuConnectionState>(&cfg));
+    shared.push_str(&option_array::<FeishuConnectionState>(
+        "FEISHU_CONNECTION_STATES",
+    ));
+    shared.push('\n');
+    shared.push_str(&declaration::<FeishuConnectionStatus>(&cfg));
     shared.push('\n');
     shared.push_str(&declaration::<MessagingEvent>(&cfg));
     shared.push('\n');

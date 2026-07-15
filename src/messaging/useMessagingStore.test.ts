@@ -8,6 +8,7 @@ vi.mock("./api", () => ({
   messagingEventRaw: vi.fn(() => Promise.resolve("{}")),
   messagingEventReplay: vi.fn(() => Promise.resolve()),
   messagingIntegrationsList: vi.fn(() => Promise.resolve([])),
+  messagingConnectionStatusesList: vi.fn(() => Promise.resolve([])),
   messagingSend: vi.fn(() => Promise.resolve({ outboxId: 9 })),
   messagingSendsList: vi.fn(() => Promise.resolve([])),
 }));
@@ -62,6 +63,7 @@ beforeEach(() => {
   vi.mocked(api.messagingEventRaw).mockResolvedValue("{}");
   vi.mocked(api.messagingEventReplay).mockResolvedValue(undefined);
   vi.mocked(api.messagingIntegrationsList).mockResolvedValue([]);
+  vi.mocked(api.messagingConnectionStatusesList).mockResolvedValue([]);
   vi.mocked(api.messagingSend).mockResolvedValue({ outboxId: 9 });
   vi.mocked(api.messagingSendsList).mockResolvedValue([]);
 });
@@ -77,6 +79,52 @@ describe("useMessagingStore refreshIntegrations()", () => {
     expect(store.integrations).toEqual([integrationOption()]);
     expect(store.integrationsLoading).toBe(false);
     expect(store.error).toBeNull();
+  });
+});
+
+describe("useMessagingStore refreshConnectionStatuses()", () => {
+  it("loads Feishu long-connection health independently from message events", async () => {
+    const statuses = [{
+      integrationId: "feishu-main",
+      status: "reconnecting" as const,
+      lastConnectedAtEpoch: 1_700_000_000,
+      lastEventAtEpoch: 1_700_000_100,
+      lastError: "socket closed",
+      reconnectCount: 3,
+    }];
+    vi.mocked(api.messagingConnectionStatusesList).mockResolvedValueOnce(statuses);
+    const store = useMessagingStore();
+
+    await store.refreshConnectionStatuses();
+
+    expect(api.messagingConnectionStatusesList).toHaveBeenCalledOnce();
+    expect(store.connectionStatuses).toEqual(statuses);
+    expect(store.connectionStatusesStale).toBe(false);
+    expect(store.connectionStatusesLastUpdatedAt).not.toBeNull();
+    expect(store.connectionStatusesLoading).toBe(false);
+    expect(store.connectionStatusesError).toBeNull();
+  });
+
+  it("does not replace the last known health snapshot on refresh failure", async () => {
+    vi.mocked(api.messagingConnectionStatusesList).mockRejectedValueOnce(new Error("offline"));
+    const store = useMessagingStore();
+    store.connectionStatusesLastUpdatedAt = 123;
+    store.connectionStatuses = [{
+      integrationId: "feishu-main",
+      status: "connected",
+      lastConnectedAtEpoch: 1,
+      lastEventAtEpoch: null,
+      lastError: null,
+      reconnectCount: 0,
+    }];
+
+    await store.refreshConnectionStatuses();
+
+    expect(store.connectionStatuses[0]?.status).toBe("connected");
+    expect(store.connectionStatusesError).toBe("offline");
+    expect(store.connectionStatusesStale).toBe(true);
+    expect(store.connectionStatusesLastUpdatedAt).toBe(123);
+    expect(store.connectionStatusesLoading).toBe(false);
   });
 });
 

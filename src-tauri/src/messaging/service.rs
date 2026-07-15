@@ -1,6 +1,7 @@
 //! Messaging ingress + command processing (#1559).
 
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use axum::http::HeaderMap;
 use sha2::{Digest, Sha256};
@@ -80,6 +81,102 @@ pub struct MessagingRuntime<R: Runtime> {
     pub actions: Arc<dyn MessagingActions<R>>,
 }
 
+/// Single-consumer durable ingress pump. Producers only insert + notify; the database is the queue,
+/// so crashes lose no accepted delivery and a burst never creates an unbounded task set.
+#[derive(Default)]
+pub struct MessagingEventWorker {
+    notify: Arc<tokio::sync::Notify>,
+    cancel: tokio_util::sync::CancellationToken,
+    task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
+}
+
+impl MessagingEventWorker {
+    pub fn start(&self, app: tauri::AppHandle<tauri::Wry>) {
+        let mut slot = self.task.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.is_some() {
+            return;
+        }
+        let notify = self.notify.clone();
+        let cancel = self.cancel.clone();
+        *slot = Some(tauri::async_runtime::spawn(async move {
+            loop {
+                if let Err(error) = drain_received(&app).await {
+                    eprintln!("messaging received drain failed: {}", error.message);
+                }
+                tokio::select! { _ = cancel.cancelled() => break, _ = notify.notified() => {} }
+            }
+        }));
+    }
+
+    pub fn wake(&self) {
+        self.notify.notify_one();
+    }
+
+    pub fn shutdown(&self) {
+        self.cancel.cancel();
+        if let Some(task) = self.task.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            task.abort();
+        }
+    }
+}
+
+async fn drain_received<R: Runtime>(app: &tauri::AppHandle<R>) -> AppResult<()> {
+    let db = app.state::<Database>();
+    let runtime = app.state::<MessagingRuntime<R>>();
+    loop {
+        let ids = store::received_ids(db.inner())?;
+        if ids.is_empty() {
+            break;
+        }
+        for id in ids {
+            let Some(entry) = store::get_entry(db.inner(), id)? else {
+                continue;
+            };
+            let integration =
+                match config_service::messaging_integration(app, &entry.event.integration_id) {
+                    Ok(value) if value.enabled && value.kind == entry.event.provider => value,
+                    Ok(value) if value.enabled => {
+                        store::mark_failed(
+                            db.inner(),
+                            id,
+                            "消息集成 provider 已变更，拒绝处理旧事件",
+                            store::now_epoch(),
+                        )?;
+                        continue;
+                    }
+                    Ok(_) => {
+                        store::mark_failed(
+                            db.inner(),
+                            id,
+                            "消息集成已禁用，无法处理持久化事件",
+                            store::now_epoch(),
+                        )?;
+                        continue;
+                    }
+                    Err(error) => {
+                        store::mark_failed(
+                            db.inner(),
+                            id,
+                            &format!("消息集成不可用: {}", error.message),
+                            store::now_epoch(),
+                        )?;
+                        continue;
+                    }
+                };
+            let _ = process_and_mark(
+                app,
+                runtime.actions.as_ref(),
+                db.inner(),
+                id,
+                &integration,
+                &entry.event,
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestResponse {
     Challenge { challenge: String },
@@ -90,6 +187,13 @@ pub enum IngestResponse {
 enum MessagingCommand {
     Help,
     Status,
+    Answer {
+        request_id: String,
+        value: String,
+    },
+    Cancel {
+        request_id: String,
+    },
     Review {
         reference: String,
         pr_number: u64,
@@ -153,6 +257,65 @@ pub async fn ingest<R: Runtime>(
     }
 }
 
+/// Verified long-connection ingress funnel. The caller holds its generation fence while this
+/// function re-reads current configuration and commits the durable delivery.
+pub(crate) fn persist_verified_long_connection_event<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    connected_integration: &MessagingIntegration,
+    event: &MessagingEvent,
+) -> AppResult<()> {
+    let current = config_service::messaging_integration(app, &connected_integration.id)?;
+    validate_long_connection_event(&current, connected_integration, event)?;
+    let db = app.state::<Database>();
+    if let store::DedupInsert::Inserted(_) = store::insert_dedup(db.inner(), event)? {
+        app.state::<MessagingEventWorker>().wake();
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_current_feishu_long_connection<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    connected: &MessagingIntegration,
+) -> AppResult<()> {
+    let current = config_service::messaging_integration(app, &connected.id)?;
+    validate_long_connection_integration(&current, connected)
+}
+
+fn validate_long_connection_event(
+    current: &MessagingIntegration,
+    connected: &MessagingIntegration,
+    event: &MessagingEvent,
+) -> AppResult<()> {
+    validate_long_connection_integration(current, connected)?;
+    if event.provider != MessagingProviderKind::Feishu || event.integration_id != current.id {
+        return Err(AppError::new("飞书长连接事件 provider 不匹配"));
+    }
+    Ok(())
+}
+
+fn validate_long_connection_integration(
+    current: &MessagingIntegration,
+    connected: &MessagingIntegration,
+) -> AppResult<()> {
+    if !current.enabled {
+        return Err(AppError::new("飞书消息集成已禁用，拒绝长连接事件"));
+    }
+    if current.kind != MessagingProviderKind::Feishu
+        || connected.kind != MessagingProviderKind::Feishu
+        || connected.id != current.id
+    {
+        return Err(AppError::new("飞书长连接事件 provider 不匹配"));
+    }
+    let current_snapshot = serde_json::to_vec(current)
+        .map_err(|error| AppError::new(format!("当前消息集成配置序列化失败: {error}")))?;
+    let connected_snapshot = serde_json::to_vec(connected)
+        .map_err(|error| AppError::new(format!("长连接消息集成配置序列化失败: {error}")))?;
+    if current_snapshot != connected_snapshot {
+        return Err(AppError::new("飞书长连接配置 generation 已失效"));
+    }
+    Ok(())
+}
+
 fn delivery_should_process(dedup: &store::DedupInsert) -> bool {
     match dedup {
         store::DedupInsert::Inserted(_) => true,
@@ -174,6 +337,9 @@ pub async fn replay<R: Runtime>(
             "messagingIntegrationId 已禁用: {}",
             integration.id
         )));
+    }
+    if integration.kind != entry.event.provider {
+        return Err(AppError::new("messagingEvent provider 与当前集成不匹配"));
     }
     ensure_replay_allowed(entry.status)?;
     process_and_mark(app, actions, db.inner(), id, &integration, &entry.event).await
@@ -391,9 +557,6 @@ async fn process_event<R: Runtime>(
     integration: &MessagingIntegration,
     event: &MessagingEvent,
 ) -> AppResult<ProcessingOutcome> {
-    if integration.require_mention && !event.mentioned_bot {
-        return Ok(ProcessingOutcome::default());
-    }
     if !conversation_allowed(integration, &event.conversation_id) {
         let reply = enqueue_reply(
             actions,
@@ -405,7 +568,14 @@ async fn process_event<R: Runtime>(
         )?;
         return Ok(ProcessingOutcome::with_reply(reply));
     }
-    let command = match parse_command(&event.text) {
+    let parsed = parse_command(&event.text);
+    if integration.require_mention
+        && !event.mentioned_bot
+        && !parsed.as_ref().is_ok_and(command_allowed_without_mention)
+    {
+        return Ok(ProcessingOutcome::default());
+    }
+    let command = match parsed {
         Ok(command) => command,
         Err(e) => {
             let reply = enqueue_reply(
@@ -435,6 +605,102 @@ async fn process_event<R: Runtime>(
             let status = passive_status(app)?;
             let reply =
                 enqueue_reply(actions, app, integration, event, ReplyKind::Status, &status)?;
+            Ok(ProcessingOutcome::with_reply(reply))
+        }
+        MessagingCommand::Answer { request_id, value } => {
+            let db = app.state::<Database>();
+            let broker = app.state::<crate::messaging::human_input::HumanInputBroker>();
+            let request = crate::messaging::human_input::get(db.inner(), &request_id)?
+                .ok_or_else(|| AppError::new(format!("人工输入请求不存在: {request_id}")))?;
+            if request.integration_id != integration.id
+                || request.conversation_id != event.conversation_id
+            {
+                return Err(AppError::new("人工输入请求不属于当前集成/会话"));
+            }
+            let mut answers = value
+                .split(';')
+                .filter_map(|part| {
+                    let (question_id, answer) = part.split_once('=')?;
+                    request
+                        .questions
+                        .iter()
+                        .any(|question| question.id == question_id.trim())
+                        .then(|| crate::messaging::human_input::HumanAnswer {
+                            question_id: question_id.trim().to_string(),
+                            answer: answer.trim().to_string(),
+                        })
+                })
+                .collect::<Vec<_>>();
+            if answers.is_empty() {
+                let question_id = request
+                    .questions
+                    .first()
+                    .map(|q| q.id.clone())
+                    .unwrap_or_else(|| "q1".into());
+                answers.push(crate::messaging::human_input::HumanAnswer {
+                    question_id,
+                    answer: value,
+                });
+            }
+            let outcome = crate::messaging::human_input::answer(
+                db.inner(),
+                broker.inner(),
+                &request_id,
+                &answers,
+                crate::messaging::human_input::HumanAnswerSource::Feishu,
+                store::now_epoch(),
+            )?;
+            let text = match outcome {
+                crate::messaging::human_input::AnswerOutcome::Won => {
+                    "已提交，Codex 将继续执行。".to_string()
+                }
+                crate::messaging::human_input::AnswerOutcome::AlreadyAnswered { source } => {
+                    format!(
+                        "该问题已由 {} 回答。",
+                        source
+                            .map(|source| source.to_string())
+                            .unwrap_or_else(|| "其他通道".into())
+                    )
+                }
+            };
+            let reply = enqueue_reply(
+                actions,
+                app,
+                integration,
+                event,
+                ReplyKind::HumanInput,
+                &text,
+            )?;
+            Ok(ProcessingOutcome::with_reply(reply))
+        }
+        MessagingCommand::Cancel { request_id } => {
+            let db = app.state::<Database>();
+            let broker = app.state::<crate::messaging::human_input::HumanInputBroker>();
+            let request = crate::messaging::human_input::get(db.inner(), &request_id)?
+                .ok_or_else(|| AppError::new(format!("人工输入请求不存在: {request_id}")))?;
+            if request.integration_id != integration.id
+                || request.conversation_id != event.conversation_id
+            {
+                return Err(AppError::new("人工输入请求不属于当前集成/会话"));
+            }
+            let cancelled = crate::messaging::human_input::cancel(
+                db.inner(),
+                broker.inner(),
+                &request_id,
+                store::now_epoch(),
+            )?;
+            let reply = enqueue_reply(
+                actions,
+                app,
+                integration,
+                event,
+                ReplyKind::HumanInput,
+                if cancelled {
+                    "已取消人工输入请求。"
+                } else {
+                    "该请求已结束，无法取消。"
+                },
+            )?;
             Ok(ProcessingOutcome::with_reply(reply))
         }
         MessagingCommand::Review {
@@ -528,6 +794,27 @@ fn parse_command(text: &str) -> AppResult<MessagingCommand> {
     match command {
         "/help" => Ok(MessagingCommand::Help),
         "/status" => Ok(MessagingCommand::Status),
+        "/answer" => {
+            let request_id = parts
+                .next()
+                .ok_or_else(|| AppError::new("/answer 需要 Q-id"))?
+                .to_string();
+            let value = parts.collect::<Vec<_>>().join(" ");
+            if value.trim().is_empty() {
+                return Err(AppError::new("/answer 需要答案"));
+            }
+            Ok(MessagingCommand::Answer { request_id, value })
+        }
+        "/cancel" => {
+            let request_id = parts
+                .next()
+                .ok_or_else(|| AppError::new("/cancel 需要 Q-id"))?
+                .to_string();
+            if parts.next().is_some() {
+                return Err(AppError::new("/cancel 只接受一个 Q-id"));
+            }
+            Ok(MessagingCommand::Cancel { request_id })
+        }
         "/review" => {
             let reference = parts
                 .next()
@@ -562,6 +849,13 @@ fn parse_command(text: &str) -> AppResult<MessagingCommand> {
     }
 }
 
+fn command_allowed_without_mention(command: &MessagingCommand) -> bool {
+    matches!(
+        command,
+        MessagingCommand::Answer { .. } | MessagingCommand::Cancel { .. }
+    )
+}
+
 fn passive_status<R: Runtime>(app: &tauri::AppHandle<R>) -> AppResult<String> {
     let cfg = config_service::load(app)?;
     let state = app.state::<AppState>();
@@ -583,7 +877,7 @@ fn passive_status<R: Runtime>(app: &tauri::AppHandle<R>) -> AppResult<String> {
 }
 
 fn help_text() -> &'static str {
-    "可用命令：\n/help\n/status\n/review <project|repo> <pr-number> [--check]"
+    "可用命令：\n/help\n/status\n/review <project|repo> <pr-number> [--check]\n/answer <Q-id> <答案>\n/cancel <Q-id>"
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -594,6 +888,7 @@ enum ReplyKind {
     Status,
     ReviewQueued,
     ReviewFailed,
+    HumanInput,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -620,6 +915,7 @@ impl ReplyKind {
             ReplyKind::Status => "status",
             ReplyKind::ReviewQueued => "review-queued",
             ReplyKind::ReviewFailed => "review-failed",
+            ReplyKind::HumanInput => "human-input",
         }
     }
 }
@@ -700,6 +996,47 @@ mod tests {
             MessagingCommand::Status
         );
         assert!(parse_command("review repo 1").is_err());
+    }
+
+    #[test]
+    fn human_input_recovery_commands_bypass_mention_gate_only() {
+        assert!(command_allowed_without_mention(
+            &parse_command("/answer Q-1 yes").unwrap()
+        ));
+        assert!(command_allowed_without_mention(
+            &parse_command("/cancel Q-1").unwrap()
+        ));
+        assert!(!command_allowed_without_mention(
+            &parse_command("/status").unwrap()
+        ));
+    }
+
+    #[test]
+    fn long_connection_event_rejects_provider_replacement() {
+        let connected = MessagingIntegration {
+            id: "fs".into(),
+            enabled: true,
+            ..MessagingIntegration::feishu_default()
+        };
+        let mut current = connected.clone();
+        let event = MessagingEvent {
+            provider: MessagingProviderKind::Feishu,
+            integration_id: "fs".into(),
+            event_id: "evt".into(),
+            conversation_id: "chat".into(),
+            thread_id: "msg".into(),
+            sender_id: "u".into(),
+            text: "/help".into(),
+            mentioned_bot: true,
+            raw_payload: "{}".into(),
+            received_at_epoch: 1,
+        };
+        assert!(validate_long_connection_event(&current, &connected, &event).is_ok());
+        current.app_secret = "rotated".into();
+        assert!(validate_long_connection_event(&current, &connected, &event).is_err());
+        current = connected.clone();
+        current.kind = MessagingProviderKind::DingTalk;
+        assert!(validate_long_connection_event(&current, &connected, &event).is_err());
     }
 
     #[test]
@@ -835,6 +1172,80 @@ mod tests {
         ) -> AppResult<ReviewReceiptId> {
             Err(AppError::new("review boom"))
         }
+    }
+
+    #[tokio::test]
+    async fn durable_worker_drains_multiple_pages_and_terminalizes_missing_integration() {
+        let app = tauri::test::mock_app();
+        let db = Database::open_in_memory().expect("open");
+        let config = serde_json::json!({
+            "projects": [],
+            "activeProjectId": "",
+            "messaging": { "integrations": [{
+                "id": "fs", "name": "Feishu", "kind": "feishu", "enabled": true,
+                "appId": "cli_test", "appSecret": "secret", "botOpenId": "bot",
+                "allowedConversationIds": ["chat"], "requireMention": true
+            }]}
+        });
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT OR REPLACE INTO config_blob (id, json) VALUES (1, ?1)",
+                [config.to_string()],
+            )?;
+            Ok(())
+        })
+        .expect("seed config");
+        for index in 0..501 {
+            let event = MessagingEvent {
+                provider: MessagingProviderKind::Feishu,
+                integration_id: "fs".into(),
+                event_id: format!("evt-{index}"),
+                conversation_id: "chat".into(),
+                thread_id: format!("msg-{index}"),
+                sender_id: "u".into(),
+                text: "/help".into(),
+                mentioned_bot: false,
+                raw_payload: "{}".into(),
+                received_at_epoch: 1,
+            };
+            store::insert_dedup(&db, &event).expect("insert");
+        }
+        let missing = MessagingEvent {
+            provider: MessagingProviderKind::Feishu,
+            integration_id: "missing".into(),
+            event_id: "evt-missing".into(),
+            conversation_id: "chat".into(),
+            thread_id: "msg-missing".into(),
+            sender_id: "u".into(),
+            text: "/help".into(),
+            mentioned_bot: false,
+            raw_payload: "{}".into(),
+            received_at_epoch: 1,
+        };
+        let missing_id = match store::insert_dedup(&db, &missing).expect("insert") {
+            store::DedupInsert::Inserted(id) => id,
+            store::DedupInsert::Existing(_) => panic!("new event"),
+        };
+        app.manage(db);
+        app.manage(MessagingRuntime::<tauri::test::MockRuntime> {
+            actions: Arc::new(FailingReviewActions {
+                enqueued: AtomicUsize::new(0),
+            }),
+        });
+
+        drain_received(app.handle()).await.expect("drain");
+
+        let db = app.state::<Database>();
+        assert!(store::received_ids(db.inner())
+            .expect("received")
+            .is_empty());
+        assert_eq!(
+            store::get_entry(db.inner(), missing_id)
+                .expect("get")
+                .expect("entry")
+                .status,
+            MessagingEventStatus::Failed
+        );
     }
 
     #[tokio::test]

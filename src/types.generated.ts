@@ -100,6 +100,11 @@ export type MessagingProviderCapability = { provider: MessagingProviderKind, sup
 
 export type MessagingIntegrationOption = { id: string, name: string, kind: MessagingProviderKind, allowedConversationIds: Array<string>, };
 
+export type FeishuConnectionState = "disabled" | "connecting" | "connected" | "reconnecting" | "error" | "stopped";
+export const FEISHU_CONNECTION_STATES = ["disabled","connecting","connected","reconnecting","error","stopped"] as const;
+
+export type FeishuConnectionStatus = { integrationId: string, status: FeishuConnectionState, lastConnectedAtEpoch: number | null, lastEventAtEpoch: number | null, lastError: string | null, reconnectCount: number, };
+
 export type MessagingEvent = { provider: MessagingProviderKind, integrationId: string, eventId: string, conversationId: string, threadId: string, senderId: string, text: string, mentionedBot: boolean, rawPayload: string, receivedAtEpoch: number, };
 
 export type MessagingReplyAudit = { outboxId: number, kind: string, summary: string, status: ActionStatus | null, error: string | null, };

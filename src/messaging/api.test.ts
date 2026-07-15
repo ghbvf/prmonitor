@@ -11,6 +11,7 @@ import {
   messagingEventReplay,
   messagingEventsList,
   messagingIntegrationsList,
+  messagingConnectionStatusesList,
   messagingSend,
   messagingSendsList,
 } from "./api";
@@ -33,6 +34,7 @@ describe("messaging api wrappers", () => {
     await messagingEventReplay(7);
     await messagingSendsList("fs");
     await messagingIntegrationsList();
+    await messagingConnectionStatusesList();
 
     expect(request).toHaveBeenNthCalledWith(1, "messaging_send", {
       request: {
@@ -47,5 +49,6 @@ describe("messaging api wrappers", () => {
     expect(request).toHaveBeenNthCalledWith(4, "messaging_event_replay", { id: 7 });
     expect(request).toHaveBeenNthCalledWith(5, "messaging_sends_list", { integrationId: "fs" });
     expect(request).toHaveBeenNthCalledWith(6, "messaging_integrations_list");
+    expect(request).toHaveBeenNthCalledWith(7, "messaging_connection_statuses_list");
   });
 });

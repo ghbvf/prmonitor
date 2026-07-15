@@ -18,6 +18,44 @@ use crate::model::{
 pub struct FeishuProvider;
 
 const MAX_SIGNATURE_AGE_SECS: i64 = 5 * 60;
+const FEISHU_BASE_URL: &str = "https://open.feishu.cn";
+
+pub(crate) fn build_feishu_http_client(
+    integration: &MessagingIntegration,
+) -> AppResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(
+            integration.timeout_secs.clamp(1, 300),
+        ))
+        .build()
+        .map_err(|error| AppError::new(format!("飞书 HTTP client 初始化失败: {error}")))
+}
+
+struct FeishuApiClient {
+    client: reqwest::Client,
+    token: String,
+}
+
+impl FeishuApiClient {
+    async fn authenticate(integration: &MessagingIntegration) -> AppResult<Self> {
+        let client = build_feishu_http_client(integration)?;
+        let token = tenant_access_token(&client, integration).await?;
+        Ok(Self { client, token })
+    }
+
+    fn post(&self, path: &str) -> reqwest::RequestBuilder {
+        self.client
+            .post(format!("{FEISHU_BASE_URL}{path}"))
+            .bearer_auth(&self.token)
+    }
+
+    fn patch(&self, path: &str) -> reqwest::RequestBuilder {
+        self.client
+            .patch(format!("{FEISHU_BASE_URL}{path}"))
+            .bearer_auth(&self.token)
+    }
+}
 
 impl FeishuProvider {
     fn verify_url_challenge(
@@ -101,10 +139,12 @@ impl MessagingProvider for FeishuProvider {
     ) -> AppResult<MessagingEvent> {
         let envelope: FeishuEnvelope = serde_json::from_slice(raw)
             .map_err(|e| AppError::new(format!("飞书事件 JSON 解析失败: {e}")))?;
-        if !constant_time_eq(
-            envelope.header.token.trim(),
-            integration.verification_token.trim(),
-        ) {
+        if !integration.verification_token.trim().is_empty()
+            && !constant_time_eq(
+                envelope.header.token.trim(),
+                integration.verification_token.trim(),
+            )
+        {
             return Err(AppError::new("飞书事件 token 校验失败"));
         }
         if envelope.header.event_type != "im.message.receive_v1" {
@@ -210,18 +250,12 @@ async fn reply_message(
     target: &MessagingReplyTarget,
     text: &str,
 ) -> AppResult<ActionExecutionResult> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(integration.timeout_secs))
-        .build()
-        .map_err(|e| AppError::new(format!("飞书 HTTP client 初始化失败: {e}")))?;
-    let token = tenant_access_token(&client, integration).await?;
-    let url = format!(
-        "https://open.feishu.cn/open-apis/im/v1/messages/{}/reply",
-        target.message_id
-    );
-    let resp = client
-        .post(url)
-        .bearer_auth(token)
+    let api = FeishuApiClient::authenticate(integration).await?;
+    let resp = api
+        .post(&format!(
+            "/open-apis/im/v1/messages/{}/reply",
+            target.message_id
+        ))
         .json(&json!({
             "msg_type": "text",
             "content": serde_json::to_string(&json!({ "text": text })).expect("text content serializes"),
@@ -237,15 +271,10 @@ async fn send_message(
     conversation_id: &str,
     text: &str,
 ) -> AppResult<ActionExecutionResult> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(integration.timeout_secs))
-        .build()
-        .map_err(|e| AppError::new(format!("飞书 HTTP client 初始化失败: {e}")))?;
-    let token = tenant_access_token(&client, integration).await?;
-    let resp = client
-        .post("https://open.feishu.cn/open-apis/im/v1/messages")
+    let api = FeishuApiClient::authenticate(integration).await?;
+    let resp = api
+        .post("/open-apis/im/v1/messages")
         .query(&[("receive_id_type", "chat_id")])
-        .bearer_auth(token)
         .json(&json!({
             "receive_id": conversation_id,
             "msg_type": "text",
@@ -255,6 +284,123 @@ async fn send_message(
         .await
         .map_err(|e| AppError::new(format!("飞书发送消息请求失败: {e}")))?;
     classify_feishu_response(resp, "飞书发送消息").await
+}
+
+/// Sends an interactive human-input card and returns Feishu's message id so the winner can close
+/// the other channel's UI. The card action value carries only the durable request/question ids.
+pub async fn send_human_input_card(
+    integration: &MessagingIntegration,
+    conversation_id: &str,
+    request: &crate::messaging::human_input::HumanInputRequest,
+) -> AppResult<String> {
+    let api = FeishuApiClient::authenticate(integration).await?;
+    let card = human_input_card(request, false);
+    let resp = api.post("/open-apis/im/v1/messages")
+        .query(&[("receive_id_type", "chat_id")])
+        .json(&json!({"receive_id": conversation_id, "msg_type": "interactive", "content": serde_json::to_string(&card).expect("card serializes")}))
+        .send().await.map_err(|e| AppError::new(format!("飞书发送问答卡片失败: {e}")))?;
+    #[derive(Deserialize)]
+    struct Response {
+        code: i64,
+        msg: String,
+        data: Option<ResponseData>,
+    }
+    #[derive(Deserialize)]
+    struct ResponseData {
+        message_id: String,
+    }
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(AppError::new(format!("飞书发送问答卡片 HTTP {status}")));
+    }
+    let body: Response = resp
+        .json()
+        .await
+        .map_err(|e| AppError::new(format!("飞书问答卡片响应损坏: {e}")))?;
+    if body.code != 0 {
+        return Err(AppError::new(format!("飞书发送问答卡片失败: {}", body.msg)));
+    }
+    body.data
+        .map(|data| data.message_id)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| AppError::new("飞书问答卡片响应缺少 message_id"))
+}
+
+pub async fn update_human_input_card(
+    integration: &MessagingIntegration,
+    message_id: &str,
+    request: &crate::messaging::human_input::HumanInputRequest,
+) -> AppResult<()> {
+    let api = FeishuApiClient::authenticate(integration).await?;
+    let resp = api.patch(&format!("/open-apis/im/v1/messages/{message_id}"))
+        .json(&json!({"content": serde_json::to_string(&human_input_card(request, true)).expect("card serializes")}))
+        .send().await.map_err(|e| AppError::new(format!("飞书更新问答卡片失败: {e}")))?;
+    let status = resp.status();
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| AppError::new(format!("飞书更新问答卡片响应读取失败: {e}")))?;
+    validate_card_update_response(status, &body)
+}
+
+fn validate_card_update_response(status: reqwest::StatusCode, raw: &[u8]) -> AppResult<()> {
+    if !status.is_success() {
+        return Err(AppError::new(format!("飞书更新问答卡片 HTTP {status}")));
+    }
+    #[derive(Deserialize)]
+    struct Response {
+        code: i64,
+        #[serde(default)]
+        msg: String,
+    }
+    let body: Response = serde_json::from_slice(raw)
+        .map_err(|e| AppError::new(format!("飞书更新问答卡片响应损坏: {e}")))?;
+    if body.code != 0 {
+        return Err(AppError::new(format!(
+            "飞书更新问答卡片失败（{}）：{}",
+            body.code, body.msg
+        )));
+    }
+    Ok(())
+}
+
+fn human_input_card(
+    request: &crate::messaging::human_input::HumanInputRequest,
+    terminal: bool,
+) -> Value {
+    let mut elements = vec![
+        json!({"tag":"markdown", "content": format!("{}\n\n`{}`", request.message, request.id)}),
+    ];
+    if terminal {
+        elements.push(json!({"tag":"note", "elements":[{"tag":"plain_text", "content": format!("已结束：{}", request.answer_source.as_deref().unwrap_or(&request.status))}]}));
+    } else {
+        for question in &request.questions {
+            elements
+                .push(json!({"tag":"markdown", "content": format!("**{}**", question.question)}));
+            if question.options.is_empty() || request.questions.len() > 1 {
+                let option_hint = if question.options.is_empty() {
+                    String::new()
+                } else {
+                    format!(" 可选：{}。", question.options.join(" / "))
+                };
+                let answer_syntax = request
+                    .questions
+                    .iter()
+                    .map(|item| format!("{}=<答案>", item.id))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                elements.push(json!({"tag":"note", "elements":[{"tag":"plain_text", "content": format!("回复 /answer {} {}", request.id, answer_syntax)}]}));
+                if !option_hint.is_empty() {
+                    elements.push(json!({"tag":"note", "elements":[{"tag":"plain_text", "content": option_hint}]}));
+                }
+            } else {
+                let actions = question.options.iter().map(|option| json!({"tag":"button", "text":{"tag":"plain_text","content":option}, "type":"primary", "value":{"requestId":request.id,"questionId":question.id,"answer":option}})).collect::<Vec<_>>();
+                elements.push(json!({"tag":"action", "actions":actions}));
+            }
+        }
+        elements.push(json!({"tag":"action", "actions":[{"tag":"button","text":{"tag":"plain_text","content":"取消"},"type":"danger","value":{"requestId":request.id,"questionId":"__cancel__","answer":"__cancel__"}}]}));
+    }
+    json!({"config":{"wide_screen_mode":true,"update_multi":true}, "header":{"template": if terminal {"grey"} else {"blue"}, "title":{"tag":"plain_text","content":request.title}}, "elements":elements})
 }
 
 async fn tenant_access_token(
@@ -268,7 +414,9 @@ async fn tenant_access_token(
         tenant_access_token: Option<String>,
     }
     let resp = client
-        .post("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal")
+        .post(format!(
+            "{FEISHU_BASE_URL}/open-apis/auth/v3/tenant_access_token/internal"
+        ))
         .json(&json!({
             "app_id": integration.app_id,
             "app_secret": integration.app_secret,
@@ -387,6 +535,9 @@ struct FeishuTextContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messaging::human_input::{
+        HumanAnswerSource, HumanInputRequest, HumanInputStatus, HumanQuestion,
+    };
     use crate::messaging::store;
     use axum::http::HeaderValue;
 
@@ -398,6 +549,31 @@ mod tests {
             bot_open_id: "bot-open-id".to_string(),
             allowed_conversation_ids: vec!["chat-a".to_string()],
             ..MessagingIntegration::feishu_default()
+        }
+    }
+
+    fn human_request(status: HumanInputStatus) -> HumanInputRequest {
+        HumanInputRequest {
+            id: "Q-card".to_string(),
+            integration_id: "fs".to_string(),
+            conversation_id: "chat-a".to_string(),
+            purpose: "approval".to_string(),
+            title: "需要确认".to_string(),
+            message: "请选择".to_string(),
+            questions: vec![HumanQuestion {
+                id: "decision".to_string(),
+                question: "是否继续？".to_string(),
+                options: vec!["继续".to_string(), "取消".to_string()],
+            }],
+            context: json!({}),
+            status,
+            answer: None,
+            answer_source: (status != HumanInputStatus::Pending)
+                .then_some(HumanAnswerSource::Feishu),
+            card_message_id: Some("om-card".to_string()),
+            created_at_epoch: 1,
+            expires_at_epoch: 2,
+            answered_at_epoch: (status != HumanInputStatus::Pending).then_some(2),
         }
     }
 
@@ -569,5 +745,45 @@ mod tests {
             &[json!({ "id": { "open_id": "someone-else" } })],
             "bot-open-id",
         ));
+    }
+
+    #[test]
+    fn human_input_cards_enable_shared_updates_and_terminal_card_has_no_actions() {
+        let pending = human_input_card(&human_request(HumanInputStatus::Pending), false);
+        assert_eq!(pending.pointer("/config/update_multi"), Some(&json!(true)));
+        assert!(pending["elements"]
+            .as_array()
+            .expect("pending elements")
+            .iter()
+            .any(|element| element["tag"] == "action"));
+
+        let terminal = human_input_card(&human_request(HumanInputStatus::Answered), true);
+        assert_eq!(terminal.pointer("/config/update_multi"), Some(&json!(true)));
+        assert_eq!(terminal.pointer("/header/template"), Some(&json!("grey")));
+        assert!(terminal["elements"]
+            .as_array()
+            .expect("terminal elements")
+            .iter()
+            .all(|element| element["tag"] != "action"));
+    }
+
+    #[test]
+    fn card_update_checks_feishu_business_code() {
+        validate_card_update_response(reqwest::StatusCode::OK, br#"{"code":0,"msg":"ok"}"#)
+            .expect("successful business response");
+
+        let error = validate_card_update_response(
+            reqwest::StatusCode::OK,
+            br#"{"code":230020,"msg":"card cannot be updated"}"#,
+        )
+        .expect_err("non-zero business code rejected");
+        assert!(error.to_string().contains("230020"));
+
+        assert!(validate_card_update_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            br#"{"code":0,"msg":"ok"}"#,
+        )
+        .is_err());
+        assert!(validate_card_update_response(reqwest::StatusCode::OK, b"not-json").is_err());
     }
 }

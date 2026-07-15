@@ -216,6 +216,18 @@ pub fn get_entry(db: &Database, id: i64) -> AppResult<Option<MessagingEventEntry
     .and_then(|maybe| maybe.map(RawRow::into_entry).transpose())
 }
 
+pub fn received_ids(db: &Database) -> AppResult<Vec<i64>> {
+    db.with_conn(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM messaging_event WHERE status='received' ORDER BY id ASC LIMIT 500",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>();
+        rows
+    })
+}
+
 pub fn get_raw_summary(db: &Database, id: i64) -> AppResult<Option<String>> {
     db.with_conn(|conn| {
         conn.query_row(

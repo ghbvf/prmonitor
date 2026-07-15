@@ -1219,30 +1219,9 @@ fn validate_messaging(settings: &MessagingSettings) -> AppResult<()> {
         }
         match integration.kind {
             MessagingProviderKind::Feishu => {
-                if integration.verification_token.trim().is_empty() {
-                    return Err(AppError::new(format!(
-                        "feishuVerificationToken 不能为空（消息集成「{}」）",
-                        integration.name
-                    )));
-                }
-                if integration.verification_token.trim().chars().count() < WEBHOOK_SECRET_MIN_LEN {
-                    return Err(AppError::new(format!(
-                        "feishuVerificationToken 太短（至少 {WEBHOOK_SECRET_MIN_LEN} 个字符；消息集成「{}」）",
-                        integration.name
-                    )));
-                }
-                if integration.encrypt_key.trim().is_empty() {
-                    return Err(AppError::new(format!(
-                        "feishuEncryptKey 不能为空（消息集成「{}」）",
-                        integration.name
-                    )));
-                }
-                if integration.encrypt_key.trim().chars().count() < WEBHOOK_SECRET_MIN_LEN {
-                    return Err(AppError::new(format!(
-                        "feishuEncryptKey 太短（至少 {WEBHOOK_SECRET_MIN_LEN} 个字符；消息集成「{}」）",
-                        integration.name
-                    )));
-                }
+                // #1810 Feishu ingress is an app-managed long connection. The endpoint bootstrap
+                // authenticates with App ID/Secret, so legacy public-webhook verification/encryption
+                // secrets are deliberately neither required nor read.
                 if integration.app_id.trim().is_empty() {
                     return Err(AppError::new(format!(
                         "feishuAppId 不能为空（消息集成「{}」）",
@@ -2665,22 +2644,6 @@ mod tests {
 
         integration.allowed_conversation_ids = vec!["oc_123".to_string()];
         cfg.messaging.integrations = vec![integration.clone()];
-        assert_error_prefix(validate(&cfg), "feishuVerificationToken 不能为空");
-
-        integration.verification_token = "short".to_string();
-        cfg.messaging.integrations = vec![integration.clone()];
-        assert_error_prefix(validate(&cfg), "feishuVerificationToken 太短");
-
-        integration.verification_token = "verify-token-1234".to_string();
-        cfg.messaging.integrations = vec![integration.clone()];
-        assert_error_prefix(validate(&cfg), "feishuEncryptKey 不能为空");
-
-        integration.encrypt_key = "short".to_string();
-        cfg.messaging.integrations = vec![integration.clone()];
-        assert_error_prefix(validate(&cfg), "feishuEncryptKey 太短");
-
-        integration.encrypt_key = "encrypt-key-1234".to_string();
-        cfg.messaging.integrations = vec![integration.clone()];
         assert_error_prefix(validate(&cfg), "feishuAppId 不能为空");
 
         integration.app_id = "cli_xxx".to_string();
@@ -2795,6 +2758,17 @@ mod tests {
             allowed_conversation_ids: vec!["oc_123".to_string()],
             ..MessagingIntegration::feishu_default()
         }
+    }
+
+    #[test]
+    fn feishu_long_connection_requires_app_credentials_not_webhook_secrets() {
+        let mut config = valid_base();
+        let mut integration = valid_messaging_integration();
+        integration.verification_token.clear();
+        integration.encrypt_key.clear();
+        config.messaging.integrations = vec![integration];
+
+        validate(&config).expect("long-connection Feishu only needs app id/secret");
     }
 
     fn assert_error_prefix(result: AppResult<()>, prefix: &str) {

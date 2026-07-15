@@ -7,7 +7,10 @@
 pub mod commands;
 pub mod dingtalk;
 pub mod feishu;
+pub mod feishu_long_connection;
+pub mod human_input;
 pub(crate) mod local_api;
+pub(crate) mod mcp;
 pub mod provider;
 pub mod service;
 pub mod store;

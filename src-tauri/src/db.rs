@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -57,10 +57,39 @@ impl Database {
             .map_err(|e| AppError::new(format!("解析应用数据目录失败: {e}")))?;
         std::fs::create_dir_all(&dir)
             .map_err(|e| AppError::new(format!("创建应用数据目录失败: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| AppError::new(format!("设置应用数据目录权限失败: {e}")))?;
+        }
         let path = dir.join("prmonitor.db");
         let conn =
             Connection::open(&path).map_err(|e| AppError::new(format!("打开 SQLite 失败: {e}")))?;
-        Self::from_conn(conn)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| AppError::new(format!("设置 SQLite 权限失败: {e}")))?;
+        }
+        let db = Self::from_conn(conn)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // WAL/SHM are normally created by the migration transaction above. The parent
+            // directory is already 0700; explicitly tighten every present SQLite artifact too.
+            for candidate in [
+                path.clone(),
+                Path::new(&format!("{}-wal", path.display())).to_path_buf(),
+                Path::new(&format!("{}-shm", path.display())).to_path_buf(),
+            ] {
+                if candidate.exists() {
+                    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+                        .map_err(|e| AppError::new(format!("设置 SQLite 文件权限失败: {e}")))?;
+                }
+            }
+        }
+        Ok(db)
     }
 
     /// Opens an EXISTING `prmonitor.db` READ-ONLY at `path`, WITHOUT running migrations — for an
@@ -215,6 +244,9 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 15 {
         apply_v15(conn)?;
     }
+    if version < 16 {
+        apply_v16(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -356,6 +388,13 @@ fn apply_v15(conn: &Connection) -> AppResult<()> {
             Err(map_err(error))
         }
     }
+}
+
+/// v16 (#1810): durable human-input requests let Codex elicitation and Feishu race through one
+/// SQL compare-and-set. Pending rows survive app restarts and are safe to recover/expire.
+fn apply_v16(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(SCHEMA_V16).map_err(map_err)?;
+    Ok(())
 }
 
 /// v1 schema — the unified store (#70). `review_session` precedes `review_history_item`
@@ -831,6 +870,31 @@ COMMIT;
 PRAGMA foreign_keys=ON;
 "#;
 
+const SCHEMA_V16: &str = r#"
+CREATE TABLE human_input_request (
+    id TEXT PRIMARY KEY NOT NULL,
+    integration_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    questions_json TEXT NOT NULL,
+    context_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','answered','cancelled','expired')),
+    answer_json TEXT,
+    answer_source TEXT CHECK(answer_source IS NULL OR answer_source IN ('feishu','codex')),
+    card_message_id TEXT,
+    created_at_epoch INTEGER NOT NULL,
+    expires_at_epoch INTEGER NOT NULL,
+    answered_at_epoch INTEGER
+);
+CREATE INDEX idx_human_input_request_pending
+    ON human_input_request(status, expires_at_epoch, created_at_epoch);
+CREATE INDEX idx_human_input_request_conversation
+    ON human_input_request(integration_id, conversation_id, created_at_epoch DESC);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -977,7 +1041,7 @@ mod tests {
         ).expect("seed legacy notification");
 
         run_migrations(&conn).expect("v14 -> current");
-        assert_eq!(SCHEMA_VERSION, 15);
+        assert_eq!(SCHEMA_VERSION, 16);
         for column in ["producer_key", "review_thread_id"] {
             assert!(
                 table_has_column(&conn, "action_outbox", column),
@@ -1176,7 +1240,7 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 15, "current schema is v15");
+            assert_eq!(SCHEMA_VERSION, 16, "current schema is v16");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"
@@ -1268,6 +1332,14 @@ mod tests {
             assert!(
                 index_exists(conn, "idx_messaging_event_reply_outbox"),
                 "fresh v0 → v13 has the messaging_event reply outbox index"
+            );
+            assert!(
+                table_exists(conn, "human_input_request"),
+                "fresh v0 → v16 has the durable human-input request table"
+            );
+            assert!(
+                index_exists(conn, "idx_human_input_request_pending"),
+                "fresh v0 → v16 can recover pending human-input requests"
             );
             assert!(
                 table_exists(conn, "workflow_instance"),

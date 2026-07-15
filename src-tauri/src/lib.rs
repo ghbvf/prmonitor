@@ -364,6 +364,9 @@ fn build_app() {
         .manage(messaging::service::MessagingRuntime::<tauri::Wry> {
             actions: Arc::new(MessagingActionsImpl),
         })
+        .manage(messaging::human_input::HumanInputBroker::default())
+        .manage(messaging::service::MessagingEventWorker::default())
+        .manage(messaging::feishu_long_connection::FeishuConnectionManager::default())
         .setup(|app| {
             // Open + migrate the unified SQLite store and manage it as a `tauri::State`
             // BEFORE anything that reads persistence (config load / poll start). It is a
@@ -372,6 +375,61 @@ fn build_app() {
             // Then run the one-time legacy JSON → SQLite import (#70) so existing users'
             // config / tracked PRs / ledger carry over before the first read.
             app.manage(db::Database::open(app.handle())?);
+            // MCP waiters are process-local. A request left pending in SQLite belongs to the
+            // previous process and can never resume after this launch, so terminalize it before
+            // the local MCP endpoint starts accepting sessions.
+            let orphaned_human_inputs = {
+                let db = app.state::<db::Database>();
+                let broker = app.state::<messaging::human_input::HumanInputBroker>();
+                let requests = messaging::human_input::reconcile_startup_orphans(
+                    db.inner(),
+                    broker.inner(),
+                    messaging::store::now_epoch(),
+                )?;
+                messaging::human_input::prune_terminal(
+                    db.inner(),
+                    messaging::store::now_epoch(),
+                )?;
+                requests
+            };
+            for request in orphaned_human_inputs {
+                let app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    messaging::mcp::update_terminal_card(&app, &request).await;
+                });
+            }
+            let maintenance_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(30));
+                // Startup reconciliation above already established the initial state.
+                interval.tick().await;
+                loop {
+                    interval.tick().await;
+                    let now = messaging::store::now_epoch();
+                    let expired = {
+                        let db = maintenance_app.state::<db::Database>();
+                        let broker = maintenance_app
+                            .state::<messaging::human_input::HumanInputBroker>();
+                        match messaging::human_input::expire_due(db.inner(), broker.inner(), now) {
+                            Ok(expired) => expired,
+                            Err(error) => {
+                                eprintln!("清理超时人工输入请求失败：{}", error.message);
+                                Vec::new()
+                            }
+                        }
+                    };
+                    for request in expired {
+                        messaging::mcp::update_terminal_card(&maintenance_app, &request).await;
+                    }
+                    let db = maintenance_app.state::<db::Database>();
+                    if let Err(error) = messaging::human_input::prune_terminal(db.inner(), now) {
+                        eprintln!("清理人工输入终态记录失败：{}", error.message);
+                    }
+                }
+            });
+            app.state::<messaging::service::MessagingEventWorker>()
+                .start(app.handle().clone());
             import_legacy_stores(app.handle())?;
             // The orphan-session reconcile (mark sessions left non-terminal by a dead previous
             // process as `failed`) now runs INSIDE `state.outbox.start(...)` via the `before_worker`
@@ -843,10 +901,13 @@ fn build_app() {
                     let cloudflared = resolve_remote_cloudflared(app.handle(), &cfg.remote_access);
                     state
                         .remote
-                        .reconcile(app.handle(), &cfg.remote_access, cloudflared)
+                        .reconcile(app.handle(), &cfg.remote_access, cloudflared);
+                    app.state::<messaging::feishu_long_connection::FeishuConnectionManager>()
+                        .reconcile(app.handle(), &cfg.messaging.integrations);
                 }
                 Err(e) => eprintln!("Remote 监听运行时：读取配置失败，跳过初次 reconcile：{e}"),
             }
+            app.state::<messaging::service::MessagingEventWorker>().wake();
             // Install the post-save reconcile hook (AB#1225 F4) — the ONLY place that bridges
             // config→remote. `config::commands::set_config` fires `state.config_saved` after a save;
             // THIS closure (capturing the concrete Wry `AppHandle` at install time, which sidesteps
@@ -863,6 +924,10 @@ fn build_app() {
                         &cfg.remote_access,
                         cloudflared,
                     );
+                    app.state::<messaging::feishu_long_connection::FeishuConnectionManager>()
+                        .reconcile(&app, &cfg.messaging.integrations);
+                    app.state::<messaging::service::MessagingEventWorker>()
+                        .wake();
                 }
             }));
 
@@ -922,6 +987,7 @@ fn build_app() {
             messaging::commands::messaging_send,
             messaging::commands::messaging_sends_list,
             messaging::commands::messaging_integrations_list,
+            messaging::commands::messaging_connection_statuses_list,
             outbox::commands::outbox_list,
             outbox::commands::outbox_get_raw,
             outbox::commands::outbox_retry,
@@ -989,6 +1055,10 @@ fn build_app() {
                 // Kill every Web PTY shell child (#1372): same contract — SIGKILL + detached reap,
                 // so no shell (and no reader thread) outlives the app.
                 state.web_pty.shutdown();
+                app_handle
+                    .state::<messaging::feishu_long_connection::FeishuConnectionManager>()
+                    .stop();
+                app_handle.state::<messaging::service::MessagingEventWorker>().shutdown();
             }
         });
 }

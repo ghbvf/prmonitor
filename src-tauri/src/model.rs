@@ -1256,6 +1256,32 @@ pub struct MessagingIntegrationOption {
     pub allowed_conversation_ids: Vec<String>,
 }
 
+/// Runtime state of one Feishu official long connection (#1810).
+#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum FeishuConnectionState {
+    Disabled,
+    Connecting,
+    Connected,
+    Reconnecting,
+    Error,
+    #[default]
+    Stopped,
+}
+
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeishuConnectionStatus {
+    pub integration_id: String,
+    pub status: FeishuConnectionState,
+    pub last_connected_at_epoch: Option<u64>,
+    pub last_event_at_epoch: Option<u64>,
+    pub last_error: Option<String>,
+    pub reconnect_count: u64,
+}
+
 /// Normalized inbound messaging event (#1559).
 ///
 /// Provider payloads (Feishu v1) are normalized to this shape before command parsing. It is stored

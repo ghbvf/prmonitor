@@ -4,11 +4,13 @@ import {
   messagingEventReplay,
   messagingEventsList,
   messagingIntegrationsList,
+  messagingConnectionStatusesList,
   messagingSend,
   messagingSendsList,
 } from "./api";
 import type { OutboxEntry } from "../types";
 import type {
+  FeishuConnectionStatus,
   MessagingEventEntry,
   MessagingIntegrationOption,
   SendMessagingRequest,
@@ -16,9 +18,14 @@ import type {
 
 interface MessagingState {
   integrations: MessagingIntegrationOption[];
+  connectionStatuses: FeishuConnectionStatus[];
   entries: MessagingEventEntry[];
   sends: OutboxEntry[];
   integrationsLoading: boolean;
+  connectionStatusesLoading: boolean;
+  connectionStatusesError: string | null;
+  connectionStatusesStale: boolean;
+  connectionStatusesLastUpdatedAt: number | null;
   loading: boolean;
   sendsLoading: boolean;
   sendLoading: boolean;
@@ -37,9 +44,14 @@ function toMessage(err: unknown): string {
 export const useMessagingStore = defineStore("messaging", {
   state: (): MessagingState => ({
     integrations: [],
+    connectionStatuses: [],
     entries: [],
     sends: [],
     integrationsLoading: false,
+    connectionStatusesLoading: false,
+    connectionStatusesError: null,
+    connectionStatusesStale: false,
+    connectionStatusesLastUpdatedAt: null,
     loading: false,
     sendsLoading: false,
     sendLoading: false,
@@ -60,6 +72,20 @@ export const useMessagingStore = defineStore("messaging", {
         this.error = toMessage(err);
       } finally {
         this.integrationsLoading = false;
+      }
+    },
+    async refreshConnectionStatuses() {
+      this.connectionStatusesLoading = true;
+      this.connectionStatusesError = null;
+      try {
+        this.connectionStatuses = await messagingConnectionStatusesList();
+        this.connectionStatusesStale = false;
+        this.connectionStatusesLastUpdatedAt = Date.now();
+      } catch (err) {
+        this.connectionStatusesError = toMessage(err);
+        this.connectionStatusesStale = this.connectionStatuses.length > 0;
+      } finally {
+        this.connectionStatusesLoading = false;
       }
     },
     async refresh() {
