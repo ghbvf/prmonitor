@@ -85,7 +85,9 @@ use tokio::sync::oneshot;
 use subtle::ConstantTimeEq;
 
 use super::ledger;
-use crate::config::service::ResolvedCli;
+use crate::config::service::{
+    managed_cloudflared_for_program, tunnel_command_uses_bare_cloudflared, ResolvedCli,
+};
 use crate::error::{AppError, AppResult};
 use crate::model::{
     Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, LabelSource, ReviewKind,
@@ -586,8 +588,8 @@ struct WebhookRuntime {
     /// status poll. For `command`/`listener` the URL is from config and never changes.
     public_url: Arc<StdMutex<Option<String>>>,
     /// The tunnel mode this runtime was started with (Copy off `TunnelSpec`). Held so
-    /// `status` is mode-aware: only `Quick` owns/depends on cloudflared, so only `Quick`
-    /// runs the install probe + renders cloudflared-specific crash/install text.
+    /// `status` is mode-aware: managed cloudflared ownership is `Quick`, or `Command`
+    /// with a bare `cloudflared` program token (install probe / fingerprint / nag text).
     mode: WebhookTunnelMode,
     cloudflared_fingerprint: Option<String>,
 }
@@ -685,7 +687,8 @@ impl WebhookManager {
     ///   `*.trycloudflare.com` URL.
     /// - `Command`: bind, spawn `tunnel_command` (split on whitespace, `{port}` →
     ///   actual port, exec'd directly — no shell), `public_url` from config (`None` if
-    ///   `public_url` is empty). Does NOT require cloudflared.
+    ///   `public_url` is empty). A bare `cloudflared` program token uses the same
+    ///   [`ResolvedCli`] funnel as `Quick`; other program tokens exec as written.
     /// - `Listener`: bind only, spawn no child; `public_url` from config. Does NOT
     ///   require cloudflared.
     ///
@@ -710,9 +713,11 @@ impl WebhookManager {
             public_url,
         } = tunnel;
         let _guard = self.start_lock.lock().await;
-        // Only Quick consumes cloudflared. Preserve the resolver's original error for
-        // that mode; command/listener must remain independent of cloudflared settings.
-        let cloudflared = if mode == WebhookTunnelMode::Quick {
+        let command_uses_cloudflared = mode == WebhookTunnelMode::Command
+            && tunnel_command_uses_bare_cloudflared(&tunnel_command);
+        // Quick always needs ResolvedCli. Command needs it only when the program token is
+        // the bare managed `cloudflared` name (absolute paths / other binaries stay raw).
+        let cloudflared = if mode == WebhookTunnelMode::Quick || command_uses_cloudflared {
             cloudflared?
         } else {
             None
@@ -729,13 +734,13 @@ impl WebhookManager {
             rt.teardown_awaiting().await;
         }
 
-        // Only the `quick` mode owns/depends on cloudflared; check it up front there so a
-        // missing binary short-circuits BEFORE we bind. `command` / `listener` never
-        // touch cloudflared (their tunnel is the user command / fully external).
+        // Probe before bind when this start path owns a managed cloudflared launch.
         let cloudflared_available = match cloudflared.as_ref() {
-            Some(cli) if mode == WebhookTunnelMode::Quick => cloudflared_installed(cli).await,
+            Some(cli) if mode == WebhookTunnelMode::Quick || command_uses_cloudflared => {
+                cloudflared_installed(cli).await
+            }
             Some(_) => true,
-            None => mode != WebhookTunnelMode::Quick,
+            None => !(mode == WebhookTunnelMode::Quick || command_uses_cloudflared),
         };
         if !cloudflared_available {
             return Ok(WebhookStatus::new(
@@ -843,18 +848,20 @@ impl WebhookManager {
                     return Err(e);
                 }
             },
-            WebhookTunnelMode::Command => match spawn_custom_tunnel(&tunnel_command, port) {
-                Ok((child, drain)) => (
-                    Some(child),
-                    Some(drain),
-                    Arc::new(StdMutex::new(configured_url)),
-                ),
-                Err(e) => {
-                    let _ = shutdown_tx.send(());
-                    let _ = server_task.await;
-                    return Err(e);
+            WebhookTunnelMode::Command => {
+                match spawn_custom_tunnel(&tunnel_command, port, cloudflared.as_ref()) {
+                    Ok((child, drain)) => (
+                        Some(child),
+                        Some(drain),
+                        Arc::new(StdMutex::new(configured_url)),
+                    ),
+                    Err(e) => {
+                        let _ = shutdown_tx.send(());
+                        let _ = server_task.await;
+                        return Err(e);
+                    }
                 }
-            },
+            }
             // No child: bind-only. The tunnel is external; the URL is whatever the
             // user configured.
             WebhookTunnelMode::Listener => (None, None, Arc::new(StdMutex::new(configured_url))),
@@ -873,13 +880,10 @@ impl WebhookManager {
             tunnel,
             public_url,
             mode,
-            cloudflared_fingerprint: (mode == WebhookTunnelMode::Quick).then(|| {
-                cloudflared
-                    .as_ref()
-                    .expect("quick mode resolved")
-                    .fingerprint()
-                    .to_string()
-            }),
+            cloudflared_fingerprint: cloudflared
+                .as_ref()
+                .filter(|_| mode == WebhookTunnelMode::Quick || command_uses_cloudflared)
+                .map(|cli| cli.fingerprint().to_string()),
         });
 
         let message = match (mode, &resolved_url) {
@@ -896,10 +900,10 @@ impl WebhookManager {
                 "接收端已监听（隧道外置，未配置 webhookPublicUrl）".to_string()
             }
         };
-        // `cloudflared_installed` is always `true` on this success path: `quick` mode
-        // only reaches here past the install short-circuit above, and the non-quick
-        // modes don't use cloudflared (reporting `true` keeps the UI's "install
-        // cloudflared" prompt from firing spuriously for a mode that doesn't need it).
+        // `cloudflared_installed` is always `true` on this success path: starts that own
+        // a managed cloudflared launch only reach here past the install short-circuit,
+        // and other modes report `true` so the UI's "install cloudflared" prompt does
+        // not fire spuriously for a mode that does not need it.
         Ok(WebhookStatus::new(true, resolved_url, true, message))
     }
 
@@ -937,9 +941,7 @@ impl WebhookManager {
     pub fn active_cloudflared_fingerprint(&self) -> Option<String> {
         let mut runtime = self.runtime.lock().unwrap();
         let runtime = runtime.as_mut()?;
-        if runtime.mode != WebhookTunnelMode::Quick {
-            return None;
-        }
+        runtime.cloudflared_fingerprint.as_ref()?;
         match runtime.tunnel.as_mut().map(Child::try_wait) {
             Some(Ok(None)) => runtime.cloudflared_fingerprint.clone(),
             // A finished child (or a liveness probe error) is not evidence of a live
@@ -963,19 +965,18 @@ impl WebhookManager {
     ///
     /// Mode is taken from the live `runtime.mode` when running; when stopped there is no
     /// runtime to read it from, so the caller passes `configured_mode` (the persisted
-    /// `webhook_tunnel_mode`). Only `Quick` owns cloudflared, so:
-    /// - the `cloudflared_installed` probe (a ~5s subprocess) runs ONLY for `Quick` —
-    ///   `command` / `listener` report `cloudflared_installed: true` unconditionally
-    ///   (their tunnel is the user command / fully external; the panel filters this field
-    ///   per mode anyway, so this only saves the probe + suppresses a spurious "install
-    ///   cloudflared" prompt for a mode that doesn't need it);
-    /// - the crash message names cloudflared only for `Quick`; `command` mode says
-    ///   "自定义隧道进程已退出" (`listener` never crashes — no child);
-    /// - the not-running install nag ("brew install cloudflared") fires only for `Quick`.
+    /// `webhook_tunnel_mode`) and `tunnel_command` (persisted command, used to detect a
+    /// bare managed `cloudflared` token in `command` mode). Managed cloudflared ownership:
+    /// - install probe + resolution-error surfacing run for `Quick`, and for `Command`
+    ///   when the program token is bare `cloudflared`;
+    /// - crash text names cloudflared for `Quick`; `command` keeps the generic child text
+    ///   (the child may still be cloudflared, but the panel already shows command mode);
+    /// - `listener` never has a child.
     pub async fn status(
         &self,
         cloudflared: AppResult<Option<ResolvedCli>>,
         configured_mode: WebhookTunnelMode,
+        tunnel_command: &str,
     ) -> WebhookStatus {
         let (cloudflared, resolution_error) = match cloudflared {
             Ok(cloudflared) => (cloudflared, None),
@@ -1012,9 +1013,10 @@ impl WebhookManager {
                 None => (false, None, configured_mode),
             }
         };
-        // Only `Quick` owns cloudflared, so only `Quick` pays for the install probe; the
-        // other modes report `true` (no nag for a mode that doesn't use cloudflared).
-        let installed = if mode == WebhookTunnelMode::Quick {
+        let owns_cloudflared = mode == WebhookTunnelMode::Quick
+            || (mode == WebhookTunnelMode::Command
+                && tunnel_command_uses_bare_cloudflared(tunnel_command));
+        let installed = if owns_cloudflared {
             match cloudflared.as_ref() {
                 Some(cli) => cloudflared_installed(cli).await,
                 None => false,
@@ -1028,7 +1030,7 @@ impl WebhookManager {
                 None => "运行中（公网 URL 尚未解析）".to_string(),
             }
         } else if crashed {
-            // Crash text is mode-specific: only `Quick`'s child is cloudflared.
+            // Crash text is mode-specific: only `Quick`'s child is always cloudflared.
             match mode {
                 WebhookTunnelMode::Quick => {
                     "隧道已退出（cloudflared 进程已退出），请重新启动 Webhook".to_string()
@@ -1040,14 +1042,14 @@ impl WebhookManager {
                 // neutral message keeps the match exhaustive without nagging cloudflared.
                 WebhookTunnelMode::Listener => "隧道已退出，请重新启动 Webhook".to_string(),
             }
-        } else if mode == WebhookTunnelMode::Quick && !installed {
+        } else if owns_cloudflared && !installed {
             resolution_error.clone().unwrap_or_else(|| {
                 "未运行；未检测到 cloudflared（brew install cloudflared）".to_string()
             })
         } else {
             "未运行".to_string()
         };
-        if running && mode == WebhookTunnelMode::Quick {
+        if running && owns_cloudflared {
             if let Some(error) = resolution_error {
                 message.push_str("；当前 cloudflared 配置错误：");
                 message.push_str(&error);
@@ -1810,12 +1812,9 @@ async fn spawn_quick_tunnel(
 /// literal `{port}` placeholder in EACH token with the actual listen `port`.
 ///
 /// Splits on ASCII whitespace (so quoting / shell metacharacters carry NO meaning):
-/// the result is exec'd directly via [`Command::new`] in [`spawn_custom_tunnel`], never
-/// handed to a shell, so a token can't word-split further or inject (`command` mode
-/// keeps the same anti-injection property `spawn_quick_tunnel` has for `bin`). Returns
-/// `None` when the command is blank (no program token) — the caller turns that into an
-/// `AppError` (defense in depth; `validate` rejects an empty command for this mode
-/// upstream). Pure — unit-tested.
+/// the result is handed to [`spawn_custom_tunnel`], which launches a bare `cloudflared`
+/// token via [`ResolvedCli`] and other tokens via `Command::new` — never a shell.
+/// Returns `None` when the command is blank (no program token). Pure — unit-tested.
 fn build_tunnel_command_argv(command: &str, port: u16) -> Option<(String, Vec<String>)> {
     let port = port.to_string();
     let mut tokens = command
@@ -1834,25 +1833,38 @@ fn build_tunnel_command_argv(command: &str, port: u16) -> Option<(String, Vec<St
 /// drain_task)`; the caller owns the drain task and aborts it on stop.
 ///
 /// The command is tokenized by [`build_tunnel_command_argv`] (`{port}` substituted) and
-/// exec'd DIRECTLY via [`Command::new`] — NOT via a shell — so no token is word-split
-/// or shell-interpreted (same anti-injection property as `spawn_quick_tunnel`'s `bin`).
-/// A blank command is an `AppError` (defense in depth; `validate` already rejects it
-/// upstream for this mode).
-fn spawn_custom_tunnel(command: &str, port: u16) -> AppResult<(Child, JoinHandle<()>)> {
+/// exec'd DIRECTLY — NOT via a shell. A bare `cloudflared` program token launches through
+/// [`ResolvedCli`] (same PATH/config funnel as [`spawn_quick_tunnel`]); other tokens use
+/// `Command::new(program)`. A blank command is an `AppError` (defense in depth; `validate`
+/// already rejects it upstream for this mode).
+fn spawn_custom_tunnel(
+    command: &str,
+    port: u16,
+    cloudflared: Option<&ResolvedCli>,
+) -> AppResult<(Child, JoinHandle<()>)> {
     let (program, args) = build_tunnel_command_argv(command, port).ok_or_else(|| {
         AppError::new("webhookTunnelCommand 不能为空（command 模式需填隧道命令）".to_string())
     })?;
+    let managed = managed_cloudflared_for_program(&program, cloudflared)?;
 
-    let mut cmd = Command::new(&program);
-    cmd.args(&args)
-        // stdout unused → null it; stderr piped + drained so an unread pipe can't block.
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| AppError::new(format!("无法启动自定义隧道命令（{program}）：{e}")))?;
+    let mut child = if let Some(cli) = managed {
+        let mut cmd = cli.command();
+        cmd.args(&args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        cmd.spawn()
+            .map_err(|e| AppError::new(format!("无法启动自定义隧道命令（cloudflared）：{e}")))?
+    } else {
+        let mut cmd = Command::new(&program);
+        cmd.args(&args)
+            // stdout unused → null it; stderr piped + drained so an unread pipe can't block.
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        cmd.spawn()
+            .map_err(|e| AppError::new(format!("无法启动自定义隧道命令（{program}）：{e}")))?
+    };
     let stderr = child
         .stderr
         .take()
@@ -2602,7 +2614,7 @@ mod tests {
 
         // Bogus install bin → the probe returns false fast (no real cloudflared in CI);
         // the assertion is the self-heal flip, independent of install state.
-        let s = mgr.status(Ok(None), WebhookTunnelMode::Quick).await;
+        let s = mgr.status(Ok(None), WebhookTunnelMode::Quick, "").await;
         assert!(!s.running, "a dead tunnel child must flip running → false");
         assert!(s.public_url.is_none());
         assert!(s.payload_url.is_none());
@@ -2679,6 +2691,114 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn command_tunnel_uses_resolved_cloudflared_for_bare_program() {
+        let root = std::env::temp_dir().join(format!(
+            "prmonitor-webhook-command-bare-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("cloudflared");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nprintf '%s\\n' \"$0\" > '{0}/argv0'\nprintf '%s\\n' \"$@\" > '{0}/args'\nexec sleep 30\n",
+                root.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let tools = CliToolsConfig {
+            cloudflared_path: CliPath::try_from(executable.to_string_lossy().into_owned()).unwrap(),
+            ..CliToolsConfig::default()
+        };
+        let cloudflared =
+            resolve_cli_from(&CliResolver::default(), &tools, CliTool::Cloudflared, false).unwrap();
+        let expected = cloudflared.fingerprint().to_string();
+        let mgr = WebhookManager::default();
+        mgr.set_ingestor(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
+        mgr.set_refresher(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
+
+        let status = mgr
+            .start(
+                0,
+                "secret".to_string(),
+                start_routes(),
+                Ok(Some(cloudflared)),
+                TunnelSpec {
+                    mode: WebhookTunnelMode::Command,
+                    command: "cloudflared tunnel run --token test-token".to_string(),
+                    public_url: "https://prmonitor.example.com".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            status.running,
+            "command tunnel should start: {}",
+            status.message
+        );
+        assert_eq!(
+            mgr.active_cloudflared_fingerprint().as_deref(),
+            Some(expected.as_str())
+        );
+
+        let argv0_path = root.join("argv0");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline && !argv0_path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let argv0 = std::fs::read_to_string(&argv0_path).unwrap();
+        assert!(
+            argv0.contains(executable.to_string_lossy().as_ref()),
+            "bare cloudflared must exec configured path, got {argv0}"
+        );
+        let args = std::fs::read_to_string(root.join("args")).unwrap();
+        assert!(args.contains("tunnel"));
+        assert!(args.contains("run"));
+
+        mgr.stop().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn command_tunnel_bare_cloudflared_without_resolver_fails_clearly() {
+        let mgr = WebhookManager::default();
+        mgr.set_ingestor(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
+        mgr.set_refresher(Arc::new(|_, _, _| Box::pin(async { Ok(()) })));
+
+        let err = mgr
+            .start(
+                0,
+                "secret".to_string(),
+                start_routes(),
+                Err(AppError::new(
+                    "未找到 cloudflared，请在「第三方 CLI」配置 cloudflaredPath".to_string(),
+                )),
+                TunnelSpec {
+                    mode: WebhookTunnelMode::Command,
+                    command: "cloudflared tunnel run --token x".to_string(),
+                    public_url: "https://example.com".to_string(),
+                },
+            )
+            .await
+            .expect_err("bare cloudflared without ResolvedCli must fail");
+        assert!(
+            err.message.contains("cloudflaredPath"),
+            "expected CLI-settings guidance, got {}",
+            err.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn quick_start_and_status_preserve_resolver_error_message() {
         let root = std::env::temp_dir().join(format!(
             "prmonitor-webhook-missing-cloudflared-{}-{}",
@@ -2716,7 +2836,7 @@ mod tests {
         assert_eq!(start_error.message, expected);
 
         let status = mgr
-            .status(Err(resolve().unwrap_err()), WebhookTunnelMode::Quick)
+            .status(Err(resolve().unwrap_err()), WebhookTunnelMode::Quick, "")
             .await;
         assert_eq!(status.message, expected);
     }
@@ -2807,7 +2927,7 @@ mod tests {
         // status() re-reports the configured URL while the child is alive (no self-heal).
         // The configured_mode arg is unused here (a live runtime carries its own mode);
         // pass Command to keep the call honest.
-        let s2 = mgr.status(Ok(None), WebhookTunnelMode::Command).await;
+        let s2 = mgr.status(Ok(None), WebhookTunnelMode::Command, "").await;
         assert!(s2.running);
         assert_eq!(s2.public_url.as_deref(), Some("https://my.example.com"));
 
@@ -2846,13 +2966,13 @@ mod tests {
         // a separate `true`+wait as a timing proxy, which flaked on CI). Poll status until
         // the self-heal observes the exit — bounded so a genuine hang fails instead of
         // looping. The child WILL exit, so this converges deterministically.
-        let mut s2 = mgr.status(Ok(None), WebhookTunnelMode::Command).await;
+        let mut s2 = mgr.status(Ok(None), WebhookTunnelMode::Command, "").await;
         for _ in 0..200 {
             if !s2.running {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
-            s2 = mgr.status(Ok(None), WebhookTunnelMode::Command).await;
+            s2 = mgr.status(Ok(None), WebhookTunnelMode::Command, "").await;
         }
         assert!(
             !s2.running,
@@ -2908,7 +3028,7 @@ mod tests {
 
         // Probe repeatedly: a childless runtime never self-heals to not-running.
         for _ in 0..3 {
-            let st = mgr.status(Ok(None), WebhookTunnelMode::Listener).await;
+            let st = mgr.status(Ok(None), WebhookTunnelMode::Listener, "").await;
             assert!(st.running, "listener mode stays running across probes");
             assert_eq!(
                 st.public_url.as_deref(),
@@ -3019,7 +3139,7 @@ mod tests {
         assert!(s.payload_url.is_none(), "no public_url → no payload_url");
 
         // status() agrees: running, but no URL.
-        let st = mgr.status(Ok(None), WebhookTunnelMode::Listener).await;
+        let st = mgr.status(Ok(None), WebhookTunnelMode::Listener, "").await;
         assert!(st.running);
         assert!(st.public_url.is_none());
         assert!(st.payload_url.is_none());
@@ -3032,21 +3152,25 @@ mod tests {
         mgr.stop().await;
     }
 
-    /// G2/G3 (stopped path): a non-quick `configured_mode` on a STOPPED manager skips the
-    /// cloudflared probe (reports `cloudflared_installed: true` despite a bogus bin) and
-    /// gives a neutral "未运行" — no "brew install cloudflared" nag for a mode that
-    /// doesn't use cloudflared. The quick branch's nag is still covered by the running
-    /// install-state assertions elsewhere; here we lock the mode gating.
+    /// G2/G3 (stopped path): modes that do NOT own managed cloudflared skip the
+    /// install probe (reports `cloudflared_installed: true`) and give a neutral
+    /// "未运行". Command+bare ownership is covered by
+    /// [`status_stopped_command_bare_cloudflared_runs_probe_and_nags`].
     #[tokio::test]
-    async fn status_stopped_non_quick_skips_probe_and_neutral_message() {
+    async fn status_stopped_non_managed_skips_probe_and_neutral_message() {
         let mgr = WebhookManager::default();
-        // No runtime → stopped; the bogus bin would make a real probe report false.
-        for mode in [WebhookTunnelMode::Command, WebhookTunnelMode::Listener] {
-            let st = mgr.status(Ok(None), mode).await;
+        for (mode, command) in [
+            (
+                WebhookTunnelMode::Command,
+                "/opt/homebrew/bin/cloudflared tunnel run",
+            ),
+            (WebhookTunnelMode::Listener, ""),
+        ] {
+            let st = mgr.status(Ok(None), mode, command).await;
             assert!(!st.running);
             assert!(
                 st.cloudflared_installed,
-                "non-quick stopped status skips the probe → reports installed: true"
+                "non-managed stopped status skips the probe → reports installed: true"
             );
             assert_eq!(
                 st.message, "未运行",
@@ -3056,12 +3180,34 @@ mod tests {
 
         // Quick + missing cloudflared → the install nag DOES fire (probe runs, bogus bin
         // → false), proving the gating is mode-conditional and not a blanket skip.
-        let st = mgr.status(Ok(None), WebhookTunnelMode::Quick).await;
+        let st = mgr.status(Ok(None), WebhookTunnelMode::Quick, "").await;
         assert!(!st.running);
         assert!(!st.cloudflared_installed, "quick mode runs the probe");
         assert!(
             st.message.contains("cloudflared"),
             "quick + missing → brew nag: {}",
+            st.message
+        );
+    }
+
+    #[tokio::test]
+    async fn status_stopped_command_bare_cloudflared_runs_probe_and_nags() {
+        let mgr = WebhookManager::default();
+        let st = mgr
+            .status(
+                Ok(None),
+                WebhookTunnelMode::Command,
+                "cloudflared tunnel run --token x",
+            )
+            .await;
+        assert!(!st.running);
+        assert!(
+            !st.cloudflared_installed,
+            "command+bare must run the install probe"
+        );
+        assert!(
+            st.message.contains("cloudflared"),
+            "command+bare stopped status must nag about cloudflared, got: {}",
             st.message
         );
     }
