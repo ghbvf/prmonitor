@@ -33,8 +33,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Check release versions are consistent
         run: node scripts/check-release-version.mjs
-      - name: Test release version checker
-        run: node --test scripts/check-release-version.test.mjs
       - run: pnpm build
       # #1504: validate the web-terminal SPA bundle here (fast frontend job) too — not only in the
       # slower Rust job — so Vite-bundle errors surface early. Mirrors beforeBuildCommand's coverage.

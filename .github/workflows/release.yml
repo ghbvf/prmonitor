@@ -149,7 +149,7 @@ jobs:
           [[ -n "${dmg_path}" && -f "${dmg_path}" ]] || { echo "No .dmg bundle found" >&2; exit 1; }
 
           executable_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${app_path}/Contents/Info.plist")"
-          lipo -verify_arch x86_64 arm64 "${app_path}/Contents/MacOS/${executable_name}"
+          lipo "${app_path}/Contents/MacOS/${executable_name}" -verify_arch x86_64 arm64
           codesign --verify --deep --strict --verbose=2 "${app_path}"
           signature_info="$(codesign -dv --verbose=4 "${app_path}" 2>&1)"
           printf '%s\n' "${signature_info}"

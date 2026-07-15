@@ -9,7 +9,7 @@
     "build:web": "vue-tsc --noEmit && vite build --outDir dist-web --base=./",
     "generate:config-types": "cargo test --manifest-path src-tauri/Cargo.toml --locked export_config_types -- --ignored --nocapture",
     "check:config-types": "pnpm run generate:config-types && git diff --exit-code -- src/types.generated.ts src/config/types.generated.ts",
-    "test": "vitest run",
+    "test": "vitest run src && node --test scripts/check-release-version.test.mjs",
     "preview": "vite preview",
     "tauri": "tauri"
   },
