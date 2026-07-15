@@ -112,7 +112,7 @@ src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
 ```bash
 APP="src-tauri/target/universal-apple-darwin/release/bundle/macos/prmonitor.app"
 EXECUTABLE=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")
-lipo -archs "$APP/Contents/MacOS/$EXECUTABLE"
+lipo "$APP/Contents/MacOS/$EXECUTABLE" -archs
 ```
 
 输出应同时包含 `x86_64` 与 `arm64`。

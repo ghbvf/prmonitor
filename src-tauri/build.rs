@@ -1,6 +1,18 @@
 use std::path::Path;
 
 fn main() {
+    // tauri#13419: tauri-winres embeds ComCtl32 v6 only on app bins (`rustc-link-arg-bins`).
+    // Without this, Windows `cargo test --lib` harnesses bind ComCtl32 v5.82 and crash at load
+    // with STATUS_ENTRYPOINT_NOT_FOUND (TaskDialogIndirect). Duplicate merge on the app bin is harmless.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if target.ends_with("windows-msvc") {
+        println!(
+            "cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' \
+             name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
+             processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
+        );
+    }
+
     ensure_web_dist_placeholder();
     tauri_build::build()
 }
