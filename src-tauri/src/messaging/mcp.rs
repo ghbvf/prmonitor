@@ -25,8 +25,16 @@ use tauri::Manager;
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::config::service as config_service;
+use crate::config::service::MessagingIntegration;
 use crate::db::Database;
-use crate::messaging::feishu::{send_human_input_card, update_human_input_card};
+use crate::messaging::dingtalk::{
+    send_human_input_card as send_dingtalk_human_input_card,
+    update_human_input_card as update_dingtalk_human_input_card,
+};
+use crate::messaging::feishu::{
+    send_human_input_card as send_feishu_human_input_card,
+    update_human_input_card as update_feishu_human_input_card,
+};
 use crate::messaging::human_input::{
     self, HumanAnswer, HumanAnswerSource, HumanInputBroker, HumanInputRequest, HumanInputStatus,
     HumanQuestion,
@@ -36,7 +44,7 @@ use crate::model::MessagingProviderKind;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct AskViaFeishuInput {
+pub struct AskViaMessagingInput {
     pub purpose: String,
     pub title: String,
     pub message: String,
@@ -45,10 +53,13 @@ pub struct AskViaFeishuInput {
     pub context: Value,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
-    /// Optional explicit selector; omitted uses the first enabled Feishu integration.
+    /// Optional explicit selector; omitted uses the first enabled matching integration.
     pub integration_id: Option<String>,
     pub conversation_id: Option<String>,
 }
+
+pub type AskViaFeishuInput = AskViaMessagingInput;
+pub type AskViaDingTalkInput = AskViaMessagingInput;
 
 fn default_timeout() -> u64 {
     human_input::MAX_WAIT_SECONDS
@@ -59,12 +70,15 @@ const SESSION_CLOSE_GRACE_SECONDS: u64 = 300;
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct AskViaFeishuOutput {
+pub struct AskViaMessagingOutput {
     pub request_id: String,
     pub status: HumanInputStatus,
     pub source: Option<HumanAnswerSource>,
     pub answers: Vec<HumanAnswer>,
 }
+
+pub type AskViaFeishuOutput = AskViaMessagingOutput;
+pub type AskViaDingTalkOutput = AskViaMessagingOutput;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CodexAnswer {
@@ -106,6 +120,30 @@ impl<R: tauri::Runtime> PrmonitorMcp<R> {
         Parameters(input): Parameters<AskViaFeishuInput>,
         context: RequestContext<RoleServer>,
     ) -> Result<Json<AskViaFeishuOutput>, String> {
+        self.ask_via_messaging(MessagingProviderKind::Feishu, input, context)
+            .await
+    }
+
+    #[tool(
+        name = "ask_via_dingtalk",
+        description = "Ask 1-3 human questions through both DingTalk interactive cards and a Codex elicitation popup; the first answer wins atomically."
+    )]
+    async fn ask_via_dingtalk(
+        &self,
+        Parameters(input): Parameters<AskViaDingTalkInput>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<AskViaDingTalkOutput>, String> {
+        self.ask_via_messaging(MessagingProviderKind::DingTalk, input, context)
+            .await
+    }
+
+    async fn ask_via_messaging(
+        &self,
+        kind: MessagingProviderKind,
+        input: AskViaMessagingInput,
+        context: RequestContext<RoleServer>,
+    ) -> Result<Json<AskViaMessagingOutput>, String> {
+        let label = provider_label(kind);
         if input.questions.is_empty() || input.questions.len() > 3 {
             return Err("questions 必须包含 1-3 个问题".into());
         }
@@ -116,13 +154,13 @@ impl<R: tauri::Runtime> PrmonitorMcp<R> {
             .into_iter()
             .find(|item| {
                 item.enabled
-                    && item.kind == MessagingProviderKind::Feishu
+                    && item.kind == kind
                     && input
                         .integration_id
                         .as_deref()
                         .is_none_or(|id| id == item.id)
             })
-            .ok_or_else(|| "没有已启用且匹配的 Feishu 消息集成".to_string())?;
+            .ok_or_else(|| format!("没有已启用且匹配的 {label} 消息集成"))?;
         let conversation_id = input
             .conversation_id
             .as_deref()
@@ -132,7 +170,7 @@ impl<R: tauri::Runtime> PrmonitorMcp<R> {
                     .first()
                     .map(String::as_str)
             })
-            .ok_or_else(|| "Feishu 消息集成没有允许的会话".to_string())?
+            .ok_or_else(|| format!("{label} 消息集成没有允许的会话"))?
             .to_string();
         if !integration
             .allowed_conversation_ids
@@ -170,19 +208,19 @@ impl<R: tauri::Runtime> PrmonitorMcp<R> {
         let broker = self.app.state::<HumanInputBroker>();
         human_input::create(db.inner(), &request).map_err(|e| e.message)?;
         let mut receiver = broker.subscribe(&request.id);
-        let message_id = match send_human_input_card(&integration, &conversation_id, &request).await
-        {
-            Ok(message_id) => message_id,
-            Err(error) => {
-                let _ = human_input::cancel(
-                    db.inner(),
-                    broker.inner(),
-                    &request.id,
-                    store::now_epoch(),
-                );
-                return Err(error.message);
-            }
-        };
+        let message_id =
+            match send_human_input_card(kind, &integration, &conversation_id, &request).await {
+                Ok(message_id) => message_id,
+                Err(error) => {
+                    let _ = human_input::cancel(
+                        db.inner(),
+                        broker.inner(),
+                        &request.id,
+                        store::now_epoch(),
+                    );
+                    return Err(error.message);
+                }
+            };
         human_input::set_card_message_id(db.inner(), &request.id, &message_id)
             .map_err(|e| e.message)?;
 
@@ -239,8 +277,8 @@ impl<R: tauri::Runtime> PrmonitorMcp<R> {
                     .await?
                 }
                 Err(error) => {
-                    eprintln!("{error}；继续等待飞书回答（{}）", request.id);
-                    wait_feishu_only(
+                    eprintln!("{error}；继续等待消息通道回答（{}）", request.id);
+                    wait_channel_only(
                         db.inner(),
                         broker.inner(),
                         &request.id,
@@ -251,7 +289,7 @@ impl<R: tauri::Runtime> PrmonitorMcp<R> {
                 }
             }
         } else {
-            wait_feishu_only(
+            wait_channel_only(
                 db.inner(),
                 broker.inner(),
                 &request.id,
@@ -266,20 +304,66 @@ impl<R: tauri::Runtime> PrmonitorMcp<R> {
             .or(Some(message_id.as_str()))
         {
             if let Err(error) =
-                update_human_input_card(&integration, card_message_id, &result).await
+                update_human_input_card(kind, &integration, card_message_id, &result).await
             {
                 eprintln!(
-                    "更新飞书人工输入卡片失败（{}）：{}",
+                    "更新{label}人工输入卡片失败（{}）：{}",
                     result.id, error.message
                 );
             }
         }
-        Ok(Json(AskViaFeishuOutput {
+        Ok(Json(AskViaMessagingOutput {
             request_id: result.id,
             status: result.status,
             source: result.answer_source,
             answers: result.answer.unwrap_or_default(),
         }))
+    }
+}
+
+fn provider_label(kind: MessagingProviderKind) -> &'static str {
+    match kind {
+        MessagingProviderKind::Feishu => "Feishu",
+        MessagingProviderKind::DingTalk => "钉钉",
+        MessagingProviderKind::WeChatWork => "企业微信",
+    }
+}
+
+async fn send_human_input_card(
+    kind: MessagingProviderKind,
+    integration: &MessagingIntegration,
+    conversation_id: &str,
+    request: &HumanInputRequest,
+) -> crate::error::AppResult<String> {
+    match kind {
+        MessagingProviderKind::Feishu => {
+            send_feishu_human_input_card(integration, conversation_id, request).await
+        }
+        MessagingProviderKind::DingTalk => {
+            send_dingtalk_human_input_card(integration, conversation_id, request).await
+        }
+        MessagingProviderKind::WeChatWork => {
+            Err(crate::error::AppError::new("企业微信不支持人工输入卡片"))
+        }
+    }
+}
+
+async fn update_human_input_card(
+    kind: MessagingProviderKind,
+    integration: &MessagingIntegration,
+    card_message_id: &str,
+    request: &HumanInputRequest,
+) -> crate::error::AppResult<()> {
+    match kind {
+        MessagingProviderKind::Feishu => {
+            update_feishu_human_input_card(integration, card_message_id, request).await
+        }
+        MessagingProviderKind::DingTalk => {
+            update_dingtalk_human_input_card(integration, card_message_id, request).await
+        }
+        MessagingProviderKind::WeChatWork => {
+            Err(crate::error::AppError::new("企业微信不支持人工输入卡片"))
+        }
     }
 }
 
@@ -293,9 +377,9 @@ async fn wait_with_elicitation(
 ) -> Result<HumanInputRequest, String> {
     tokio::select! {
         changed = receiver.changed() => {
-            changed.map_err(|_| "Feishu answer channel closed".to_string())?;
-            let winner = receiver.borrow().clone().ok_or_else(|| "Feishu answer missing".to_string())?;
-            if let Err(error) = handle.cancel(Some("Feishu answered first".into())).await {
+            changed.map_err(|_| "Messaging answer channel closed".to_string())?;
+            let winner = receiver.borrow().clone().ok_or_else(|| "Messaging answer missing".to_string())?;
+            if let Err(error) = handle.cancel(Some("Messaging channel answered first".into())).await {
                 eprintln!("取消 Codex elicitation 失败（{}）：{error}", request.id);
             }
             Ok(winner)
@@ -305,7 +389,7 @@ async fn wait_with_elicitation(
                 Ok(Ok(ClientResult::ElicitResult(result))) => {
                     match result.action {
                         ElicitationAction::Accept => {
-                            accept_codex_or_wait_feishu(
+                            accept_codex_or_wait_channel(
                                 db,
                                 broker,
                                 request,
@@ -329,20 +413,20 @@ async fn wait_with_elicitation(
                             .await
                         }
                         _ => {
-                            eprintln!("Codex elicitation 返回了未知 action（{}）；继续等待飞书回答", request.id);
-                            wait_feishu_only(db, broker, &request.id, receiver, deadline).await
+                            eprintln!("Codex elicitation 返回了未知 action（{}）；继续等待消息通道回答", request.id);
+                            wait_channel_only(db, broker, &request.id, receiver, deadline).await
                         }
                     }
                 }
                 Ok(Ok(_)) => {
-                    eprintln!("Codex elicitation 返回了意外响应（{}）；继续等待飞书回答", request.id);
-                    wait_feishu_only(db, broker, &request.id, receiver, deadline).await
+                    eprintln!("Codex elicitation 返回了意外响应（{}）；继续等待消息通道回答", request.id);
+                    wait_channel_only(db, broker, &request.id, receiver, deadline).await
                 }
                 Ok(Err(error)) => {
                     eprintln!("Codex elicitation 失败（{}）：{error}", request.id);
-                    wait_feishu_only(db, broker, &request.id, receiver, deadline).await
+                    wait_channel_only(db, broker, &request.id, receiver, deadline).await
                 }
-                Err(_) => wait_feishu_only(db, broker, &request.id, receiver, deadline).await,
+                Err(_) => wait_channel_only(db, broker, &request.id, receiver, deadline).await,
             }
         }
         _ = tokio::time::sleep_until(deadline) => {
@@ -362,10 +446,10 @@ async fn continue_after_codex_cancel(
     deadline: tokio::time::Instant,
 ) -> Result<HumanInputRequest, String> {
     eprintln!(
-        "Codex elicitation Cancel（{}）；继续等待飞书回答",
+        "Codex elicitation Cancel（{}）；继续等待消息通道回答",
         request.id
     );
-    wait_feishu_only(db, broker, &request.id, receiver, deadline).await
+    wait_channel_only(db, broker, &request.id, receiver, deadline).await
 }
 
 fn cancel_after_codex_decline(
@@ -379,7 +463,7 @@ fn cancel_after_codex_decline(
     current_request(db, request_id)
 }
 
-async fn accept_codex_or_wait_feishu(
+async fn accept_codex_or_wait_channel(
     db: &Database,
     broker: &HumanInputBroker,
     request: &HumanInputRequest,
@@ -402,10 +486,10 @@ async fn accept_codex_or_wait_feishu(
         Ok(_) => current_request(db, &request.id),
         Err(error) => {
             eprintln!(
-                "Codex elicitation 答案无效（{}）：{error}；继续等待飞书回答",
+                "Codex elicitation 答案无效（{}）：{error}；继续等待消息通道回答",
                 request.id
             );
-            wait_feishu_only(db, broker, &request.id, receiver, deadline).await
+            wait_channel_only(db, broker, &request.id, receiver, deadline).await
         }
     }
 }
@@ -437,7 +521,7 @@ fn parse_codex_accept(
     Ok(answers)
 }
 
-async fn wait_feishu_only(
+async fn wait_channel_only(
     db: &Database,
     broker: &HumanInputBroker,
     request_id: &str,
@@ -446,8 +530,8 @@ async fn wait_feishu_only(
 ) -> Result<HumanInputRequest, String> {
     tokio::select! {
         changed = receiver.changed() => {
-            changed.map_err(|_| "Feishu answer channel closed".to_string())?;
-            receiver.borrow().clone().ok_or_else(|| "Feishu answer missing".to_string())
+            changed.map_err(|_| "messaging answer channel closed".to_string())?;
+            receiver.borrow().clone().ok_or_else(|| "messaging answer missing".to_string())
         }
         _ = tokio::time::sleep_until(deadline) => expire_request(db, broker, request_id),
     }
@@ -483,11 +567,17 @@ pub(crate) async fn update_terminal_card<R: tauri::Runtime>(
             return;
         }
     };
-    if let Err(error) = update_human_input_card(&integration, message_id, request).await {
-        eprintln!(
-            "更新飞书人工输入卡片失败（{}）：{}",
-            request.id, error.message
-        );
+    let result = match integration.kind {
+        MessagingProviderKind::Feishu => {
+            update_feishu_human_input_card(&integration, message_id, request).await
+        }
+        MessagingProviderKind::DingTalk => {
+            update_dingtalk_human_input_card(&integration, message_id, request).await
+        }
+        MessagingProviderKind::WeChatWork => return,
+    };
+    if let Err(error) = result {
+        eprintln!("更新人工输入卡片失败（{}）：{}", request.id, error.message);
     }
 }
 
@@ -721,6 +811,20 @@ mod tests {
             .await
             .expect("tools/list body")
             .contains("ask_via_feishu"));
+        // Re-list to assert DingTalk tool registration without consuming the prior body twice.
+        let tools_again = mcp_request(&client, &url, token)
+            .header("mcp-session-id", &session)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0", "id": 22, "method": "tools/list", "params": {}
+            }))
+            .send()
+            .await
+            .expect("tools/list again");
+        assert!(tools_again
+            .text()
+            .await
+            .expect("tools/list body")
+            .contains("ask_via_dingtalk"));
 
         let invalid_call = mcp_request(&client, &url, token)
             .header("mcp-session-id", &session)
@@ -747,6 +851,33 @@ mod tests {
             .text()
             .await
             .expect("tools/call body")
+            .contains("questions 必须包含 1-3 个问题"));
+
+        let invalid_dingtalk = mcp_request(&client, &url, token)
+            .header("mcp-session-id", &session)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "ask_via_dingtalk",
+                    "arguments": {
+                        "purpose": "question",
+                        "title": "test",
+                        "message": "test",
+                        "questions": [],
+                        "timeoutSecs": 1
+                    }
+                }
+            }))
+            .send()
+            .await
+            .expect("tools/call dingtalk");
+        assert_eq!(invalid_dingtalk.status(), reqwest::StatusCode::OK);
+        assert!(invalid_dingtalk
+            .text()
+            .await
+            .expect("tools/call dingtalk body")
             .contains("questions 必须包含 1-3 个问题"));
 
         let closed = client
@@ -788,7 +919,7 @@ mod tests {
         human_input::create(&db, &request).unwrap();
         let mut receiver = broker.subscribe(&request.id);
 
-        let wait = accept_codex_or_wait_feishu(
+        let wait = accept_codex_or_wait_channel(
             &db,
             &broker,
             &request,

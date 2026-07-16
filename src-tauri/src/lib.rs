@@ -367,6 +367,7 @@ fn build_app() {
         .manage(messaging::human_input::HumanInputBroker::default())
         .manage(messaging::service::MessagingEventWorker::default())
         .manage(messaging::feishu_long_connection::FeishuConnectionManager::default())
+        .manage(messaging::dingtalk_stream::DingTalkConnectionManager::default())
         .setup(|app| {
             // Open + migrate the unified SQLite store and manage it as a `tauri::State`
             // BEFORE anything that reads persistence (config load / poll start). It is a
@@ -904,6 +905,8 @@ fn build_app() {
                         .reconcile(app.handle(), &cfg.remote_access, cloudflared);
                     app.state::<messaging::feishu_long_connection::FeishuConnectionManager>()
                         .reconcile(app.handle(), &cfg.messaging.integrations);
+                    app.state::<messaging::dingtalk_stream::DingTalkConnectionManager>()
+                        .reconcile(app.handle(), &cfg.messaging.integrations);
                 }
                 Err(e) => eprintln!("Remote 监听运行时：读取配置失败，跳过初次 reconcile：{e}"),
             }
@@ -925,6 +928,8 @@ fn build_app() {
                         cloudflared,
                     );
                     app.state::<messaging::feishu_long_connection::FeishuConnectionManager>()
+                        .reconcile(&app, &cfg.messaging.integrations);
+                    app.state::<messaging::dingtalk_stream::DingTalkConnectionManager>()
                         .reconcile(&app, &cfg.messaging.integrations);
                     app.state::<messaging::service::MessagingEventWorker>()
                         .wake();
@@ -1057,6 +1062,9 @@ fn build_app() {
                 state.web_pty.shutdown();
                 app_handle
                     .state::<messaging::feishu_long_connection::FeishuConnectionManager>()
+                    .stop();
+                app_handle
+                    .state::<messaging::dingtalk_stream::DingTalkConnectionManager>()
                     .stop();
                 app_handle.state::<messaging::service::MessagingEventWorker>().shutdown();
             }

@@ -89,6 +89,7 @@ export const NOTIFICATION_KINDS = ["desktop","email","slack","telegram","weChatW
 
 export type MessagingProviderKind = "feishu" | "weChatWork" | "dingTalk";
 export const MESSAGING_PROVIDER_KINDS = ["feishu","weChatWork","dingTalk"] as const;
+export const MESSAGING_LONG_CONNECTION_KINDS = ["feishu","dingTalk"] as const;
 
 export type MessagingEventStatus = "received" | "processed" | "failed";
 export const MESSAGING_EVENT_STATUSES = ["received","processed","failed"] as const;
@@ -96,14 +97,18 @@ export const MESSAGING_EVENT_STATUSES = ["received","processed","failed"] as con
 export type ActionStatus = "pending" | "blocked" | "done" | "dead";
 export const ACTION_STATUSES = ["pending","blocked","done","dead"] as const;
 
-export type MessagingProviderCapability = { provider: MessagingProviderKind, supportsReply: boolean, supportsSend: boolean, supportsInformationCard: boolean, requiresAllowedConversations: boolean, };
+export type MessagingProviderCapability = { provider: MessagingProviderKind, supportsReply: boolean, supportsSend: boolean, supportsInformationCard: boolean,
+/**
+ * Provider runs a Stream / long-connection ingress (HTTP callback disabled).
+ */
+supportsLongConnection: boolean, requiresAllowedConversations: boolean, };
 
 export type MessagingIntegrationOption = { id: string, name: string, kind: MessagingProviderKind, allowedConversationIds: Array<string>, };
 
-export type FeishuConnectionState = "disabled" | "connecting" | "connected" | "reconnecting" | "error" | "stopped";
-export const FEISHU_CONNECTION_STATES = ["disabled","connecting","connected","reconnecting","error","stopped"] as const;
+export type MessagingConnectionState = "disabled" | "connecting" | "connected" | "reconnecting" | "error" | "stopped";
+export const MESSAGING_CONNECTION_STATES = ["disabled","connecting","connected","reconnecting","error","stopped"] as const;
 
-export type FeishuConnectionStatus = { integrationId: string, status: FeishuConnectionState, lastConnectedAtEpoch: number | null, lastEventAtEpoch: number | null, lastError: string | null, reconnectCount: number, };
+export type MessagingConnectionStatus = { provider: MessagingProviderKind, integrationId: string, status: MessagingConnectionState, lastConnectedAtEpoch: number | null, lastEventAtEpoch: number | null, lastError: string | null, reconnectCount: number, };
 
 export type MessagingEvent = { provider: MessagingProviderKind, integrationId: string, eventId: string, conversationId: string, threadId: string, senderId: string, text: string, mentionedBot: boolean, rawPayload: string, receivedAtEpoch: number, };
 

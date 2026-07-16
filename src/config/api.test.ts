@@ -6,7 +6,7 @@ vi.mock("../transport", () => ({
   getTransport: () => ({ request }),
 }));
 
-import { getFeishuConnectionStatuses, probeCliTools } from "./api";
+import { getMessagingConnectionStatuses, probeCliTools } from "./api";
 
 beforeEach(() => request.mockReset());
 
@@ -24,11 +24,11 @@ describe("probeCliTools", () => {
   });
 });
 
-describe("getFeishuConnectionStatuses", () => {
+describe("getMessagingConnectionStatuses", () => {
   it("uses the long-connection runtime status command", async () => {
     request.mockResolvedValue([]);
 
-    await getFeishuConnectionStatuses();
+    await getMessagingConnectionStatuses();
 
     expect(request).toHaveBeenCalledWith("messaging_connection_statuses_list");
   });

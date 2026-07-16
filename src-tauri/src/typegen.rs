@@ -21,8 +21,8 @@ use crate::{
     model::{
         ActionStatus, ClaudeEffort, CliResolutionSource, CliTool, CodexReasoningEffort, EngineKind,
         EventEnvelope, EventPayload, EventSubject, EventType, ExternalRequestId,
-        ExternalTriggerOrigin, FeishuConnectionState, FeishuConnectionStatus, InboxDedupeKey,
-        InboxEventId, LabelSource, MessagingCardTemplate, MessagingEvent, MessagingEventEntry,
+        ExternalTriggerOrigin, InboxDedupeKey, InboxEventId, LabelSource, MessagingCardTemplate,
+        MessagingConnectionState, MessagingConnectionStatus, MessagingEvent, MessagingEventEntry,
         MessagingEventStatus, MessagingIntegrationOption, MessagingProviderCapability,
         MessagingProviderKind, MessagingReplyAudit, MessagingSendContent, NotificationKind,
         NotificationLevel, OutboxProducerKey, PullRequestView, ReviewActionKey, ReviewKind,
@@ -86,6 +86,18 @@ where
     T: IntoEnumIterator + Serialize,
 {
     format!("export const {name} = {} as const;\n", enum_values::<T>())
+}
+
+fn messaging_long_connection_kinds_const() -> String {
+    use crate::messaging::service::supports_long_connection;
+    let kinds = MessagingProviderKind::iter()
+        .filter(|kind| supports_long_connection(*kind))
+        .map(MessagingProviderKind::as_wire)
+        .collect::<Vec<_>>();
+    format!(
+        "export const MESSAGING_LONG_CONNECTION_KINDS = {} as const;\n",
+        serde_json::to_string(&kinds).expect("long-connection kinds serialize")
+    )
 }
 
 fn default_const<T: Serialize>(name: &str, type_name: &str, value: &T) -> String {
@@ -217,6 +229,7 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push_str(&option_array::<MessagingProviderKind>(
         "MESSAGING_PROVIDER_KINDS",
     ));
+    shared.push_str(&messaging_long_connection_kinds_const());
     shared.push('\n');
     shared.push_str(&declaration::<MessagingEventStatus>(&cfg));
     shared.push_str(&option_array::<MessagingEventStatus>(
@@ -230,12 +243,12 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push('\n');
     shared.push_str(&declaration::<MessagingIntegrationOption>(&cfg));
     shared.push('\n');
-    shared.push_str(&declaration::<FeishuConnectionState>(&cfg));
-    shared.push_str(&option_array::<FeishuConnectionState>(
-        "FEISHU_CONNECTION_STATES",
+    shared.push_str(&declaration::<MessagingConnectionState>(&cfg));
+    shared.push_str(&option_array::<MessagingConnectionState>(
+        "MESSAGING_CONNECTION_STATES",
     ));
     shared.push('\n');
-    shared.push_str(&declaration::<FeishuConnectionStatus>(&cfg));
+    shared.push_str(&declaration::<MessagingConnectionStatus>(&cfg));
     shared.push('\n');
     shared.push_str(&declaration::<MessagingEvent>(&cfg));
     shared.push('\n');

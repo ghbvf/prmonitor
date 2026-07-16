@@ -281,8 +281,23 @@ pub(crate) fn validate_current_feishu_long_connection<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     connected: &MessagingIntegration,
 ) -> AppResult<()> {
+    validate_current_long_connection(app, connected, MessagingProviderKind::Feishu)
+}
+
+pub(crate) fn validate_current_dingtalk_long_connection<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    connected: &MessagingIntegration,
+) -> AppResult<()> {
+    validate_current_long_connection(app, connected, MessagingProviderKind::DingTalk)
+}
+
+fn validate_current_long_connection<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    connected: &MessagingIntegration,
+    expected: MessagingProviderKind,
+) -> AppResult<()> {
     let current = config_service::messaging_integration(app, &connected.id)?;
-    validate_long_connection_integration(&current, connected)
+    validate_long_connection_integration(&current, connected, expected)
 }
 
 fn validate_long_connection_event(
@@ -290,9 +305,9 @@ fn validate_long_connection_event(
     connected: &MessagingIntegration,
     event: &MessagingEvent,
 ) -> AppResult<()> {
-    validate_long_connection_integration(current, connected)?;
-    if event.provider != MessagingProviderKind::Feishu || event.integration_id != current.id {
-        return Err(AppError::new("飞书长连接事件 provider 不匹配"));
+    validate_long_connection_integration(current, connected, current.kind)?;
+    if event.provider != current.kind || event.integration_id != current.id {
+        return Err(AppError::new("长连接事件 provider 不匹配"));
     }
     Ok(())
 }
@@ -300,22 +315,23 @@ fn validate_long_connection_event(
 fn validate_long_connection_integration(
     current: &MessagingIntegration,
     connected: &MessagingIntegration,
+    expected: MessagingProviderKind,
 ) -> AppResult<()> {
     if !current.enabled {
-        return Err(AppError::new("飞书消息集成已禁用，拒绝长连接事件"));
+        return Err(AppError::new("消息集成已禁用，拒绝长连接事件"));
     }
-    if current.kind != MessagingProviderKind::Feishu
-        || connected.kind != MessagingProviderKind::Feishu
-        || connected.id != current.id
-    {
-        return Err(AppError::new("飞书长连接事件 provider 不匹配"));
+    if current.kind != expected || connected.kind != expected || connected.id != current.id {
+        return Err(AppError::new("长连接事件 provider 不匹配"));
+    }
+    if !provider_for(expected).capability().supports_long_connection {
+        return Err(AppError::new("该消息集成不支持长连接入站"));
     }
     let current_snapshot = serde_json::to_vec(current)
         .map_err(|error| AppError::new(format!("当前消息集成配置序列化失败: {error}")))?;
     let connected_snapshot = serde_json::to_vec(connected)
         .map_err(|error| AppError::new(format!("长连接消息集成配置序列化失败: {error}")))?;
     if current_snapshot != connected_snapshot {
-        return Err(AppError::new("飞书长连接配置 generation 已失效"));
+        return Err(AppError::new("长连接配置 generation 已失效"));
     }
     Ok(())
 }
@@ -508,7 +524,7 @@ pub(crate) fn prepare_send(
                 .supports_information_card
             {
                 return Err(AppError::new(format!(
-                    "信息卡片仅支持 Feishu，消息集成「{}」是 {}",
+                    "信息卡片不受支持：消息集成「{}」是 {}",
                     integration.name,
                     integration.kind.as_wire()
                 )));
@@ -686,12 +702,25 @@ async fn process_event<R: Runtime>(
                     answer: value,
                 });
             }
+            let answer_source = match event.provider {
+                MessagingProviderKind::Feishu => {
+                    crate::messaging::human_input::HumanAnswerSource::Feishu
+                }
+                MessagingProviderKind::DingTalk => {
+                    crate::messaging::human_input::HumanAnswerSource::DingTalk
+                }
+                MessagingProviderKind::WeChatWork => {
+                    return Err(AppError::new(
+                        "企业微信不支持长连接 /answer；请使用支持互动问答的通道",
+                    ));
+                }
+            };
             let outcome = crate::messaging::human_input::answer(
                 db.inner(),
                 broker.inner(),
                 &request_id,
                 &answers,
-                crate::messaging::human_input::HumanAnswerSource::Feishu,
+                answer_source,
                 store::now_epoch(),
             )?;
             let text = match outcome {
@@ -814,11 +843,29 @@ fn messaging_review_request_id(event: &MessagingEvent) -> ExternalRequestId {
         .expect("SHA-256 prefix is lowercase hexadecimal")
 }
 
-fn provider_for(kind: MessagingProviderKind) -> &'static dyn MessagingProvider {
+pub(crate) fn provider_for(kind: MessagingProviderKind) -> &'static dyn MessagingProvider {
     match kind {
         MessagingProviderKind::Feishu => &FeishuProvider,
         MessagingProviderKind::WeChatWork => &WeChatWorkProvider,
         MessagingProviderKind::DingTalk => &DingTalkProvider,
+    }
+}
+
+pub(crate) fn supports_long_connection(kind: MessagingProviderKind) -> bool {
+    provider_for(kind).capability().supports_long_connection
+}
+
+pub(crate) fn long_connection_http_gone_message(kind: MessagingProviderKind) -> &'static str {
+    match kind {
+        MessagingProviderKind::Feishu => {
+            "飞书 HTTP 回调已禁用；请在飞书开放平台启用官方长连接"
+        }
+        MessagingProviderKind::DingTalk => {
+            "钉钉 HTTP 回调已禁用；请在钉钉开放平台启用 Stream 模式"
+        }
+        MessagingProviderKind::WeChatWork => {
+            "该 messaging provider 未启用长连接 HTTP 410"
+        }
     }
 }
 
@@ -1082,6 +1129,55 @@ mod tests {
         current = connected.clone();
         current.kind = MessagingProviderKind::DingTalk;
         assert!(validate_long_connection_event(&current, &connected, &event).is_err());
+    }
+
+    #[test]
+    fn long_connection_accepts_dingtalk_and_rejects_wechat() {
+        let connected = MessagingIntegration {
+            id: "dt".into(),
+            kind: MessagingProviderKind::DingTalk,
+            enabled: true,
+            app_id: "app".into(),
+            app_secret: "secret".into(),
+            bot_open_id: "robot".into(),
+            card_template_id: "tpl".into(),
+            ..MessagingIntegration::feishu_default()
+        };
+        let event = MessagingEvent {
+            provider: MessagingProviderKind::DingTalk,
+            integration_id: "dt".into(),
+            event_id: "evt".into(),
+            conversation_id: "chat".into(),
+            thread_id: "msg".into(),
+            sender_id: "u".into(),
+            text: "/help".into(),
+            mentioned_bot: true,
+            raw_payload: "{}".into(),
+            received_at_epoch: 1,
+        };
+        assert!(validate_long_connection_event(&connected, &connected, &event).is_ok());
+        assert!(
+            provider_for(MessagingProviderKind::DingTalk)
+                .capability()
+                .supports_long_connection
+        );
+        assert!(
+            !provider_for(MessagingProviderKind::WeChatWork)
+                .capability()
+                .supports_long_connection
+        );
+        let wechat = MessagingIntegration {
+            id: "ww".into(),
+            kind: MessagingProviderKind::WeChatWork,
+            enabled: true,
+            ..MessagingIntegration::feishu_default()
+        };
+        let wechat_event = MessagingEvent {
+            provider: MessagingProviderKind::WeChatWork,
+            integration_id: "ww".into(),
+            ..event.clone()
+        };
+        assert!(validate_long_connection_event(&wechat, &wechat, &wechat_event).is_err());
     }
 
     #[test]
@@ -1559,37 +1655,63 @@ mod tests {
     }
 
     #[test]
-    fn prepare_send_rejects_cards_for_non_feishu_and_empty_fields() {
-        for kind in [
-            MessagingProviderKind::WeChatWork,
-            MessagingProviderKind::DingTalk,
-        ] {
-            let integration = MessagingIntegration {
-                id: kind.as_wire().to_string(),
-                name: kind.as_wire().to_string(),
-                kind,
-                allowed_conversation_ids: vec!["chat".to_string()],
-                enabled: true,
-                ..MessagingIntegration::feishu_default()
-            };
-            let error = match prepare_send(
-                &integration,
-                SendMessagingRequest {
-                    integration_id: integration.id.clone(),
-                    conversation_id: "chat".to_string(),
-                    content: MessagingSendContent::Card {
-                        title: "title".to_string(),
-                        text: "body".to_string(),
-                        template: MessagingCardTemplate::Blue,
-                    },
-                    request_id: "req-card".to_string(),
+    fn prepare_send_rejects_cards_for_unsupported_providers_and_empty_fields() {
+        let integration = MessagingIntegration {
+            id: "wecom".to_string(),
+            name: "weChatWork".to_string(),
+            kind: MessagingProviderKind::WeChatWork,
+            allowed_conversation_ids: vec!["chat".to_string()],
+            enabled: true,
+            ..MessagingIntegration::feishu_default()
+        };
+        let error = match prepare_send(
+            &integration,
+            SendMessagingRequest {
+                integration_id: integration.id.clone(),
+                conversation_id: "chat".to_string(),
+                content: MessagingSendContent::Card {
+                    title: "title".to_string(),
+                    text: "body".to_string(),
+                    template: MessagingCardTemplate::Blue,
                 },
-            ) {
-                Ok(_) => panic!("non-Feishu cards must fail before enqueue"),
-                Err(error) => error,
-            };
-            assert!(error.message.contains("仅支持 Feishu"), "{}", error.message);
-        }
+                request_id: "req-card".to_string(),
+            },
+        ) {
+            Ok(_) => panic!("WeChat Work cards must fail before enqueue"),
+            Err(error) => error,
+        };
+        assert!(
+            error.message.contains("信息卡片不受支持"),
+            "{}",
+            error.message
+        );
+
+        let dingtalk = MessagingIntegration {
+            id: "dingtalk".to_string(),
+            name: "dingTalk".to_string(),
+            kind: MessagingProviderKind::DingTalk,
+            allowed_conversation_ids: vec!["chat".to_string()],
+            enabled: true,
+            app_id: "app".into(),
+            app_secret: "secret".into(),
+            bot_open_id: "robot".into(),
+            card_template_id: "tpl".into(),
+            ..MessagingIntegration::feishu_default()
+        };
+        prepare_send(
+            &dingtalk,
+            SendMessagingRequest {
+                integration_id: dingtalk.id.clone(),
+                conversation_id: "chat".to_string(),
+                content: MessagingSendContent::Card {
+                    title: "title".to_string(),
+                    text: "body".to_string(),
+                    template: MessagingCardTemplate::Blue,
+                },
+                request_id: "req-dt-card".to_string(),
+            },
+        )
+        .expect("DingTalk information cards must enqueue");
 
         let integration = MessagingIntegration {
             id: "fs".to_string(),

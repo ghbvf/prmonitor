@@ -7,7 +7,7 @@ import type {
   NotificationChannel,
   RemoteAccessRuntimeStatus,
 } from "./types";
-import type { FeishuConnectionStatus } from "../types.generated";
+import type { MessagingConnectionStatus } from "../types.generated";
 
 export function appVersion(): Promise<string> {
   return getTransport().request<string>("app_version");
@@ -47,6 +47,6 @@ export function getRemoteAccessRuntimeStatus(): Promise<RemoteAccessRuntimeStatu
   return getTransport().request<RemoteAccessRuntimeStatus>("get_remote_access_runtime_status");
 }
 
-export function getFeishuConnectionStatuses(): Promise<FeishuConnectionStatus[]> {
-  return getTransport().request<FeishuConnectionStatus[]>("messaging_connection_statuses_list");
+export function getMessagingConnectionStatuses(): Promise<MessagingConnectionStatus[]> {
+  return getTransport().request<MessagingConnectionStatus[]>("messaging_connection_statuses_list");
 }

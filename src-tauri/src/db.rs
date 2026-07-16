@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -247,6 +247,9 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 16 {
         apply_v16(conn)?;
     }
+    if version < 17 {
+        apply_v17(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -394,6 +397,11 @@ fn apply_v15(conn: &Connection) -> AppResult<()> {
 /// SQL compare-and-set. Pending rows survive app restarts and are safe to recover/expire.
 fn apply_v16(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(SCHEMA_V16).map_err(map_err)?;
+    Ok(())
+}
+
+fn apply_v17(conn: &Connection) -> AppResult<()> {
+    conn.execute_batch(SCHEMA_V17).map_err(map_err)?;
     Ok(())
 }
 
@@ -895,6 +903,38 @@ CREATE INDEX idx_human_input_request_conversation
     ON human_input_request(integration_id, conversation_id, created_at_epoch DESC);
 "#;
 
+const SCHEMA_V17: &str = r#"
+CREATE TABLE human_input_request_v17 (
+    id TEXT PRIMARY KEY NOT NULL,
+    integration_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    title TEXT NOT NULL,
+    message TEXT NOT NULL,
+    questions_json TEXT NOT NULL,
+    context_json TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','answered','cancelled','expired')),
+    answer_json TEXT,
+    answer_source TEXT CHECK(answer_source IS NULL OR answer_source IN ('feishu','dingTalk','codex')),
+    card_message_id TEXT,
+    created_at_epoch INTEGER NOT NULL,
+    expires_at_epoch INTEGER NOT NULL,
+    answered_at_epoch INTEGER
+);
+INSERT INTO human_input_request_v17
+SELECT id, integration_id, conversation_id, purpose, title, message, questions_json, context_json,
+       status, answer_json, answer_source, card_message_id, created_at_epoch, expires_at_epoch,
+       answered_at_epoch
+FROM human_input_request;
+DROP TABLE human_input_request;
+ALTER TABLE human_input_request_v17 RENAME TO human_input_request;
+CREATE INDEX idx_human_input_request_pending
+    ON human_input_request(status, expires_at_epoch, created_at_epoch);
+CREATE INDEX idx_human_input_request_conversation
+    ON human_input_request(integration_id, conversation_id, created_at_epoch DESC);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1041,7 +1081,7 @@ mod tests {
         ).expect("seed legacy notification");
 
         run_migrations(&conn).expect("v14 -> current");
-        assert_eq!(SCHEMA_VERSION, 16);
+        assert_eq!(SCHEMA_VERSION, 17);
         for column in ["producer_key", "review_thread_id"] {
             assert!(
                 table_has_column(&conn, "action_outbox", column),
@@ -1240,7 +1280,7 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 16, "current schema is v16");
+            assert_eq!(SCHEMA_VERSION, 17, "current schema is v17");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"
@@ -1878,6 +1918,48 @@ mod tests {
             index_exists(&conn, "idx_messaging_event_reply_outbox"),
             "v13 added the messaging_event reply outbox index"
         );
+    }
+
+    #[test]
+    fn migrate_v16_to_v17_allows_dingtalk_answer_source() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open");
+        conn.execute_batch(SCHEMA_V16)
+            .expect("seed v16 human_input");
+        conn.pragma_update(None, "user_version", 16)
+            .expect("stamp v16");
+        conn.execute(
+            "INSERT INTO human_input_request (
+                id, integration_id, conversation_id, purpose, title, message,
+                questions_json, context_json, status, answer_json, answer_source,
+                card_message_id, created_at_epoch, expires_at_epoch, answered_at_epoch
+             ) VALUES (?1, 'dt', 'cid', 'ask', 't', 'm', '[]', '{}', 'answered', '[]', 'feishu', NULL, 1, 2, 1)",
+            ["Q-seed"],
+        )
+        .expect("seed feishu row under v16");
+
+        run_migrations(&conn).expect("v16 -> v17");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read version");
+        assert_eq!(version, SCHEMA_VERSION);
+        conn.execute(
+            "INSERT INTO human_input_request (
+                id, integration_id, conversation_id, purpose, title, message,
+                questions_json, context_json, status, answer_json, answer_source,
+                card_message_id, created_at_epoch, expires_at_epoch, answered_at_epoch
+             ) VALUES (?1, 'dt', 'cid', 'ask', 't', 'm', '[]', '{}', 'answered', '[]', 'dingTalk', NULL, 1, 2, 1)",
+            ["Q-dt"],
+        )
+        .expect("dingTalk answer_source must be allowed after v17");
+        let source: String = conn
+            .query_row(
+                "SELECT answer_source FROM human_input_request WHERE id = 'Q-dt'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read");
+        assert_eq!(source, "dingTalk");
     }
 
     /// Whether an index of the given name exists (via `sqlite_master`).

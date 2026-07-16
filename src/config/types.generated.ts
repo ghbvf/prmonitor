@@ -57,6 +57,10 @@ export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {"channels":[
 
 export type MessagingIntegration = { id: string, name: string, kind: MessagingProviderKind, enabled: boolean, verificationToken: string, encryptKey: string, appId: string, appSecret: string, botOpenId: string,
 /**
+ * DingTalk interactive card template id (`cardTemplateId`). Unused by Feishu / WeCom.
+ */
+cardTemplateId: string,
+/**
  * Stable provider conversation ids allowed to execute commands. Empty fail-closes when enabled.
  */
 allowedConversationIds: Array<string>,
@@ -64,7 +68,7 @@ allowedConversationIds: Array<string>,
  * Whether group chat events must mention the bot before command parsing.
  */
 requireMention: boolean, timeoutSecs: number, };
-export const DEFAULT_MESSAGING_INTEGRATION: MessagingIntegration = {"id":"","name":"飞书","kind":"feishu","enabled":false,"verificationToken":"","encryptKey":"","appId":"","appSecret":"","botOpenId":"","allowedConversationIds":[],"requireMention":true,"timeoutSecs":15};
+export const DEFAULT_MESSAGING_INTEGRATION: MessagingIntegration = {"id":"","name":"飞书","kind":"feishu","enabled":false,"verificationToken":"","encryptKey":"","appId":"","appSecret":"","botOpenId":"","cardTemplateId":"","allowedConversationIds":[],"requireMention":true,"timeoutSecs":15};
 
 export type MessagingSettings = { integrations: Array<MessagingIntegration>, };
 export const DEFAULT_MESSAGING_SETTINGS: MessagingSettings = {"integrations":[]};

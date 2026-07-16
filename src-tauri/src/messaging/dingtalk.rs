@@ -1,27 +1,100 @@
-//! DingTalk messaging provider.
+//! DingTalk messaging provider — Stream ingress + OpenAPI egress.
 
 use axum::http::HeaderMap;
-use base64::{engine::general_purpose, Engine as _};
-use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sha2::Sha256;
-use subtle::ConstantTimeEq;
 
 use crate::config::service::MessagingIntegration;
 use crate::error::{AppError, AppResult};
+use crate::messaging::human_input::HumanInputRequest;
 use crate::messaging::provider::{MessagingProvider, ProviderFuture, Verification};
 use crate::messaging::redact_raw_summary;
 use crate::model::{
-    ActionExecutionResult, MessagingEvent, MessagingProviderCapability, MessagingProviderKind,
-    MessagingReplyTarget, MessagingSendContent,
+    ActionExecutionResult, MessagingCardTemplate, MessagingEvent, MessagingProviderCapability,
+    MessagingProviderKind, MessagingReplyTarget, MessagingSendContent,
 };
-
-type HmacSha256 = Hmac<Sha256>;
 
 pub struct DingTalkProvider;
 
-const MAX_TIMESTAMP_SKEW_SECS: i64 = 300;
+const DINGTALK_API_HOST: &str = "https://api.dingtalk.com";
+
+pub(crate) fn build_dingtalk_http_client(
+    integration: &MessagingIntegration,
+) -> AppResult<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(
+            integration.timeout_secs.clamp(1, 300),
+        ))
+        .build()
+        .map_err(|e| AppError::new(format!("钉钉 HTTP client 初始化失败: {e}")))
+}
+
+struct DingTalkApiClient {
+    client: reqwest::Client,
+    token: String,
+}
+
+impl DingTalkApiClient {
+    async fn authenticate(integration: &MessagingIntegration) -> AppResult<Self> {
+        let client = build_dingtalk_http_client(integration)?;
+        let token = access_token(&client, integration).await?;
+        Ok(Self { client, token })
+    }
+
+    fn post(&self, path: &str) -> reqwest::RequestBuilder {
+        self.client
+            .post(format!("{DINGTALK_API_HOST}{path}"))
+            .header("x-acs-dingtalk-access-token", &self.token)
+    }
+
+    fn put(&self, path: &str) -> reqwest::RequestBuilder {
+        self.client
+            .put(format!("{DINGTALK_API_HOST}{path}"))
+            .header("x-acs-dingtalk-access-token", &self.token)
+    }
+}
+
+async fn access_token(
+    client: &reqwest::Client,
+    integration: &MessagingIntegration,
+) -> AppResult<String> {
+    #[derive(Deserialize)]
+    struct TokenResp {
+        #[serde(rename = "accessToken")]
+        access_token: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        code: Option<String>,
+    }
+    let resp = client
+        .post(format!("{DINGTALK_API_HOST}/v1.0/oauth2/accessToken"))
+        .json(&json!({
+            "appKey": integration.app_id.trim(),
+            "appSecret": integration.app_secret.trim(),
+        }))
+        .send()
+        .await
+        .map_err(|e| AppError::new(format!("钉钉 accessToken 请求失败: {}", e.without_url())))?;
+    let status = resp.status();
+    let body: TokenResp = resp
+        .json()
+        .await
+        .map_err(|e| AppError::new(format!("钉钉 accessToken 响应损坏: {e}")))?;
+    if !status.is_success() {
+        return Err(AppError::new(format!(
+            "钉钉 accessToken HTTP {status}: {}",
+            body.message.unwrap_or_default()
+        )));
+    }
+    body.access_token.filter(|t| !t.is_empty()).ok_or_else(|| {
+        AppError::new(format!(
+            "钉钉 accessToken 为空（{}）",
+            body.code.unwrap_or_default()
+        ))
+    })
+}
 
 impl MessagingProvider for DingTalkProvider {
     fn kind(&self) -> MessagingProviderKind {
@@ -33,30 +106,21 @@ impl MessagingProvider for DingTalkProvider {
             provider: MessagingProviderKind::DingTalk,
             supports_reply: true,
             supports_send: true,
-            supports_information_card: false,
+            supports_information_card: true,
+            supports_long_connection: true,
             requires_allowed_conversations: true,
         }
     }
 
     fn verify(
         &self,
-        headers: &HeaderMap,
-        raw: &[u8],
-        integration: &MessagingIntegration,
+        _headers: &HeaderMap,
+        _raw: &[u8],
+        _integration: &MessagingIntegration,
     ) -> AppResult<Verification> {
-        let timestamp =
-            header(headers, "timestamp").or_else(|_| header(headers, "x-dingtalk-timestamp"))?;
-        let signature = header(headers, "sign").or_else(|_| header(headers, "x-dingtalk-sign"))?;
-        verify_timestamp_fresh(timestamp, crate::messaging::store::now_epoch())?;
-        verify_signature(integration.app_secret.trim(), timestamp, signature)?;
-        if let Ok(value) = serde_json::from_slice::<Value>(raw) {
-            if let Some(challenge) = value.get("challenge").and_then(Value::as_str) {
-                return Ok(Verification::UrlVerification {
-                    challenge: challenge.to_string(),
-                });
-            }
-        }
-        Ok(Verification::Event)
+        Err(AppError::new(
+            "钉钉 HTTP 回调已禁用；请在钉钉开放平台启用 Stream 模式",
+        ))
     }
 
     fn parse_event(
@@ -104,10 +168,7 @@ impl MessagingProvider for DingTalkProvider {
         target: &'a MessagingReplyTarget,
         text: &'a str,
     ) -> ProviderFuture<'a> {
-        Box::pin(async move {
-            let webhook = dingtalk_webhook(integration, &target.conversation_id)?;
-            post_text(integration, &webhook, text).await
-        })
+        Box::pin(async move { send_text(integration, &target.conversation_id, text).await })
     }
 
     fn send<'a>(
@@ -119,109 +180,197 @@ impl MessagingProvider for DingTalkProvider {
         Box::pin(async move {
             match content {
                 MessagingSendContent::Text { text } => {
-                    let webhook = dingtalk_webhook(integration, conversation_id)?;
-                    post_text(integration, &webhook, text).await
+                    send_text(integration, conversation_id, text).await
                 }
-                MessagingSendContent::Card { .. } => Ok(ActionExecutionResult::Dead {
-                    message: format!(
-                        "信息卡片仅支持 Feishu，消息集成「{}」是 {}",
-                        integration.name,
-                        integration.kind.as_wire()
-                    ),
-                }),
+                MessagingSendContent::Card {
+                    title,
+                    text,
+                    template,
+                } => {
+                    send_information_card(integration, conversation_id, title, text, *template)
+                        .await
+                }
             }
         })
     }
 }
 
-fn verify_signature(secret: &str, timestamp: &str, signature: &str) -> AppResult<()> {
-    let expected = signed_value(secret, timestamp)?;
-    if expected.as_bytes().ct_eq(signature.as_bytes()).into() {
-        Ok(())
-    } else {
-        Err(AppError::new("钉钉事件签名校验失败"))
-    }
-}
-
-fn verify_timestamp_fresh(timestamp: &str, now_epoch: u64) -> AppResult<()> {
-    let millis = timestamp
-        .trim()
-        .parse::<i64>()
-        .map_err(|_| AppError::new("钉钉事件 timestamp 无效"))?;
-    let seconds = millis / 1000;
-    let now = now_epoch as i64;
-    if (now - seconds).abs() > MAX_TIMESTAMP_SKEW_SECS {
-        return Err(AppError::new("钉钉事件 timestamp 已过期"));
-    }
-    Ok(())
-}
-
-fn signed_value(secret: &str, timestamp: &str) -> AppResult<String> {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
-        .map_err(|e| AppError::new(format!("钉钉签名初始化失败: {e}")))?;
-    mac.update(format!("{timestamp}\n{secret}").as_bytes());
-    Ok(general_purpose::STANDARD.encode(mac.finalize().into_bytes()))
-}
-
-fn dingtalk_webhook(
+async fn send_text(
     integration: &MessagingIntegration,
     conversation_id: &str,
-) -> AppResult<String> {
-    let mut url = reqwest::Url::parse("https://oapi.dingtalk.com/robot/send")
-        .map_err(|e| AppError::new(format!("钉钉 webhook URL 初始化失败: {e}")))?;
-    url.query_pairs_mut()
-        .append_pair("access_token", integration.verification_token.trim());
-    if !integration.app_secret.trim().is_empty() {
-        let timestamp = crate::messaging::store::now_epoch()
-            .saturating_mul(1000)
-            .to_string();
-        let sign = signed_value(integration.app_secret.trim(), &timestamp)?;
-        url.query_pairs_mut()
-            .append_pair("timestamp", &timestamp)
-            .append_pair("sign", &sign);
-    }
-    if !conversation_id.trim().is_empty() && conversation_id.trim() != "default" {
-        url.query_pairs_mut()
-            .append_pair("openConversationId", conversation_id.trim());
-    }
-    Ok(url.to_string())
-}
-
-async fn post_text(
-    integration: &MessagingIntegration,
-    webhook: &str,
     text: &str,
 ) -> AppResult<ActionExecutionResult> {
-    if webhook.trim().is_empty() {
-        return Ok(ActionExecutionResult::Dead {
-            message: "钉钉回复缺少 sessionWebhook".to_string(),
-        });
-    }
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(integration.timeout_secs))
-        .build()
-        .map_err(|e| AppError::new(format!("钉钉 HTTP client 初始化失败: {e}")))?;
-    let resp = client
-        .post(webhook)
+    let api = DingTalkApiClient::authenticate(integration).await?;
+    let resp = api
+        .post("/v1.0/robot/groupMessages/send")
         .json(&json!({
-            "msgtype": "text",
-            "text": { "content": text },
+            "robotCode": integration.bot_open_id.trim(),
+            "openConversationId": conversation_id.trim(),
+            "msgKey": "sampleText",
+            "msgParam": serde_json::to_string(&json!({ "content": text }))
+                .expect("sampleText param serializes"),
         }))
         .send()
         .await
         .map_err(|e| AppError::new(format!("钉钉发送消息请求失败: {}", e.without_url())))?;
-    classify_dingtalk_response(resp, "钉钉发送消息").await
+    classify_dingtalk_open_api(resp, "钉钉发送消息").await
 }
 
-async fn classify_dingtalk_response(
+/// Display-only information card via robot `sampleMarkdown` (no buttons / callbacks).
+pub(crate) async fn send_information_card(
+    integration: &MessagingIntegration,
+    conversation_id: &str,
+    title: &str,
+    text: &str,
+    template: MessagingCardTemplate,
+) -> AppResult<ActionExecutionResult> {
+    let api = DingTalkApiClient::authenticate(integration).await?;
+    let resp = api
+        .post("/v1.0/robot/groupMessages/send")
+        .json(&information_card_request(
+            integration,
+            conversation_id,
+            title,
+            text,
+            template,
+        ))
+        .send()
+        .await
+        .map_err(|e| AppError::new(format!("钉钉发送信息卡片请求失败: {}", e.without_url())))?;
+    classify_dingtalk_open_api(resp, "钉钉发送信息卡片").await
+}
+
+pub(crate) fn information_card_request(
+    integration: &MessagingIntegration,
+    conversation_id: &str,
+    title: &str,
+    text: &str,
+    template: MessagingCardTemplate,
+) -> Value {
+    let titled = format!("[{}] {}", template.as_wire(), title);
+    json!({
+        "robotCode": integration.bot_open_id.trim(),
+        "openConversationId": conversation_id.trim(),
+        "msgKey": "sampleMarkdown",
+        "msgParam": serde_json::to_string(&json!({
+            "title": titled,
+            "text": text,
+        }))
+        .expect("sampleMarkdown param serializes"),
+    })
+}
+
+/// Creates and delivers an interactive human-input card with Stream callbacks.
+pub async fn send_human_input_card(
+    integration: &MessagingIntegration,
+    conversation_id: &str,
+    request: &HumanInputRequest,
+) -> AppResult<String> {
+    let api = DingTalkApiClient::authenticate(integration).await?;
+    let body = human_input_create_and_deliver_request(integration, conversation_id, request);
+    let resp = api
+        .post("/v1.0/card/instances/createAndDeliver")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AppError::new(format!("钉钉发送问答卡片失败: {}", e.without_url())))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(AppError::new(format!(
+            "钉钉发送问答卡片 HTTP {status}: {}",
+            truncate_err(&detail)
+        )));
+    }
+    Ok(request.id.clone())
+}
+
+pub async fn update_human_input_card(
+    integration: &MessagingIntegration,
+    out_track_id: &str,
+    request: &HumanInputRequest,
+) -> AppResult<()> {
+    let api = DingTalkApiClient::authenticate(integration).await?;
+    let resp = api
+        .put("/v1.0/card/instances")
+        .json(&human_input_update_request(out_track_id, request))
+        .send()
+        .await
+        .map_err(|e| AppError::new(format!("钉钉更新问答卡片失败: {}", e.without_url())))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let detail = resp.text().await.unwrap_or_default();
+        return Err(AppError::new(format!(
+            "钉钉更新问答卡片 HTTP {status}: {}",
+            truncate_err(&detail)
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn human_input_create_and_deliver_request(
+    integration: &MessagingIntegration,
+    conversation_id: &str,
+    request: &HumanInputRequest,
+) -> Value {
+    json!({
+        "cardTemplateId": integration.card_template_id.trim(),
+        "outTrackId": request.id,
+        "callbackType": "STREAM",
+        "cardData": {
+            "cardParamMap": human_input_card_params(request, false),
+        },
+        "openSpaceId": format!("dtv1.card//IM_GROUP.{}", conversation_id.trim()),
+        "imGroupOpenSpaceModel": {
+            "supportForward": false,
+        },
+        "imGroupOpenDeliverModel": {
+            "robotCode": integration.bot_open_id.trim(),
+        },
+        "userIdType": 1,
+    })
+}
+
+fn human_input_update_request(out_track_id: &str, request: &HumanInputRequest) -> Value {
+    json!({
+        "outTrackId": out_track_id,
+        "cardData": {
+            "cardParamMap": human_input_card_params(request, true),
+        },
+    })
+}
+
+fn human_input_card_params(request: &HumanInputRequest, terminal: bool) -> Value {
+    let options = request
+        .questions
+        .iter()
+        .flat_map(|q| q.options.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let status = if terminal {
+        format!(
+            "已结束：{}",
+            request
+                .answer_source
+                .as_deref()
+                .unwrap_or(request.status.as_str())
+        )
+    } else {
+        "pending".to_string()
+    };
+    json!({
+        "title": request.title,
+        "message": request.message,
+        "requestId": request.id,
+        "options": options,
+        "status": status,
+    })
+}
+
+async fn classify_dingtalk_open_api(
     resp: reqwest::Response,
     op: &str,
 ) -> AppResult<ActionExecutionResult> {
-    #[derive(Deserialize)]
-    struct ApiResp {
-        errcode: i64,
-        errmsg: String,
-    }
     let status = resp.status();
     if status.as_u16() == 429 || status.is_server_error() {
         return Ok(ActionExecutionResult::Retry {
@@ -230,37 +379,23 @@ async fn classify_dingtalk_response(
         });
     }
     if !status.is_success() {
+        let detail = resp.text().await.unwrap_or_default();
         return Ok(ActionExecutionResult::Dead {
-            message: format!("{op} 不可重试失败: HTTP {status}"),
+            message: format!(
+                "{op} 不可重试失败: HTTP {status}: {}",
+                truncate_err(&detail)
+            ),
         });
     }
-    let body: ApiResp = resp
-        .json()
-        .await
-        .map_err(|e| AppError::new(format!("{op} 响应解析失败: {e}")))?;
-    if body.errcode == 0 {
-        Ok(ActionExecutionResult::done())
-    } else if body.errcode == 130101 || body.errcode == 130102 {
-        Ok(ActionExecutionResult::Retry {
-            message: format!("{op} 暂时失败: {}", body.errmsg),
-            retry_after_secs: None,
-        })
-    } else {
-        Ok(ActionExecutionResult::Dead {
-            message: format!("{op} 失败: {}", body.errmsg),
-        })
-    }
+    Ok(ActionExecutionResult::done())
 }
 
-fn header<'a>(headers: &'a HeaderMap, name: &str) -> AppResult<&'a str> {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| AppError::new(format!("钉钉事件缺少请求头: {name}")))
+fn truncate_err(value: &str) -> String {
+    crate::messaging::truncate_utf8_boundary(value, 240)
 }
 
 fn stable_event_id(raw: &[u8]) -> String {
-    use sha2::Digest;
+    use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(raw);
     format!("sha256:{}", hex::encode(hasher.finalize()))
@@ -287,7 +422,10 @@ struct DingTalkEvent {
 
 impl DingTalkEvent {
     fn mentioned_bot(&self) -> bool {
-        self.is_in_at_list.unwrap_or(false) || !self.at_users.is_empty()
+        // DingTalk sets isInAtList when the bot itself is @-mentioned. Non-empty
+        // atUsers alone means someone else was mentioned — must not open the gate.
+        let _ = &self.at_users;
+        self.is_in_at_list.unwrap_or(false)
     }
 }
 
@@ -300,91 +438,144 @@ struct DingTalkText {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+    use crate::messaging::human_input::HumanInputStatus;
 
     fn integration() -> MessagingIntegration {
         MessagingIntegration {
             id: "dt".to_string(),
-            verification_token: "token-123456".to_string(),
+            app_id: "ding-app-key".to_string(),
             app_secret: "secret-123456".to_string(),
             bot_open_id: "robot-code".to_string(),
+            card_template_id: "tpl-human".to_string(),
             allowed_conversation_ids: vec!["cid".to_string()],
             ..MessagingIntegration::feishu_default()
         }
     }
 
-    fn signed_headers(timestamp: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "timestamp",
-            HeaderValue::from_str(timestamp).expect("timestamp"),
-        );
-        headers.insert(
-            "sign",
-            HeaderValue::from_str(&signed_value("secret-123456", timestamp).expect("sign"))
-                .expect("sign header"),
-        );
-        headers
+    #[test]
+    fn http_verify_is_disabled() {
+        let err = DingTalkProvider
+            .verify(&HeaderMap::new(), b"{}", &integration())
+            .expect_err("HTTP verify must fail closed");
+        assert!(err.message.contains("HTTP 回调已禁用"), "{}", err.message);
     }
 
     #[test]
-    fn verifies_signature_and_parses_text_event() {
-        let raw = br#"{"msgId":"m1","msgtype":"text","conversationId":"cid","senderId":"u","sessionWebhook":"https://example.com/reply","text":{"content":"/help"},"isInAtList":true}"#;
-        let provider = DingTalkProvider;
-        let timestamp = format!("{}000", crate::messaging::store::now_epoch());
-        provider
-            .verify(&signed_headers(&timestamp), raw, &integration())
-            .expect("verify");
-        let event = provider
+    fn parses_text_event() {
+        let raw = br#"{"msgId":"m1","msgtype":"text","conversationId":"cid","senderId":"u","text":{"content":"/help"},"isInAtList":true}"#;
+        let event = DingTalkProvider
             .parse_event(raw, &integration(), 42)
             .expect("parse");
         assert_eq!(event.provider, MessagingProviderKind::DingTalk);
         assert_eq!(event.event_id, "m1");
         assert_eq!(event.conversation_id, "cid");
-        assert_eq!(event.thread_id, "m1");
         assert_eq!(event.text, "/help");
         assert!(event.mentioned_bot);
     }
 
     #[test]
-    fn rejects_actual_wire_non_text_msgtype() {
-        let raw = br#"{"msgId":"m2","msgtype":"image","conversationId":"cid","senderId":"u","text":{"content":"not text"}}"#;
-        let err = DingTalkProvider
+    fn mentioned_bot_ignores_at_users_when_bot_not_in_list() {
+        let raw = br#"{"msgId":"m1","msgtype":"text","conversationId":"cid","senderId":"u","text":{"content":"/help"},"isInAtList":false,"atUsers":[{"dingtalkId":"other"}]}"#;
+        let event = DingTalkProvider
             .parse_event(raw, &integration(), 42)
-            .expect_err("non-text msgtype must not default to text");
-        assert!(err.message.contains("不是文本消息"), "{}", err.message);
-    }
-
-    #[tokio::test]
-    async fn request_error_does_not_include_secret_webhook_url() {
-        let err = post_text(
-            &MessagingIntegration {
-                timeout_secs: 1,
-                ..integration()
-            },
-            "http://127.0.0.1:9/robot/send?access_token=secret-token&sign=secret-sign",
-            "hello",
-        )
-        .await
-        .expect_err("closed local port should fail");
-        assert!(!err.message.contains("secret-token"), "{}", err.message);
-        assert!(!err.message.contains("secret-sign"), "{}", err.message);
-        assert!(!err.message.contains("access_token"), "{}", err.message);
+            .expect("parse");
+        assert!(!event.mentioned_bot);
     }
 
     #[test]
-    fn rejects_bad_signature_expired_timestamp_and_redacts_secrets() {
-        let provider = DingTalkProvider;
-        assert!(provider
-            .verify(&HeaderMap::new(), b"{}", &integration())
-            .is_err());
-        assert!(
-            verify_timestamp_fresh("1700000000000", crate::messaging::store::now_epoch()).is_err()
+    fn capability_supports_long_connection() {
+        assert!(DingTalkProvider.capability().supports_long_connection);
+        assert!(DingTalkProvider.capability().supports_information_card);
+    }
+
+    #[test]
+    fn rejects_non_text_msgtype() {
+        let raw = br#"{"msgId":"m2","msgtype":"image","conversationId":"cid","senderId":"u","text":{"content":"not text"}}"#;
+        let err = DingTalkProvider
+            .parse_event(raw, &integration(), 42)
+            .expect_err("non-text");
+        assert!(err.message.contains("不是文本消息"), "{}", err.message);
+    }
+
+    #[test]
+    fn information_card_embeds_template_prefix_in_title() {
+        let body = information_card_request(
+            &integration(),
+            "cid",
+            "Task stopped",
+            "**Status:** done",
+            MessagingCardTemplate::Grey,
         );
-        let summary =
-            redact_raw_summary(br#"{"accessToken":"t","sessionWebhook":"https://secret"}"#);
-        assert!(!summary.contains("https://secret"));
-        assert!(!summary.contains("\"t\""));
-        assert!(summary.contains("[redacted]"));
+        assert_eq!(body["msgKey"], "sampleMarkdown");
+        let param: Value = serde_json::from_str(body["msgParam"].as_str().unwrap()).unwrap();
+        assert_eq!(param["title"], "[grey] Task stopped");
+        assert_eq!(param["text"], "**Status:** done");
+    }
+
+    #[test]
+    fn human_input_create_and_deliver_requires_stream_callback() {
+        let request = HumanInputRequest {
+            id: "Q-1".into(),
+            integration_id: "dt".into(),
+            conversation_id: "cid".into(),
+            purpose: "ask".into(),
+            title: "Choose".into(),
+            message: "Pick one".into(),
+            questions: vec![],
+            context: Value::Null,
+            status: HumanInputStatus::Pending,
+            answer: None,
+            answer_source: None,
+            card_message_id: None,
+            created_at_epoch: 1,
+            expires_at_epoch: 2,
+            answered_at_epoch: None,
+        };
+        let body = human_input_create_and_deliver_request(&integration(), "cid", &request);
+        assert_eq!(body["callbackType"], "STREAM");
+        assert_eq!(body["cardTemplateId"], "tpl-human");
+        assert_eq!(body["outTrackId"], "Q-1");
+        let forbidden = format!("{}{}", "oapi.dingtalk.com", "/robot/send");
+        assert!(!serde_json::to_string(&body).unwrap().contains(&forbidden));
+    }
+
+    #[test]
+    fn messaging_tree_does_not_resurrect_robot_send_webhook() {
+        use std::fs;
+        use std::path::Path;
+
+        // Split so this test file does not contain the forbidden contiguous literal.
+        let forbidden = format!("{}{}", "oapi.dingtalk.com", "/robot/send");
+        fn scan(dir: &Path, needle: &str, offenders: &mut Vec<String>) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan(&path, needle, offenders);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(text) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (i, line) in text.lines().enumerate() {
+                    let code = line.split("//").next().unwrap_or(line);
+                    if code.contains(needle) {
+                        offenders.push(format!("{}:{}", path.display(), i + 1));
+                    }
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/messaging");
+        let mut offenders = Vec::new();
+        scan(&root, &forbidden, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "DingTalk webhook robot/send must stay deleted: {offenders:?}"
+        );
     }
 }

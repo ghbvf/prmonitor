@@ -59,6 +59,7 @@ const MESSAGING_NAV_ID = "messaging";
 // the `refreshKey` prop chain.
 const remoteAccessRefreshKey = ref(0);
 const cliToolsRefreshKey = ref(0);
+const messagingRefreshKey = ref(0);
 
 // Editable draft (decoupled from the store). The full multi-project AppConfig:
 // `projects`/`activeProjectId` are edited by ProjectsManager; the webhook fields by
@@ -235,6 +236,7 @@ async function onSave() {
     emit("saved");
     remoteAccessRefreshKey.value += 1;
     cliToolsRefreshKey.value += 1;
+    messagingRefreshKey.value += 1;
   }
   else if (store.error?.startsWith("rules[")) {
     activeGroupId.value = RULES_NAV_ID;
@@ -270,9 +272,10 @@ async function onSave() {
       store.error.startsWith("weChatWorkCorpId") ||
       store.error.startsWith("weChatWorkCorpSecret") ||
       store.error.startsWith("weChatWorkAgentId") ||
-      store.error.startsWith("dingTalkToken") ||
+      store.error.startsWith("dingTalkAppId") ||
       store.error.startsWith("dingTalkAppSecret") ||
-      store.error.startsWith("dingTalkRobotCode")
+      store.error.startsWith("dingTalkRobotCode") ||
+      store.error.startsWith("dingTalkCardTemplateId")
     ) {
       activeGroupId.value = MESSAGING_NAV_ID;
     } else if (
@@ -404,7 +407,7 @@ async function onSave() {
           v-if="activeGroupId === MESSAGING_NAV_ID"
           class="group projects-group"
         >
-          <MessagingIntegrationsManager :draft="draft" @edit="onEdit" />
+          <MessagingIntegrationsManager :draft="draft" :refresh-key="messagingRefreshKey" @edit="onEdit" />
         </div>
 
         <template v-for="g in GLOBAL_GROUPS" :key="g.id">

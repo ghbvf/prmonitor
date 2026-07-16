@@ -1,21 +1,28 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import type { AppConfig, MessagingIntegration } from "./types";
-import type { FeishuConnectionStatus } from "../types.generated";
-import { MESSAGING_PROVIDER_KINDS, type MessagingProviderKind } from "../types.generated";
+import type { MessagingConnectionStatus } from "../types.generated";
+import { MESSAGING_LONG_CONNECTION_KINDS, MESSAGING_PROVIDER_KINDS, type MessagingProviderKind } from "../types.generated";
 import { DEFAULT_MESSAGING_INTEGRATION } from "./defaults";
 import { normalizeStringList } from "./remoteAccessOps";
-import { getFeishuConnectionStatuses } from "./api";
-import FeishuConnectionStatusList from "../FeishuConnectionStatusList.vue";
+import { getMessagingConnectionStatuses } from "./api";
+import MessagingConnectionStatusList from "../MessagingConnectionStatusList.vue";
 
-const props = defineProps<{ draft: AppConfig }>();
+const props = defineProps<{ draft: AppConfig; refreshKey?: number }>();
 const emit = defineEmits<{ edit: [] }>();
-const connectionStatuses = ref<FeishuConnectionStatus[]>([]);
+const connectionStatuses = ref<MessagingConnectionStatus[]>([]);
 const connectionStatusesLoading = ref(false);
 const connectionStatusesError = ref<string | null>(null);
 const connectionStatusesStale = ref(false);
 const connectionStatusesLastUpdatedAt = ref<number | null>(null);
-const hasFeishu = computed(() => props.draft.messaging.integrations.some((item) => item.kind === "feishu"));
+
+function supportsLongConnection(kind: MessagingProviderKind): boolean {
+  return (MESSAGING_LONG_CONNECTION_KINDS as readonly string[]).includes(kind);
+}
+
+const hasLongConnection = computed(() =>
+  props.draft.messaging.integrations.some((item) => supportsLongConnection(item.kind)),
+);
 
 const KIND_META: Record<MessagingProviderKind, { label: string; form: "feishu" | "weChatWork" | "dingTalk" }> = {
   feishu: { label: "飞书", form: "feishu" },
@@ -60,9 +67,10 @@ function onKind(integration: MessagingIntegration, event: Event) {
   const shouldSyncName = !integration.name.trim() || integration.name.trim() === oldDefaultName;
   integration.kind = nextKind;
   clearObsoleteFeishuCredentials(integration);
+  clearObsoleteDingTalkCredentials(integration);
   if (shouldSyncName) integration.name = KIND_META[nextKind].label;
   emit("edit");
-  if (nextKind === "feishu") void refreshConnectionStatuses();
+  if (supportsLongConnection(nextKind)) void refreshConnectionStatuses();
 }
 
 function clearObsoleteFeishuCredentials(integration: MessagingIntegration): boolean {
@@ -73,11 +81,19 @@ function clearObsoleteFeishuCredentials(integration: MessagingIntegration): bool
   return changed;
 }
 
+function clearObsoleteDingTalkCredentials(integration: MessagingIntegration): boolean {
+  if (integration.kind !== "dingTalk") return false;
+  const changed = Boolean(integration.verificationToken || integration.encryptKey);
+  integration.verificationToken = "";
+  integration.encryptKey = "";
+  return changed;
+}
+
 async function refreshConnectionStatuses() {
   connectionStatusesLoading.value = true;
   connectionStatusesError.value = null;
   try {
-    connectionStatuses.value = await getFeishuConnectionStatuses();
+    connectionStatuses.value = await getMessagingConnectionStatuses();
     connectionStatusesStale.value = false;
     connectionStatusesLastUpdatedAt.value = Date.now();
   } catch (error) {
@@ -90,15 +106,25 @@ async function refreshConnectionStatuses() {
 
 let clearedObsoleteCredentials = false;
 for (const integration of props.draft.messaging.integrations) {
-  clearedObsoleteCredentials = clearObsoleteFeishuCredentials(integration) || clearedObsoleteCredentials;
+  clearedObsoleteCredentials =
+    clearObsoleteFeishuCredentials(integration) ||
+    clearObsoleteDingTalkCredentials(integration) ||
+    clearedObsoleteCredentials;
 }
 if (clearedObsoleteCredentials) {
   emit("edit");
 }
 
 onMounted(() => {
-  if (hasFeishu.value) void refreshConnectionStatuses();
+  if (hasLongConnection.value) void refreshConnectionStatuses();
 });
+
+watch(
+  () => props.refreshKey,
+  () => {
+    if (hasLongConnection.value) void refreshConnectionStatuses();
+  },
+);
 
 function setText(integration: MessagingIntegration, key: keyof MessagingIntegration, event: Event) {
   (integration as Record<string, unknown>)[key] = (event.target as HTMLInputElement).value;
@@ -137,8 +163,8 @@ function setAllowed(integration: MessagingIntegration, event: Event) {
       暂无消息集成
     </div>
 
-    <FeishuConnectionStatusList
-      v-if="hasFeishu"
+    <MessagingConnectionStatusList
+      v-if="hasLongConnection"
       :statuses="connectionStatuses"
       :loading="connectionStatusesLoading"
       :error="connectionStatusesError"
@@ -233,19 +259,27 @@ function setAllowed(integration: MessagingIntegration, event: Event) {
         </template>
         <template v-else>
           <label>
-            <span>Robot Access Token</span>
-            <input type="password" :value="integration.verificationToken" @input="setText(integration, 'verificationToken', $event)" />
+            <span>App Key / Client ID</span>
+            <input type="password" :value="integration.appId" @input="setText(integration, 'appId', $event)" />
           </label>
           <label>
-            <span>Callback / Robot Secret</span>
+            <span>App Secret / Client Secret</span>
             <input type="password" :value="integration.appSecret" @input="setText(integration, 'appSecret', $event)" />
           </label>
           <label>
             <span>Robot Code</span>
             <input type="text" :value="integration.botOpenId" @input="setText(integration, 'botOpenId', $event)" />
           </label>
+          <label>
+            <span>卡片模板 ID</span>
+            <input type="text" :value="integration.cardTemplateId" placeholder="例如：dingTalkCardTemplateId…" @input="setText(integration, 'cardTemplateId', $event)" />
+            <small class="hint">在钉钉开放平台 → 机器人 → 卡片模板 创建互动卡片后复制模板 ID；Stream 模式必填。</small>
+          </label>
         </template>
       </div>
+      <p v-if="integration.kind === 'dingTalk'" class="migrate-hint">
+        钉钉已改为 Stream 长连接：旧 Webhook Token / Encrypt Key 已清空，请填写 App Key、App Secret、Robot Code 与卡片模板 ID。
+      </p>
     </section>
   </div>
 </template>
@@ -267,7 +301,10 @@ function setAllowed(integration: MessagingIntegration, event: Event) {
   font-size: var(--font-size-sm);
   cursor: pointer;
 }
-.empty {
+.hint,
+.migrate-hint {
+  display: block;
+  margin-top: var(--space-1);
   color: var(--color-text-muted);
   font-size: var(--font-size-sm);
 }

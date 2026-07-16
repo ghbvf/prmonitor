@@ -44,10 +44,11 @@ async fn handle_provider<R: tauri::Runtime>(
         Ok(provider) => provider,
         Err(e) => return (StatusCode::NOT_FOUND, e.message).into_response(),
     };
-    if provider == MessagingProviderKind::Feishu {
+    // Capability is the single source — never Soft-match Feishu|DingTalk here.
+    if service::supports_long_connection(provider) {
         return (
             StatusCode::GONE,
-            "飞书 HTTP 回调已禁用；请在飞书开放平台启用官方长连接",
+            service::long_connection_http_gone_message(provider),
         )
             .into_response();
     }
@@ -94,22 +95,23 @@ fn merge_provider_query_headers(
     let Some(query) = query else {
         return;
     };
-    match provider {
-        MessagingProviderKind::WeChatWork => {
-            for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-                let header = match key.as_ref() {
-                    "msg_signature" => "x-wechatwork-msg-signature",
-                    "timestamp" => "x-wechatwork-timestamp",
-                    "nonce" => "x-wechatwork-nonce",
-                    "echostr" => "x-wechatwork-echostr",
-                    _ => continue,
-                };
-                if let Ok(value) = HeaderValue::from_str(value.as_ref()) {
-                    headers.insert(header, value);
-                }
-            }
+    if service::supports_long_connection(provider) {
+        return;
+    }
+    if provider != MessagingProviderKind::WeChatWork {
+        return;
+    }
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        let header = match key.as_ref() {
+            "msg_signature" => "x-wechatwork-msg-signature",
+            "timestamp" => "x-wechatwork-timestamp",
+            "nonce" => "x-wechatwork-nonce",
+            "echostr" => "x-wechatwork-echostr",
+            _ => continue,
+        };
+        if let Ok(value) = HeaderValue::from_str(value.as_ref()) {
+            headers.insert(header, value);
         }
-        MessagingProviderKind::DingTalk | MessagingProviderKind::Feishu => {}
     }
 }
 
@@ -177,9 +179,21 @@ pub fn messaging_integrations_list<R: tauri::Runtime>(
 #[tauri::command]
 pub fn messaging_connection_statuses_list<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
-) -> Vec<crate::model::FeishuConnectionStatus> {
-    app.state::<crate::messaging::feishu_long_connection::FeishuConnectionManager>()
-        .statuses()
+) -> Vec<crate::model::MessagingConnectionStatus> {
+    let mut statuses = app
+        .state::<crate::messaging::feishu_long_connection::FeishuConnectionManager>()
+        .statuses();
+    statuses.extend(
+        app.state::<crate::messaging::dingtalk_stream::DingTalkConnectionManager>()
+            .statuses(),
+    );
+    statuses.sort_by(|a, b| {
+        a.provider
+            .as_wire()
+            .cmp(b.provider.as_wire())
+            .then_with(|| a.integration_id.cmp(&b.integration_id))
+    });
+    statuses
 }
 
 #[cfg(test)]
@@ -218,7 +232,28 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("hello")
         );
-        assert!(headers.get("ignored").is_none());
+        assert!(!headers.contains_key("ignored"));
+    }
+
+    #[test]
+    fn http_gone_follows_supports_long_connection_capability() {
+        assert!(service::supports_long_connection(
+            MessagingProviderKind::Feishu
+        ));
+        assert!(service::supports_long_connection(
+            MessagingProviderKind::DingTalk
+        ));
+        assert!(!service::supports_long_connection(
+            MessagingProviderKind::WeChatWork
+        ));
+        assert!(service::long_connection_http_gone_message(
+            MessagingProviderKind::Feishu
+        )
+        .contains("飞书"));
+        assert!(service::long_connection_http_gone_message(
+            MessagingProviderKind::DingTalk
+        )
+        .contains("钉钉"));
     }
 
     #[test]

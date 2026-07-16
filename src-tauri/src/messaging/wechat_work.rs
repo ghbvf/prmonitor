@@ -36,6 +36,7 @@ impl MessagingProvider for WeChatWorkProvider {
             supports_reply: true,
             supports_send: true,
             supports_information_card: false,
+            supports_long_connection: false,
             requires_allowed_conversations: true,
         }
     }
@@ -114,7 +115,7 @@ impl MessagingProvider for WeChatWorkProvider {
                 }
                 MessagingSendContent::Card { .. } => Ok(ActionExecutionResult::Dead {
                     message: format!(
-                        "信息卡片仅支持 Feishu，消息集成「{}」是 {}",
+                        "信息卡片不受支持，消息集成「{}」是 {}",
                         integration.name,
                         integration.kind.as_wire()
                     ),

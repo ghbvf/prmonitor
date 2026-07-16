@@ -3,7 +3,7 @@ import { computed, onMounted, ref, watch } from "vue";
 import { assertNever, outboxKindLabel, outboxStatusLabel } from "../types";
 import type { MessagingEventStatus } from "../types.generated";
 import { useMessagingStore } from "./useMessagingStore";
-import FeishuConnectionStatusList from "../FeishuConnectionStatusList.vue";
+import MessagingConnectionStatusList from "../MessagingConnectionStatusList.vue";
 
 const store = useMessagingStore();
 const rawOpen = ref<Set<number>>(new Set());
@@ -115,7 +115,7 @@ function sendTest() {
       <button type="button" class="dismiss" aria-label="关闭 / dismiss" @click="store.error = null">x</button>
     </p>
 
-    <FeishuConnectionStatusList
+    <MessagingConnectionStatusList
       :statuses="store.connectionStatuses"
       :loading="store.connectionStatusesLoading"
       :error="store.connectionStatusesError"

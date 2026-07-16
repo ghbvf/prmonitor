@@ -51,19 +51,21 @@ the change as pending until that resident process is stopped/restarted, exits na
 restarts. The removed `cloudflaredBin` setting is intentionally not migrated—configure
 `cliTools.cloudflaredPath` or leave it empty for automatic discovery.
 
-## Feishu long connection and Codex MCP
+## Messaging long connection and Codex MCP
 
-Feishu inbound messages use the official long connection; no public callback URL or tunnel is
-required. Configure an enabled Feishu messaging integration with App ID, App Secret and at least
-one allowed conversation. In the Feishu developer console, enable the bot and subscribe to
-`im.message.receive_v1` plus the current `card.action.trigger` event. Do not run the development
-build and an installed build with the same Feishu credentials at the same time: Feishu distributes
-events across connections instead of broadcasting them.
+Feishu and DingTalk inbound messages use official long connections (Feishu WebSocket /
+DingTalk Stream Mode); no public messaging callback URL or tunnel is required.
 
-The settings and Messaging views show `disabled`, `connecting`, `connected`, `reconnecting`,
-`error`, or `stopped`, together with the last connection/event/error and reconnect count. The old
-Feishu HTTP webhook route returns `410 Gone`; WeCom and DingTalk continue using their HTTP inbound
-routes.
+- **Feishu**: App ID, App Secret, allowed conversations; subscribe to `im.message.receive_v1`
+  plus `card.action.trigger`. Do not run the development build and an installed build with the
+  same Feishu credentials at the same time: Feishu distributes events across connections.
+- **DingTalk**: App Key / Client ID, App Secret, Robot Code, interactive card template ID
+  (`cardTemplateId`); enable Stream Mode in the DingTalk console and keep a single client
+  instance per App Key. The old DingTalk HTTP webhook route returns `410 Gone`.
+
+The settings and Messaging views show long-connection health (`disabled`, `connecting`,
+`connected`, `reconnecting`, `error`, or `stopped`) for both providers. WeCom continues to use
+its HTTP inbound route. The old Feishu HTTP webhook route also returns `410 Gone`.
 
 The existing loopback Local API also serves a Streamable HTTP MCP endpoint at
 `http://127.0.0.1:8788/api/mcp`. The route is mounted only when the Local API entrypoint binds to a
@@ -79,10 +81,13 @@ enabled = false
 required = false
 startup_timeout_sec = 5
 tool_timeout_sec = 3900
-enabled_tools = ["ask_via_feishu"]
+enabled_tools = ["ask_via_feishu", "ask_via_dingtalk"]
 default_tools_approval_mode = "approve"
 
 [mcp_servers.prmonitor_human.tools.ask_via_feishu]
+approval_mode = "approve"
+
+[mcp_servers.prmonitor_human.tools.ask_via_dingtalk]
 approval_mode = "approve"
 ```
 
@@ -100,14 +105,13 @@ A trusted repository enables the inherited server with:
 enabled = true
 ```
 
-`ask_via_feishu` creates one durable request, sends a Feishu card, and opens a Codex elicitation.
-The first valid answer wins through a SQLite compare-and-set. Text fallbacks are
-`/answer Q-id <answer>` (multiple answers: `q1=A;q2=B`) and `/cancel Q-id`. Feishu renders all
-questions as one form; suggested options always include a final custom-input choice, and the
-complete form is committed atomically on submit. Tool/sandbox permissions remain native Codex
-approvals and are never delegated to Feishu.
+`ask_via_feishu` / `ask_via_dingtalk` create one durable request, send a provider card, and open a
+Codex elicitation. The first valid answer wins through a SQLite compare-and-set. Text fallbacks are
+`/answer Q-id <answer>` (multiple answers: `q1=A;q2=B`) and `/cancel Q-id`. Tool/sandbox permissions
+remain native Codex approvals and are never delegated to messaging bots.
 
-Display-only notifications can use a Feishu information card without buttons or answer handling:
+Display-only notifications can use a Feishu or DingTalk information card without buttons or answer
+handling:
 
 ```bash
 prmonitor message send-card \
@@ -120,8 +124,9 @@ prmonitor message send-card \
 ```
 
 `--template` accepts `blue`, `orange`, or `grey`. Information cards are rejected before enqueue
-for WeChat Work and DingTalk; their existing `prmonitor message send --text ...` path remains a
-plain-text send. Both commands use the configured Local API and never accept provider credentials.
+for WeChat Work; Feishu and DingTalk accept them. Plain-text sends remain available via
+`prmonitor message send --text ...`. Both commands use the configured Local API and never accept
+provider credentials.
 
 ## Default branch
 

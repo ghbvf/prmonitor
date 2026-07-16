@@ -85,6 +85,7 @@ describe("useMessagingStore refreshIntegrations()", () => {
 describe("useMessagingStore refreshConnectionStatuses()", () => {
   it("loads Feishu long-connection health independently from message events", async () => {
     const statuses = [{
+      provider: "feishu" as const,
       integrationId: "feishu-main",
       status: "reconnecting" as const,
       lastConnectedAtEpoch: 1_700_000_000,
@@ -110,6 +111,7 @@ describe("useMessagingStore refreshConnectionStatuses()", () => {
     const store = useMessagingStore();
     store.connectionStatusesLastUpdatedAt = 123;
     store.connectionStatuses = [{
+      provider: "feishu" as const,
       integrationId: "feishu-main",
       status: "connected",
       lastConnectedAtEpoch: 1,

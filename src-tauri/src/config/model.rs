@@ -557,6 +557,8 @@ pub struct MessagingIntegration {
     pub app_id: String,
     pub app_secret: String,
     pub bot_open_id: String,
+    /// DingTalk interactive card template id (`cardTemplateId`). Unused by Feishu / WeCom.
+    pub card_template_id: String,
     /// Stable provider conversation ids allowed to execute commands. Empty fail-closes when enabled.
     pub allowed_conversation_ids: Vec<String>,
     /// Whether group chat events must mention the bot before command parsing.
@@ -576,6 +578,7 @@ impl MessagingIntegration {
             app_id: String::new(),
             app_secret: String::new(),
             bot_open_id: String::new(),
+            card_template_id: String::new(),
             allowed_conversation_ids: Vec::new(),
             require_mention: true,
             timeout_secs: DEFAULT_NOTIFICATION_TIMEOUT_SECS,
@@ -1281,15 +1284,9 @@ fn validate_messaging(settings: &MessagingSettings) -> AppResult<()> {
                 }
             }
             MessagingProviderKind::DingTalk => {
-                if integration.verification_token.trim().is_empty() {
+                if integration.app_id.trim().is_empty() {
                     return Err(AppError::new(format!(
-                        "dingTalkToken 不能为空（消息集成「{}」）",
-                        integration.name
-                    )));
-                }
-                if integration.verification_token.trim().chars().count() < WEBHOOK_SECRET_MIN_LEN {
-                    return Err(AppError::new(format!(
-                        "dingTalkToken 太短（至少 {WEBHOOK_SECRET_MIN_LEN} 个字符；消息集成「{}」）",
+                        "dingTalkAppId 不能为空（消息集成「{}」）",
                         integration.name
                     )));
                 }
@@ -1302,6 +1299,12 @@ fn validate_messaging(settings: &MessagingSettings) -> AppResult<()> {
                 if integration.bot_open_id.trim().is_empty() {
                     return Err(AppError::new(format!(
                         "dingTalkRobotCode 不能为空（消息集成「{}」）",
+                        integration.name
+                    )));
+                }
+                if integration.card_template_id.trim().is_empty() {
+                    return Err(AppError::new(format!(
+                        "dingTalkCardTemplateId 不能为空（消息集成「{}」）",
                         integration.name
                     )));
                 }
@@ -2712,20 +2715,28 @@ mod tests {
         integration.id = "dingtalk-main".to_string();
         integration.name = "DingTalk".to_string();
         integration.verification_token = String::new();
+        integration.encrypt_key = String::new();
+        integration.app_id = String::new();
         integration.app_secret = "dingtalk-secret".to_string();
         integration.bot_open_id = "robot-code".to_string();
+        integration.card_template_id = "template-id".to_string();
         cfg.messaging.integrations = vec![integration.clone()];
-        assert_error_prefix(validate(&cfg), "dingTalkToken 不能为空");
+        assert_error_prefix(validate(&cfg), "dingTalkAppId 不能为空");
 
-        integration.verification_token = "token-1234567890".to_string();
+        integration.app_id = "dingtalk-app-key".to_string();
         integration.app_secret = String::new();
         cfg.messaging.integrations = vec![integration.clone()];
         assert_error_prefix(validate(&cfg), "dingTalkAppSecret 不能为空");
 
         integration.app_secret = "dingtalk-secret".to_string();
         integration.bot_open_id = String::new();
-        cfg.messaging.integrations = vec![integration];
+        cfg.messaging.integrations = vec![integration.clone()];
         assert_error_prefix(validate(&cfg), "dingTalkRobotCode 不能为空");
+
+        integration.bot_open_id = "robot-code".to_string();
+        integration.card_template_id = String::new();
+        cfg.messaging.integrations = vec![integration];
+        assert_error_prefix(validate(&cfg), "dingTalkCardTemplateId 不能为空");
     }
 
     fn valid_notification_channel(kind: NotificationKind) -> NotificationChannel {

@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import type { FeishuConnectionState, FeishuConnectionStatus } from "./types.generated";
+import type { MessagingConnectionState, MessagingConnectionStatus, MessagingProviderKind } from "./types.generated";
 
 defineProps<{
-  statuses: FeishuConnectionStatus[];
+  statuses: MessagingConnectionStatus[];
   loading?: boolean;
   error?: string | null;
   stale?: boolean;
@@ -11,7 +11,7 @@ defineProps<{
 
 const emit = defineEmits<{ refresh: [] }>();
 
-const STATE_LABELS: Record<FeishuConnectionState, string> = {
+const STATE_LABELS: Record<MessagingConnectionState, string> = {
   disabled: "已禁用 / Disabled",
   connecting: "连接中 / Connecting",
   connected: "已连接 / Connected",
@@ -20,8 +20,18 @@ const STATE_LABELS: Record<FeishuConnectionState, string> = {
   stopped: "已停止 / Stopped",
 };
 
-function stateLabel(state: FeishuConnectionState): string {
+const PROVIDER_LABELS: Record<MessagingProviderKind, string> = {
+  feishu: "飞书",
+  weChatWork: "企业微信",
+  dingTalk: "钉钉",
+};
+
+function stateLabel(state: MessagingConnectionState): string {
   return STATE_LABELS[state];
+}
+
+function providerLabel(provider: MessagingProviderKind): string {
+  return PROVIDER_LABELS[provider] ?? provider;
 }
 
 function timestamp(epoch: number | null): string {
@@ -42,9 +52,9 @@ function snapshotTimestamp(milliseconds: number | null | undefined): string {
 </script>
 
 <template>
-  <section class="connection-health" aria-label="飞书长连接状态">
+  <section class="connection-health" aria-label="消息长连接状态">
     <header>
-      <h3>飞书长连接 / Feishu long connection</h3>
+      <h3>消息长连接 / Messaging long connection</h3>
       <button type="button" :disabled="loading" @click="emit('refresh')">
         {{ loading ? "刷新中…" : "刷新" }}
       </button>
@@ -53,11 +63,13 @@ function snapshotTimestamp(milliseconds: number | null | undefined): string {
     <p v-if="stale && statuses.length > 0" class="stale-notice">
       已过期 / Stale · 快照更新于 {{ snapshotTimestamp(lastUpdatedAt) }}
     </p>
-    <p v-if="!loading && statuses.length === 0" class="empty">暂无飞书长连接。</p>
+    <p v-if="loading && statuses.length === 0" class="empty">加载消息长连接状态…</p>
+    <p v-else-if="!loading && statuses.length === 0" class="empty">暂无消息长连接。</p>
     <ul v-else class="status-list">
       <li v-for="item in statuses" :key="item.integrationId" class="status-row">
         <div class="status-heading">
           <strong>{{ item.integrationId }}</strong>
+          <span class="provider">{{ providerLabel(item.provider) }}</span>
           <span class="state" :class="stale ? 'stale' : item.status">{{ stateLabel(item.status) }}</span>
           <span v-if="item.reconnectCount > 0" class="reconnects">重连 {{ item.reconnectCount }} 次</span>
         </div>
@@ -124,6 +136,7 @@ button {
   gap: var(--space-2);
 }
 .state,
+.provider,
 .reconnects {
   padding: 2px 6px;
   border-radius: var(--radius-sm);

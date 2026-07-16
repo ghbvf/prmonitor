@@ -1,8 +1,9 @@
 //! Durable two-channel human input broker (#1810).
 //!
-//! Codex elicitation and a Feishu card/text reply race through [`answer`]. SQLite's conditional
-//! update is the authority: exactly one source changes `pending`, and every later answer reads the
-//! already committed winner. The in-memory notifier is only a latency optimization.
+//! Codex elicitation and a messaging card/text reply (Feishu or DingTalk) race through
+//! [`answer`]. SQLite's conditional update is the authority: exactly one source changes
+//! `pending`, and every later answer reads the already committed winner. The in-memory
+//! notifier is only a latency optimization.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -90,9 +91,12 @@ impl FromStr for HumanInputStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
 pub enum HumanAnswerSource {
+    #[serde(rename = "feishu")]
     Feishu,
+    #[serde(rename = "dingTalk")]
+    DingTalk,
+    #[serde(rename = "codex")]
     Codex,
 }
 
@@ -100,6 +104,7 @@ impl HumanAnswerSource {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Feishu => "feishu",
+            Self::DingTalk => "dingTalk",
             Self::Codex => "codex",
         }
     }
@@ -125,6 +130,7 @@ impl FromStr for HumanAnswerSource {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "feishu" => Ok(Self::Feishu),
+            "dingTalk" | "ding_talk" => Ok(Self::DingTalk),
             "codex" => Ok(Self::Codex),
             _ => Err(AppError::new(format!(
                 "human input answer source 非法: {value}"
@@ -731,6 +737,36 @@ mod tests {
     }
 
     #[test]
+    fn dingtalk_first_answer_wins_and_serde_wire_is_ding_talk() {
+        let db = Database::open_in_memory().unwrap();
+        let broker = HumanInputBroker::default();
+        create(&db, &pending("Q-dt")).unwrap();
+        let answers = vec![HumanAnswer {
+            question_id: "q1".into(),
+            answer: "A".into(),
+        }];
+        assert_eq!(
+            answer(
+                &db,
+                &broker,
+                "Q-dt",
+                &answers,
+                HumanAnswerSource::DingTalk,
+                20,
+            )
+            .unwrap(),
+            AnswerOutcome::Won
+        );
+        let stored = get(&db, "Q-dt").unwrap().unwrap();
+        assert_eq!(stored.answer_source, Some(HumanAnswerSource::DingTalk));
+        assert_eq!(
+            serde_json::to_value(HumanAnswerSource::DingTalk).unwrap(),
+            serde_json::json!("dingTalk")
+        );
+        assert_eq!(HumanAnswerSource::DingTalk.as_str(), "dingTalk");
+    }
+
+    #[test]
     fn rejects_incomplete_unknown_and_empty_answers() {
         let db = Database::open_in_memory().unwrap();
         let broker = HumanInputBroker::default();
@@ -972,7 +1008,9 @@ mod tests {
         assert_eq!(stored.status, HumanInputStatus::Answered);
         assert!(matches!(
             stored.answer_source,
-            Some(HumanAnswerSource::Feishu | HumanAnswerSource::Codex)
+            Some(
+                HumanAnswerSource::Feishu | HumanAnswerSource::DingTalk | HumanAnswerSource::Codex
+            )
         ));
     }
 }

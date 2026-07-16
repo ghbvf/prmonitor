@@ -10,7 +10,7 @@ import {
 } from "./api";
 import type { OutboxEntry } from "../types";
 import type {
-  FeishuConnectionStatus,
+  MessagingConnectionStatus,
   MessagingEventEntry,
   MessagingIntegrationOption,
   SendMessagingRequest,
@@ -18,7 +18,7 @@ import type {
 
 interface MessagingState {
   integrations: MessagingIntegrationOption[];
-  connectionStatuses: FeishuConnectionStatus[];
+  connectionStatuses: MessagingConnectionStatus[];
   entries: MessagingEventEntry[];
   sends: OutboxEntry[];
   integrationsLoading: boolean;

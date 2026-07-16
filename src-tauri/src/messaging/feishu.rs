@@ -129,6 +129,7 @@ impl MessagingProvider for FeishuProvider {
             supports_reply: true,
             supports_send: true,
             supports_information_card: true,
+            supports_long_connection: true,
             requires_allowed_conversations: true,
         }
     }

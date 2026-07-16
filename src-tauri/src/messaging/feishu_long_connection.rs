@@ -23,6 +23,10 @@ use crate::config::service::MessagingIntegration;
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::messaging::human_input::{self, HumanAnswer, HumanAnswerSource, HumanInputBroker};
+use crate::messaging::long_connection::{
+    self as long_connection, abort_join_wait, cancel_abort_task, integration_fingerprint,
+    lock_current_generation, next_generation, update_current,
+};
 use crate::messaging::provider::MessagingProvider;
 use crate::messaging::{
     feishu::{
@@ -32,7 +36,7 @@ use crate::messaging::{
     },
     service, store,
 };
-use crate::model::{FeishuConnectionState, FeishuConnectionStatus, MessagingProviderKind};
+use crate::model::{MessagingConnectionState, MessagingConnectionStatus, MessagingProviderKind};
 
 const BOOTSTRAP_URL: &str = "https://open.feishu.cn/callback/ws/endpoint";
 const MAX_FRAME_PARTS: usize = 64;
@@ -89,7 +93,7 @@ impl Frame {
 #[derive(Default)]
 pub struct FeishuConnectionManager {
     tasks: Mutex<HashMap<String, ConnectionTask>>,
-    statuses: Arc<Mutex<HashMap<String, FeishuConnectionStatus>>>,
+    statuses: Arc<Mutex<HashMap<String, MessagingConnectionStatus>>>,
     generations: Arc<Mutex<HashMap<String, u64>>>,
 }
 
@@ -122,11 +126,11 @@ impl FeishuConnectionManager {
             .filter(|(id, task)| desired.get(*id) != Some(&task.fingerprint))
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
+        let mut aborted = Vec::new();
         for id in obsolete {
             if let Some(task) = tasks.remove(&id) {
                 next_generation(&self.generations, &id);
-                task.cancel.cancel();
-                task.task.abort();
+                cancel_abort_task(task.cancel, task.task, &mut aborted);
             }
         }
         let mut statuses = self.statuses.lock().unwrap_or_else(|p| p.into_inner());
@@ -138,15 +142,19 @@ impl FeishuConnectionManager {
             if !integration.enabled {
                 if let Some(task) = tasks.remove(&integration.id) {
                     next_generation(&self.generations, &integration.id);
-                    task.cancel.cancel();
-                    task.task.abort();
+                    cancel_abort_task(task.cancel, task.task, &mut aborted);
                 }
                 statuses.insert(
                     integration.id.clone(),
-                    status(integration, FeishuConnectionState::Disabled),
+                    status(integration, MessagingConnectionState::Disabled),
                 );
-                continue;
             }
+        }
+        abort_join_wait(aborted);
+        for integration in integrations
+            .iter()
+            .filter(|item| item.kind == MessagingProviderKind::Feishu && item.enabled)
+        {
             if tasks.contains_key(&integration.id) {
                 continue;
             }
@@ -155,13 +163,13 @@ impl FeishuConnectionManager {
             let Some(fingerprint) = desired.get(&integration.id).copied() else {
                 statuses.insert(
                     integration.id.clone(),
-                    status(integration, FeishuConnectionState::Error),
+                    status(integration, MessagingConnectionState::Error),
                 );
                 continue;
             };
             statuses.insert(
                 integration.id.clone(),
-                status(integration, FeishuConnectionState::Connecting),
+                status(integration, MessagingConnectionState::Connecting),
             );
             let app = app.clone();
             let integration = integration.clone();
@@ -184,7 +192,7 @@ impl FeishuConnectionManager {
                 integration_id,
                 ConnectionTask {
                     fingerprint,
-                    cancel: token.clone(),
+                    cancel: token,
                     task,
                 },
             );
@@ -212,11 +220,11 @@ impl FeishuConnectionManager {
             .unwrap_or_else(|p| p.into_inner())
             .values_mut()
         {
-            value.status = FeishuConnectionState::Stopped;
+            value.status = MessagingConnectionState::Stopped;
         }
     }
 
-    pub fn statuses(&self) -> Vec<FeishuConnectionStatus> {
+    pub fn statuses(&self) -> Vec<MessagingConnectionStatus> {
         let mut values = self
             .statuses
             .lock()
@@ -231,9 +239,10 @@ impl FeishuConnectionManager {
 
 fn status(
     integration: &MessagingIntegration,
-    state: FeishuConnectionState,
-) -> FeishuConnectionStatus {
-    FeishuConnectionStatus {
+    state: MessagingConnectionState,
+) -> MessagingConnectionStatus {
+    MessagingConnectionStatus {
+        provider: MessagingProviderKind::Feishu,
         integration_id: integration.id.clone(),
         status: state,
         last_connected_at_epoch: None,
@@ -246,7 +255,7 @@ fn status(
 async fn run_supervisor(
     app: tauri::AppHandle<tauri::Wry>,
     integration: MessagingIntegration,
-    statuses: Arc<Mutex<HashMap<String, FeishuConnectionStatus>>>,
+    statuses: Arc<Mutex<HashMap<String, MessagingConnectionStatus>>>,
     generations: Arc<Mutex<HashMap<String, u64>>>,
     generation: u64,
     cancel: CancellationToken,
@@ -261,7 +270,7 @@ async fn run_supervisor(
             &generations,
             &integration.id,
             generation,
-            |value| value.status = FeishuConnectionState::Connecting,
+            |value| value.status = MessagingConnectionState::Connecting,
         );
         match connect_once(
             &app,
@@ -282,7 +291,7 @@ async fn run_supervisor(
                 &integration.id,
                 generation,
                 |value| {
-                    value.status = FeishuConnectionState::Error;
+                    value.status = MessagingConnectionState::Error;
                     value.last_error = Some(error.message);
                 },
             ),
@@ -296,7 +305,7 @@ async fn run_supervisor(
             &integration.id,
             generation,
             |value| {
-                value.status = FeishuConnectionState::Reconnecting;
+                value.status = MessagingConnectionState::Reconnecting;
                 value.reconnect_count = value.reconnect_count.saturating_add(1);
             },
         );
@@ -310,7 +319,7 @@ async fn run_supervisor(
         &generations,
         &integration.id,
         generation,
-        |value| value.status = FeishuConnectionState::Stopped,
+        |value| value.status = MessagingConnectionState::Stopped,
     );
 }
 
@@ -409,7 +418,7 @@ async fn bootstrap(integration: &MessagingIntegration) -> AppResult<EndpointData
 async fn connect_once(
     app: &tauri::AppHandle<tauri::Wry>,
     integration: &MessagingIntegration,
-    statuses: &Arc<Mutex<HashMap<String, FeishuConnectionStatus>>>,
+    statuses: &Arc<Mutex<HashMap<String, MessagingConnectionStatus>>>,
     generations: &Arc<Mutex<HashMap<String, u64>>>,
     generation: u64,
     cancel: &CancellationToken,
@@ -437,7 +446,7 @@ async fn connect_once(
         &integration.id,
         generation,
         |value| {
-            value.status = FeishuConnectionState::Connected;
+            value.status = MessagingConnectionState::Connected;
             value.last_connected_at_epoch = Some(store::now_epoch());
             value.last_error = None;
         },
@@ -730,22 +739,6 @@ fn delivery_route(kind: &str, payload: &[u8]) -> AppResult<DeliveryRoute> {
     }
 }
 
-fn lock_current_generation<'a>(
-    generations: &'a Arc<Mutex<HashMap<String, u64>>>,
-    integration_id: &str,
-    generation: u64,
-    cancel: &CancellationToken,
-) -> AppResult<std::sync::MutexGuard<'a, HashMap<String, u64>>> {
-    if cancel.is_cancelled() {
-        return Err(AppError::new("飞书长连接 delivery 已取消"));
-    }
-    let current = generations.lock().unwrap_or_else(|p| p.into_inner());
-    if current.get(integration_id).copied() != Some(generation) || cancel.is_cancelled() {
-        return Err(AppError::new("飞书长连接 generation 已失效"));
-    }
-    Ok(current)
-}
-
 fn handle_card<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     integration: &MessagingIntegration,
@@ -903,46 +896,8 @@ fn validate_callback_conversation(value: &serde_json::Value, expected: &str) -> 
     Ok(())
 }
 
-fn update_current(
-    statuses: &Arc<Mutex<HashMap<String, FeishuConnectionStatus>>>,
-    generations: &Arc<Mutex<HashMap<String, u64>>>,
-    id: &str,
-    generation: u64,
-    f: impl FnOnce(&mut FeishuConnectionStatus),
-) {
-    let current = generations
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(id)
-        .copied();
-    if current != Some(generation) {
-        return;
-    }
-    if let Some(value) = statuses
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get_mut(id)
-    {
-        f(value);
-    }
-}
-
-fn next_generation(generations: &Arc<Mutex<HashMap<String, u64>>>, id: &str) -> u64 {
-    let mut generations = generations.lock().unwrap_or_else(|p| p.into_inner());
-    let generation = generations.entry(id.to_string()).or_default();
-    *generation = generation.saturating_add(1);
-    *generation
-}
-
-fn integration_fingerprint(integration: &MessagingIntegration) -> AppResult<[u8; 32]> {
-    use sha2::{Digest, Sha256};
-    let serialized = serde_json::to_vec(integration)
-        .map_err(|error| AppError::new(format!("飞书集成配置序列化失败: {error}")))?;
-    Ok(Sha256::digest(serialized).into())
-}
-
 fn clamp_reconnect_secs(value: u64) -> u64 {
-    value.clamp(2, 300)
+    long_connection::clamp_reconnect_secs(value)
 }
 
 fn clamp_ping_secs(value: u64) -> u64 {

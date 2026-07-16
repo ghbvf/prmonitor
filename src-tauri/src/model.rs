@@ -1243,6 +1243,8 @@ pub struct MessagingProviderCapability {
     pub supports_reply: bool,
     pub supports_send: bool,
     pub supports_information_card: bool,
+    /// Provider runs a Stream / long-connection ingress (HTTP callback disabled).
+    pub supports_long_connection: bool,
     pub requires_allowed_conversations: bool,
 }
 
@@ -1257,11 +1259,11 @@ pub struct MessagingIntegrationOption {
     pub allowed_conversation_ids: Vec<String>,
 }
 
-/// Runtime state of one Feishu official long connection (#1810).
+/// Runtime state of one messaging long connection (Feishu / DingTalk Stream).
 #[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub enum FeishuConnectionState {
+pub enum MessagingConnectionState {
     Disabled,
     Connecting,
     Connected,
@@ -1274,9 +1276,10 @@ pub enum FeishuConnectionState {
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FeishuConnectionStatus {
+pub struct MessagingConnectionStatus {
+    pub provider: MessagingProviderKind,
     pub integration_id: String,
-    pub status: FeishuConnectionState,
+    pub status: MessagingConnectionState,
     pub last_connected_at_epoch: Option<u64>,
     pub last_event_at_epoch: Option<u64>,
     pub last_error: Option<String>,
@@ -3277,6 +3280,23 @@ mod tests {
             Some(MessagingProviderKind::DingTalk)
         );
         assert_eq!(MessagingProviderKind::from_wire("slack"), None);
+
+        let connection = MessagingConnectionStatus {
+            provider: MessagingProviderKind::DingTalk,
+            integration_id: "dingtalk-main".to_string(),
+            status: MessagingConnectionState::Connected,
+            last_connected_at_epoch: Some(1),
+            last_event_at_epoch: None,
+            last_error: None,
+            reconnect_count: 2,
+        };
+        let cv = serde_json::to_value(&connection).expect("MessagingConnectionStatus serializes");
+        assert_eq!(cv["provider"], "dingTalk");
+        assert_eq!(cv["integrationId"], "dingtalk-main");
+        assert_eq!(cv["status"], "connected");
+        assert_eq!(cv["reconnectCount"], 2);
+        assert!(cv.get("integration_id").is_none());
+        assert!(cv.get("last_connected_at_epoch").is_none());
 
         for (status, wire) in [
             (MessagingEventStatus::Received, "received"),
