@@ -37,19 +37,23 @@ pub struct CursorStatus {
     pub message: String,
 }
 
-/// Build `agent … acp` argv. Blank/whitespace `model` → just `["acp"]`;
-/// non-blank → `["--model", trimmed, "acp"]`.
+/// Build `agent … acp` argv for unattended full-access ACP.
+/// Always `--force --sandbox disabled` (Claude/Codex-parity dangerous mode).
+/// Blank/whitespace `model` → omit `--model`; non-blank → insert trimmed after sandbox flags.
+/// **Medium**: locked by `cursor_acp_args_*` + Unix spawn recorder tests.
 pub(super) fn cursor_acp_args(model: &str) -> Vec<String> {
     let trimmed = model.trim();
-    if trimmed.is_empty() {
-        vec!["acp".to_string()]
-    } else {
-        vec![
-            "--model".to_string(),
-            trimmed.to_string(),
-            "acp".to_string(),
-        ]
+    let mut args = vec![
+        "--force".to_string(),
+        "--sandbox".to_string(),
+        "disabled".to_string(),
+    ];
+    if !trimmed.is_empty() {
+        args.push("--model".to_string());
+        args.push(trimmed.to_string());
     }
+    args.push("acp".to_string());
+    args
 }
 
 /// A live, handshaken connection to an `agent acp` child.
@@ -317,9 +321,15 @@ mod tests {
 
     #[test]
     fn cursor_acp_args_omit_model_when_blank() {
-        assert_eq!(cursor_acp_args(""), vec!["acp".to_string()]);
-        assert_eq!(cursor_acp_args("   "), vec!["acp".to_string()]);
-        assert_eq!(cursor_acp_args("\t\n"), vec!["acp".to_string()]);
+        let expected = vec![
+            "--force".to_string(),
+            "--sandbox".to_string(),
+            "disabled".to_string(),
+            "acp".to_string(),
+        ];
+        assert_eq!(cursor_acp_args(""), expected.clone());
+        assert_eq!(cursor_acp_args("   "), expected.clone());
+        assert_eq!(cursor_acp_args("\t\n"), expected);
     }
 
     #[test]
@@ -327,6 +337,9 @@ mod tests {
         assert_eq!(
             cursor_acp_args("composer-2-fast"),
             vec![
+                "--force".to_string(),
+                "--sandbox".to_string(),
+                "disabled".to_string(),
                 "--model".to_string(),
                 "composer-2-fast".to_string(),
                 "acp".to_string(),
@@ -339,6 +352,9 @@ mod tests {
         assert_eq!(
             cursor_acp_args("  composer-2-fast  "),
             vec![
+                "--force".to_string(),
+                "--sandbox".to_string(),
+                "disabled".to_string(),
                 "--model".to_string(),
                 "composer-2-fast".to_string(),
                 "acp".to_string(),
@@ -444,7 +460,7 @@ done
         assert_eq!(proc.spawn_model(), "");
 
         let args = fs::read_to_string(root.join("args")).unwrap();
-        assert_eq!(args.trim(), "acp");
+        assert_eq!(args.trim(), "--force\n--sandbox\ndisabled\nacp");
         let cwd = fs::read_to_string(root.join("cwd")).unwrap();
         assert_eq!(
             std::fs::canonicalize(cwd.trim()).unwrap(),
@@ -527,6 +543,9 @@ done
         assert_eq!(
             args,
             vec![
+                "--force".to_string(),
+                "--sandbox".to_string(),
+                "disabled".to_string(),
                 "--model".to_string(),
                 "composer-2-fast".to_string(),
                 "acp".to_string()

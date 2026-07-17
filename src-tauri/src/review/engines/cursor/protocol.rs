@@ -32,15 +32,16 @@ pub const AUTH_METHOD_CURSOR_LOGIN: &str = "cursor_login";
 
 /// `session/request_permission` option ids (ACP Permission Options).
 pub mod option_ids {
+    pub const ALLOW_ALWAYS: &str = "allow-always";
     pub const ALLOW_ONCE: &str = "allow-once";
     pub const REJECT_ONCE: &str = "reject-once";
 }
 
-/// ACP / Cursor `toolCall.kind` strings we recognize for permission auto-reply.
+/// ACP / Cursor `toolCall.kind` strings for tests / diagnostics.
 ///
 /// Official ACP kinds: `read` / `edit` / `delete` / `move` / `search` / `execute` /
 /// `think` / `fetch` / `switch_mode` / `other`. We also accept `list` / `write` as
-/// common variants seen in the wild.
+/// common variants seen in the wild. Production `permission_reply` ignores kind.
 pub mod tool_kinds {
     pub const READ: &str = "read";
     pub const SEARCH: &str = "search";
@@ -158,9 +159,11 @@ pub struct SessionCancelParams {
 
 /// What to reply to a server→client request so an unattended review never stalls.
 pub enum ApprovalReply {
-    /// `session/request_permission` → selected `allow-once` (read-ish + option present).
+    /// `session/request_permission` → selected `allow-always`.
+    AllowAlways,
+    /// `session/request_permission` → selected `allow-once`.
     AllowOnce,
-    /// `session/request_permission` → selected `reject-once` (non-allowlisted / no allow).
+    /// `session/request_permission` → selected `reject-once` (no allow option offered).
     RejectOnce,
     /// `cursor/ask_question` → skipped.
     Skipped,
@@ -173,6 +176,9 @@ pub enum ApprovalReply {
 impl ApprovalReply {
     pub fn result(&self) -> Option<Value> {
         match self {
+            Self::AllowAlways => Some(serde_json::json!({
+                "outcome": { "outcome": "selected", "optionId": option_ids::ALLOW_ALWAYS }
+            })),
             Self::AllowOnce => Some(serde_json::json!({
                 "outcome": { "outcome": "selected", "optionId": option_ids::ALLOW_ONCE }
             })),
@@ -193,9 +199,8 @@ impl ApprovalReply {
 /// Map a server→client request method (+ params) to its auto-response.
 /// **Medium** carrier: wrong tokens stall unattended reviews — locked by unit tests.
 ///
-/// Permission is an **allowlist**: only read-ish kinds (`read` / `search` / `list` /
-/// `think` / `fetch`) may AllowOnce, and only when `allow-once` is offered.
-/// `switch_mode` / `execute` / `edit` / `write` / `delete` / MCP / unknown → RejectOnce.
+/// Unrestricted (Claude/Codex-parity): ignore `toolCall.kind`; prefer `allow-always`,
+/// else `allow-once`, else `reject-once`, else Unhandled.
 pub fn auto_response(method: &str, params: &Value) -> ApprovalReply {
     match method {
         server_methods::SESSION_REQUEST_PERMISSION => permission_reply(params),
@@ -205,25 +210,9 @@ pub fn auto_response(method: &str, params: &Value) -> ApprovalReply {
     }
 }
 
-/// Read-ish tool kinds that may be auto-allowed (still requires `allow-once` option).
-fn is_allowlisted_read_kind(tool_kind: &str) -> bool {
-    matches!(
-        tool_kind,
-        tool_kinds::READ
-            | tool_kinds::SEARCH
-            | tool_kinds::LIST
-            | tool_kinds::THINK
-            | tool_kinds::FETCH
-    )
-}
-
-/// Decide allow-once vs reject-once from `session/request_permission` params.
+/// Option priority for `session/request_permission` (kind ignored).
+/// **Medium**: golden in `auto_response_locks_permission_and_cursor_extensions`.
 fn permission_reply(params: &Value) -> ApprovalReply {
-    let tool_kind = params
-        .pointer("/toolCall/kind")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-
     let options = params.get("options").and_then(Value::as_array);
     let has_option = |option_id: &str| {
         options
@@ -234,19 +223,14 @@ fn permission_reply(params: &Value) -> ApprovalReply {
             .unwrap_or(false)
     };
 
-    if is_allowlisted_read_kind(tool_kind) {
-        if has_option(option_ids::ALLOW_ONCE) {
-            ApprovalReply::AllowOnce
-        } else if has_option(option_ids::REJECT_ONCE) {
-            ApprovalReply::RejectOnce
-        } else {
-            // No usable option advertised — fail closed with a JSON-RPC error.
-            ApprovalReply::Unhandled
-        }
+    if has_option(option_ids::ALLOW_ALWAYS) {
+        ApprovalReply::AllowAlways
+    } else if has_option(option_ids::ALLOW_ONCE) {
+        ApprovalReply::AllowOnce
     } else if has_option(option_ids::REJECT_ONCE) {
-        // execute / edit / write / delete / switch_mode / move / other / unknown / MCP
         ApprovalReply::RejectOnce
     } else {
+        // No usable option advertised — fail closed with a JSON-RPC error.
         ApprovalReply::Unhandled
     }
 }
@@ -458,74 +442,79 @@ mod tests {
 
     #[test]
     fn auto_response_locks_permission_and_cursor_extensions() {
-        // Medium golden: unattended reviews depend on these exact outcome shapes.
-        // Allowlist: only read-ish kinds may AllowOnce (and only when allow-once offered).
-        let both_options = serde_json::json!([
+        // Medium golden: unrestricted option priority (kind ignored).
+        // allow-always > allow-once > reject-once > Unhandled.
+        let once_and_reject = serde_json::json!([
+            { "optionId": option_ids::ALLOW_ONCE, "name": "Allow once", "kind": "allow_once" },
+            { "optionId": option_ids::REJECT_ONCE, "name": "Reject", "kind": "reject_once" }
+        ]);
+        let all_three = serde_json::json!([
+            { "optionId": option_ids::ALLOW_ALWAYS, "name": "Allow always", "kind": "allow_always" },
             { "optionId": option_ids::ALLOW_ONCE, "name": "Allow once", "kind": "allow_once" },
             { "optionId": option_ids::REJECT_ONCE, "name": "Reject", "kind": "reject_once" }
         ]);
 
-        let read_params = serde_json::json!({
+        let read_once = serde_json::json!({
             "sessionId": "s1",
             "toolCall": { "toolCallId": "c1", "kind": tool_kinds::READ },
-            "options": both_options.clone()
+            "options": once_and_reject.clone()
         });
         assert_eq!(
-            auto_response(server_methods::SESSION_REQUEST_PERMISSION, &read_params).result(),
+            auto_response(server_methods::SESSION_REQUEST_PERMISSION, &read_once).result(),
             Some(serde_json::json!({
                 "outcome": { "outcome": "selected", "optionId": option_ids::ALLOW_ONCE }
             }))
         );
 
-        let search_params = serde_json::json!({
-            "sessionId": "s1",
-            "toolCall": { "toolCallId": "c1b", "kind": tool_kinds::SEARCH },
-            "options": both_options.clone()
-        });
-        assert_eq!(
-            auto_response(server_methods::SESSION_REQUEST_PERMISSION, &search_params).result(),
-            Some(serde_json::json!({
-                "outcome": { "outcome": "selected", "optionId": option_ids::ALLOW_ONCE }
-            }))
-        );
-
-        let execute_params = serde_json::json!({
+        let execute_always = serde_json::json!({
             "sessionId": "s1",
             "toolCall": { "toolCallId": "c1c", "kind": tool_kinds::EXECUTE },
-            "options": both_options.clone()
+            "options": all_three.clone()
         });
         assert_eq!(
-            auto_response(server_methods::SESSION_REQUEST_PERMISSION, &execute_params).result(),
+            auto_response(server_methods::SESSION_REQUEST_PERMISSION, &execute_always).result(),
             Some(serde_json::json!({
-                "outcome": { "outcome": "selected", "optionId": option_ids::REJECT_ONCE }
+                "outcome": { "outcome": "selected", "optionId": option_ids::ALLOW_ALWAYS }
             }))
         );
 
-        let edit_params = serde_json::json!({
+        let execute_once = serde_json::json!({
             "sessionId": "s1",
-            "toolCall": { "toolCallId": "c1d", "kind": tool_kinds::EDIT },
-            "options": both_options.clone()
+            "toolCall": { "toolCallId": "c1d", "kind": tool_kinds::EXECUTE },
+            "options": once_and_reject.clone()
         });
         assert_eq!(
-            auto_response(server_methods::SESSION_REQUEST_PERMISSION, &edit_params).result(),
+            auto_response(server_methods::SESSION_REQUEST_PERMISSION, &execute_once).result(),
             Some(serde_json::json!({
-                "outcome": { "outcome": "selected", "optionId": option_ids::REJECT_ONCE }
+                "outcome": { "outcome": "selected", "optionId": option_ids::ALLOW_ONCE }
+            }))
+        );
+
+        let edit_once = serde_json::json!({
+            "sessionId": "s1",
+            "toolCall": { "toolCallId": "c1e", "kind": tool_kinds::EDIT },
+            "options": once_and_reject.clone()
+        });
+        assert_eq!(
+            auto_response(server_methods::SESSION_REQUEST_PERMISSION, &edit_once).result(),
+            Some(serde_json::json!({
+                "outcome": { "outcome": "selected", "optionId": option_ids::ALLOW_ONCE }
             }))
         );
 
         let switch_mode = serde_json::json!({
             "sessionId": "s1",
             "toolCall": { "toolCallId": "c2", "kind": tool_kinds::SWITCH_MODE },
-            "options": both_options
+            "options": once_and_reject
         });
         assert_eq!(
             auto_response(server_methods::SESSION_REQUEST_PERMISSION, &switch_mode).result(),
             Some(serde_json::json!({
-                "outcome": { "outcome": "selected", "optionId": option_ids::REJECT_ONCE }
+                "outcome": { "outcome": "selected", "optionId": option_ids::ALLOW_ONCE }
             }))
         );
 
-        let no_allow = serde_json::json!({
+        let only_reject = serde_json::json!({
             "sessionId": "s1",
             "toolCall": { "toolCallId": "c3", "kind": tool_kinds::READ },
             "options": [
@@ -533,7 +522,7 @@ mod tests {
             ]
         });
         assert_eq!(
-            auto_response(server_methods::SESSION_REQUEST_PERMISSION, &no_allow).result(),
+            auto_response(server_methods::SESSION_REQUEST_PERMISSION, &only_reject).result(),
             Some(serde_json::json!({
                 "outcome": { "outcome": "selected", "optionId": option_ids::REJECT_ONCE }
             }))

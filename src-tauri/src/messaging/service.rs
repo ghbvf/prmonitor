@@ -857,15 +857,9 @@ pub(crate) fn supports_long_connection(kind: MessagingProviderKind) -> bool {
 
 pub(crate) fn long_connection_http_gone_message(kind: MessagingProviderKind) -> &'static str {
     match kind {
-        MessagingProviderKind::Feishu => {
-            "飞书 HTTP 回调已禁用；请在飞书开放平台启用官方长连接"
-        }
-        MessagingProviderKind::DingTalk => {
-            "钉钉 HTTP 回调已禁用；请在钉钉开放平台启用 Stream 模式"
-        }
-        MessagingProviderKind::WeChatWork => {
-            "该 messaging provider 未启用长连接 HTTP 410"
-        }
+        MessagingProviderKind::Feishu => "飞书 HTTP 回调已禁用；请在飞书开放平台启用官方长连接",
+        MessagingProviderKind::DingTalk => "钉钉 HTTP 回调已禁用；请在钉钉开放平台启用 Stream 模式",
+        MessagingProviderKind::WeChatWork => "该 messaging provider 未启用长连接 HTTP 410",
     }
 }
 

@@ -312,7 +312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_rejects_execute_permission() {
+    async fn auto_allows_execute_permission() {
         let (client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let _client = RpcClient::connect(client_w, tokio::io::BufReader::new(client_r), 16);
@@ -331,11 +331,11 @@ mod tests {
         sr.read_line(&mut line).await.unwrap();
         let v: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(v["id"], 98);
-        assert_eq!(v["result"]["outcome"]["optionId"], "reject-once");
+        assert_eq!(v["result"]["outcome"]["optionId"], "allow-once");
     }
 
     #[tokio::test]
-    async fn auto_rejects_switch_mode_permission() {
+    async fn auto_allows_switch_mode_permission() {
         let (client_w, server_r) = tokio::io::duplex(64 * 1024);
         let (server_w, client_r) = tokio::io::duplex(64 * 1024);
         let _client = RpcClient::connect(client_w, tokio::io::BufReader::new(client_r), 16);
@@ -354,7 +354,7 @@ mod tests {
         sr.read_line(&mut line).await.unwrap();
         let v: Value = serde_json::from_str(line.trim()).unwrap();
         assert_eq!(v["id"], 100);
-        assert_eq!(v["result"]["outcome"]["optionId"], "reject-once");
+        assert_eq!(v["result"]["outcome"]["optionId"], "allow-once");
     }
 
     #[tokio::test]

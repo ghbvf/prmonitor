@@ -246,14 +246,14 @@ mod tests {
         assert!(!service::supports_long_connection(
             MessagingProviderKind::WeChatWork
         ));
-        assert!(service::long_connection_http_gone_message(
-            MessagingProviderKind::Feishu
-        )
-        .contains("飞书"));
-        assert!(service::long_connection_http_gone_message(
-            MessagingProviderKind::DingTalk
-        )
-        .contains("钉钉"));
+        assert!(
+            service::long_connection_http_gone_message(MessagingProviderKind::Feishu)
+                .contains("飞书")
+        );
+        assert!(
+            service::long_connection_http_gone_message(MessagingProviderKind::DingTalk)
+                .contains("钉钉")
+        );
     }
 
     #[test]
