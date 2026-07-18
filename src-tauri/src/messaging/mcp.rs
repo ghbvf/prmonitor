@@ -399,16 +399,17 @@ async fn wait_with_elicitation(
                             )
                             .await
                         }
-                        ElicitationAction::Decline => {
-                            cancel_after_codex_decline(db, broker, &request.id)
-                        }
-                        ElicitationAction::Cancel => {
-                            continue_after_codex_cancel(
+                        // Codex Desktop may auto-Decline nested tool-call elicitations
+                        // without showing a popup. Treat Decline like Cancel: keep the
+                        // messaging card alive until timeout / Feishu|DingTalk answer.
+                        ElicitationAction::Decline | ElicitationAction::Cancel => {
+                            continue_after_codex_dismiss(
                                 db,
                                 broker,
                                 request,
                                 receiver,
                                 deadline,
+                                result.action,
                             )
                             .await
                         }
@@ -438,29 +439,24 @@ async fn wait_with_elicitation(
     }
 }
 
-async fn continue_after_codex_cancel(
+async fn continue_after_codex_dismiss(
     db: &Database,
     broker: &HumanInputBroker,
     request: &HumanInputRequest,
     receiver: &mut tokio::sync::watch::Receiver<Option<HumanInputRequest>>,
     deadline: tokio::time::Instant,
+    action: ElicitationAction,
 ) -> Result<HumanInputRequest, String> {
+    let label = match action {
+        ElicitationAction::Decline => "Decline",
+        ElicitationAction::Cancel => "Cancel",
+        _ => "dismiss",
+    };
     eprintln!(
-        "Codex elicitation Cancel（{}）；继续等待消息通道回答",
+        "Codex elicitation {label}（{}）；继续等待消息通道回答",
         request.id
     );
     wait_channel_only(db, broker, &request.id, receiver, deadline).await
-}
-
-fn cancel_after_codex_decline(
-    db: &Database,
-    broker: &HumanInputBroker,
-    request_id: &str,
-) -> Result<HumanInputRequest, String> {
-    eprintln!("Codex elicitation Decline（{request_id}）；取消人工输入请求");
-    human_input::cancel(db, broker, request_id, store::now_epoch())
-        .map_err(|error| error.message)?;
-    current_request(db, request_id)
 }
 
 async fn accept_codex_or_wait_channel(
@@ -978,12 +974,13 @@ mod tests {
         human_input::create(&db, &request).unwrap();
         let mut receiver = broker.subscribe(&request.id);
 
-        let wait = continue_after_codex_cancel(
+        let wait = continue_after_codex_dismiss(
             &db,
             &broker,
             &request,
             &mut receiver,
             tokio::time::Instant::now() + Duration::from_secs(1),
+            ElicitationAction::Cancel,
         );
         let answer = async {
             tokio::task::yield_now().await;
@@ -1009,7 +1006,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_decline_cancels_human_input_request() {
+    async fn codex_decline_keeps_waiting_until_feishu_answers() {
         let db = Database::open_in_memory().unwrap();
         let broker = HumanInputBroker::default();
         let request = HumanInputRequest {
@@ -1034,26 +1031,36 @@ mod tests {
             answered_at_epoch: None,
         };
         human_input::create(&db, &request).unwrap();
+        let mut receiver = broker.subscribe(&request.id);
 
-        let cancelled = cancel_after_codex_decline(&db, &broker, &request.id).unwrap();
-        assert_eq!(cancelled.status, HumanInputStatus::Cancelled);
-
-        let outcome = human_input::answer(
+        let wait = continue_after_codex_dismiss(
             &db,
             &broker,
-            &request.id,
-            &[HumanAnswer {
-                question_id: "q1".into(),
-                answer: "A".into(),
-            }],
-            HumanAnswerSource::Feishu,
-            20,
-        )
-        .unwrap();
-        assert_ne!(outcome, human_input::AnswerOutcome::Won);
-        assert_eq!(
-            human_input::get(&db, &request.id).unwrap().unwrap().status,
-            HumanInputStatus::Cancelled
+            &request,
+            &mut receiver,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            ElicitationAction::Decline,
         );
+        let answer = async {
+            tokio::task::yield_now().await;
+            human_input::answer(
+                &db,
+                &broker,
+                &request.id,
+                &[HumanAnswer {
+                    question_id: "q1".into(),
+                    answer: "A".into(),
+                }],
+                HumanAnswerSource::Feishu,
+                20,
+            )
+            .unwrap()
+        };
+        let (winner, outcome) = tokio::join!(wait, answer);
+
+        assert_eq!(outcome, human_input::AnswerOutcome::Won);
+        let winner = winner.unwrap();
+        assert_eq!(winner.status, HumanInputStatus::Answered);
+        assert_eq!(winner.answer_source, Some(HumanAnswerSource::Feishu));
     }
 }

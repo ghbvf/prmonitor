@@ -106,7 +106,9 @@ enabled = true
 ```
 
 `ask_via_feishu` / `ask_via_dingtalk` create one durable request, send a provider card, and open a
-Codex elicitation. The first valid answer wins through a SQLite compare-and-set. Text fallbacks are
+Codex elicitation. The first valid answer wins through a SQLite compare-and-set. If Codex returns
+`Decline` or `Cancel` for the elicitation (including Desktop auto-decline without a popup), the
+messaging card stays open until timeout or a Feishu/DingTalk answer. Text fallbacks are
 `/answer Q-id <answer>` (multiple answers: `q1=A;q2=B`) and `/cancel Q-id`. Tool/sandbox permissions
 remain native Codex approvals and are never delegated to messaging bots.
 
