@@ -48,14 +48,18 @@ export function stopCursor(): Promise<CursorStatus> {
 }
 
 // Starts a review for a PR in the given project (#35); resolves with the session
-// id (codex threadId). Output streams out-of-band via `onReviewEvent`. `kind` is
-// "review" or "check".
+// id (codex threadId). Output streams out-of-band via `onReviewEvent`.
+// Pass `extraArgs = "--check"` for the former check mode.
 export function startReview(
   projectId: string,
   prNumber: number,
-  kind: string,
+  extraArgs: string = "",
 ): Promise<string> {
-  return getTransport().request<string>("start_review", { projectId, prNumber, kind });
+  return getTransport().request<string>("start_review", {
+    projectId,
+    prNumber,
+    extraArgs: extraArgs || null,
+  });
 }
 
 export function stopReview(sessionId: string): Promise<void> {

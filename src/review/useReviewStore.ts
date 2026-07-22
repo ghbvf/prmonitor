@@ -308,7 +308,7 @@ function applyEvent(ev: ReviewEvent) {
 
 // Start a review for a PR in the given project (#35). Resets the panel, then
 // records the returned session id.
-async function start(projectId: string, prNumber: number, kind: string) {
+async function start(projectId: string, prNumber: number, extraArgs: string = "") {
   // Single-active MVP: one start at a time. A non-null buffer means a start is
   // already in flight; bail so two overlapping starts can't race the shared buffer.
   if (inFlightBuffer !== null) return;
@@ -320,7 +320,7 @@ async function start(projectId: string, prNumber: number, kind: string) {
   running.value = true;
   inFlightBuffer = []; // buffer events until the id is known (see applyEvent).
   try {
-    const id = await startReview(projectId, prNumber, kind);
+    const id = await startReview(projectId, prNumber, extraArgs);
     activeThreadId.value = id;
     // Replay what arrived during the start; applyEvent now drops foreign sessions.
     const buffered = inFlightBuffer;

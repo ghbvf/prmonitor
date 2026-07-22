@@ -1,4 +1,12 @@
 import type { AppConfig, RuleActionConfig, RuleActionKind, RuleConfig } from "./types";
+import { assertNever } from "../types";
+import {
+  DEFAULT_COMMAND_TEMPLATE,
+  DEFAULT_SKILL_NAME,
+  DEFAULT_SKILL_PATH,
+} from "../types.generated";
+
+export { DEFAULT_SKILL_NAME, DEFAULT_SKILL_PATH, DEFAULT_COMMAND_TEMPLATE };
 
 export function parseRuleCsv(value: string): string[] {
   return value
@@ -15,15 +23,33 @@ export function nextRuleId(rules: Pick<RuleConfig, "id">[]): string {
 }
 
 export function createRuleAction(kind: RuleActionKind): RuleActionConfig {
-  return {
-    id: kind,
-    kind,
-    enabled: true,
-    target: { kind: "none" },
-    dedupePolicy: "event",
-    delaySecs: 0,
-    level: "action",
-  };
+  switch (kind) {
+    case "runSkill":
+      return {
+        id: "runSkill",
+        kind: "runSkill",
+        enabled: true,
+        dedupePolicy: "event",
+        delaySecs: 0,
+        level: "action",
+        skillName: DEFAULT_SKILL_NAME,
+        skillPath: DEFAULT_SKILL_PATH,
+        commandTemplate: DEFAULT_COMMAND_TEMPLATE,
+        extraArgs: "",
+      };
+    case "notify":
+      return {
+        id: "notify",
+        kind: "notify",
+        enabled: true,
+        target: { kind: "none" },
+        dedupePolicy: "event",
+        delaySecs: 0,
+        level: "action",
+      };
+    default:
+      return assertNever(kind);
+  }
 }
 
 export function createDefaultRule(draft: AppConfig): RuleConfig {
@@ -41,7 +67,7 @@ export function createDefaultRule(draft: AppConfig): RuleConfig {
     labelsAll: [],
     titleContains: "",
     bodyContains: "",
-    actions: [createRuleAction("review")],
+    actions: [createRuleAction("runSkill")],
     allowActionKinds: [],
     denyActionKinds: [],
   };
@@ -63,8 +89,16 @@ export function toggleRuleAction(
       ),
     };
   }
-  if (!checked) {
-    return { ...rule, actions: rule.actions.filter((action) => action.kind !== kind) };
-  }
-  return rule;
+  // Disable by kind — do not delete, so migrated multi-runSkill (review+check) is preserved.
+  return {
+    ...rule,
+    actions: rule.actions.map((action) =>
+      action.kind === kind ? { ...action, enabled: false } : action,
+    ),
+  };
+}
+
+/** Remove a single action by id (per-row control in RulesManager). */
+export function removeRuleAction(rule: RuleConfig, actionId: string): RuleConfig {
+  return { ...rule, actions: rule.actions.filter((action) => action.id !== actionId) };
 }

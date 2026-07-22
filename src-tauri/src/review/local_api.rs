@@ -30,7 +30,7 @@
 //!     token is the "disabled" sentinel).
 //!
 //! The endpoints copy `gh`'s two-layer model (submit-and-return + poll):
-//!  - `POST /reviews` `{projectId|repo, pr, kind, requestId}` →
+//!  - `POST /reviews` `{projectId|repo, pr, skill_key, requestId}` →
 //!    `202 {receiptId, statusUrl}` (durably inserts one external review intent).
 //!  - `GET /reviews/{receiptId}` → the durable queue/session aggregate, including states before
 //!    a thread exists and after an app restart.
@@ -56,14 +56,14 @@ use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, StreamEvent};
 use crate::model::{
-    ExternalRequestId, ExternalTriggerOrigin, ReviewKind, ReviewReceiptId, ReviewReceiptSnapshot,
+    ExternalRequestId, ExternalTriggerOrigin, ReviewReceiptId, ReviewReceiptSnapshot,
     ReviewReceiptStatus, SendNotificationRequest,
 };
 use crate::state::AppState;
 
 const RECEIPT_QUERY_FAILED_MESSAGE: &str = "查询 review receipt 失败";
 
-/// Review-request bodies are tiny (`{projectId, pr, kind, requestId}`). Cap what an unauthenticated POST can
+/// Review-request bodies are tiny (`{projectId, pr, skill_key, requestId}`). Cap what an unauthenticated POST can
 /// make us buffer before the auth check rejects it (the same body-cap defense the webhook
 /// receiver uses, with a smaller cap — this body is far smaller than a webhook payload).
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -90,7 +90,9 @@ pub(crate) struct ReviewRequestBody {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) repo: Option<String>,
     pub(crate) pr: u64,
-    pub(crate) kind: ReviewKind,
+    /// Only `""` or `"--check"` — skill identity is resolved from project rules server-side.
+    #[serde(default)]
+    pub(crate) extra_args: String,
     pub(crate) request_id: ExternalRequestId,
 }
 
@@ -299,10 +301,17 @@ async fn handle_create<R: tauri::Runtime>(
         ExternalTriggerOrigin::Http
     };
     let state = ctx.app.state::<AppState>();
-    match state
-        .external_review
-        .submit(reference, req.pr, req.kind, req.request_id, origin, false)
-    {
+    if let Err(message) = crate::model::SkillInvocation::validate_extra_args(&req.extra_args) {
+        return error_response(StatusCode::BAD_REQUEST, message);
+    }
+    match state.external_review.submit(
+        reference,
+        req.pr,
+        req.extra_args,
+        req.request_id,
+        origin,
+        false,
+    ) {
         Ok(receipt_id) => {
             let status_url = receipt_status_url(
                 ctx.port,
@@ -776,7 +785,7 @@ mod tests {
             project_id: project_id.map(str::to_string),
             repo: repo.map(str::to_string),
             pr: 7,
-            kind: ReviewKind::Review,
+            extra_args: String::new(),
             request_id: ExternalRequestId::parse("0123456789abcdef0123456789abcdef")
                 .expect("request id"),
         }
@@ -808,25 +817,37 @@ mod tests {
         let req: ReviewRequestBody = serde_json::from_value(serde_json::json!({
             "projectId": "p1",
             "pr": 9,
-            "kind": "check",
+            "extraArgs": "--check",
             "requestId": "0123456789abcdef0123456789abcdef"
         }))
         .expect("camelCase body deserializes");
         assert_eq!(req.project_id.as_deref(), Some("p1"));
         assert_eq!(req.pr, 9);
-        assert_eq!(req.kind, ReviewKind::Check);
+        assert_eq!(req.extra_args, "--check");
         assert_eq!(req.request_id.as_str(), "0123456789abcdef0123456789abcdef");
 
         let missing = serde_json::from_value::<ReviewRequestBody>(
-            serde_json::json!({"projectId": "p1", "pr": 9, "kind": "check"}),
+            serde_json::json!({"projectId": "p1", "pr": 9, "extraArgs": "--check"}),
         )
         .expect_err("requestId is mandatory");
         assert!(missing.to_string().contains("requestId"));
 
+        // Free skill fields are rejected (Hard ingress — skill resolved from rules server-side).
+        let free_skill = serde_json::from_value::<ReviewRequestBody>(serde_json::json!({
+            "projectId": "p1",
+            "pr": 9,
+            "skillName": "evil",
+            "skillPath": "secrets.env",
+            "commandTemplate": "rm -rf /",
+            "requestId": "0123456789abcdef0123456789abcdef"
+        }))
+        .expect_err("free skill fields fail closed");
+        assert!(free_skill.to_string().contains("unknown field"));
+
         let legacy = serde_json::from_value::<ReviewRequestBody>(serde_json::json!({
             "projectId": "p1",
             "pr": 9,
-            "kind": "check",
+            "skill_key": "check",
             "requestId": "0123456789abcdef0123456789abcdef",
             "id": "legacy-thread"
         }))
@@ -839,7 +860,7 @@ mod tests {
             "0123456789abcdef0123456789abcdeg",
         ] {
             let error = serde_json::from_value::<ReviewRequestBody>(serde_json::json!({
-                "repo": "owner/name", "pr": 9, "kind": "review", "requestId": invalid
+                "repo": "owner/name", "pr": 9, "requestId": invalid
             }))
             .expect_err("invalid requestId must fail closed");
             assert!(error.to_string().contains("requestId"), "{error}");
@@ -955,14 +976,17 @@ mod tests {
             project_id: Some("p1".to_string()),
             repo: None,
             pr: 9,
-            kind: ReviewKind::Review,
+            extra_args: String::new(),
             request_id: ExternalRequestId::parse("0123456789abcdef0123456789abcdef")
                 .expect("request id"),
         })
         .expect("serializes");
         assert_eq!(v["projectId"], "p1");
         assert_eq!(v["pr"], 9);
-        assert_eq!(v["kind"], "review");
+        assert_eq!(v["extraArgs"], "");
+        assert!(v.get("skillName").is_none());
+        assert!(v.get("skillPath").is_none());
+        assert!(v.get("commandTemplate").is_none());
         assert_eq!(v["requestId"], "0123456789abcdef0123456789abcdef");
         assert!(v.get("repo").is_none(), "unset repo is omitted");
         assert!(v.get("project_id").is_none(), "snake_case absent");
@@ -1039,7 +1063,7 @@ mod tests {
             thread_id: thread.to_string(),
             turn_id: String::new(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: crate::model::EngineKind::Codex,
             status: SessionStatus::Done,
             created_at_epoch: 0,

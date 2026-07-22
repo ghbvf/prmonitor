@@ -17,8 +17,7 @@ use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, LabelSource, ReviewKind,
-    SourceKind,
+    Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, LabelSource, SourceKind,
 };
 
 use super::labels;
@@ -192,8 +191,8 @@ async fn read_body_capped(mut resp: reqwest::Response, limit: usize) -> AppResul
 /// (all paginated PRs).
 ///
 /// - Effective labels come from [`labels::effective_labels`] over the PR TITLE (Bitbucket
-///   has no native labels), then [`labels::classify`] gives `(kind, conflict)` — both
-///   trigger tags → conflict (kept, kind "review", gh parity); neither → dropped.
+///   has no native labels). A PR is kept when it matches any configured trigger label;
+///   skill identity is filled later by the rule engine.
 /// - `id` → number; `fromRef.latestCommit` → head_sha; `fromRef.displayId` → head_ref;
 ///   `fromRef.repository.id` ≠ `toRef.repository.id` → is_cross_repository; `draft` →
 ///   is_draft; `author.user.name` (fallback `displayName`) → author.
@@ -224,7 +223,7 @@ fn map_rows(
         // F2 (fail-closed): a real open PR always carries `fromRef` with a `latestCommit`
         // (→ head_sha, the dispatch key) and `displayId` (→ head_ref). A missing/empty one
         // is a malformed response — skip the PR rather than emitting an empty-head candidate
-        // that would corrupt the dispatch ledger key (`{number}@{headSha}:{kind}`).
+        // that would corrupt the dispatch ledger key (`{number}@{headSha}:{skill_key}`).
         let Some(from_ref) = pr.from_ref else {
             continue;
         };
@@ -275,7 +274,7 @@ fn map_rows(
                 author,
                 is_cross_repository,
                 is_draft: pr.draft,
-                kind: ReviewKind::Review,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             },
             title: pr.title,
             body: pr.description,
@@ -588,7 +587,10 @@ mod tests {
         assert_eq!(row.candidate.head_sha, "abc123");
         assert_eq!(row.candidate.head_ref, "feature/widget"); // no refs/heads/ on Bitbucket
         assert_eq!(row.candidate.author, "tom"); // name preferred over displayName
-        assert_eq!(row.candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            row.candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert_eq!(row.body, "Widget details");
         assert!(!row.candidate.is_cross_repository);
         assert!(!row.candidate.is_draft);
@@ -630,7 +632,10 @@ mod tests {
         );
         let r = rows(&json).expect("parses");
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            r[0].candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert_eq!(
             r[0].url,
             "https://bitbucket.example.com/projects/GOCELL/repos/myrepo/pull-requests/7"
@@ -659,7 +664,7 @@ mod tests {
 
     #[test]
     fn parse_rows_keeps_pr_with_multiple_trigger_tags() {
-        // Trigger tags are rule-interest filters only; action kind is decided by rules.
+        // Trigger tags are rule-interest filters only; action skill_key is decided by rules.
         let json = format!(
             r#"{{ "isLastPage": true, "values": [
                 {{ "id": 9, "title": "[{REVIEW}][{CHECK}] both", "fromRef": {{ "displayId": "b", "latestCommit": "s" }} }}
@@ -668,7 +673,10 @@ mod tests {
         let r = rows(&json).expect("parses");
         assert_eq!(r.len(), 1);
         assert!(!r[0].conflict);
-        assert_eq!(r[0].candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            r[0].candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert_eq!(r[0].labels, vec![REVIEW.to_string(), CHECK.to_string()]);
         assert_eq!(candidates(&json).expect("parses").len(), 1);
     }

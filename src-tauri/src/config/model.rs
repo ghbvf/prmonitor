@@ -240,9 +240,7 @@ pub struct Project {
     pub poll_interval_secs: u64,
     /// PR author allowlist (mirrors the dispatcher's author gate).
     pub authors: Vec<String>,
-    /// Path (relative to `repo_root`) of the codex pr-review skill to invoke.
-    pub skill_rel_path: String,
-    /// Per-PR cooldown between dispatches of the same `(pr, kind)`.
+    /// Per-PR cooldown between dispatches of the same `(pr, skill_key)`.
     pub pr_cooldown_seconds: u64,
     /// Which PR source backs the monitor: [`SourceKind::Github`] (`gh` CLI),
     /// [`SourceKind::Azure`] (`az` CLI), or [`SourceKind::Bitbucket`] (REST). #11
@@ -302,7 +300,6 @@ impl Default for Project {
             repo_root: String::new(),
             poll_interval_secs: 120,
             authors: Vec::new(),
-            skill_rel_path: ".codex/skills/pr-review/SKILL.md".to_string(),
             pr_cooldown_seconds: 1800,
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
@@ -372,8 +369,7 @@ impl Default for OutboxConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RuleActionKind {
-    Review,
-    Check,
+    RunSkill,
     Notify,
 }
 
@@ -404,24 +400,124 @@ pub enum RuleActionTarget {
     },
 }
 
+/// One rule action. Tagged on `kind` so skill fields cannot appear on notify (and vice versa).
 #[cfg_attr(test, derive(ts_rs::TS))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
-pub struct RuleActionConfig {
-    pub id: String,
-    pub kind: RuleActionKind,
-    pub enabled: bool,
-    pub target: RuleActionTarget,
-    pub dedupe_policy: RuleActionDedupePolicy,
-    pub delay_secs: u64,
-    pub level: String,
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum RuleActionConfig {
+    RunSkill {
+        id: String,
+        enabled: bool,
+        #[serde(rename = "dedupePolicy")]
+        dedupe_policy: RuleActionDedupePolicy,
+        #[serde(rename = "delaySecs")]
+        delay_secs: u64,
+        level: String,
+        #[serde(rename = "skillName")]
+        skill_name: String,
+        #[serde(rename = "skillPath")]
+        skill_path: String,
+        #[serde(rename = "commandTemplate")]
+        command_template: String,
+        #[serde(rename = "extraArgs")]
+        extra_args: String,
+    },
+    Notify {
+        id: String,
+        enabled: bool,
+        target: RuleActionTarget,
+        #[serde(rename = "dedupePolicy")]
+        dedupe_policy: RuleActionDedupePolicy,
+        #[serde(rename = "delaySecs")]
+        delay_secs: u64,
+        level: String,
+    },
 }
 
 impl RuleActionConfig {
-    pub fn new(id: impl Into<String>, kind: RuleActionKind) -> Self {
-        Self {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::RunSkill { id, .. } | Self::Notify { id, .. } => id,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::RunSkill { enabled, .. } | Self::Notify { enabled, .. } => *enabled,
+        }
+    }
+
+    pub fn kind(&self) -> RuleActionKind {
+        match self {
+            Self::RunSkill { .. } => RuleActionKind::RunSkill,
+            Self::Notify { .. } => RuleActionKind::Notify,
+        }
+    }
+
+    pub fn dedupe_policy(&self) -> RuleActionDedupePolicy {
+        match self {
+            Self::RunSkill { dedupe_policy, .. } | Self::Notify { dedupe_policy, .. } => {
+                *dedupe_policy
+            }
+        }
+    }
+
+    pub fn delay_secs(&self) -> u64 {
+        match self {
+            Self::RunSkill { delay_secs, .. } | Self::Notify { delay_secs, .. } => *delay_secs,
+        }
+    }
+
+    pub fn level(&self) -> &str {
+        match self {
+            Self::RunSkill { level, .. } | Self::Notify { level, .. } => level,
+        }
+    }
+
+    pub fn run_skill(id: impl Into<String>) -> Self {
+        Self::RunSkill {
             id: id.into(),
-            kind,
+            enabled: true,
+            dedupe_policy: RuleActionDedupePolicy::default(),
+            delay_secs: 0,
+            level: "action".to_string(),
+            skill_name: crate::model::DEFAULT_SKILL_NAME.to_string(),
+            skill_path: crate::model::DEFAULT_SKILL_PATH.to_string(),
+            command_template: crate::model::DEFAULT_COMMAND_TEMPLATE.to_string(),
+            extra_args: String::new(),
+        }
+    }
+
+    pub fn run_skill_check(id: impl Into<String>) -> Self {
+        match Self::run_skill(id) {
+            Self::RunSkill {
+                id,
+                enabled,
+                dedupe_policy,
+                delay_secs,
+                level,
+                skill_name,
+                skill_path,
+                command_template,
+                ..
+            } => Self::RunSkill {
+                id,
+                enabled,
+                dedupe_policy,
+                delay_secs,
+                level,
+                skill_name,
+                skill_path,
+                command_template,
+                extra_args: "--check".to_string(),
+            },
+            Self::Notify { .. } => unreachable!(),
+        }
+    }
+
+    pub fn notify(id: impl Into<String>) -> Self {
+        Self::Notify {
+            id: id.into(),
             enabled: true,
             target: RuleActionTarget::None,
             dedupe_policy: RuleActionDedupePolicy::default(),
@@ -433,7 +529,7 @@ impl RuleActionConfig {
 
 impl Default for RuleActionConfig {
     fn default() -> Self {
-        Self::new(String::new(), RuleActionKind::Review)
+        Self::run_skill(String::new())
     }
 }
 
@@ -1328,22 +1424,23 @@ fn validate_messaging(settings: &MessagingSettings) -> AppResult<()> {
 ///
 /// The source-agnostic checks then run: `repo_root` is a non-empty, **absolute**
 /// path to an existing directory (absolute so resolution never depends on the
-/// process CWD, matching the field's doc contract); `skill_rel_path` resolves to an
-/// existing file that stays **inside** `repo_root` (the skill check defends two
-/// `Path::join` pitfalls: an absolute `skill_rel_path` would discard `repo_root`,
-/// and `..` traversal could escape the clone — both would let a later engine read
-/// arbitrary files); positive poll/cooldown intervals; and non-empty
-/// `review_label` / `check_label` (each is fed to the source's label filter, so a
-/// blank one makes every poll match nothing / fail).
+/// process CWD, matching the field's doc contract); rule `runSkill` actions resolve
+/// their `skill_path` to an existing file that stays **inside** `repo_root` (the
+/// skill check defends two `Path::join` pitfalls: an absolute `skill_path` would
+/// discard `repo_root`, and `..` traversal could escape the clone — both would let
+/// a later engine read arbitrary files); positive poll/cooldown intervals; and
+/// non-empty `review_label` / `check_label` (each is fed to the source's label
+/// filter, so a blank one makes every poll match nothing / fail).
 ///
 /// Errors funnel through [`AppError`], and each message **starts with** the
 /// offending field's wire name (`repo` / `azureOrg` / `azureProject` /
 /// `bitbucketHost` / `bitbucketProject` / `bitbucketToken` / `labelSource` /
-/// `repoRoot` / `skillRelPath` / `skill` / `pollIntervalSecs` / `prCooldownSeconds` /
-/// `reviewLabel` / `checkLabel`). That prefix is the cross-end routing contract the
-/// onboarding wizard's `errorToStep` (src/config/fields.ts) keys on — locked at
-/// this end by the `validate_error_*` test below (PR #41 F4, Medium). Checks run in
-/// wizard-step order so the first failure routes to the earliest offending step.
+/// `repoRoot` / `skillName` / `skillPath` / `commandTemplate` / `skill` /
+/// `pollIntervalSecs` / `prCooldownSeconds` / `reviewLabel` / `checkLabel`). That
+/// prefix is the cross-end routing contract the onboarding wizard's `errorToStep`
+/// (src/config/fields.ts) keys on — locked at this end by the `validate_error_*`
+/// test below (PR #41 F4, Medium). Checks run in wizard-step order so the first
+/// failure routes to the earliest offending step.
 pub fn validate_project(project: &Project) -> AppResult<()> {
     // Repo-shape check branches on the source (#818). EXHAUSTIVE match (no wildcard):
     // a new `SourceKind` variant fails to compile here until its repo rule is added.
@@ -1497,42 +1594,6 @@ pub fn validate_project(project: &Project) -> AppResult<()> {
         )));
     }
 
-    // `skillRelPath` is the codex pr-review skill path (`.codex/skills/...`) the codex
-    // engine attaches to a turn. The claude engine (#718) discovers `.claude/skills/`
-    // from the turn cwd instead, so the field is unused for it — validate it ONLY for
-    // a codex project, mirroring how source-specific fields (azure org/project,
-    // bitbucket host/project/token) are validated only under their matching source.
-    // A claude project keeps whatever value sits in `skill_rel_path` (the field is
-    // hidden in the UI via `engineKind==="codex"` visibleWhen) but it is never used.
-    if project.engine_kind == EngineKind::Codex {
-        let skill_rel = Path::new(&project.skill_rel_path);
-        if skill_rel.is_absolute() {
-            return Err(AppError::new(format!(
-                "skillRelPath 必须是相对路径: {}",
-                project.skill_rel_path
-            )));
-        }
-        let skill = root.join(skill_rel);
-        if !skill.is_file() {
-            return Err(AppError::new(format!(
-                "skill 路径不存在: {}",
-                skill.display()
-            )));
-        }
-        let root_canon = root
-            .canonicalize()
-            .map_err(|e| AppError::new(format!("repoRoot 规范化失败: {e}")))?;
-        let skill_canon = skill
-            .canonicalize()
-            .map_err(|e| AppError::new(format!("skill 路径规范化失败: {e}")))?;
-        if !skill_canon.starts_with(&root_canon) {
-            return Err(AppError::new(format!(
-                "skillRelPath 不能逃逸 repoRoot: {}",
-                project.skill_rel_path
-            )));
-        }
-    }
-
     if project.poll_interval_secs == 0 {
         return Err(AppError::new("pollIntervalSecs 必须大于 0"));
     }
@@ -1545,6 +1606,7 @@ pub fn validate_project(project: &Project) -> AppResult<()> {
 
 fn validate_rule(
     rule: &RuleConfig,
+    projects: &[Project],
     notifications: &NotificationSettings,
     messaging: &MessagingSettings,
 ) -> AppResult<()> {
@@ -1567,21 +1629,22 @@ fn validate_rule(
     }
     let mut seen_action_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (idx, action) in rule.actions.iter().enumerate() {
-        validate_rule_action(action, notifications, messaging)
+        validate_rule_action(action, rule, projects, notifications, messaging)
             .map_err(|e| AppError::new(format!("actions[{idx}].{}", e.message)))?;
-        if !seen_action_ids.insert(action.id.as_str()) {
+        if !seen_action_ids.insert(action.id()) {
             return Err(AppError::new(format!(
                 "actions[{idx}].id 动作 id 重复: {}",
-                action.id
+                action.id()
             )));
         }
-        if rule.deny_action_kinds.contains(&action.kind)
+        let action_kind = action.kind();
+        if rule.deny_action_kinds.contains(&action_kind)
             || (!rule.allow_action_kinds.is_empty()
-                && !rule.allow_action_kinds.contains(&action.kind))
+                && !rule.allow_action_kinds.contains(&action_kind))
         {
             return Err(AppError::new(format!(
                 "actions[{idx}].kind 被组合策略拒绝: {:?}",
-                action.kind
+                action_kind
             )));
         }
     }
@@ -1590,29 +1653,76 @@ fn validate_rule(
 
 fn validate_rule_action(
     action: &RuleActionConfig,
+    rule: &RuleConfig,
+    projects: &[Project],
     notifications: &NotificationSettings,
     messaging: &MessagingSettings,
 ) -> AppResult<()> {
-    if action.id.trim().is_empty()
-        || action.id.contains(':')
-        || action.id.chars().any(char::is_whitespace)
+    if action.id().trim().is_empty()
+        || action.id().contains(':')
+        || action.id().chars().any(char::is_whitespace)
     {
         return Err(AppError::new(format!(
             "id 非法（不能为空、含 `:` 或空白字符）: {:?}",
-            action.id
+            action.id()
         )));
     }
-    if action.level.trim().is_empty()
-        || action.level.contains(':')
-        || action.level.chars().any(char::is_whitespace)
+    if action.level().trim().is_empty()
+        || action.level().contains(':')
+        || action.level().chars().any(char::is_whitespace)
     {
         return Err(AppError::new(format!(
             "level 非法（不能为空、含 `:` 或空白字符）: {:?}",
-            action.level
+            action.level()
         )));
     }
-    validate_delay_secs("delaySecs", action.delay_secs)?;
-    validate_rule_action_target(&action.target, notifications, messaging)?;
+    validate_delay_secs("delaySecs", action.delay_secs())?;
+    match action {
+        RuleActionConfig::RunSkill {
+            skill_name,
+            skill_path,
+            command_template,
+            ..
+        } => {
+            if skill_name.trim().is_empty() {
+                return Err(AppError::new("skillName 不能为空"));
+            }
+            if skill_path.trim().is_empty() {
+                return Err(AppError::new("skillPath 不能为空"));
+            }
+            if command_template.trim().is_empty() {
+                return Err(AppError::new("commandTemplate 不能为空"));
+            }
+            // Empty projectId means the rule applies to any project — confine skillPath against
+            // every configured project (fail closed; no "skip when empty" bypass).
+            let targets: Vec<&Project> = if rule.project_id.trim().is_empty() {
+                projects.iter().collect()
+            } else {
+                let project = projects
+                    .iter()
+                    .find(|p| p.id == rule.project_id)
+                    .ok_or_else(|| {
+                        AppError::new(format!(
+                            "skillPath 校验需要存在的 projectId: {}",
+                            rule.project_id
+                        ))
+                    })?;
+                vec![project]
+            };
+            if targets.is_empty() {
+                return Err(AppError::new("runSkill skillPath 校验需要至少一个 project"));
+            }
+            for project in targets {
+                crate::model::SkillInvocation::resolve_skill_path(&project.repo_root, skill_path)
+                    .map_err(|e| {
+                    AppError::new(format!("skillPath 在项目 {} 校验失败: {e}", project.id))
+                })?;
+            }
+        }
+        RuleActionConfig::Notify { target, .. } => {
+            validate_rule_action_target(target, notifications, messaging)?;
+        }
+    }
     Ok(())
 }
 
@@ -2208,8 +2318,13 @@ pub fn validate(config: &AppConfig) -> AppResult<()> {
 
     let mut seen_rule_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (idx, rule) in config.rules.iter().enumerate() {
-        validate_rule(rule, &config.notifications, &config.messaging)
-            .map_err(|e| AppError::new(format!("rules[{idx}].{}", e.message)))?;
+        validate_rule(
+            rule,
+            &config.projects,
+            &config.notifications,
+            &config.messaging,
+        )
+        .map_err(|e| AppError::new(format!("rules[{idx}].{}", e.message)))?;
         if !seen_rule_ids.insert(rule.id.as_str()) {
             return Err(AppError::new(format!(
                 "rules[{idx}].id 规则 id 重复: {}（每条规则的 id 必须唯一）",
@@ -2322,8 +2437,12 @@ mod tests {
         Project {
             id: "default".to_string(),
             name: "default".to_string(),
-            repo_root: env!("CARGO_MANIFEST_DIR").to_string(),
-            skill_rel_path: "Cargo.toml".to_string(),
+            // Repo root (parent of src-tauri) so DEFAULT_SKILL_PATH resolves for runSkill validate.
+            repo_root: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("src-tauri parent")
+                .to_string_lossy()
+                .into_owned(),
             ..Project::default()
         }
     }
@@ -2482,9 +2601,9 @@ mod tests {
             title_contains: "ship".to_string(),
             body_contains: "details".to_string(),
             actions: vec![
-                RuleActionConfig::new("review", RuleActionKind::Review),
-                RuleActionConfig::new("check", RuleActionKind::Check),
-                RuleActionConfig::new("notify", RuleActionKind::Notify),
+                RuleActionConfig::run_skill("review"),
+                RuleActionConfig::run_skill_check("check"),
+                RuleActionConfig::notify("notify"),
             ],
             allow_action_kinds: Vec::new(),
             deny_action_kinds: Vec::new(),
@@ -2508,21 +2627,27 @@ mod tests {
                 "actions": [
                     {
                         "id": "review",
-                        "kind": "review",
+                        "kind": "runSkill",
                         "enabled": true,
-                        "target": { "kind": "none" },
                         "dedupePolicy": "event",
                         "delaySecs": 0,
-                        "level": "action"
+                        "level": "action",
+                        "skillName": "pr-review",
+                        "skillPath": ".codex/skills/pr-review/SKILL.md",
+                        "commandTemplate": "/{skill} {pr}",
+                        "extraArgs": ""
                     },
                     {
                         "id": "check",
-                        "kind": "check",
+                        "kind": "runSkill",
                         "enabled": true,
-                        "target": { "kind": "none" },
                         "dedupePolicy": "event",
                         "delaySecs": 0,
-                        "level": "action"
+                        "level": "action",
+                        "skillName": "pr-review",
+                        "skillPath": ".codex/skills/pr-review/SKILL.md",
+                        "commandTemplate": "/{skill} {pr}",
+                        "extraArgs": "--check"
                     },
                     {
                         "id": "notify",
@@ -2801,7 +2926,6 @@ mod tests {
             repo_root: "/path/to/repo".to_string(),
             poll_interval_secs: 120,
             authors: vec!["octocat".to_string()],
-            skill_rel_path: ".codex/skills/pr-review/SKILL.md".to_string(),
             pr_cooldown_seconds: 1800,
             source_kind: SourceKind::default(),
             engine_kind: EngineKind::default(),
@@ -2831,7 +2955,7 @@ mod tests {
         assert!(v.get("authors").is_some());
         assert!(v.get("reviewLabel").is_none());
         assert!(v.get("checkLabel").is_none());
-        assert!(v.get("skillRelPath").is_some());
+        assert!(v.get("skillRelPath").is_none());
         assert!(v.get("prCooldownSeconds").is_some());
         assert!(v.get("sourceKind").is_some());
         assert_eq!(v["sourceKind"], "github");
@@ -3099,7 +3223,6 @@ mod tests {
         let disabled = Project {
             enabled: false,
             repo_root: "/no/such/dir/xyz".to_string(),
-            skill_rel_path: "definitely_missing.md".to_string(),
             ..valid_project()
         };
         assert!(validate(&with_project(disabled)).is_ok());
@@ -3238,12 +3361,31 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_missing_skill() {
-        assert!(validate(&with_project(Project {
-            skill_rel_path: "definitely_missing.md".to_string(),
-            ..valid_project()
-        }))
-        .is_err());
+    fn validate_rejects_run_skill_with_empty_skill_name() {
+        let mut cfg = with_project(valid_project());
+        cfg.rules = vec![RuleConfig {
+            id: "r1".to_string(),
+            name: "r".to_string(),
+            enabled: true,
+            source: None,
+            event_type: Some(EventType::PullRequest),
+            project_id: valid_project().id.clone(),
+            repo: String::new(),
+            labels_any: vec!["x".to_string()],
+            labels_all: vec![],
+            title_contains: String::new(),
+            body_contains: String::new(),
+            actions: vec![RuleActionConfig::run_skill("a")],
+            allow_action_kinds: vec![],
+            deny_action_kinds: vec![],
+        }];
+        if let RuleActionConfig::RunSkill {
+            ref mut skill_name, ..
+        } = cfg.rules[0].actions[0]
+        {
+            skill_name.clear();
+        }
+        assert!(validate(&cfg).is_err());
     }
 
     #[test]
@@ -3251,48 +3393,6 @@ mod tests {
         // `repo_root` must be absolute (doc contract) regardless of CWD.
         assert!(validate(&with_project(Project {
             repo_root: "src".to_string(),
-            ..valid_project()
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn validate_rejects_absolute_skill_rel_path() {
-        // An absolute skill path would let `Path::join` discard `repo_root`.
-        assert!(validate(&with_project(Project {
-            skill_rel_path: "/etc/hosts".to_string(),
-            ..valid_project()
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn validate_rejects_skill_escaping_repo_root() {
-        // `repo_root`/src + `../Cargo.toml` resolves to repo_root/Cargo.toml,
-        // which is outside repo_root/src — must be rejected.
-        assert!(validate(&with_project(Project {
-            repo_root: format!("{}/src", env!("CARGO_MANIFEST_DIR")),
-            skill_rel_path: "../Cargo.toml".to_string(),
-            ..valid_project()
-        }))
-        .is_err());
-    }
-
-    #[test]
-    fn validate_skips_skill_path_for_claude_engine() {
-        // #718: the claude engine discovers `.claude/skills/` from the turn cwd, so
-        // `skillRelPath` is unused for it — `validate_project` must NOT reject a claude
-        // project for a missing/bad skill path. The SAME bad path under codex still
-        // rejects, proving the gate is engine-conditional, not a blanket skip.
-        assert!(validate(&with_project(Project {
-            skill_rel_path: "definitely_missing.md".to_string(),
-            engine_kind: EngineKind::Claude,
-            ..valid_project()
-        }))
-        .is_ok());
-        assert!(validate(&with_project(Project {
-            skill_rel_path: "definitely_missing.md".to_string(),
-            engine_kind: EngineKind::Codex,
             ..valid_project()
         }))
         .is_err());
@@ -3386,8 +3486,8 @@ mod tests {
             name: "Duplicate action".to_string(),
             enabled: true,
             actions: vec![
-                RuleActionConfig::new("dup", RuleActionKind::Review),
-                RuleActionConfig::new("dup", RuleActionKind::Check),
+                RuleActionConfig::run_skill("dup"),
+                RuleActionConfig::run_skill_check("dup"),
             ],
             ..RuleConfig::default()
         });
@@ -3402,7 +3502,7 @@ mod tests {
             name: "Dangling project".to_string(),
             enabled: true,
             project_id: "missing".to_string(),
-            actions: vec![RuleActionConfig::new("notify", RuleActionKind::Notify)],
+            actions: vec![RuleActionConfig::notify("notify")],
             ..RuleConfig::default()
         });
         assert!(validate(&config)
@@ -3418,8 +3518,8 @@ mod tests {
             id: "r1".to_string(),
             name: "Allow only review".to_string(),
             enabled: true,
-            actions: vec![RuleActionConfig::new("notify", RuleActionKind::Notify)],
-            allow_action_kinds: vec![RuleActionKind::Review],
+            actions: vec![RuleActionConfig::notify("notify")],
+            allow_action_kinds: vec![RuleActionKind::RunSkill],
             ..RuleConfig::default()
         });
         assert!(validate(&config)
@@ -3432,9 +3532,9 @@ mod tests {
             id: "r1".to_string(),
             name: "Deny wins".to_string(),
             enabled: true,
-            actions: vec![RuleActionConfig::new("review", RuleActionKind::Review)],
-            allow_action_kinds: vec![RuleActionKind::Review],
-            deny_action_kinds: vec![RuleActionKind::Review],
+            actions: vec![RuleActionConfig::run_skill("review")],
+            allow_action_kinds: vec![RuleActionKind::RunSkill],
+            deny_action_kinds: vec![RuleActionKind::RunSkill],
             ..RuleConfig::default()
         });
         assert!(validate(&config)
@@ -3444,13 +3544,58 @@ mod tests {
     }
 
     #[test]
+    fn validate_run_skill_path_confinement_and_allowlist() {
+        let mut config = valid_base();
+        config.rules.push(RuleConfig {
+            id: "r1".to_string(),
+            name: "ok".to_string(),
+            enabled: true,
+            project_id: "default".to_string(),
+            actions: vec![RuleActionConfig::run_skill("review")],
+            ..RuleConfig::default()
+        });
+        assert!(validate(&config).is_ok(), "default skill path resolves");
+
+        // Empty projectId still confines against all projects.
+        config.rules[0].project_id.clear();
+        assert!(validate(&config).is_ok());
+
+        // Escape / non-allowlisted path rejected.
+        if let RuleActionConfig::RunSkill {
+            ref mut skill_path, ..
+        } = config.rules[0].actions[0]
+        {
+            *skill_path = "../secrets.env".to_string();
+        }
+        let err = validate(&config).unwrap_err().message;
+        assert!(
+            err.contains("skillPath") || err.contains("..") || err.contains("must be under"),
+            "{err}"
+        );
+
+        if let RuleActionConfig::RunSkill {
+            ref mut skill_path, ..
+        } = config.rules[0].actions[0]
+        {
+            *skill_path = "Cargo.toml".to_string();
+        }
+        let err = validate(&config).unwrap_err().message;
+        assert!(
+            err.contains("must be under") || err.contains("skillPath"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn validate_rule_action_targets_reject_missing_or_disabled_references() {
         let mut config = valid_base();
         config.notifications.channels = vec![valid_notification_channel(NotificationKind::Slack)];
-        let mut notify = RuleActionConfig::new("notify", RuleActionKind::Notify);
-        notify.target = RuleActionTarget::NotificationChannels {
-            channel_ids: vec!["missing".to_string()],
-        };
+        let mut notify = RuleActionConfig::notify("notify");
+        if let RuleActionConfig::Notify { ref mut target, .. } = notify {
+            *target = RuleActionTarget::NotificationChannels {
+                channel_ids: vec!["missing".to_string()],
+            };
+        }
         config.rules.push(RuleConfig {
             id: "r1".to_string(),
             name: "Notify missing channel".to_string(),
@@ -3468,10 +3613,12 @@ mod tests {
         disabled.id = "slack-main".to_string();
         disabled.enabled = false;
         config.notifications.channels = vec![disabled];
-        let mut notify = RuleActionConfig::new("notify", RuleActionKind::Notify);
-        notify.target = RuleActionTarget::NotificationChannels {
-            channel_ids: vec!["slack-main".to_string()],
-        };
+        let mut notify = RuleActionConfig::notify("notify");
+        if let RuleActionConfig::Notify { ref mut target, .. } = notify {
+            *target = RuleActionTarget::NotificationChannels {
+                channel_ids: vec!["slack-main".to_string()],
+            };
+        }
         config.rules.push(RuleConfig {
             id: "r1".to_string(),
             name: "Notify disabled channel".to_string(),
@@ -3486,11 +3633,13 @@ mod tests {
 
         let mut config = valid_base();
         config.messaging.integrations = vec![valid_messaging_integration()];
-        let mut notify = RuleActionConfig::new("notify", RuleActionKind::Notify);
-        notify.target = RuleActionTarget::MessagingConversation {
-            integration_id: "feishu-main".to_string(),
-            conversation_id: "oc_missing".to_string(),
-        };
+        let mut notify = RuleActionConfig::notify("notify");
+        if let RuleActionConfig::Notify { ref mut target, .. } = notify {
+            *target = RuleActionTarget::MessagingConversation {
+                integration_id: "feishu-main".to_string(),
+                conversation_id: "oc_missing".to_string(),
+            };
+        }
         config.rules.push(RuleConfig {
             id: "r1".to_string(),
             name: "Notify unauthorized conversation".to_string(),
@@ -3507,8 +3656,13 @@ mod tests {
     #[test]
     fn validate_rejects_configured_delay_overflow_guardrail() {
         let mut config = valid_base();
-        let mut action = RuleActionConfig::new("notify", RuleActionKind::Notify);
-        action.delay_secs = MAX_CONFIGURED_DELAY_SECS + 1;
+        let mut action = RuleActionConfig::notify("notify");
+        if let RuleActionConfig::Notify {
+            ref mut delay_secs, ..
+        } = action
+        {
+            *delay_secs = MAX_CONFIGURED_DELAY_SECS + 1;
+        }
         config.rules.push(RuleConfig {
             id: "r1".to_string(),
             name: "Too much delay".to_string(),
@@ -4059,11 +4213,6 @@ mod tests {
             ..base.clone()
         })
         .starts_with("repoRoot"));
-        assert!(msg(Project {
-            skill_rel_path: "/etc/hosts".to_string(),
-            ..base.clone()
-        })
-        .starts_with("skill"));
         assert!(msg(Project {
             poll_interval_secs: 0,
             ..base.clone()

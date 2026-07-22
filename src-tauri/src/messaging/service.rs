@@ -17,7 +17,7 @@ use crate::messaging::{dingtalk::DingTalkProvider, wechat_work::WeChatWorkProvid
 use crate::model::{
     ActionExecutionResult, ActionKind, ExternalRequestId, MessagingEvent, MessagingEventStatus,
     MessagingProviderKind, MessagingReplyPayload, MessagingReplyTarget, MessagingSendContent,
-    MessagingSendPayload, OutboxEntry, ReviewKind, ReviewReceiptId, SendMessagingRequest,
+    MessagingSendPayload, OutboxEntry, ReviewReceiptId, SendMessagingRequest,
     SendMessagingResponse,
 };
 use crate::state::AppState;
@@ -76,7 +76,7 @@ pub trait MessagingActions<R: Runtime>: Send + Sync + 'static {
         app: &tauri::AppHandle<R>,
         reference: String,
         pr_number: u64,
-        kind: ReviewKind,
+        extra_args: String,
         request_id: ExternalRequestId,
     ) -> AppResult<ReviewReceiptId>;
 }
@@ -212,15 +212,18 @@ enum ReviewCommandKind {
 }
 
 impl ReviewCommandKind {
-    fn as_model(self) -> ReviewKind {
+    fn extra_args(self) -> &'static str {
         match self {
-            ReviewCommandKind::Review => ReviewKind::Review,
-            ReviewCommandKind::Check => ReviewKind::Check,
+            ReviewCommandKind::Review => "",
+            ReviewCommandKind::Check => "--check",
         }
     }
 
     fn as_wire(self) -> &'static str {
-        self.as_model().as_str()
+        match self {
+            ReviewCommandKind::Review => "review",
+            ReviewCommandKind::Check => "check",
+        }
     }
 }
 
@@ -786,7 +789,7 @@ async fn process_event<R: Runtime>(
                 app,
                 reference.clone(),
                 pr_number,
-                kind.as_model(),
+                kind.extra_args().to_string(),
                 request_id,
             ) {
                 Ok(receipt_id) => {
@@ -843,20 +846,20 @@ fn messaging_review_request_id(event: &MessagingEvent) -> ExternalRequestId {
         .expect("SHA-256 prefix is lowercase hexadecimal")
 }
 
-pub(crate) fn provider_for(kind: MessagingProviderKind) -> &'static dyn MessagingProvider {
-    match kind {
+pub(crate) fn provider_for(provider: MessagingProviderKind) -> &'static dyn MessagingProvider {
+    match provider {
         MessagingProviderKind::Feishu => &FeishuProvider,
         MessagingProviderKind::WeChatWork => &WeChatWorkProvider,
         MessagingProviderKind::DingTalk => &DingTalkProvider,
     }
 }
 
-pub(crate) fn supports_long_connection(kind: MessagingProviderKind) -> bool {
-    provider_for(kind).capability().supports_long_connection
+pub(crate) fn supports_long_connection(provider: MessagingProviderKind) -> bool {
+    provider_for(provider).capability().supports_long_connection
 }
 
-pub(crate) fn long_connection_http_gone_message(kind: MessagingProviderKind) -> &'static str {
-    match kind {
+pub(crate) fn long_connection_http_gone_message(provider: MessagingProviderKind) -> &'static str {
+    match provider {
         MessagingProviderKind::Feishu => "飞书 HTTP 回调已禁用；请在飞书开放平台启用官方长连接",
         MessagingProviderKind::DingTalk => "钉钉 HTTP 回调已禁用；请在钉钉开放平台启用 Stream 模式",
         MessagingProviderKind::WeChatWork => "该 messaging provider 未启用长连接 HTTP 410",
@@ -1302,7 +1305,7 @@ mod tests {
             _app: &tauri::AppHandle<R>,
             _reference: String,
             _pr_number: u64,
-            _kind: ReviewKind,
+            _extra_args: String,
             _request_id: ExternalRequestId,
         ) -> AppResult<ReviewReceiptId> {
             Err(AppError::new("review boom"))
@@ -1516,7 +1519,7 @@ mod tests {
             _app: &tauri::AppHandle<R>,
             _reference: String,
             _pr_number: u64,
-            _kind: ReviewKind,
+            _extra_args: String,
             _request_id: ExternalRequestId,
         ) -> AppResult<ReviewReceiptId> {
             ReviewReceiptId::new(17).map_err(AppError::new)

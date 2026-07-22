@@ -174,7 +174,7 @@ pub enum ReviewEvent {
         thread_id: String,
         status: String,
         /// The resolved pr-review comment URL (AB#1042), present on a `completed` turn
-        /// when the source kind resolves one (GitHub: exact comment URL; Azure: PR URL;
+        /// when the source resolves one (GitHub: exact comment URL; Azure: PR URL;
         /// Bitbucket / a failed resolve: `None`). `skip_serializing_if` OMITS the key
         /// when `None`, so the wire matches the optional `commentUrl?: string` on
         /// `src/types.ts`'s `turnCompleted` (an absent key, not a JSON `null`).
@@ -333,7 +333,7 @@ mod tests {
                 title: "Add feature".to_string(),
                 labels: vec!["review".to_string()],
                 url: "https://example.com/pr/1".to_string(),
-                kind: crate::model::ReviewKind::Review,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 skip_reason: None,
             },
             presence: PrPresence::Current,
@@ -361,7 +361,7 @@ mod tests {
         assert_eq!(row["number"], 1);
         assert!(row.get("title").is_some());
         assert!(row.get("url").is_some());
-        assert!(row.get("kind").is_some());
+        assert!(row.get("skillKey").is_some());
         // `sample_view` has `skip_reason: None` → JSON null at the flattened depth;
         // the snake_case form must not leak through the union either.
         assert_eq!(row["skipReason"], serde_json::Value::Null);
@@ -709,6 +709,21 @@ mod tests {
         // snake_case must not leak through the envelope.
         assert!(v.get("project_id").is_none());
         assert!(v.get("thread_id").is_none());
+    }
+
+    #[test]
+    fn stream_event_dispatch_error_uses_kind_tag_not_skill_key() {
+        let event = StreamEvent::Review(ReviewEvent::DispatchError {
+            project_id: "p1".to_string(),
+            message: "boom".to_string(),
+        });
+        let v = serde_json::to_value(&event).expect("StreamEvent serializes");
+        assert_eq!(v["domain"], "review");
+        assert_eq!(v["kind"], "dispatchError");
+        assert!(v.get("skill_key").is_none());
+        assert!(v.get("skillKey").is_none());
+        assert_eq!(v["projectId"], "p1");
+        assert_eq!(v["message"], "boom");
     }
 
     #[test]

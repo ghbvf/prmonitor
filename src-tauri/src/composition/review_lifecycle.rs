@@ -136,7 +136,11 @@ fn message(
         ReviewLifecycleEvent::Failed => "失败",
         ReviewLifecycleEvent::Interrupted => "已中断",
     };
-    let title = format!("PR #{} {} {label}", event.pr_number, event.kind);
+    let title = format!(
+        "PR #{} {} {label}",
+        event.pr_number,
+        crate::model::SkillInvocation::display_label(&event.skill_key)
+    );
     let repo = cfg
         .projects
         .iter()
@@ -178,9 +182,7 @@ mod tests {
     use std::sync::Mutex;
 
     use crate::db::Database;
-    use crate::model::{
-        ActionKind, ActionStatus, ExternalRequestId, OutboxEntry, ReviewKind, ReviewReceiptId,
-    };
+    use crate::model::{ActionKind, ActionStatus, ExternalRequestId, OutboxEntry, ReviewReceiptId};
     use crate::state::AppState;
     use tauri::Manager;
 
@@ -188,7 +190,7 @@ mod tests {
         ReviewLifecycleDispatch {
             project_id: "p1".to_string(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             thread_id: "thread-1".to_string(),
             event,
             comment_url: Some("https://example.com/pr/7#discussion".to_string()),
@@ -215,7 +217,7 @@ mod tests {
         };
         let (title, body, url) = message(&cfg, &dispatch(ReviewLifecycleEvent::Completed));
 
-        assert_eq!(title, "PR #7 review 已完成");
+        assert_eq!(title, "PR #7 pr-review 已完成");
         assert!(body.contains("projectId: p1"), "{body}");
         assert!(body.contains("repo: owner/repo"), "{body}");
         assert!(body.contains("threadId: thread-1"), "{body}");
@@ -292,7 +294,7 @@ mod tests {
             _app: &tauri::AppHandle<R>,
             _reference: String,
             _pr_number: u64,
-            _kind: ReviewKind,
+            _extra_args: String,
             _request_id: ExternalRequestId,
         ) -> AppResult<ReviewReceiptId> {
             ReviewReceiptId::new(1).map_err(AppError::new)

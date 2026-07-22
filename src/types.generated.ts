@@ -27,15 +27,11 @@ export const UPDATE_MODES = ["webhook-only","pull-only","hybrid","manual"] as co
 export type EventType = "pullRequest" | "issue" | "comment" | "label" | "generic";
 export const EVENT_TYPES = ["pullRequest","issue","comment","label","generic"] as const;
 
-export type ReviewKind = "review" | "check";
-export const REVIEW_KINDS = ["review","check"] as const;
-
 export type PullRequestView = { number: number, title: string, labels: Array<string>, url: string,
 /**
- * The trigger-label mode this PR maps to. Typed at the Rust source so the
- * generated TypeScript projection cannot claim a narrower value domain.
+ * Skill identity key for the review action this PR maps to.
  */
-kind: ReviewKind,
+skillKey: string,
 /**
  * Why this PR would be skipped (not dispatched), or `None` when it would
  * dispatch. Serializes to `null` / a string for the frontend.
@@ -81,7 +77,7 @@ export type ReviewReceiptStatus = "received" | "queued" | "blocked" | "starting"
 export const REVIEW_RECEIPT_STATUSES = ["received","queued","blocked","starting","running","interrupting","done","failed"] as const;
 export type ReviewReceiptSnapshot = { receiptId: ReviewReceiptId, status: ReviewReceiptStatus, threadId: string | null, commentUrl: string | null, outcome: string | null, error: string | null, };
 export type EventSubject = { number: number | null, title: string, body: string, labels: Array<string>, url: string, };
-export type EventPayload = { "kind": "observation", eventType: EventType, subject: EventSubject, } | { "kind": "reviewRequest", prNumber: number, reviewKind: ReviewKind, requestId: ExternalRequestId, origin: ExternalTriggerOrigin, notifyOnCompletion: boolean, };
+export type EventPayload = { "kind": "observation", eventType: EventType, subject: EventSubject, } | { "kind": "reviewRequest", prNumber: number, skillName: string, extraArgs: string, skillPath: string, commandTemplate: string, requestId: ExternalRequestId, origin: ExternalTriggerOrigin, notifyOnCompletion: boolean, };
 export type EventEnvelope = { dedupeKey: InboxDedupeKey, source: SourceKind, projectId: string, repo: string, payload: EventPayload, receivedAtEpoch: number, };
 
 export type NotificationKind = "desktop" | "email" | "slack" | "telegram" | "weChatWork" | "feishu" | "dingTalk";
@@ -133,3 +129,7 @@ export type SendMessagingRequest = { integrationId: string, conversationId: stri
 export type SendMessagingResponse = { outboxId: number, };
 
 export type RuleMatchEntry = { id: number, ruleId: string, ruleName: string, inboxEventId: number, projectId: string, actionCount: number, error: string | null, createdAt: number, actionOutboxIds: Array<number>, };
+
+export const DEFAULT_SKILL_NAME: string = "pr-review";
+export const DEFAULT_SKILL_PATH: string = ".codex/skills/pr-review/SKILL.md";
+export const DEFAULT_COMMAND_TEMPLATE: string = "/{skill} {pr}";

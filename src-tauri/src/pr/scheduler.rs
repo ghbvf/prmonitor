@@ -1139,7 +1139,8 @@ mod tests {
         );
     }
 
-    fn candidate(number: u64, kind: &str) -> DiscoveredEvent {
+    fn candidate(number: u64, skill_key: impl AsRef<str>) -> DiscoveredEvent {
+        let skill_key = skill_key.as_ref();
         let candidate = Candidate {
             number,
             head_sha: "sha".to_string(),
@@ -1147,7 +1148,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: kind.parse().unwrap(),
+            skill_key: crate::model::SkillInvocation::migrate_legacy_skill_key(skill_key),
         };
         DiscoveredEvent {
             event: EventEnvelope::observation(

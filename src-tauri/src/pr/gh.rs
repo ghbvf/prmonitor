@@ -7,7 +7,7 @@
 //! - `Native` (status quo): one `--label <label>` call per trigger label, merged by
 //!   PR number (`parse_pr_list` / `to_row` / `merge_rows`).
 //! - `Title`: ONE all-open-PRs call (no `--label`), classified client-side from
-//!   bracketed title segments (`to_row_classified`, sharing `super::labels::classify`).
+//!   bracketed title segments (`to_row_classified` + [`super::labels::effective_labels`]).
 //!
 //! Parsing is split into pure functions so the `router.py` discovery semantics are
 //! unit-tested without invoking `gh`.
@@ -17,8 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, LabelSource, ReviewKind,
-    SourceKind,
+    Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, LabelSource, SourceKind,
 };
 
 use super::labels;
@@ -97,7 +96,7 @@ fn parse_pr_list(json: &str) -> AppResult<Vec<RawPr>> {
     serde_json::from_str(json).map_err(|e| AppError::new(format!("解析 gh pr list JSON 失败: {e}")))
 }
 
-/// Maps one raw gh row + its trigger `kind` into a [`GhRow`] (mirrors
+/// Maps one raw gh row + its trigger `skill_key` into a [`GhRow`] (mirrors
 /// `router.py` `candidate_from_json`: author is the nested `login`, defaulting
 /// to empty when the author object is null).
 fn to_row(raw: RawPr) -> GhRow {
@@ -116,7 +115,7 @@ fn to_row(raw: RawPr) -> GhRow {
             author,
             is_cross_repository: raw.is_cross_repository,
             is_draft: raw.is_draft,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
         },
         title: raw.title,
         body: raw.body,
@@ -128,10 +127,9 @@ fn to_row(raw: RawPr) -> GhRow {
 
 /// Maps one raw gh row into a [`GhRow`] for the title-label path (AB#717), returning
 /// `None` when it carries no trigger label (not monitored). Unlike [`to_row`] (which
-/// stamps a server-filtered `kind` and never conflicts), this resolves effective labels
-/// via [`labels::effective_labels`] and derives `kind` + `conflict` client-side through
-/// the shared [`labels::classify`] — the same classification the native two-call path
-/// gets from `merge_rows`, but from a single all-open-PRs fetch.
+/// stamps a server-filtered `skill_key` and never conflicts), this resolves effective labels
+/// via [`labels::effective_labels`] and keeps any PR that matches at least one trigger label.
+/// Skill identity is filled later by the rule engine (default pr-review placeholder here).
 fn to_row_classified(
     raw: RawPr,
     trigger_labels: &[String],
@@ -160,7 +158,7 @@ fn to_row_classified(
             author,
             is_cross_repository: raw.is_cross_repository,
             is_draft: raw.is_draft,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
         },
         title: raw.title,
         body: raw.body,
@@ -548,7 +546,10 @@ mod tests {
         assert_eq!(row.candidate.head_sha, "abc123");
         assert_eq!(row.candidate.head_ref, "feature/widget");
         assert_eq!(row.candidate.author, "octocat");
-        assert_eq!(row.candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            row.candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert!(!row.candidate.is_cross_repository);
         assert!(!row.candidate.is_draft);
         assert_eq!(row.title, "Add widget");
@@ -595,7 +596,10 @@ mod tests {
         assert_eq!(row.candidate.author, ""); // null author → empty login
         assert!(row.candidate.is_cross_repository);
         assert!(row.candidate.is_draft);
-        assert_eq!(row.candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            row.candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert_eq!(row.title, ""); // missing optional display fields default empty
         assert!(row.labels.is_empty());
     }
@@ -612,7 +616,8 @@ mod tests {
         assert!(parse_pr_list("not json").is_err());
     }
 
-    fn row(number: u64, kind: &str) -> GhRow {
+    fn row(number: u64, skill_key: impl AsRef<str>) -> GhRow {
+        let skill_key = skill_key.as_ref();
         let mut row = to_row(RawPr {
             number,
             title: format!("PR {number}"),
@@ -627,7 +632,8 @@ mod tests {
             is_draft: false,
             labels: vec![],
         });
-        row.candidate.kind = kind.parse().unwrap();
+        row.candidate.skill_key =
+            crate::model::SkillInvocation::migrate_legacy_skill_key(skill_key);
         row
     }
 
@@ -664,7 +670,10 @@ mod tests {
     fn merge_rows_check_only_keeps_check_kind() {
         let merged = merge_rows(vec![], vec![row(2, "check")]);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].candidate.kind, crate::model::ReviewKind::Check);
+        assert_eq!(
+            merged[0].candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "--check")
+        );
         assert!(!merged[0].conflict);
     }
 
@@ -672,7 +681,10 @@ mod tests {
     fn merge_rows_review_only_keeps_review_kind() {
         let merged = merge_rows(vec![row(1, "review")], vec![]);
         assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            merged[0].candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert!(!merged[0].conflict);
     }
 
@@ -703,7 +715,10 @@ mod tests {
             }],
         };
         let row = to_row_classified(raw, &trigger_labels, LabelSource::Title).expect("monitored");
-        assert_eq!(row.candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            row.candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert_eq!(row.labels, vec![REVIEW.to_string()]);
         assert!(!row.conflict);
 
@@ -724,7 +739,7 @@ mod tests {
         };
         assert!(to_row_classified(raw_native_only, &trigger_labels, LabelSource::Title).is_none());
 
-        // Both trigger tags in the title → conflict, kept with kind "review".
+        // Both trigger tags in the title → conflict, kept with skill_key "review".
         let raw_both = RawPr {
             number: 9,
             title: format!("[{REVIEW}][{CHECK}] both"),
@@ -740,7 +755,10 @@ mod tests {
         let row_both =
             to_row_classified(raw_both, &trigger_labels, LabelSource::Title).expect("kept");
         assert!(!row_both.conflict);
-        assert_eq!(row_both.candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            row_both.candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
     }
 
     // Wire-shape lock for `GhStatus` — the `gh_status` command's front/back wire

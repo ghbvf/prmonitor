@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import ReviewStream from "./review/ReviewStream.vue";
-import type { ReviewEvent, TrackedPrView } from "./types";
+import { skillKeyLabel, type ReviewEvent, type TrackedPrView } from "./types";
 import type {
   ReviewReceiptId,
   ReviewReceiptSnapshot,
@@ -330,7 +330,7 @@ function retryReceiptPolling() {
   void refreshReceipt(activeReceiptId.value);
 }
 
-async function run(kind: "review" | "check") {
+async function run(extraArgs: string = "") {
   if (!activeProject.value || !selectedPr.value) return;
   busy.value = true;
   error.value = null;
@@ -342,12 +342,12 @@ async function run(kind: "review" | "check") {
     const requestId = requestIds.forOperation(
       activeProject.value.id,
       selectedPr.value.number,
-      kind,
+      extraArgs,
     );
     const accepted = await requestRemoteReview(
       activeProject.value.id,
       selectedPr.value.number,
-      kind,
+      extraArgs,
       requestId,
     );
     requestIds.accepted();
@@ -455,7 +455,7 @@ onUnmounted(() => {
           >
             <span>#{{ pr.number }}</span>
             <strong>{{ pr.title }}</strong>
-            <small>{{ pr.kind }} · {{ pr.presence }}</small>
+            <small>{{ skillKeyLabel(pr.skillKey) }} · {{ pr.presence }}</small>
           </button>
         </div>
       </aside>
@@ -467,8 +467,8 @@ onUnmounted(() => {
             <a :href="selectedPr.url" target="_blank" rel="noreferrer">Open PR</a>
           </div>
           <div class="actions">
-            <button type="button" :disabled="busy" @click="run('review')">Review</button>
-            <button type="button" :disabled="busy" @click="run('check')">Check</button>
+            <button type="button" :disabled="busy" @click="run()">Review</button>
+            <button type="button" :disabled="busy" @click="run('--check')">Check</button>
           </div>
         </div>
         <p v-else class="empty">No PRs available for this project.</p>
@@ -492,7 +492,7 @@ onUnmounted(() => {
             :class="{ selected: session.threadId === focusedSession?.threadId }"
             @click="focusSession(session.threadId)"
           >
-            <span>{{ session.kind }}</span>
+            <span>{{ skillKeyLabel(session.skillKey) }}</span>
             <strong>{{ session.status }}</strong>
             <small>{{ new Date(session.createdAtEpoch * 1000).toLocaleString() }}</small>
           </button>
@@ -501,7 +501,7 @@ onUnmounted(() => {
         <article v-if="focusedSession" class="review-pane">
           <header>
             <div>
-              <strong>{{ focusedSession.kind }} session</strong>
+              <strong>{{ skillKeyLabel(focusedSession.skillKey) }} session</strong>
               <small>{{ focusedSession.threadId }}</small>
             </div>
             <div class="actions">

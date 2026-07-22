@@ -22,6 +22,8 @@ import {
   WORKFLOW_TYPES,
   workflowStatusLabel,
   workflowStepLabel,
+  skillKeyLabel,
+  extraArgsFromSkillKey,
   type ExternalRequestId,
   type InboxEventId,
   type OutboxProducerKey,
@@ -92,14 +94,17 @@ describe("typed dispatch contracts", () => {
       payload: {
         kind: "reviewRequest",
         prNumber: 7,
-        reviewKind: "check",
+        skillName: "pr-review",
+        extraArgs: "--check",
+        skillPath: ".codex/skills/pr-review/SKILL.md",
+        commandTemplate: "/{skill} {pr}",
         requestId: externalRequestId("00112233445566778899aabbccddeeff"),
         origin: "remoteWeb",
         notifyOnCompletion: false,
       },
       receivedAtEpoch: 42,
     });
-    expect(presented).toEqual({ eventType: "pullRequest", number: 7, title: "Check request" });
+    expect(presented).toEqual({ eventType: "pullRequest", number: 7, title: "pr-review --check request" });
   });
 });
 
@@ -152,7 +157,7 @@ describe("workflow contracts", () => {
       type: "reviewNotify",
       status: "done",
       currentStep: "done",
-      input: { reference: "repo", prNumber: 7, kind: "review" },
+      input: { reference: "repo", prNumber: 7, skillKey: "pr-review\0" },
       state: {
         reviewThreadId: "t1",
         reviewWireStatus: "completed",
@@ -168,5 +173,17 @@ describe("workflow contracts", () => {
 
     expect(row.input.prNumber).toBe(7);
     expect(row.state.notificationOutboxIds).toEqual([9]);
+  });
+});
+
+// Parity with Rust `SkillInvocation::migrate_legacy_skill_key` / `display_label`.
+describe("skillKeyLabel", () => {
+  it("migrates legacy review/check and formats skill keys", () => {
+    expect(skillKeyLabel("review")).toBe("pr-review");
+    expect(skillKeyLabel("check")).toBe("pr-review --check");
+    expect(skillKeyLabel("pr-review\0")).toBe("pr-review");
+    expect(skillKeyLabel("pr-review\0--check")).toBe("pr-review --check");
+    expect(extraArgsFromSkillKey("check")).toBe("--check");
+    expect(extraArgsFromSkillKey("pr-review\0")).toBe("");
   });
 });

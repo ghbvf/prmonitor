@@ -30,15 +30,15 @@ export type OutboxConfig = {
  */
 notificationTtlSecs: number, };
 
-export type RuleActionKind = "review" | "check" | "notify";
-export const RULE_ACTION_KINDS = ["review","check","notify"] as const;
+export type RuleActionKind = "runSkill" | "notify";
+export const RULE_ACTION_KINDS = ["runSkill","notify"] as const;
 
 export type RuleActionDedupePolicy = "event" | "action";
 export const RULE_ACTION_DEDUPE_POLICIES = ["event","action"] as const;
 
 export type RuleActionTarget = { "kind": "none" } | { "kind": "notificationChannels", channelIds: Array<string>, } | { "kind": "messagingConversation", integrationId: string, conversationId: string, };
 
-export type RuleActionConfig = { id: string, kind: RuleActionKind, enabled: boolean, target: RuleActionTarget, dedupePolicy: RuleActionDedupePolicy, delaySecs: number, level: string, };
+export type RuleActionConfig = { "kind": "runSkill", id: string, enabled: boolean, dedupePolicy: RuleActionDedupePolicy, delaySecs: number, level: string, skillName: string, skillPath: string, commandTemplate: string, extraArgs: string, } | { "kind": "notify", id: string, enabled: boolean, target: RuleActionTarget, dedupePolicy: RuleActionDedupePolicy, delaySecs: number, level: string, };
 
 export type ReviewLifecycleEvent = "started" | "completed" | "failed" | "interrupted";
 export const REVIEW_LIFECYCLE_EVENTS = ["started","completed","failed","interrupted"] as const;
@@ -126,11 +126,7 @@ pollIntervalSecs: number,
  */
 authors: Array<string>,
 /**
- * Path (relative to `repo_root`) of the codex pr-review skill to invoke.
- */
-skillRelPath: string,
-/**
- * Per-PR cooldown between dispatches of the same `(pr, kind)`.
+ * Per-PR cooldown between dispatches of the same `(pr, skill_key)`.
  */
 prCooldownSeconds: number,
 /**
@@ -207,7 +203,7 @@ bitbucketProject: string,
  * `Authorization: Bearer <token>`。无 CLI 登录，故凭据存配置。其余源留空。
  */
 bitbucketToken: string, };
-export const DEFAULT_PROJECT: Project = {"id":"","name":"","enabled":true,"repo":"ghbvf/gocell","repoRoot":"","pollIntervalSecs":120,"authors":[],"skillRelPath":".codex/skills/pr-review/SKILL.md","prCooldownSeconds":1800,"sourceKind":"github","engineKind":"codex","codexModel":"","claudeModel":"","cursorModel":"","codexReasoningEffort":"default","claudeEffort":"default","updateMode":"webhook-only","azureOrg":"","azureProject":"","labelSource":"native","bitbucketHost":"","bitbucketProject":"","bitbucketToken":""};
+export const DEFAULT_PROJECT: Project = {"id":"","name":"","enabled":true,"repo":"ghbvf/gocell","repoRoot":"","pollIntervalSecs":120,"authors":[],"prCooldownSeconds":1800,"sourceKind":"github","engineKind":"codex","codexModel":"","claudeModel":"","cursorModel":"","codexReasoningEffort":"default","claudeEffort":"default","updateMode":"webhook-only","azureOrg":"","azureProject":"","labelSource":"native","bitbucketHost":"","bitbucketProject":"","bitbucketToken":""};
 
 export type AppConfig = {
 /**

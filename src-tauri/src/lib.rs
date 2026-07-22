@@ -219,13 +219,13 @@ impl<R: tauri::Runtime> messaging::service::MessagingActions<R> for MessagingAct
         app: &tauri::AppHandle<R>,
         reference: String,
         pr_number: u64,
-        kind: model::ReviewKind,
+        extra_args: String,
         request_id: model::ExternalRequestId,
     ) -> error::AppResult<model::ReviewReceiptId> {
         app.state::<AppState>().external_review.submit(
             reference,
             pr_number,
-            kind,
+            extra_args,
             request_id,
             model::ExternalTriggerOrigin::MessagingBot,
             false,
@@ -305,8 +305,17 @@ async fn start_review<R: tauri::Runtime>(
     state: tauri::State<'_, AppState>,
     project_id: String,
     pr_number: u64,
-    kind: model::ReviewKind,
+    extra_args: Option<String>,
 ) -> error::AppResult<String> {
+    let project = config::service::project_validated(&app, &project_id)?;
+    let config = config::service::load(&app)?;
+    let invocation = rule::service::resolve_skill_invocation(
+        &config.rules,
+        &project,
+        pr_number,
+        extra_args.as_deref().unwrap_or(""),
+    )
+    .map_err(error::AppError::new)?;
     // SAFETY: this composition-root command is an authorized durable review ingress.
     let capability = unsafe { review::engine::ReviewStartCapability::new_composition_root() };
     review::commands::start_review_authorized(
@@ -315,7 +324,7 @@ async fn start_review<R: tauri::Runtime>(
         state.inner(),
         project_id,
         pr_number,
-        kind,
+        invocation,
     )
     .await
 }
@@ -462,17 +471,35 @@ fn build_app() {
             state.external_review.set_sinks(
                 Arc::new({
                     let app = app.handle().clone();
-                    move |reference, pr_number, kind, request_id, origin, notify_on_completion| {
+                    move |reference,
+                          pr_number,
+                          extra_args,
+                          request_id,
+                          origin,
+                          notify_on_completion| {
                         let project = config::service::project_by_ref_validated(&app, &reference)?;
+                        let config = config::service::load(&app)?;
+                        let invocation = rule::service::resolve_skill_invocation(
+                            &config.rules,
+                            &project,
+                            pr_number,
+                            &extra_args,
+                        )
+                        .map_err(error::AppError::new)?;
                         let dedupe = model::InboxDedupeKey::new(format!("external:{request_id}"))
                             .map_err(error::AppError::new)?;
+                        // Skill identity is resolved from rules at plan time; payload fields are
+                        // placeholders for wire/DB shape only (ingress no longer accepts free skill).
                         let event = model::EventEnvelope::review_request(
                             dedupe,
                             project.source_kind,
                             project.id.clone(),
                             project.repo.clone(),
                             pr_number,
-                            kind,
+                            model::DEFAULT_SKILL_NAME,
+                            extra_args.clone(),
+                            model::DEFAULT_SKILL_PATH,
+                            model::DEFAULT_COMMAND_TEMPLATE,
                             request_id,
                             origin,
                             notify_on_completion,
@@ -503,7 +530,11 @@ fn build_app() {
                         app_state.inbox.wake();
                         if notify_on_completion {
                             app_state.workflow.start_receipt_notify(
-                                app.clone(), receipt, reference, pr_number, kind,
+                                app.clone(),
+                                receipt,
+                                reference,
+                                pr_number,
+                                invocation.skill_key,
                             )?;
                         }
                         Ok(receipt)
@@ -678,7 +709,7 @@ fn build_app() {
             // Install the ACTION OUTBOX executor (AB#1066/AB#1069) — the ONLY place that names
             // `review::notify` / `review::commands`. The outbox slice holds this only as the OPAQUE
             // `ActionExecutor`; the exhaustive `match ActionKind` HERE is the Hard carrier routing
-            // each kind to its provider — `Notification` → the desktop notifier; `Review`/`Check` →
+            // each ActionKind to its provider — `Notification` → the desktop notifier; `RunSkill` →
             // the review funnel (`run_review_action`); `StopReview` → the idempotent stop
             // (`run_stop_action`). A new `ActionKind` without an arm is a compile error — the missing
             // action cannot be expressed. Each arm deserializes the stored payload; a deser/execute
@@ -726,7 +757,7 @@ fn build_app() {
                                 if channel.kind != payload.kind {
                                     return Ok(model::ActionExecutionResult::Dead {
                                         message: format!(
-                                            "通知渠道「{}」kind 已从 {:?} 改为 {:?}，停止投递",
+                                            "通知渠道「{}」类型不匹配：payload={:?} channel={:?}",
                                             channel.name, payload.kind, channel.kind
                                         ),
                                     });
@@ -740,18 +771,7 @@ fn build_app() {
                                 )
                                 .await
                             }
-                            model::ActionKind::Review => run_review_action(
-                                &app,
-                                &action,
-                                model::ReviewKind::Review,
-                            )
-                                .await,
-                            model::ActionKind::Check => run_review_action(
-                                &app,
-                                &action,
-                                model::ReviewKind::Check,
-                            )
-                                .await,
+                            model::ActionKind::RunSkill => run_review_action(&app, &action).await,
                             model::ActionKind::StopReview => run_stop_action(&app, &action)
                                 .await
                                 .map(|_| model::ActionExecutionResult::done()),
@@ -1186,7 +1206,7 @@ fn ensure_same_external_review_request(
     let same_request = match (existing.as_review_request(), requested.as_review_request()) {
         (Some(existing), Some(requested)) => {
             existing.pr_number == requested.pr_number
-                && existing.review_kind == requested.review_kind
+                && existing.extra_args == requested.extra_args
                 && existing.request_id == requested.request_id
                 && existing.origin == requested.origin
                 && existing.notify_on_completion == requested.notify_on_completion
@@ -1209,7 +1229,7 @@ fn ensure_same_external_review_request(
 /// Execute an AB#1069 `review` / `check` outbox action (the composition root's executor arm body):
 /// deserialize the routing payload and run it through the review funnel
 /// ([`review::commands::start_for_outbox`], which returns an executor outcome that separates a real
-/// start / suppressed replay from active-session dedupe). `kind` is the funnel string the executor derived from the sealed
+/// start / suppressed replay from active-session dedupe). `skill_key` is the funnel string the executor derived from the sealed
 /// [`model::ActionKind`] variant (`Review` → `"review"`, `Check` → `"check"`), so it is valid by
 /// construction. A deser `Err` propagates so the worker retries / dead-letters rather than marking the
 /// row falsely `done`.
@@ -1224,13 +1244,16 @@ fn ensure_same_external_review_request(
 async fn run_review_action(
     app: &tauri::AppHandle,
     action: &outbox::OutboxAction,
-    kind: model::ReviewKind,
 ) -> error::AppResult<model::ActionExecutionResult> {
     let payload: model::ReviewActionPayload = serde_json::from_str(action.payload())
         .map_err(|e| error::AppError::new(format!("outbox review action 反序列化失败：{e}")))?;
+    let invocation = payload.invocation().clone();
     let (pr_number, candidate, explicit) = match payload {
-        model::ReviewActionPayload::Automatic { mut candidate } => {
-            candidate.kind = kind;
+        model::ReviewActionPayload::Automatic {
+            mut candidate,
+            invocation: inv,
+        } => {
+            candidate.skill_key = inv.skill_key.clone();
             model::ReviewActionKey::for_candidate(&candidate).map_err(error::AppError::new)?;
             (candidate.number, Some(candidate), false)
         }
@@ -1274,7 +1297,7 @@ async fn run_review_action(
         state.inner(),
         action.project_id(),
         pr_number,
-        kind,
+        &invocation,
         // AB#1204: the outbox ROW id is the dedup key — a crash-replay of this row resolves its
         // prior review's claim instead of starting a duplicate.
         action.id(),
@@ -1291,8 +1314,8 @@ async fn run_review_action(
 }
 
 /// Execute an AB#1069 `stop-review` outbox action (the composition root's executor arm body):
-/// deserialize the `(pr, kind)` payload and interrupt the matching in-flight session
-/// ([`review::commands::stop_for_outbox`], keyed by the ROW's `project_id` + payload `(pr, kind)`).
+/// deserialize the `(pr, skill_key)` payload and interrupt the matching in-flight session
+/// ([`review::commands::stop_for_outbox`], keyed by the ROW's `project_id` + payload `(pr, skill_key)`).
 /// IDEMPOTENT — no live session is a benign `Ok(())`, so an at-least-once replay (or a stop fired
 /// after the review already self-completed) never dead-letters; a bare reservation retries (F4).
 /// Routing key is `action.project_id` (the row's single source, AB#1069 F3), not a payload copy.
@@ -1311,13 +1334,13 @@ async fn run_stop_action(
         state.inner(),
         action.project_id(),
         payload.pr_number,
-        payload.kind,
+        payload.skill_key.as_str(),
     )
     .await
 }
 
 /// Composition-root assembly for one auto-trigger cycle: validate config, snapshot active
-/// `(pr, kind)` pairs, and inject durable inbox/outbox writers + UI error reporting into the
+/// `(pr, skill_key)` pairs, and inject durable inbox/outbox writers + UI error reporting into the
 /// durable discovery producer. The executor is the only place that starts review
 /// work; this path only materializes replayable actions.
 async fn ingest_discovered_events<R: tauri::Runtime>(
@@ -1417,7 +1440,7 @@ fn process_rule_event<R: Runtime>(
     candidate: Option<Candidate>,
 ) -> error::AppResult<()> {
     let cfg = config::service::load(app)?;
-    let plans = rule::service::plan_event(&cfg.rules, &event, candidate.as_ref());
+    let plans = rule::service::plan_event(&cfg.rules, &cfg.projects, &event, candidate.as_ref());
     let db = app.state::<db::Database>();
     let now = rule::store::now_epoch();
     let announced_action_ids = db.inner().with_tx(|tx| {
@@ -1560,11 +1583,23 @@ mod tests {
             request_id: model::ExternalRequestId::parse("0123456789abcdef0123456789abcdef")
                 .unwrap(),
             origin: model::ExternalTriggerOrigin::Http,
+            invocation: model::SkillInvocation::build(
+                "pr-review",
+                Some("/tmp/skill.md".into()),
+                "/pr-review 7",
+                "",
+            ),
         })
         .expect("payload");
-        let id =
-            outbox::store::enqueue(&db, "p1", model::ActionKind::Review, "review", &payload, 1)
-                .expect("enqueue");
+        let id = outbox::store::enqueue(
+            &db,
+            "p1",
+            model::ActionKind::RunSkill,
+            "review",
+            &payload,
+            1,
+        )
+        .expect("enqueue");
         outbox::store::mark_blocked(&db, id, "stopped", 2).expect("block");
         assert!(outbox::store::claim_due(&db, 3)
             .expect("claim")
@@ -1590,7 +1625,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: model::ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
         };
         DiscoveredEvent {
             event: EventEnvelope::observation(
@@ -1661,7 +1696,10 @@ mod tests {
                 0 => subject.title.push('!'),
                 1 => subject.body.push('!'),
                 2 => subject.labels.push("new".to_string()),
-                _ => changed.candidate.kind = model::ReviewKind::Check,
+                _ => {
+                    changed.candidate.skill_key =
+                        model::SkillInvocation::skill_key("pr-review", "--check")
+                }
             }
             changed.event = EventEnvelope::observation(
                 model::InboxDedupeKey::new("changed-seed").unwrap(),
@@ -1684,14 +1722,17 @@ mod tests {
 
     #[test]
     fn external_request_id_is_bound_to_request_semantics() {
-        let make = |pr_number, kind, received_at| {
+        let make = |pr_number, extra_args: &str, received_at| {
             model::EventEnvelope::review_request(
                 model::InboxDedupeKey::new("external:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
                 model::SourceKind::Github,
                 "p1",
                 "owner/repo",
                 pr_number,
-                kind,
+                model::DEFAULT_SKILL_NAME,
+                extra_args,
+                model::DEFAULT_SKILL_PATH,
+                model::DEFAULT_COMMAND_TEMPLATE,
                 model::ExternalRequestId::parse("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
                 model::ExternalTriggerOrigin::Http,
                 true,
@@ -1699,13 +1740,13 @@ mod tests {
             )
             .unwrap()
         };
-        let first = make(7, model::ReviewKind::Review, 1);
-        let retry = make(7, model::ReviewKind::Review, 2);
+        let first = make(7, "", 1);
+        let retry = make(7, "", 2);
         assert!(ensure_same_external_review_request(&first, &retry).is_ok());
 
-        let different_pr = make(8, model::ReviewKind::Review, 3);
+        let different_pr = make(8, "", 3);
         assert!(ensure_same_external_review_request(&first, &different_pr).is_err());
-        let different_kind = make(7, model::ReviewKind::Check, 4);
+        let different_kind = make(7, "--check", 4);
         assert!(ensure_same_external_review_request(&first, &different_kind).is_err());
     }
 
@@ -1736,6 +1777,11 @@ mod tests {
             projects: vec![config::model::Project {
                 id: "p1".to_string(),
                 repo: "owner/repo".to_string(),
+                repo_root: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .expect("src-tauri parent")
+                    .display()
+                    .to_string(),
                 enabled: false,
                 ..config::model::Project::default()
             }],
@@ -1748,18 +1794,9 @@ mod tests {
                 project_id: "p1".to_string(),
                 labels_any: vec!["ready".to_string()],
                 actions: vec![
-                    config::model::RuleActionConfig::new(
-                        "review",
-                        config::model::RuleActionKind::Review,
-                    ),
-                    config::model::RuleActionConfig::new(
-                        "check",
-                        config::model::RuleActionKind::Check,
-                    ),
-                    config::model::RuleActionConfig::new(
-                        "notify",
-                        config::model::RuleActionKind::Notify,
-                    ),
+                    config::model::RuleActionConfig::run_skill("review"),
+                    config::model::RuleActionConfig::run_skill_check("check"),
+                    config::model::RuleActionConfig::notify("notify"),
                 ],
                 ..config::model::RuleConfig::default()
             }],
@@ -1787,7 +1824,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: model::ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
         };
 
         process_rule_event(app.handle(), inbox_id, event, Some(candidate)).expect("process rules");
@@ -1803,7 +1840,7 @@ mod tests {
                 Ok(rows)
             })
             .expect("read outbox");
-        assert_eq!(kinds, vec!["review", "check", "notification"]);
+        assert_eq!(kinds, vec!["runSkill", "runSkill", "notification"]);
 
         let trace = rule::store::list_by_inbox(db.inner(), inbox_id).expect("trace");
         assert_eq!(trace.len(), 1);
@@ -1821,6 +1858,11 @@ mod tests {
             projects: vec![config::model::Project {
                 id: "p1".to_string(),
                 repo: "owner/repo".to_string(),
+                repo_root: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .expect("src-tauri parent")
+                    .display()
+                    .to_string(),
                 enabled: false,
                 ..config::model::Project::default()
             }],
@@ -1832,10 +1874,7 @@ mod tests {
                 event_type: Some(model::EventType::PullRequest),
                 project_id: "p1".to_string(),
                 labels_any: vec!["ready".to_string()],
-                actions: vec![config::model::RuleActionConfig::new(
-                    "review",
-                    config::model::RuleActionKind::Review,
-                )],
+                actions: vec![config::model::RuleActionConfig::run_skill("review")],
                 ..config::model::RuleConfig::default()
             }],
             ..config::model::AppConfig::default()
@@ -1875,6 +1914,11 @@ mod tests {
             projects: vec![config::model::Project {
                 id: "p1".to_string(),
                 repo: "owner/repo".to_string(),
+                repo_root: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .expect("src-tauri parent")
+                    .display()
+                    .to_string(),
                 enabled: false,
                 ..config::model::Project::default()
             }],
@@ -1886,10 +1930,7 @@ mod tests {
                 event_type: Some(model::EventType::PullRequest),
                 project_id: "p1".to_string(),
                 labels_any: vec!["ready".to_string()],
-                actions: vec![config::model::RuleActionConfig::new(
-                    "review",
-                    config::model::RuleActionKind::Review,
-                )],
+                actions: vec![config::model::RuleActionConfig::run_skill("review")],
                 ..config::model::RuleConfig::default()
             }],
             ..config::model::AppConfig::default()
@@ -1925,7 +1966,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: model::ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
         };
 
         let error = process_rule_event(app.handle(), inbox_id, event, Some(candidate))
@@ -1966,16 +2007,21 @@ mod tests {
             "default".to_string(),
             serde_json::json!([{
                 "number": 7, "title": "PR 7", "labels": ["needs-review"],
-                "url": "https://x/7", "kind": "review", "skipReason": null,
+                "url": "https://x/7", "skillKey": "review", "skipReason": null,
                 "firstSeenEpoch": 1, "lastSeenEpoch": 2, "archived": false
             }]),
         )];
-        let dispatched = vec![("default".to_string(), serde_json::json!(["7@sha:review"]))];
+        let review_key = model::SkillInvocation::skill_key("pr-review", "");
+        let action_key = format!("7@sha:{review_key}");
+        let dispatched = vec![(
+            "default".to_string(),
+            serde_json::json!([action_key.clone()]),
+        )];
         let events = vec![(
             "default".to_string(),
             serde_json::json!([{
-                "pr": 7, "kind": "review", "headSha": "sha",
-                "key": "7@sha:review", "dispatchedAtEpoch": 100
+                "pr": 7, "skillKey": "review", "headSha": "sha",
+                "key": action_key, "dispatchedAtEpoch": 100
             }]),
         )];
 
@@ -2001,7 +2047,10 @@ mod tests {
         assert_eq!(prs.prs[0].number, 7);
 
         let ledger = pr::ledger::Ledger::load_db(&db, "default").expect("ledger load");
-        assert!(ledger.has_dispatched("7@sha:review"));
+        assert!(ledger.has_dispatched(&format!(
+            "7@sha:{}",
+            model::SkillInvocation::skill_key("pr-review", "")
+        )));
         assert_eq!(ledger.events.len(), 1);
 
         // Second call short-circuits on the guard → NO duplicate dispatch_event rows.

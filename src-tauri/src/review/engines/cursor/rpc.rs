@@ -294,7 +294,7 @@ mod tests {
 
         let mut sw = server_w;
         sw.write_all(
-            br#"{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"c1","kind":"read"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}
+            br#"{"jsonrpc":"2.0","id":99,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"c1","skill_key":"read"},"options":[{"optionId":"allow-once","name":"Allow once","skill_key":"allow_once"},{"optionId":"reject-once","name":"Reject","skill_key":"reject_once"}]}}
 "#,
         )
         .await
@@ -319,7 +319,7 @@ mod tests {
 
         let mut sw = server_w;
         sw.write_all(
-            br#"{"jsonrpc":"2.0","id":98,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"c1","kind":"execute"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}
+            br#"{"jsonrpc":"2.0","id":98,"method":"session/request_permission","params":{"sessionId":"s","toolCall":{"toolCallId":"c1","skill_key":"execute"},"options":[{"optionId":"allow-once","name":"Allow once","skill_key":"allow_once"},{"optionId":"reject-once","name":"Reject","skill_key":"reject_once"}]}}
 "#,
         )
         .await
@@ -342,7 +342,7 @@ mod tests {
 
         let mut sw = server_w;
         sw.write_all(
-            br#"{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"toolCall":{"kind":"switch_mode"},"options":[{"optionId":"allow-once","kind":"allow_once"},{"optionId":"reject-once","kind":"reject_once"}]}}
+            br#"{"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"toolCall":{"skill_key":"switch_mode"},"options":[{"optionId":"allow-once","skill_key":"allow_once"},{"optionId":"reject-once","skill_key":"reject_once"}]}}
 "#,
         )
         .await

@@ -11,6 +11,7 @@ import { computed, onMounted, reactive, ref, watch } from "vue";
 import { useConfigStore } from "./useConfigStore";
 import type { AppConfig, Project } from "./types";
 import { cloneReviewLifecycleNotifications, cloneRule } from "./configClone";
+import { createDefaultRule } from "./ruleDraft";
 import {
   DEFAULT_CLI_TOOLS_CONFIG,
   DEFAULT_MESSAGING_SETTINGS,
@@ -145,7 +146,7 @@ function authorsArray(): string[] {
 // defaults. The first project gets the fixed id "default" (mirrors the backend
 // migration's fixed id for symmetry) and `activeProjectId` points at it.
 function composeConfig(): AppConfig {
-  return {
+  const config: AppConfig = {
     projects: [{ ...draft, id: DEFAULT_PROJECT_ID, authors: authorsArray() }],
     activeProjectId: DEFAULT_PROJECT_ID,
     webhookEnabled: false,
@@ -157,7 +158,9 @@ function composeConfig(): AppConfig {
     webhookPublicUrl: "",
     localApiToken: "",
     outbox: { ...DEFAULT_OUTBOX_CONFIG },
-    rules: store.config?.rules ? store.config.rules.map(cloneRule) : [],
+    rules: store.config?.rules?.length
+      ? store.config.rules.map(cloneRule)
+      : [],
     notifications: {
       ...DEFAULT_NOTIFICATION_SETTINGS,
       channels: DEFAULT_NOTIFICATION_SETTINGS.channels.map((c) => ({ ...c })),
@@ -187,6 +190,11 @@ function composeConfig(): AppConfig {
       tunnels: (store.config?.remoteAccess.tunnels ?? []).map((tunnel) => ({ ...tunnel })),
     },
   };
+  // Seed a default runSkill rule so first launch can auto-dispatch without an empty rules list.
+  if (config.rules.length === 0) {
+    config.rules = [createDefaultRule(config)];
+  }
+  return config;
 }
 
 async function finish() {
@@ -230,10 +238,6 @@ async function finish() {
           <h2>本地仓库路径</h2>
           <p class="lead">填写本地 clone 的绝对路径，review 将在此运行。</p>
         </template>
-        <template v-else-if="currentStep === 'skill'">
-          <h2>Skill 路径</h2>
-          <p class="lead">指向仓库内的 review skill（相对路径）。</p>
-        </template>
         <template v-else-if="currentStep === 'source'">
           <h2>PR 来源</h2>
           <p class="lead">选择 PR 来源；Azure 源需填写组织 / 项目；Bitbucket 源需填写 Host / 项目 Key / Token。</p>
@@ -244,7 +248,9 @@ async function finish() {
         </template>
         <template v-else>
           <h2>准备就绪</h2>
-          <p class="lead">确认配置后开始监控。</p>
+          <p class="lead">
+            确认配置后开始监控。将自动添加一条默认 pr-review 规则（可在「规则」页调整 skill / extraArgs）。
+          </p>
         </template>
 
         <div v-if="currentFields.length" class="fields">
@@ -261,7 +267,6 @@ async function finish() {
         <dl v-if="currentStep === 'done'" class="summary">
           <div><dt>仓库</dt><dd>{{ draft.repo }}</dd></div>
           <div><dt>本地路径</dt><dd>{{ draft.repoRoot }}</dd></div>
-          <div><dt>Skill</dt><dd>{{ draft.skillRelPath }}</dd></div>
           <div><dt>PR 来源</dt><dd>{{ draft.sourceKind }}</dd></div>
           <template v-if="draft.sourceKind === 'azure'">
             <div><dt>Azure 组织</dt><dd>{{ draft.azureOrg || "—" }}</dd></div>

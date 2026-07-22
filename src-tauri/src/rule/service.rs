@@ -1,11 +1,78 @@
 use crate::config::service::{
-    RuleActionConfig, RuleActionDedupePolicy, RuleActionKind, RuleActionTarget, RuleConfig,
+    Project, RuleActionConfig, RuleActionDedupePolicy, RuleActionTarget, RuleConfig,
 };
 use crate::error::{AppError, AppResult};
 use crate::model::{
     ActionKind, Candidate, EventEnvelope, MessagingSendContent, NotificationLevel,
-    ReviewActionPayload, ReviewKind, SendMessagingRequest, SendNotificationRequest,
+    ReviewActionPayload, SendMessagingRequest, SendNotificationRequest, SkillInvocation,
 };
+
+/// Resolve a skill invocation from project rules (manual UI / external ingress).
+/// Prefers an enabled `runSkill` whose `extra_args` matches the request; otherwise the first
+/// enabled `runSkill` for the project (skill template only); otherwise the built-in default skill.
+/// Caller's validated `extra_args` always wins for the rendered command / skill_key.
+pub fn resolve_skill_invocation(
+    rules: &[RuleConfig],
+    project: &Project,
+    pr_number: u64,
+    extra_args: &str,
+) -> Result<SkillInvocation, String> {
+    let extra_args = SkillInvocation::validate_extra_args(extra_args)?;
+    let mut actions: Vec<&RuleActionConfig> = Vec::new();
+    for rule in rules {
+        if !rule.enabled {
+            continue;
+        }
+        if !rule.project_id.is_empty() && rule.project_id != project.id {
+            continue;
+        }
+        for action in &rule.actions {
+            if let RuleActionConfig::RunSkill { enabled, .. } = action {
+                if *enabled {
+                    actions.push(action);
+                }
+            }
+        }
+    }
+    let chosen = actions
+        .iter()
+        .find(|action| {
+            matches!(
+                action,
+                RuleActionConfig::RunSkill {
+                    extra_args: ea,
+                    ..
+                } if ea.trim() == extra_args
+            )
+        })
+        .or_else(|| actions.first())
+        .copied();
+    match chosen {
+        Some(RuleActionConfig::RunSkill {
+            skill_name,
+            skill_path,
+            command_template,
+            ..
+        }) => SkillInvocation::from_config(
+            &project.repo_root,
+            skill_name,
+            skill_path,
+            command_template,
+            pr_number,
+            &project.repo,
+            extra_args,
+            project.engine_kind,
+        ),
+        Some(_) => unreachable!("only RunSkill actions are collected"),
+        None => SkillInvocation::default_pr_review(
+            &project.repo_root,
+            pr_number,
+            &project.repo,
+            extra_args,
+            project.engine_kind,
+        ),
+    }
+}
 
 pub fn matches(rule: &RuleConfig, event: &EventEnvelope) -> bool {
     let Some(observation) = event.as_observation() else {
@@ -83,18 +150,40 @@ pub enum RuleActionDispatch {
 
 pub fn plan_event(
     rules: &[RuleConfig],
+    projects: &[Project],
     event: &EventEnvelope,
     candidate: Option<&Candidate>,
 ) -> Vec<RuleMatchPlan> {
     if let Some(request) = event.as_review_request() {
-        let kind = match request.review_kind {
-            ReviewKind::Review => ActionKind::Review,
-            ReviewKind::Check => ActionKind::Check,
+        let project = projects
+            .iter()
+            .find(|project| project.id == event.project_id());
+        let invocation = match project {
+            Some(project) => {
+                resolve_skill_invocation(rules, project, request.pr_number, request.extra_args)
+            }
+            None => Err(format!(
+                "external review request project not found: {}",
+                event.project_id()
+            )),
+        };
+        let invocation = match invocation {
+            Ok(invocation) => invocation,
+            Err(message) => {
+                return vec![RuleMatchPlan {
+                    rule_id: "system:external-review".to_string(),
+                    rule_name: "External review request".to_string(),
+                    project_id: event.project_id().to_string(),
+                    actions: Vec::new(),
+                    errors: vec![message],
+                }];
+            }
         };
         let payload = serde_json::to_string(&ReviewActionPayload::Explicit {
             pr_number: request.pr_number,
             request_id: request.request_id.clone(),
             origin: request.origin,
+            invocation: invocation.clone(),
         })
         .expect("typed review request serializes");
         return vec![RuleMatchPlan {
@@ -102,15 +191,15 @@ pub fn plan_event(
             rule_name: "External review request".to_string(),
             project_id: event.project_id().to_string(),
             actions: vec![RuleActionPlan {
-                kind,
+                kind: ActionKind::RunSkill,
                 summary: format!(
                     "External {} request for PR #{}",
-                    request.review_kind, request.pr_number
+                    invocation.skill_name, request.pr_number
                 ),
                 dispatch: RuleActionDispatch::Outbox { payload },
                 dedupe_key: format!("external:{}", request.request_id),
                 delay_secs: 0,
-                action_id: request.review_kind.to_string(),
+                action_id: invocation.skill_key.clone(),
                 level: "system".to_string(),
             }],
             errors: Vec::new(),
@@ -121,8 +210,8 @@ pub fn plan_event(
         let mut actions = Vec::new();
         let mut errors = Vec::new();
         {
-            for action in rule.actions.iter().filter(|action| action.enabled) {
-                match plan_action(rule, event, candidate, action) {
+            for action in rule.actions.iter().filter(|action| action.enabled()) {
+                match plan_action(rule, projects, event, candidate, action) {
                     Ok(plan) => actions.push(plan),
                     Err(e) => errors.push(e.message),
                 }
@@ -141,72 +230,98 @@ pub fn plan_event(
 
 fn plan_action(
     rule: &RuleConfig,
+    projects: &[Project],
     event: &EventEnvelope,
     candidate: Option<&Candidate>,
     action: &RuleActionConfig,
 ) -> AppResult<RuleActionPlan> {
-    let mut plan = match action.kind {
-        RuleActionKind::Review => plan_review_like(rule, candidate, action, RuleActionKind::Review),
-        RuleActionKind::Check => plan_review_like(rule, candidate, action, RuleActionKind::Check),
-        RuleActionKind::Notify => plan_notification(rule, event, action),
+    let mut plan = match action {
+        RuleActionConfig::RunSkill { .. } => {
+            plan_run_skill(rule, projects, event, candidate, action)
+        }
+        RuleActionConfig::Notify { .. } => plan_notification(rule, event, action),
     }?;
-    plan.delay_secs = action.delay_secs;
-    plan.action_id = action.id.clone();
-    plan.level = action.level.clone();
+    plan.delay_secs = action.delay_secs();
+    plan.action_id = action.id().to_string();
+    plan.level = action.level().to_string();
     Ok(plan)
 }
 
-fn plan_review_like(
+fn plan_run_skill(
     rule: &RuleConfig,
+    projects: &[Project],
+    event: &EventEnvelope,
     candidate: Option<&Candidate>,
     action_config: &RuleActionConfig,
-    action: RuleActionKind,
 ) -> AppResult<RuleActionPlan> {
-    let (candidate_kind, action_kind) = review_like_kinds(action);
+    let RuleActionConfig::RunSkill {
+        skill_name,
+        skill_path,
+        command_template,
+        extra_args,
+        ..
+    } = action_config
+    else {
+        unreachable!("plan_run_skill only accepts RunSkill");
+    };
     let Some(candidate) = candidate else {
         return Err(AppError::new(format!(
-            "规则 {} 需要 PR candidate 才能触发 {candidate_kind}",
+            "规则 {} 需要 PR candidate 才能触发 runSkill",
             rule.id
         )));
     };
+    let project_id = if rule.project_id.is_empty() {
+        event.project_id()
+    } else {
+        rule.project_id.as_str()
+    };
+    let project = projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .ok_or_else(|| AppError::new(format!("规则 {} 找不到项目 {project_id}", rule.id)))?;
+    let invocation = SkillInvocation::from_config(
+        &project.repo_root,
+        skill_name,
+        skill_path,
+        command_template,
+        candidate.number,
+        event.repo(),
+        extra_args,
+        project.engine_kind,
+    )
+    .map_err(AppError::new)?;
     let mut candidate = candidate.clone();
-    candidate.kind = candidate_kind;
+    candidate.skill_key = invocation.skill_key.clone();
     let payload = serde_json::to_string(&ReviewActionPayload::Automatic {
         candidate: candidate.clone(),
+        invocation: invocation.clone(),
     })
     .map_err(|e| AppError::new(format!("rule action 序列化失败：{e}")))?;
     let summary = format!(
-        "Rule {} action {} -> PR #{} {candidate_kind}",
+        "Rule {} action {} -> PR #{} {}",
         rule.name,
         action_node_id(action_config),
-        candidate.number
+        candidate.number,
+        invocation.skill_name
     );
     let base_dedupe_key = crate::model::ReviewActionKey::for_candidate(&candidate)
         .map_err(AppError::new)?
         .into_inner();
-    let dedupe_key = match action_config.dedupe_policy {
+    let dedupe_key = match action_config.dedupe_policy() {
         RuleActionDedupePolicy::Event => base_dedupe_key,
         RuleActionDedupePolicy::Action => {
-            format!("rule:{}:{}:{base_dedupe_key}", rule.id, action_config.id)
+            format!("rule:{}:{}:{base_dedupe_key}", rule.id, action_config.id())
         }
     };
     Ok(RuleActionPlan {
-        kind: action_kind,
+        kind: ActionKind::RunSkill,
         summary,
         dispatch: RuleActionDispatch::Outbox { payload },
         dedupe_key,
-        delay_secs: action_config.delay_secs,
-        action_id: action_config.id.clone(),
-        level: action_config.level.clone(),
+        delay_secs: action_config.delay_secs(),
+        action_id: action_config.id().to_string(),
+        level: action_config.level().to_string(),
     })
-}
-
-fn review_like_kinds(action: RuleActionKind) -> (ReviewKind, ActionKind) {
-    match action {
-        RuleActionKind::Review => (ReviewKind::Review, ActionKind::Review),
-        RuleActionKind::Check => (ReviewKind::Check, ActionKind::Check),
-        RuleActionKind::Notify => unreachable!("notify is not a review-like action"),
-    }
 }
 
 fn plan_notification(
@@ -214,6 +329,9 @@ fn plan_notification(
     event: &EventEnvelope,
     action: &RuleActionConfig,
 ) -> AppResult<RuleActionPlan> {
+    let RuleActionConfig::Notify { target, .. } = action else {
+        return Err(AppError::new("notify plan requires Notify action"));
+    };
     let node_id = action_node_id(action);
     let subject = event
         .as_observation()
@@ -226,7 +344,7 @@ fn plan_notification(
     };
     let body = format!("Rule matched an inbound event\nnodeId: {node_id}");
     let dedupe_key = rule_action_dedupe_key(rule, action, event, "notify");
-    let (kind, dispatch) = match &action.target {
+    let (kind, dispatch) = match target {
         RuleActionTarget::None => (
             ActionKind::Notification,
             RuleActionDispatch::Notification {
@@ -280,9 +398,9 @@ fn plan_notification(
         summary: title,
         dispatch,
         dedupe_key,
-        delay_secs: action.delay_secs,
-        action_id: action.id.clone(),
-        level: action.level.clone(),
+        delay_secs: action.delay_secs(),
+        action_id: action.id().to_string(),
+        level: action.level().to_string(),
     })
 }
 
@@ -292,7 +410,7 @@ fn rule_action_dedupe_key(
     event: &EventEnvelope,
     suffix: &str,
 ) -> String {
-    match action.dedupe_policy {
+    match action.dedupe_policy() {
         RuleActionDedupePolicy::Event => {
             format!("rule:{}:{}:{suffix}", rule.id, event.dedupe_key())
         }
@@ -300,7 +418,7 @@ fn rule_action_dedupe_key(
             format!(
                 "rule:{}:{}:{}:{suffix}",
                 rule.id,
-                action.id,
+                action.id(),
                 event.dedupe_key()
             )
         }
@@ -308,13 +426,18 @@ fn rule_action_dedupe_key(
 }
 
 fn action_node_id(action: &RuleActionConfig) -> String {
-    format!("{}:{}", action.level.trim(), action.id.trim())
+    format!("{}:{}", action.level().trim(), action.id().trim())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{EventSubject, EventType, InboxDedupeKey, SourceKind};
+    use crate::model::{
+        EventSubject, EventType, InboxDedupeKey, SourceKind, DEFAULT_COMMAND_TEMPLATE,
+        DEFAULT_SKILL_NAME, DEFAULT_SKILL_PATH,
+    };
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn event() -> EventEnvelope {
         EventEnvelope::observation(
@@ -335,6 +458,21 @@ mod tests {
         .unwrap()
     }
 
+    fn project_with_skill() -> Project {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("prmonitor-rule-skill-{n}"));
+        let skill = dir.join(DEFAULT_SKILL_PATH);
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::write(&skill, "skill").unwrap();
+        Project {
+            id: "p1".to_string(),
+            repo: "Owner/Repo".to_string(),
+            repo_root: dir.to_string_lossy().into_owned(),
+            ..Project::default()
+        }
+    }
+
     fn rule() -> RuleConfig {
         RuleConfig {
             id: "r1".to_string(),
@@ -348,7 +486,7 @@ mod tests {
             labels_all: vec!["urgent".to_string()],
             title_contains: "login".to_string(),
             body_contains: "BODY".to_string(),
-            actions: vec![RuleActionConfig::new("review", RuleActionKind::Review)],
+            actions: vec![RuleActionConfig::run_skill("review")],
             allow_action_kinds: Vec::new(),
             deny_action_kinds: Vec::new(),
         }
@@ -372,7 +510,7 @@ mod tests {
             id: "r".to_string(),
             name: "all".to_string(),
             enabled: true,
-            actions: vec![RuleActionConfig::new("notify", RuleActionKind::Notify)],
+            actions: vec![RuleActionConfig::notify("notify")],
             ..RuleConfig::default()
         };
         assert!(matches(&r, &event()));
@@ -386,22 +524,23 @@ mod tests {
             author: "dev".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: ReviewKind::Review,
+            skill_key: String::new(),
         }
     }
 
     #[test]
-    fn plan_event_builds_review_check_and_notify_actions() {
+    fn plan_event_builds_run_skill_and_notify_actions() {
+        let project = project_with_skill();
         let mut r = rule();
         r.actions = vec![
-            RuleActionConfig::new("review", RuleActionKind::Review),
-            RuleActionConfig::new("check", RuleActionKind::Check),
-            RuleActionConfig::new("notify", RuleActionKind::Notify),
+            RuleActionConfig::run_skill("review"),
+            RuleActionConfig::run_skill_check("check"),
+            RuleActionConfig::notify("notify"),
         ];
-        let plans = plan_event(&[r], &event(), Some(&candidate()));
+        let plans = plan_event(&[r], &[project], &event(), Some(&candidate()));
 
         assert_eq!(plans.len(), 1);
-        assert!(plans[0].errors.is_empty());
+        assert!(plans[0].errors.is_empty(), "{:?}", plans[0].errors);
         assert_eq!(
             plans[0]
                 .actions
@@ -409,35 +548,52 @@ mod tests {
                 .map(|action| action.kind)
                 .collect::<Vec<_>>(),
             vec![
-                ActionKind::Review,
-                ActionKind::Check,
+                ActionKind::RunSkill,
+                ActionKind::RunSkill,
                 ActionKind::Notification
             ]
         );
-        assert_eq!(plans[0].actions[0].dedupe_key, "7@abc123:review");
-        assert_eq!(plans[0].actions[1].dedupe_key, "7@abc123:check");
+        let review_key = SkillInvocation::skill_key(DEFAULT_SKILL_NAME, "");
+        let check_key = SkillInvocation::skill_key(DEFAULT_SKILL_NAME, "--check");
+        assert_eq!(
+            plans[0].actions[0].dedupe_key,
+            format!("7@abc123:{review_key}")
+        );
+        assert_eq!(
+            plans[0].actions[1].dedupe_key,
+            format!("7@abc123:{check_key}")
+        );
         assert_eq!(plans[0].actions[2].dedupe_key, "rule:r1:k:notify");
     }
 
     #[test]
     fn review_like_actions_share_dispatch_dedupe_across_rules() {
+        let project = project_with_skill();
         let mut first = rule();
         first.id = "r1".to_string();
-        first.actions = vec![RuleActionConfig::new("review", RuleActionKind::Review)];
+        first.actions = vec![RuleActionConfig::run_skill("review")];
         let mut second = rule();
         second.id = "r2".to_string();
-        second.actions = vec![RuleActionConfig::new("review", RuleActionKind::Review)];
+        second.actions = vec![RuleActionConfig::run_skill("review")];
 
-        let plans = plan_event(&[first, second], &event(), Some(&candidate()));
+        let plans = plan_event(&[first, second], &[project], &event(), Some(&candidate()));
 
         assert_eq!(plans.len(), 2);
-        assert_eq!(plans[0].actions[0].dedupe_key, "7@abc123:review");
-        assert_eq!(plans[1].actions[0].dedupe_key, "7@abc123:review");
+        let review_key = SkillInvocation::skill_key(DEFAULT_SKILL_NAME, "");
+        assert_eq!(
+            plans[0].actions[0].dedupe_key,
+            format!("7@abc123:{review_key}")
+        );
+        assert_eq!(
+            plans[1].actions[0].dedupe_key,
+            format!("7@abc123:{review_key}")
+        );
     }
 
     #[test]
     fn plan_event_records_error_when_candidate_missing() {
-        let plans = plan_event(&[rule()], &event(), None);
+        let project = project_with_skill();
+        let plans = plan_event(&[rule()], &[project], &event(), None);
 
         assert_eq!(plans.len(), 1);
         assert!(plans[0].actions.is_empty());
@@ -447,14 +603,12 @@ mod tests {
 
     #[test]
     fn plan_event_preserves_configured_action_order() {
+        let project = project_with_skill();
         let mut r = rule();
-        let notify = RuleActionConfig::new("notify", RuleActionKind::Notify);
-        r.actions = vec![
-            notify,
-            RuleActionConfig::new("review", RuleActionKind::Review),
-        ];
+        let notify = RuleActionConfig::notify("notify");
+        r.actions = vec![notify, RuleActionConfig::run_skill("review")];
 
-        let plans = plan_event(&[r], &event(), Some(&candidate()));
+        let plans = plan_event(&[r], &[project], &event(), Some(&candidate()));
 
         assert_eq!(
             plans[0]
@@ -468,39 +622,60 @@ mod tests {
 
     #[test]
     fn plan_event_consumes_action_dedupe_policy() {
+        let project = project_with_skill();
         let mut event_policy = rule();
         event_policy.id = "event-rule".to_string();
-        event_policy.actions = vec![RuleActionConfig::new("review", RuleActionKind::Review)];
+        event_policy.actions = vec![RuleActionConfig::run_skill("review")];
         let mut action_policy = rule();
         action_policy.id = "action-rule".to_string();
-        let mut action = RuleActionConfig::new("review", RuleActionKind::Review);
-        action.dedupe_policy = RuleActionDedupePolicy::Action;
+        let mut action = RuleActionConfig::run_skill("review");
+        if let RuleActionConfig::RunSkill {
+            ref mut dedupe_policy,
+            ..
+        } = action
+        {
+            *dedupe_policy = RuleActionDedupePolicy::Action;
+        }
         action_policy.actions = vec![action];
 
-        let plans = plan_event(&[event_policy, action_policy], &event(), Some(&candidate()));
+        let plans = plan_event(
+            &[event_policy, action_policy],
+            &[project],
+            &event(),
+            Some(&candidate()),
+        );
 
-        assert_eq!(plans[0].actions[0].dedupe_key, "7@abc123:review");
+        let review_key = SkillInvocation::skill_key(DEFAULT_SKILL_NAME, "");
+        assert_eq!(
+            plans[0].actions[0].dedupe_key,
+            format!("7@abc123:{review_key}")
+        );
         assert_eq!(
             plans[1].actions[0].dedupe_key,
-            "rule:action-rule:review:7@abc123:review"
+            format!("rule:action-rule:review:7@abc123:{review_key}")
         );
     }
 
     #[test]
     fn plan_notification_targets_channels_and_messaging_conversation() {
+        let project = project_with_skill();
         let mut notify_rule = rule();
-        let mut channel_action = RuleActionConfig::new("notify", RuleActionKind::Notify);
-        channel_action.target = RuleActionTarget::NotificationChannels {
-            channel_ids: vec!["desktop".to_string()],
-        };
-        let mut messaging_action = RuleActionConfig::new("message", RuleActionKind::Notify);
-        messaging_action.target = RuleActionTarget::MessagingConversation {
-            integration_id: "feishu-main".to_string(),
-            conversation_id: "oc_123".to_string(),
-        };
+        let mut channel_action = RuleActionConfig::notify("notify");
+        if let RuleActionConfig::Notify { ref mut target, .. } = channel_action {
+            *target = RuleActionTarget::NotificationChannels {
+                channel_ids: vec!["desktop".to_string()],
+            };
+        }
+        let mut messaging_action = RuleActionConfig::notify("message");
+        if let RuleActionConfig::Notify { ref mut target, .. } = messaging_action {
+            *target = RuleActionTarget::MessagingConversation {
+                integration_id: "feishu-main".to_string(),
+                conversation_id: "oc_123".to_string(),
+            };
+        }
         notify_rule.actions = vec![channel_action, messaging_action];
 
-        let plans = plan_event(&[notify_rule], &event(), Some(&candidate()));
+        let plans = plan_event(&[notify_rule], &[project], &event(), Some(&candidate()));
 
         assert_eq!(plans[0].actions.len(), 2);
         match &plans[0].actions[0].dispatch {
@@ -530,5 +705,39 @@ mod tests {
                 panic!("expected messaging dispatch")
             }
         }
+    }
+
+    #[test]
+    fn render_command_appends_extra_args_only_when_non_empty() {
+        assert_eq!(
+            SkillInvocation::render_command(
+                DEFAULT_COMMAND_TEMPLATE,
+                DEFAULT_SKILL_NAME,
+                7,
+                "owner/repo",
+                ""
+            ),
+            "/pr-review 7"
+        );
+        assert_eq!(
+            SkillInvocation::render_command(
+                DEFAULT_COMMAND_TEMPLATE,
+                DEFAULT_SKILL_NAME,
+                7,
+                "owner/repo",
+                "--check"
+            ),
+            "/pr-review 7 --check"
+        );
+        assert_eq!(
+            SkillInvocation::render_command(
+                "/{skill} {pr} in {repo}",
+                DEFAULT_SKILL_NAME,
+                9,
+                "a/b",
+                "  "
+            ),
+            "/pr-review 9 in a/b"
+        );
     }
 }

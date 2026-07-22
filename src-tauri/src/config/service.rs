@@ -233,8 +233,8 @@ const WEBHOOK_KEYS: &[&str] = &[
 /// before shape normalization can discard it; [`normalize_multiproject`] then lifts the
 /// legacy-flat project; finally [`migrate_remote_access`] (#1553) lifts legacy remote fields.
 fn migrate_value(raw: Value) -> Value {
-    seed_rule_configs(migrate_remote_access(normalize_multiproject(
-        migrate_cli_tools(raw),
+    migrate_inline_skills(seed_rule_configs(migrate_remote_access(
+        normalize_multiproject(migrate_cli_tools(raw)),
     )))
 }
 
@@ -525,6 +525,11 @@ fn seed_rule_configs(value: Value) -> Value {
                 .get("repo")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            let skill_path = project
+                .get("skillRelPath")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .unwrap_or(crate::model::DEFAULT_SKILL_PATH);
             if let Some(label) = project.get("reviewLabel").and_then(Value::as_str) {
                 if !label.trim().is_empty() {
                     rules.push(json!({
@@ -539,7 +544,7 @@ fn seed_rule_configs(value: Value) -> Value {
                         "labelsAll": [],
                         "titleContains": "",
                         "bodyContains": "",
-                        "actions": [rule_action_json("review")]
+                        "actions": [run_skill_action_json("review", skill_path, "")]
                     }));
                 }
             }
@@ -557,7 +562,7 @@ fn seed_rule_configs(value: Value) -> Value {
                         "labelsAll": [],
                         "titleContains": "",
                         "bodyContains": "",
-                        "actions": [rule_action_json("check")]
+                        "actions": [run_skill_action_json("check", skill_path, "--check")]
                     }));
                 }
             }
@@ -576,19 +581,52 @@ fn seed_rule_configs(value: Value) -> Value {
     Value::Object(obj)
 }
 
-fn rule_action_json(kind: &str) -> Value {
+fn run_skill_action_json(id: &str, skill_path: &str, extra_args: &str) -> Value {
     json!({
-        "id": kind,
-        "kind": kind,
+        "id": id,
+        "kind": "runSkill",
         "enabled": true,
-        "target": { "kind": "none" },
         "dedupePolicy": "event",
         "delaySecs": 0,
-        "level": "action"
+        "level": "action",
+        "skillName": crate::model::DEFAULT_SKILL_NAME,
+        "skillPath": skill_path,
+        "commandTemplate": crate::model::DEFAULT_COMMAND_TEMPLATE,
+        "extraArgs": extra_args,
+    })
+}
+
+fn notify_action_json(id: &str, target: Value) -> Value {
+    json!({
+        "id": id,
+        "kind": "notify",
+        "enabled": true,
+        "target": target,
+        "dedupePolicy": "event",
+        "delaySecs": 0,
+        "level": "action",
     })
 }
 
 fn migrate_rule_actions(obj: &mut Map<String, Value>) {
+    // Collect per-project skill paths BEFORE rewriting actions so string forms
+    // (`"review"` / `"check"`) inherit the project's `skillRelPath` when present.
+    let mut project_skill_paths: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    if let Some(projects) = obj.get("projects").and_then(Value::as_array) {
+        for project in projects {
+            let Some(id) = project.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            let skill_path = project
+                .get("skillRelPath")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .unwrap_or(crate::model::DEFAULT_SKILL_PATH);
+            project_skill_paths.insert(id.to_string(), skill_path.to_string());
+        }
+    }
+
     let Some(rules) = obj.get_mut("rules").and_then(Value::as_array_mut) else {
         return;
     };
@@ -596,16 +634,221 @@ fn migrate_rule_actions(obj: &mut Map<String, Value>) {
         let Some(rule_obj) = rule.as_object_mut() else {
             continue;
         };
+        let project_id = rule_obj
+            .get("projectId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let skill_path = project_skill_paths
+            .get(project_id)
+            .map(String::as_str)
+            .unwrap_or(crate::model::DEFAULT_SKILL_PATH);
         let Some(actions) = rule_obj.get_mut("actions").and_then(Value::as_array_mut) else {
             continue;
         };
         for action in actions {
             if let Some(kind) = action.as_str() {
-                *action = rule_action_json(kind);
-            } else if let Some(action) = action.as_object_mut() {
-                action.remove("dependsOn");
+                *action = legacy_kind_to_action(kind, skill_path, None);
+            } else if let Some(action_obj) = action.as_object_mut() {
+                action_obj.remove("dependsOn");
             }
         }
+    }
+}
+
+fn legacy_kind_to_action(
+    kind: &str,
+    skill_path: &str,
+    existing: Option<&Map<String, Value>>,
+) -> Value {
+    let id = existing
+        .and_then(|m| m.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or(kind);
+    let enabled = existing
+        .and_then(|m| m.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let dedupe_policy = existing
+        .and_then(|m| m.get("dedupePolicy"))
+        .cloned()
+        .unwrap_or_else(|| json!("event"));
+    let delay_secs = existing
+        .and_then(|m| m.get("delaySecs"))
+        .cloned()
+        .unwrap_or_else(|| json!(0));
+    let level = existing
+        .and_then(|m| m.get("level"))
+        .and_then(Value::as_str)
+        .unwrap_or("action");
+    match kind {
+        "review" => {
+            let mut action = run_skill_action_json(id, skill_path, "");
+            if let Some(obj) = action.as_object_mut() {
+                obj.insert("enabled".into(), json!(enabled));
+                obj.insert("dedupePolicy".into(), dedupe_policy);
+                obj.insert("delaySecs".into(), delay_secs);
+                obj.insert("level".into(), json!(level));
+            }
+            action
+        }
+        "check" => {
+            let mut action = run_skill_action_json(id, skill_path, "--check");
+            if let Some(obj) = action.as_object_mut() {
+                obj.insert("enabled".into(), json!(enabled));
+                obj.insert("dedupePolicy".into(), dedupe_policy);
+                obj.insert("delaySecs".into(), delay_secs);
+                obj.insert("level".into(), json!(level));
+            }
+            action
+        }
+        "notify" => {
+            let target = existing
+                .and_then(|m| m.get("target"))
+                .cloned()
+                .unwrap_or_else(|| json!({ "kind": "none" }));
+            let mut action = notify_action_json(id, target);
+            if let Some(obj) = action.as_object_mut() {
+                obj.insert("enabled".into(), json!(enabled));
+                obj.insert("dedupePolicy".into(), dedupe_policy);
+                obj.insert("delaySecs".into(), delay_secs);
+                obj.insert("level".into(), json!(level));
+            }
+            action
+        }
+        other => {
+            // Unknown string kind — leave a notify-shaped placeholder so serde can fail loudly
+            // on the typed path rather than inventing skill fields.
+            notify_action_json(other, json!({ "kind": "none" }))
+        }
+    }
+}
+
+/// Inline skills into rule actions: drop `skillRelPath` from projects and rewrite legacy
+/// `review` / `check` / `notify` action shapes into the tagged `runSkill` / `notify` forms.
+fn migrate_inline_skills(value: Value) -> Value {
+    let Value::Object(mut obj) = value else {
+        return value;
+    };
+
+    let mut project_skill_paths: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    if let Some(projects) = obj.get_mut("projects").and_then(Value::as_array_mut) {
+        for project in projects {
+            let Some(project) = project.as_object_mut() else {
+                continue;
+            };
+            let skill_path = project
+                .remove("skillRelPath")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .filter(|path| !path.trim().is_empty())
+                .unwrap_or_else(|| crate::model::DEFAULT_SKILL_PATH.to_string());
+            if let Some(id) = project.get("id").and_then(Value::as_str) {
+                project_skill_paths.insert(id.to_string(), skill_path);
+            }
+        }
+    }
+
+    if let Some(rules) = obj.get_mut("rules").and_then(Value::as_array_mut) {
+        for rule in rules {
+            let Some(rule_obj) = rule.as_object_mut() else {
+                continue;
+            };
+            let project_id = rule_obj
+                .get("projectId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let skill_path = project_skill_paths
+                .get(project_id)
+                .map(String::as_str)
+                .unwrap_or(crate::model::DEFAULT_SKILL_PATH);
+            let Some(actions) = rule_obj.get_mut("actions").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            for action in actions {
+                *action = migrate_one_rule_action(action.take(), skill_path);
+            }
+        }
+    }
+
+    // allow/deny lists may still mention review/check.
+    if let Some(rules) = obj.get_mut("rules").and_then(Value::as_array_mut) {
+        for rule in rules {
+            let Some(rule_obj) = rule.as_object_mut() else {
+                continue;
+            };
+            for key in ["allowActionKinds", "denyActionKinds"] {
+                if let Some(list) = rule_obj.get_mut(key).and_then(Value::as_array_mut) {
+                    let is_deny = key == "denyActionKinds";
+                    let mut rewritten = Vec::new();
+                    for item in list.iter() {
+                        let Some(kind) = item.as_str() else {
+                            rewritten.push(item.clone());
+                            continue;
+                        };
+                        // deny:check cannot be expressed at runSkill grain — drop, do not promote
+                        // to deny:runSkill (that would also block review).
+                        if is_deny && kind == "check" {
+                            continue;
+                        }
+                        rewritten.push(json!(match kind {
+                            "review" | "check" => "runSkill",
+                            other => other,
+                        }));
+                    }
+                    // Dedupe after review(+check on allow) map to runSkill.
+                    let mut seen = std::collections::HashSet::new();
+                    rewritten.retain(|item| {
+                        item.as_str()
+                            .map(|kind| seen.insert(kind.to_string()))
+                            .unwrap_or(true)
+                    });
+                    *list = rewritten;
+                }
+            }
+        }
+    }
+
+    Value::Object(obj)
+}
+
+fn migrate_one_rule_action(action: Value, skill_path: &str) -> Value {
+    match action {
+        Value::String(kind) => legacy_kind_to_action(&kind, skill_path, None),
+        Value::Object(mut obj) => {
+            obj.remove("dependsOn");
+            let kind = obj
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            match kind.as_str() {
+                "review" | "check" | "notify" => {
+                    legacy_kind_to_action(&kind, skill_path, Some(&obj))
+                }
+                "runSkill" => {
+                    // Already tagged; ensure required skill fields exist.
+                    if !obj.contains_key("skillName") {
+                        obj.insert("skillName".into(), json!(crate::model::DEFAULT_SKILL_NAME));
+                    }
+                    if !obj.contains_key("skillPath") {
+                        obj.insert("skillPath".into(), json!(skill_path));
+                    }
+                    if !obj.contains_key("commandTemplate") {
+                        obj.insert(
+                            "commandTemplate".into(),
+                            json!(crate::model::DEFAULT_COMMAND_TEMPLATE),
+                        );
+                    }
+                    if !obj.contains_key("extraArgs") {
+                        obj.insert("extraArgs".into(), json!(""));
+                    }
+                    obj.remove("target");
+                    Value::Object(obj)
+                }
+                _ => Value::Object(obj),
+            }
+        }
+        other => other,
     }
 }
 
@@ -1144,7 +1387,7 @@ mod tests {
         assert_eq!(project["authors"], json!(["octocat"]));
         assert!(project.get("reviewLabel").is_none());
         assert!(project.get("checkLabel").is_none());
-        assert_eq!(project["skillRelPath"], ".codex/skills/pr-review/SKILL.md");
+        assert!(project.get("skillRelPath").is_none());
         assert_eq!(project["prCooldownSeconds"], 900);
         assert_eq!(project["sourceKind"], "github");
         assert_eq!(project["engineKind"], "codex");
@@ -1157,12 +1400,15 @@ mod tests {
         assert_eq!(rules[0]["projectId"], MIGRATED_PROJECT_ID);
         assert_eq!(rules[0]["repo"], "octocat/hello");
         assert_eq!(rules[0]["labelsAny"], json!(["needs-review"]));
-        assert_eq!(rules[0]["actions"][0]["kind"], "review");
+        assert_eq!(rules[0]["actions"][0]["kind"], "runSkill");
         assert_eq!(rules[0]["actions"][0]["id"], "review");
+        assert_eq!(rules[0]["actions"][0]["skillName"], "pr-review");
+        assert_eq!(rules[0]["actions"][0]["extraArgs"], "");
         assert_eq!(rules[1]["id"], "default-check");
         assert_eq!(rules[1]["labelsAny"], json!(["needs-check"]));
-        assert_eq!(rules[1]["actions"][0]["kind"], "check");
+        assert_eq!(rules[1]["actions"][0]["kind"], "runSkill");
         assert_eq!(rules[1]["actions"][0]["id"], "check");
+        assert_eq!(rules[1]["actions"][0]["extraArgs"], "--check");
 
         // The migrated shape must deserialize into a real `AppConfig` (lenient path
         // `load` uses) with the lifted values intact.
@@ -1205,14 +1451,87 @@ mod tests {
         let migrated = migrate_value(raw);
 
         assert_eq!(migrated["rules"][0]["actions"][0]["id"], "review");
-        assert_eq!(migrated["rules"][0]["actions"][0]["kind"], "review");
-        assert_eq!(
-            migrated["rules"][0]["actions"][0]["target"],
-            json!({ "kind": "none" })
-        );
+        assert_eq!(migrated["rules"][0]["actions"][0]["kind"], "runSkill");
+        assert_eq!(migrated["rules"][0]["actions"][0]["skillName"], "pr-review");
+        assert_eq!(migrated["rules"][0]["actions"][0]["extraArgs"], "");
         assert_eq!(migrated["rules"][0]["actions"][0]["dedupePolicy"], "event");
         assert_eq!(migrated["rules"][0]["actions"][1]["id"], "notify");
         serde_json::from_value::<AppConfig>(migrated).expect("migrated config deserializes");
+    }
+
+    #[test]
+    fn migrate_inline_skills_rewrites_review_check_and_drops_skill_rel_path() {
+        let raw = json!({
+            "activeProjectId": "p1",
+            "projects": [{
+                "id": "p1",
+                "name": "Project",
+                "repo": "octocat/hello",
+                "skillRelPath": "custom/SKILL.md"
+            }],
+            "rules": [{
+                "id": "r1",
+                "name": "Legacy kinds",
+                "enabled": true,
+                "projectId": "p1",
+                "actions": [
+                    { "id": "a1", "kind": "review", "enabled": true, "dedupePolicy": "event", "delaySecs": 0, "level": "action", "target": { "kind": "none" } },
+                    { "id": "a2", "kind": "check", "enabled": true, "dedupePolicy": "event", "delaySecs": 0, "level": "action", "target": { "kind": "none" } },
+                    "notify"
+                ],
+                "allowActionKinds": ["review", "check"],
+                "denyActionKinds": ["check"]
+            }]
+        });
+        let migrated = migrate_value(raw);
+        assert!(migrated["projects"][0].get("skillRelPath").is_none());
+        let actions = migrated["rules"][0]["actions"].as_array().unwrap();
+        assert_eq!(actions[0]["kind"], "runSkill");
+        assert_eq!(actions[0]["skillName"], "pr-review");
+        assert_eq!(actions[0]["skillPath"], "custom/SKILL.md");
+        assert_eq!(actions[0]["extraArgs"], "");
+        assert_eq!(actions[1]["kind"], "runSkill");
+        assert_eq!(actions[1]["extraArgs"], "--check");
+        assert_eq!(actions[1]["skillPath"], "custom/SKILL.md");
+        assert_eq!(actions[2]["kind"], "notify");
+        assert_eq!(
+            migrated["rules"][0]["allowActionKinds"],
+            json!(["runSkill"])
+        );
+        // deny:check is dropped (cannot express check-only deny at runSkill grain).
+        assert_eq!(migrated["rules"][0]["denyActionKinds"], json!([]));
+        serde_json::from_value::<AppConfig>(migrated).expect("deserializes");
+    }
+
+    #[test]
+    fn migrate_string_actions_use_project_skill_rel_path() {
+        let raw = json!({
+            "activeProjectId": "p1",
+            "projects": [{
+                "id": "p1",
+                "name": "Project",
+                "repo": "octocat/hello",
+                "skillRelPath": "custom/SKILL.md"
+            }],
+            "rules": [{
+                "id": "r1",
+                "name": "String actions",
+                "enabled": true,
+                "projectId": "p1",
+                "actions": ["review", "check"]
+            }]
+        });
+        let migrated = migrate_value(raw);
+        assert!(migrated["projects"][0].get("skillRelPath").is_none());
+        let actions = migrated["rules"][0]["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0]["kind"], "runSkill");
+        assert_eq!(actions[0]["skillPath"], "custom/SKILL.md");
+        assert_eq!(actions[0]["extraArgs"], "");
+        assert_eq!(actions[1]["kind"], "runSkill");
+        assert_eq!(actions[1]["skillPath"], "custom/SKILL.md");
+        assert_eq!(actions[1]["extraArgs"], "--check");
+        serde_json::from_value::<AppConfig>(migrated).expect("deserializes");
     }
 
     #[test]

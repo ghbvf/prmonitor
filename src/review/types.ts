@@ -40,7 +40,7 @@ export interface ReviewSession {
   threadId: string;
   turnId: string;
   prNumber: number;
-  kind: string;
+  skillKey: string;
   // Engine that created this session. Follow-up chat routes by this durable value, not
   // by the project's current engine setting.
   engineKind: EngineKind;

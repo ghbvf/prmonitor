@@ -330,7 +330,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use crate::model::{ReviewKind, ReviewReceiptId, SendNotificationResponse};
+    use crate::model::{ReviewReceiptId, SendNotificationResponse};
 
     fn test_app() -> tauri::App<tauri::test::MockRuntime> {
         let app = tauri::test::mock_app();
@@ -344,7 +344,7 @@ mod tests {
             receipt_id: ReviewReceiptId::new(17).expect("receipt"),
             reference: "repo".to_string(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
         }
     }
 
@@ -612,7 +612,7 @@ mod tests {
             receipt_id: ReviewReceiptId::new(17).expect("receipt"),
             reference: "repo".to_string(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
         };
         assert_eq!(
             review_notify_dedupe_key(&req),
@@ -626,7 +626,7 @@ mod tests {
             receipt_id: ReviewReceiptId::new(17).expect("receipt"),
             reference: "repo".to_string(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
         };
         let instance = WorkflowInstance {
             id: 1,
@@ -677,7 +677,10 @@ mod tests {
         let input = serde_json::to_value(request()).expect("input");
         assert_eq!(input["reference"], "repo");
         assert_eq!(input["prNumber"], 7);
-        assert_eq!(input["kind"], "review");
+        assert_eq!(
+            input["skillKey"],
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
 
         let state = ReviewNotifyState {
             review_thread_id: Some("t1".to_string()),

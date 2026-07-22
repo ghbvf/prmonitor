@@ -25,7 +25,7 @@ use crate::{
         MessagingConnectionState, MessagingConnectionStatus, MessagingEvent, MessagingEventEntry,
         MessagingEventStatus, MessagingIntegrationOption, MessagingProviderCapability,
         MessagingProviderKind, MessagingReplyAudit, MessagingSendContent, NotificationKind,
-        NotificationLevel, OutboxProducerKey, PullRequestView, ReviewActionKey, ReviewKind,
+        NotificationLevel, OutboxProducerKey, PullRequestView, ReviewActionKey,
         ReviewLifecycleEvent, ReviewReceiptId, ReviewReceiptSnapshot, ReviewReceiptStatus,
         SendMessagingRequest, SendMessagingResponse, SendNotificationRequest,
         SendNotificationResponse, SourceKind, UpdateMode, WebhookTunnelMode,
@@ -155,9 +155,6 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push_str(&declaration::<EventType>(&cfg));
     shared.push_str(&option_array::<EventType>("EVENT_TYPES"));
     shared.push('\n');
-    shared.push_str(&declaration::<ReviewKind>(&cfg));
-    shared.push_str(&option_array::<ReviewKind>("REVIEW_KINDS"));
-    shared.push('\n');
     shared.push_str(&declaration::<PullRequestView>(&cfg));
     shared.push('\n');
     shared.push_str(&declaration::<ExternalTriggerOrigin>(&cfg));
@@ -275,6 +272,22 @@ fn generated_outputs() -> Vec<(&'static str, String)> {
     shared.push_str(&declaration::<SendMessagingResponse>(&cfg));
     shared.push('\n');
     shared.push_str(&declaration::<RuleMatchEntry>(&cfg));
+    shared.push('\n');
+    shared.push_str(&default_const(
+        "DEFAULT_SKILL_NAME",
+        "string",
+        &crate::model::DEFAULT_SKILL_NAME,
+    ));
+    shared.push_str(&default_const(
+        "DEFAULT_SKILL_PATH",
+        "string",
+        &crate::model::DEFAULT_SKILL_PATH,
+    ));
+    shared.push_str(&default_const(
+        "DEFAULT_COMMAND_TEMPLATE",
+        "string",
+        &crate::model::DEFAULT_COMMAND_TEMPLATE,
+    ));
 
     let mut config_types = String::from(HEADER);
     config_types.push_str(
@@ -451,7 +464,7 @@ fn pull_request_view_is_generated_from_the_rust_wire_type() {
         .find_map(|(path, contents)| (path == "src/types.generated.ts").then_some(contents))
         .expect("shared TypeScript output exists");
     assert!(shared.contains("export type PullRequestView = {"));
-    assert!(shared.contains("kind: ReviewKind,"));
+    assert!(shared.contains("skillKey: string,"));
     assert!(shared.contains("skipReason: string | null,"));
 }
 

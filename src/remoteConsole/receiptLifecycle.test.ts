@@ -14,7 +14,7 @@ function session(threadId: string, createdAtEpoch: number): ReviewSession {
     threadId,
     turnId: `${threadId}-turn`,
     prNumber: 42,
-    kind: "review",
+    skillKey: "pr-review\0",
     engineKind: "codex",
     status: "running",
     createdAtEpoch,
@@ -51,12 +51,12 @@ describe("receipt lifecycle", () => {
     ];
     const lifecycle = new RequestIdLifecycle(() => ids.shift()!);
 
-    const first = lifecycle.forOperation("p1", 42, "review");
-    const retry = lifecycle.forOperation("p1", 42, "review");
+    const first = lifecycle.forOperation("p1", 42, "");
+    const retry = lifecycle.forOperation("p1", 42, "");
     expect(retry).toBe(first);
 
     lifecycle.accepted();
-    expect(lifecycle.forOperation("p1", 42, "review")).not.toBe(first);
+    expect(lifecycle.forOperation("p1", 42, "")).not.toBe(first);
   });
 
   it("does not turn a terminal receipt into a receipt retry when session refresh fails", async () => {

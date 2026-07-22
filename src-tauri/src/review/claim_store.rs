@@ -10,7 +10,7 @@
 //! schema v6 in [`crate::db`]). The outbox row is the unit of at-least-once replay, so keying the
 //! claim on its id lets a replay distinguish *"this same action already started a review"*
 //! (resolve its outcome, don't duplicate) from *"a new review need"* (a new commit ⇒ a new outbox
-//! row ⇒ a fresh claim). Keying on `(project, pr, kind)` instead would wrongly suppress a
+//! row ⇒ a fresh claim). Keying on `(project, pr, skill_key)` instead would wrongly suppress a
 //! legitimate re-review of a new commit — the trap this design avoids.
 //!
 //! [`try_reserve_pair`] is deliberately left untouched (it stays the pure in-memory test-and-set
@@ -22,7 +22,6 @@
 
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
-use crate::model::ReviewKind;
 use crate::review::session::SessionInfo;
 
 /// Write-ahead claim for an outbox row that is about to start a review (AB#1204): insert a row
@@ -43,8 +42,9 @@ pub fn begin_claim(
     outbox_id: i64,
     project_id: &str,
     pr_number: u64,
-    kind: ReviewKind,
+    skill_key: impl AsRef<str>,
 ) -> AppResult<Option<String>> {
+    let skill_key = skill_key.as_ref();
     let now = super::history_store::now_epoch() as i64;
     // **Hard-ized atomicity (AB#1204):** the INSERT and the read-back SELECT are wrapped in ONE
     // [`Database::with_tx`] transaction, so "claim this `outbox_id` once AND read back its
@@ -59,10 +59,10 @@ pub fn begin_claim(
     db.with_tx(|tx| {
         tx.execute(
             "INSERT INTO outbox_review_claim \
-             (outbox_id, project_id, pr_number, kind, created_at) \
+             (outbox_id, project_id, pr_number, skill_key, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT(outbox_id) DO NOTHING",
-            rusqlite::params![outbox_id, project_id, pr_number as i64, kind.as_str(), now],
+            rusqlite::params![outbox_id, project_id, pr_number as i64, skill_key, now],
         )
         .map_err(crate::db::map_err)?;
         // The row always exists now (just inserted, or pre-existing). A NULL `thread_id` (fresh
@@ -136,7 +136,7 @@ mod tests {
             thread_id: thread_id.to_string(),
             turn_id: String::new(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: crate::model::EngineKind::Codex,
             status: crate::review::session::SessionStatus::Starting,
             created_at_epoch: 1,
@@ -184,7 +184,7 @@ mod tests {
                 conn.execute(
                     "INSERT INTO action_outbox \
                      (id, project_id, kind, summary, payload, status, next_attempt_at, created_at, updated_at, producer_key) \
-                     VALUES (?1, 'p1', 'review', 's', '{}', 'pending', 0, 0, 0, ?2)",
+                     VALUES (?1, 'p1', 'runSkill', 's', '{}', 'pending', 0, 0, 0, ?2)",
                     rusqlite::params![id, format!("claim-test:{id}")],
                 )?;
             }
@@ -203,7 +203,14 @@ mod tests {
 
         // Fresh claim: row inserted, thread_id NULL → None (caller starts the review).
         assert_eq!(
-            begin_claim(&db, 42, "p1", 7, ReviewKind::Review).expect("begin"),
+            begin_claim(
+                &db,
+                42,
+                "p1",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            )
+            .expect("begin"),
             None,
             "a fresh claim has no thread yet"
         );
@@ -212,26 +219,47 @@ mod tests {
 
         // Replay: the SAME outbox_id is a PK conflict (no dup row) and surfaces the attached thread.
         assert_eq!(
-            begin_claim(&db, 42, "p1", 7, ReviewKind::Review).expect("re-begin"),
+            begin_claim(
+                &db,
+                42,
+                "p1",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            )
+            .expect("re-begin"),
             Some("thread-abc".to_string()),
             "a replayed claim returns its attached thread_id"
         );
         assert_eq!(peek(&db, 42), Some(Some("thread-abc".to_string())));
     }
 
-    /// A different outbox row claims independently (the key is the row id, not `(project,pr,kind)`)
+    /// A different outbox row claims independently (the key is the row id, not `(project,pr,skill_key)`)
     /// — this is what lets a new commit's review (a new outbox row) run even though a prior row for
-    /// the same `(project,pr,kind)` was claimed.
+    /// the same `(project,pr,skill_key)` was claimed.
     #[test]
     fn claims_are_per_outbox_row() {
         let db = db_with_outbox_rows(&[1, 2]);
         assert_eq!(
-            begin_claim(&db, 1, "p1", 7, ReviewKind::Review).expect("c1"),
+            begin_claim(
+                &db,
+                1,
+                "p1",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            )
+            .expect("c1"),
             None
         );
-        // Same (project,pr,kind) but a DIFFERENT outbox row → a fresh, independent claim.
+        // Same (project,pr,skill_key) but a DIFFERENT outbox row → a fresh, independent claim.
         assert_eq!(
-            begin_claim(&db, 2, "p1", 7, ReviewKind::Review).expect("c2"),
+            begin_claim(
+                &db,
+                2,
+                "p1",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            )
+            .expect("c2"),
             None
         );
     }
@@ -240,7 +268,14 @@ mod tests {
     #[test]
     fn release_claim_deletes_and_is_idempotent() {
         let db = db_with_outbox_rows(&[9]);
-        begin_claim(&db, 9, "p1", 3, ReviewKind::Check).expect("begin");
+        begin_claim(
+            &db,
+            9,
+            "p1",
+            3,
+            crate::model::SkillInvocation::skill_key("pr-review", "--check"),
+        )
+        .expect("begin");
         assert!(peek(&db, 9).is_some(), "claimed");
 
         release_claim(&db, 9).expect("release");
@@ -262,7 +297,14 @@ mod tests {
 
         // First attempt: fresh claim → None (caller would start the review).
         assert_eq!(
-            begin_claim(&db, 7, "p1", 3, ReviewKind::Review).expect("begin"),
+            begin_claim(
+                &db,
+                7,
+                "p1",
+                3,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            )
+            .expect("begin"),
             None
         );
         // Simulate `engine.start` FAILING: `attach_thread` is NOT called, so the breadcrumb stays
@@ -272,7 +314,14 @@ mod tests {
 
         // Replay of the SAME outbox row: still None (NULL thread ⇒ no review ran yet) → restartable.
         assert_eq!(
-            begin_claim(&db, 7, "p1", 3, ReviewKind::Review).expect("re-begin"),
+            begin_claim(
+                &db,
+                7,
+                "p1",
+                3,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            )
+            .expect("re-begin"),
             None,
             "a claim that never attached a thread (engine failed) is restartable on replay"
         );
@@ -294,7 +343,14 @@ mod tests {
     #[test]
     fn attach_thread_is_idempotent_on_repeat() {
         let db = db_with_outbox_rows(&[11]);
-        begin_claim(&db, 11, "p1", 5, ReviewKind::Check).expect("begin");
+        begin_claim(
+            &db,
+            11,
+            "p1",
+            5,
+            crate::model::SkillInvocation::skill_key("pr-review", "--check"),
+        )
+        .expect("begin");
 
         attach_thread(&db, 11, "t-1").expect("attach");
         attach_thread(&db, 11, "t-1").expect("attach-again");
@@ -330,7 +386,14 @@ mod tests {
     #[test]
     fn starting_session_and_claim_breadcrumb_commit_together() {
         let db = db_with_outbox_rows(&[41]);
-        begin_claim(&db, 41, "p1", 7, ReviewKind::Review).expect("begin");
+        begin_claim(
+            &db,
+            41,
+            "p1",
+            7,
+            crate::model::SkillInvocation::skill_key("pr-review", ""),
+        )
+        .expect("begin");
         let info = starting_session("thread-atomic");
 
         attach_started_session(&db, 41, &info).expect("atomic linkage");
@@ -361,7 +424,14 @@ mod tests {
         // Claim-layer equivalent of the engine sequence: begin_claim (fresh → None), then attach
         // the stable thread before the turn runs.
         assert_eq!(
-            begin_claim(&db, 31, "p1", 7, ReviewKind::Review).expect("begin"),
+            begin_claim(
+                &db,
+                31,
+                "p1",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            )
+            .expect("begin"),
             None,
             "fresh claim has no thread yet (engine is about to start the turn)"
         );
@@ -376,7 +446,14 @@ mod tests {
         // A crash-replay re-enters `begin_claim` for the SAME outbox row and now SEES the thread,
         // so the caller resolves the prior review instead of starting a duplicate.
         assert_eq!(
-            begin_claim(&db, 31, "p1", 7, ReviewKind::Review).expect("re-begin"),
+            begin_claim(
+                &db,
+                31,
+                "p1",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            )
+            .expect("re-begin"),
             Some("thread-pre-turn".to_string()),
             "replay resolves the prior review via the pre-turn breadcrumb (no duplicate)"
         );
@@ -395,7 +472,14 @@ mod tests {
     fn dead_terminal_retains_claim_breadcrumb_for_manual_retry() {
         let db = db_with_outbox_rows(&[51]);
         // Review started: claim attached a thread (the engine's pre-turn breadcrumb, F1).
-        begin_claim(&db, 51, "p1", 7, ReviewKind::Review).expect("begin");
+        begin_claim(
+            &db,
+            51,
+            "p1",
+            7,
+            crate::model::SkillInvocation::skill_key("pr-review", ""),
+        )
+        .expect("begin");
         attach_thread(&db, 51, "thread-dead").expect("attach");
 
         // The row dead-letters. Per F2 the service does NOT release the claim on `Dead`, so it
@@ -410,7 +494,14 @@ mod tests {
         // `begin_claim` now returns the retained thread so the caller resolves-and-suppresses
         // instead of duplicating the review.
         assert_eq!(
-            begin_claim(&db, 51, "p1", 7, ReviewKind::Review).expect("re-begin after manual retry"),
+            begin_claim(
+                &db,
+                51,
+                "p1",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            )
+            .expect("re-begin after manual retry"),
             Some("thread-dead".to_string()),
             "manual retry of a dead row resolves the prior review via the retained breadcrumb"
         );
@@ -426,7 +517,14 @@ mod tests {
     fn release_claim_cleans_up_null_thread_claim() {
         let db = db_with_outbox_rows(&[21]);
         // A Deduped path leaves the claim with thread_id NULL (no `attach_thread`).
-        begin_claim(&db, 21, "p1", 9, ReviewKind::Review).expect("begin");
+        begin_claim(
+            &db,
+            21,
+            "p1",
+            9,
+            crate::model::SkillInvocation::skill_key("pr-review", ""),
+        )
+        .expect("begin");
         assert_eq!(peek(&db, 21), Some(None), "Deduped claim has NULL thread");
 
         release_claim(&db, 21).expect("release");

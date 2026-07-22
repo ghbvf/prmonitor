@@ -10,6 +10,7 @@ import { getPrSessions } from "./api";
 import { formatStartedAt } from "./sessionTime";
 import { useReviewStore } from "./useReviewStore";
 import type { ReviewSession, SessionStatus } from "./types";
+import { skillKeyLabel } from "../types";
 
 const props = defineProps<{ projectId: string; prNumber: number | null }>();
 const { sessions, activeThreadId, focus } = useReviewStore();
@@ -136,7 +137,7 @@ function statusLabel(status: SessionStatus): string {
         @click="focus(s.projectId, s.threadId, s.prNumber, s.status)"
       >
         <span class="pr">PR #{{ s.prNumber }}</span>
-        <span class="badge kind">{{ s.kind }}</span>
+        <span class="badge kind">{{ skillKeyLabel(s.skillKey) }}</span>
         <span class="badge status" :class="`status-${s.status}`">
           {{ statusLabel(s.status) }}
         </span>

@@ -96,7 +96,7 @@ function session(over: Partial<ReviewSession> = {}): ReviewSession {
     threadId: "th_1",
     turnId: "tn_1",
     prNumber: 7,
-    kind: "review",
+    skillKey: "pr-review\0",
     engineKind: "codex",
     status: "running",
     createdAtEpoch: 0,
@@ -421,9 +421,9 @@ describe("useReviewStore start()/stop()", () => {
     const store = useReviewStore();
     store.items.value = [{ itemId: "stale", kind: "message", text: "old" }];
 
-    await store.start("p1", 7, "review");
+    await store.start("p1", 7, "");
 
-    expect(api.startReview).toHaveBeenCalledWith("p1", 7, "review");
+    expect(api.startReview).toHaveBeenCalledWith("p1", 7, "");
     expect(store.activeThreadId.value).toBe("th_1");
     expect(store.activePr.value).toBe(7);
     expect(store.running.value).toBe(true);
@@ -434,7 +434,7 @@ describe("useReviewStore start()/stop()", () => {
     vi.mocked(api.startReview).mockRejectedValueOnce({ message: "nope" });
     const store = useReviewStore();
 
-    await store.start("p1", 7, "review");
+    await store.start("p1", 7, "");
 
     expect(store.running.value).toBe(false);
     expect(store.error.value).toBe("nope");
@@ -449,7 +449,7 @@ describe("useReviewStore start()/stop()", () => {
       } as never,
     ];
     const store = useReviewStore();
-    await store.start("p1", 7, "review");
+    await store.start("p1", 7, "");
     expect(api.getCursorStatus).toHaveBeenCalled();
   });
 
@@ -463,7 +463,7 @@ describe("useReviewStore start()/stop()", () => {
     ];
     vi.mocked(api.startReview).mockRejectedValueOnce({ message: "nope" });
     const store = useReviewStore();
-    await store.start("p1", 7, "review");
+    await store.start("p1", 7, "");
     expect(store.error.value).toBe("nope");
     expect(api.getCursorStatus).toHaveBeenCalled();
   });
@@ -477,7 +477,7 @@ describe("useReviewStore start()/stop()", () => {
       } as never,
     ];
     const store = useReviewStore();
-    await store.start("p1", 7, "review");
+    await store.start("p1", 7, "");
     expect(api.getCursorStatus).not.toHaveBeenCalled();
   });
 
@@ -547,7 +547,7 @@ describe("useReviewStore init()", () => {
         threadId: "th_live",
         turnId: "tn",
         prNumber: 42,
-        kind: "review",
+        skillKey: "pr-review\0",
         engineKind: "codex",
         status: "running",
         createdAtEpoch: 0,
@@ -574,7 +574,7 @@ describe("useReviewStore init()", () => {
         threadId: "th_done",
         turnId: "tn",
         prNumber: 1,
-        kind: "review",
+        skillKey: "pr-review\0",
         engineKind: "codex",
         status: "done",
         createdAtEpoch: 0,
@@ -602,7 +602,7 @@ describe("useReviewStore start() in-flight buffering", () => {
       }),
     );
     const store = useReviewStore();
-    const startPromise = store.start("p1", 7, "review");
+    const startPromise = store.start("p1", 7, "");
 
     // Events arriving before the id resolves: one foreign, one for our session.
     store.applyEvent({

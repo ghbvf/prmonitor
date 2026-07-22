@@ -16,7 +16,7 @@ use super::process::{self, ParsedEvent, ParserState};
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, StreamEvent};
-use crate::model::{ClaudeEffort, EngineKind, ReviewKind};
+use crate::model::{ClaudeEffort, EngineKind};
 use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, StartReviewOutcome};
 use crate::review::history_store::{self, HistoryItemKind};
 use crate::review::session::{
@@ -58,7 +58,7 @@ pub struct ClaudeEngine<'a, R: tauri::Runtime> {
     /// method arg and ignore this field (set to 0 at those construction sites).
     pub pr_number: u64,
     /// Full persisted session identity for the FOLLOW-UP path. It pins the creating engine,
-    /// original kind, timestamp, and URL metadata across app restarts/config edits.
+    /// original skill_key, timestamp, and URL metadata across app restarts/config edits.
     pub session_info: Option<SessionInfo>,
     /// The owning outbox row id for the AB#1204 cross-restart dedup claim — `Some(outbox_id)` ONLY
     /// on the OUTBOX executor's start path ([`crate::review::commands::start_for_outbox`]), `None`
@@ -71,12 +71,20 @@ pub struct ClaudeEngine<'a, R: tauri::Runtime> {
 }
 
 impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
+    fn requires_skill_path(&self) -> bool {
+        false
+    }
+
     async fn start(
         &self,
         _capability: &ReviewStartCapability,
         pr_number: u64,
-        kind: ReviewKind,
+        invocation: &crate::model::SkillInvocation,
     ) -> AppResult<StartReviewOutcome> {
+        debug_assert!(
+            !self.requires_skill_path() && invocation.skill_path.is_none(),
+            "Claude is command-only"
+        );
         start_review(
             self.app,
             self.claude,
@@ -87,7 +95,7 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
             self.claude_model,
             self.claude_effort,
             pr_number,
-            kind,
+            invocation,
             // `&self` start can't move the field; clone the owned context for this turn.
             self.url_ctx.clone(),
             // AB#1204: outbox path passes `Some(outbox_id)` so the claim breadcrumb is written
@@ -128,7 +136,7 @@ impl<R: tauri::Runtime> ReviewEngine for ClaudeEngine<'_, R> {
 
 /// Start a one-shot `claude -p` review for `pr_number`, streaming its `stream-json`
 /// output as [`ReviewEvent`]s. Returns [`StartReviewOutcome::Started`] with the claude
-/// `session_id`, or [`StartReviewOutcome::Deduped`] when the `(project_id, pr, kind)` is
+/// `session_id`, or [`StartReviewOutcome::Deduped`] when the `(project_id, pr, &invocation.skill_key)` is
 /// already covered by an in-flight (or reserved) review.
 ///
 /// Flow (mirrors codex's two-phase start, adapted to a subprocess): reserve → spawn →
@@ -148,7 +156,7 @@ async fn start_review<R: tauri::Runtime>(
     claude_model: &str,
     claude_effort: ClaudeEffort,
     pr_number: u64,
-    kind: ReviewKind,
+    invocation: &crate::model::SkillInvocation,
     // IMMUTABLE comment-URL source context (AB#1042); handed to the `Starting` session in
     // `promote_reservation` so the terminal `finalize_turn` resolves the URL against the
     // project this review ran against (mirrors the codex path).
@@ -158,10 +166,10 @@ async fn start_review<R: tauri::Runtime>(
     // after the `system/init` line yields the session id (below) — before the turn posts a comment.
     outbox_claim_id: Option<i64>,
 ) -> AppResult<StartReviewOutcome> {
-    // Atomic test-and-set BEFORE spawning: if this `(project_id, pr, kind)` is already
+    // Atomic test-and-set BEFORE spawning: if this `(project_id, pr, &invocation.skill_key)` is already
     // reserved or covered by an in-flight session, do NOT start a second review (the
     // SAME idempotency boundary the codex path uses — reused, not re-implemented).
-    if !registry.try_reserve_pair(project_id, pr_number, kind) {
+    if !registry.try_reserve_pair(project_id, pr_number, &invocation.skill_key) {
         return Ok(StartReviewOutcome::Deduped);
     }
     // From here any early return releases the reservation via the guard's Drop;
@@ -170,13 +178,13 @@ async fn start_review<R: tauri::Runtime>(
         registry,
         project_id: project_id.to_string(),
         pr_number,
-        kind,
+        skill_key: invocation.skill_key.clone(),
         armed: true,
     };
 
     // Spawn the one-shot child. `?` releases the reservation (guard Drop) on failure.
     // `None` resume → a FRESH review (no `--resume`); the follow-up path is `resume_review`.
-    let prompt = process::review_prompt(pr_number, kind);
+    let prompt = invocation.command.clone();
     let proc = process::spawn_claude(
         claude_cli,
         repo_root,
@@ -220,7 +228,7 @@ async fn start_review<R: tauri::Runtime>(
         thread_id: session_id.clone(),
         turn_id: session_id.clone(),
         pr_number,
-        kind,
+        skill_key: invocation.skill_key.clone(),
         engine_kind: EngineKind::Claude,
         status: SessionStatus::Starting,
         created_at_epoch,
@@ -475,8 +483,8 @@ async fn resume_review<R: tauri::Runtime>(
 
 /// Best-effort durable mirror of a session STATUS transition on the follow-up path, where
 /// only the thread id (not a full live `SessionInfo`) is at hand. Reads the current
-/// in-memory row (via `registry`) to preserve its `pr_number`/`kind`/`created_at_epoch`,
-/// falling back to the resolved `pr_number` + empty kind if the row is absent. Logs +
+/// in-memory row (via `registry`) to preserve its `pr_number`/`skill_key`/`created_at_epoch`,
+/// falling back to the resolved `pr_number` + empty skill_key if the row is absent. Logs +
 /// swallows like the other claude `persist_*` helpers (the in-memory registry stays the
 /// dedup/status authority). `upsert_session` keys `created_at` on first insert (ON CONFLICT
 /// preserves it), so a re-stamped `created_at_epoch` in the fallback is harmless for an
@@ -498,7 +506,7 @@ fn persist_session_status<R: tauri::Runtime>(
             thread_id: thread_id.to_string(),
             turn_id: thread_id.to_string(),
             pr_number,
-            kind: durable_info.kind,
+            skill_key: durable_info.skill_key.clone(),
             engine_kind: durable_info.engine_kind,
             status,
             created_at_epoch: durable_info.created_at_epoch,
@@ -702,15 +710,15 @@ fn emit_and_persist<R: tauri::Runtime>(
             item_id: item_id.to_string(),
             text: text.clone(),
         },
-        // `User` is a stored-only kind (a follow-up message the user typed) — it is persisted
+        // `User` is a stored-only skill_key (a follow-up message the user typed) — it is persisted
         // directly by `session::persist_user_message`, NEVER streamed through this delta path.
         // The pump only ever calls this with the two delta kinds above; this arm is
         // unreachable by construction. `debug_assert!(false)` trips a future regression that
-        // starts streaming a `User` kind in dev/test, while staying a no-op `return` in release.
+        // starts streaming a `User` skill_key in dev/test, while staying a no-op `return` in release.
         HistoryItemKind::User => {
             debug_assert!(
                 false,
-                "User kind must not reach emit_and_persist (persisted directly by persist_user_message)"
+                "User skill_key must not reach emit_and_persist (persisted directly by persist_user_message)"
             );
             return;
         }

@@ -4,7 +4,11 @@
 //! boundary lives here. Serialized fields use camelCase for the frontend.
 
 use serde::{Deserialize, Serialize};
-use std::{fmt, ops::Deref};
+use std::{
+    fmt,
+    ops::Deref,
+    path::{Path, PathBuf},
+};
 
 macro_rules! validated_string_newtype {
     ($name:ident, $validator:expr) => {
@@ -231,46 +235,295 @@ impl ReviewLifecycleEvent {
 pub struct ReviewLifecycleDispatch {
     pub project_id: String,
     pub pr_number: u64,
-    pub kind: ReviewKind,
+    pub skill_key: String,
     pub thread_id: String,
     pub event: ReviewLifecycleEvent,
     pub comment_url: Option<String>,
 }
 
-/// The only two supported review execution modes.
-#[cfg_attr(test, derive(ts_rs::TS, strum::EnumIter))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+/// Default skill name for the built-in pr-review skill.
+pub const DEFAULT_SKILL_NAME: &str = "pr-review";
+/// Default (repo-relative) skill path for the built-in pr-review skill.
+pub const DEFAULT_SKILL_PATH: &str = ".codex/skills/pr-review/SKILL.md";
+/// Default command template: `/{skill} {pr}` with optional `extra_args` appended.
+pub const DEFAULT_COMMAND_TEMPLATE: &str = "/{skill} {pr}";
+
+/// Allowed repo-relative prefixes for skill files (Hard allowlist — no other paths).
+pub const SKILL_PATH_PREFIXES: &[&str] = &[".codex/skills/", ".claude/skills/", ".cursor/skills/"];
+
+/// Fully-resolved skill invocation carried on review outbox payloads and engine starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum ReviewKind {
-    #[default]
-    Review,
-    Check,
+pub struct SkillInvocation {
+    pub skill_name: String,
+    /// Absolute skill file path when the consuming engine needs it ([`EngineKind::requires_skill_path`]);
+    /// `None` for command-only engines (Claude / Cursor). Relative values are materialised at
+    /// engine start (migration may leave a config-relative path or `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_path: Option<String>,
+    /// Rendered command ready to execute / attach.
+    pub command: String,
+    /// Stable identity: `"{skill_name}\0{extra_args.trim()}"`.
+    pub skill_key: String,
 }
 
-impl ReviewKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Review => "review",
-            Self::Check => "check",
+impl SkillInvocation {
+    pub fn skill_key(name: &str, extra_args: &str) -> String {
+        format!("{name}\0{}", extra_args.trim())
+    }
+
+    /// External / manual ingress may only select full review (`""`) or check (`"--check"`).
+    pub fn validate_extra_args(extra_args: &str) -> Result<&str, String> {
+        match extra_args.trim() {
+            "" | "--check" => Ok(extra_args.trim()),
+            other => Err(format!(
+                "extraArgs must be empty or \"--check\", got {other:?}"
+            )),
         }
     }
-}
 
-impl fmt::Display for ReviewKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl std::str::FromStr for ReviewKind {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "review" => Ok(Self::Review),
-            "check" => Ok(Self::Check),
-            _ => Err(format!("unsupported review kind: {value}")),
+    /// Tokens embedded in Codex backtick prompts must not break the prompt grammar.
+    pub fn validate_prompt_token(field: &str, value: &str) -> Result<(), String> {
+        if value.contains('`') || value.contains('\n') || value.contains('\r') {
+            return Err(format!(
+                "{field} must not contain backticks or newlines: {value:?}"
+            ));
         }
+        Ok(())
+    }
+
+    /// Map legacy persisted wire values (`"review"` / `"check"`) to skill keys on load only.
+    pub fn migrate_legacy_skill_key(wire: &str) -> String {
+        match wire {
+            "review" => Self::skill_key(DEFAULT_SKILL_NAME, ""),
+            "check" => Self::skill_key(DEFAULT_SKILL_NAME, "--check"),
+            other => other.to_string(),
+        }
+    }
+
+    /// Fail-closed skill_key parse for durable session rows (reserve/stop identity).
+    pub fn parse_skill_key_wire(wire: &str) -> Result<String, String> {
+        match wire {
+            "review" => Ok(Self::skill_key(DEFAULT_SKILL_NAME, "")),
+            "check" => Ok(Self::skill_key(DEFAULT_SKILL_NAME, "--check")),
+            other if Self::is_skill_key(other) => Ok(other.to_string()),
+            other => Err(format!("unknown skill_key wire value: {other:?}")),
+        }
+    }
+
+    /// `true` when `wire` is a non-empty skill name plus `\0` separator (extra may be empty).
+    pub fn is_skill_key(wire: &str) -> bool {
+        match wire.split_once('\0') {
+            Some((name, _)) => !name.is_empty(),
+            None => false,
+        }
+    }
+
+    /// Migrate a dispatch ledger key `{pr}@{head}:{skill}` when `skill` is a legacy
+    /// `"review"` / `"check"` identity (load-only / one-shot DB rewrite).
+    pub fn migrate_legacy_dispatch_key(key: &str) -> String {
+        match key.rsplit_once(':') {
+            Some((prefix, skill_part)) => {
+                format!("{prefix}:{}", Self::migrate_legacy_skill_key(skill_part))
+            }
+            None => key.to_string(),
+        }
+    }
+
+    /// Human-readable label for notifications / UI (`pr-review` or `pr-review --check`).
+    pub fn display_label(skill_key: &str) -> String {
+        let key = Self::migrate_legacy_skill_key(skill_key);
+        match key.split_once('\0') {
+            Some((name, "")) => name.to_string(),
+            Some((name, extra)) => format!("{name} {extra}"),
+            None => key,
+        }
+    }
+
+    pub fn render_command(
+        template: &str,
+        skill_name: &str,
+        pr: u64,
+        repo: &str,
+        extra_args: &str,
+    ) -> String {
+        let mut command = template
+            .replace("{skill}", skill_name)
+            .replace("{pr}", &pr.to_string())
+            .replace("{repo}", repo);
+        let extra = extra_args.trim();
+        if !extra.is_empty() {
+            command.push(' ');
+            command.push_str(extra);
+        }
+        command
+    }
+
+    /// Resolve a **repo-relative** skill path: allowlisted prefix, join `repo_root`, canonicalize,
+    /// require the result stays under `repo_root` and is a file. Absolute paths are rejected.
+    pub fn resolve_skill_path(repo_root: &str, skill_path: &str) -> Result<PathBuf, String> {
+        let path = Path::new(skill_path);
+        if path.is_absolute() {
+            return Err(format!(
+                "skill path must be relative to repo_root (absolute rejected): {skill_path}"
+            ));
+        }
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!("skill path must not contain '..': {skill_path}"));
+        }
+        let normalized = skill_path.trim_start_matches("./");
+        if !SKILL_PATH_PREFIXES
+            .iter()
+            .any(|prefix| normalized.starts_with(prefix))
+        {
+            return Err(format!(
+                "skill path must be under {} (got {skill_path})",
+                SKILL_PATH_PREFIXES.join(" | ")
+            ));
+        }
+        let root = Path::new(repo_root);
+        let joined = root.join(path);
+        let root_canon = root
+            .canonicalize()
+            .map_err(|e| format!("repo_root canonicalize failed: {e}"))?;
+        let skill_canon = joined
+            .canonicalize()
+            .map_err(|e| format!("skill path canonicalize failed: {e}"))?;
+        if !skill_canon.starts_with(&root_canon) {
+            return Err(format!("skill path escapes repo_root: {skill_path}"));
+        }
+        if !skill_canon.is_file() {
+            return Err(format!(
+                "skill path is not a file: {}",
+                skill_canon.display()
+            ));
+        }
+        Ok(skill_canon)
+    }
+
+    /// Assert an already-absolute skill path is a file under `repo_root` and an allowed prefix.
+    pub fn assert_skill_path_confined(repo_root: &str, skill_abs: &str) -> Result<(), String> {
+        let root = Path::new(repo_root)
+            .canonicalize()
+            .map_err(|e| format!("repo_root canonicalize failed: {e}"))?;
+        let skill = Path::new(skill_abs)
+            .canonicalize()
+            .map_err(|e| format!("skill path canonicalize failed: {e}"))?;
+        if !skill.starts_with(&root) {
+            return Err(format!("skill path escapes repo_root: {skill_abs}"));
+        }
+        if !skill.is_file() {
+            return Err(format!("skill path is not a file: {skill_abs}"));
+        }
+        let rel = skill
+            .strip_prefix(&root)
+            .map_err(|_| format!("skill path escapes repo_root: {skill_abs}"))?;
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if !SKILL_PATH_PREFIXES
+            .iter()
+            .any(|prefix| rel_str.starts_with(prefix))
+        {
+            return Err(format!(
+                "skill path must be under {} (got {rel_str})",
+                SKILL_PATH_PREFIXES.join(" | ")
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn build(
+        skill_name: impl Into<String>,
+        skill_path: Option<String>,
+        command: impl Into<String>,
+        extra_args: &str,
+    ) -> Self {
+        let skill_name = skill_name.into();
+        let skill_key = Self::skill_key(&skill_name, extra_args);
+        Self {
+            skill_name,
+            skill_path,
+            command: command.into(),
+            skill_key,
+        }
+    }
+
+    /// Render the command template and, when `engine.requires_skill_path()`, resolve `skill_path`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_config(
+        repo_root: &str,
+        skill_name: &str,
+        skill_path: &str,
+        command_template: &str,
+        pr: u64,
+        repo: &str,
+        extra_args: &str,
+        engine: EngineKind,
+    ) -> Result<Self, String> {
+        Self::validate_prompt_token("skillName", skill_name)?;
+        let command = Self::render_command(command_template, skill_name, pr, repo, extra_args);
+        Self::validate_prompt_token("command", &command)?;
+        let resolved = if engine.requires_skill_path() {
+            Some(
+                Self::resolve_skill_path(repo_root, skill_path)?
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else {
+            None
+        };
+        Ok(Self::build(skill_name, resolved, command, extra_args))
+    }
+
+    /// Materialise a (possibly relative / missing) skill path for `project`'s engine at start time.
+    /// Pending outbox rows migrated before path resolution land here and are confined.
+    pub fn materialize_for_engine(
+        mut self,
+        repo_root: &str,
+        engine: EngineKind,
+    ) -> Result<Self, String> {
+        if !engine.requires_skill_path() {
+            self.skill_path = None;
+            return Ok(self);
+        }
+        let path = match self.skill_path.as_deref() {
+            Some(p) if Path::new(p).is_absolute() => {
+                Self::assert_skill_path_confined(repo_root, p)?;
+                p.to_string()
+            }
+            Some(rel) if !rel.is_empty() => Self::resolve_skill_path(repo_root, rel)?
+                .to_string_lossy()
+                .into_owned(),
+            _ => Self::resolve_skill_path(repo_root, DEFAULT_SKILL_PATH)?
+                .to_string_lossy()
+                .into_owned(),
+        };
+        Self::validate_prompt_token("skillName", &self.skill_name)?;
+        Self::validate_prompt_token("command", &self.command)?;
+        self.skill_path = Some(path);
+        Ok(self)
+    }
+
+    /// Default pr-review invocation; pass `extra_args = "--check"` for the former check mode.
+    pub fn default_pr_review(
+        repo_root: &str,
+        pr: u64,
+        repo: &str,
+        extra_args: &str,
+        engine: EngineKind,
+    ) -> Result<Self, String> {
+        Self::from_config(
+            repo_root,
+            DEFAULT_SKILL_NAME,
+            DEFAULT_SKILL_PATH,
+            DEFAULT_COMMAND_TEMPLATE,
+            pr,
+            repo,
+            extra_args,
+            engine,
+        )
     }
 }
 
@@ -284,22 +537,28 @@ pub struct Candidate {
     pub author: String,
     pub is_cross_repository: bool,
     pub is_draft: bool,
-    pub kind: ReviewKind,
+    /// Skill identity key; discovery may stamp `""`, and the rule plan fills it.
+    pub skill_key: String,
 }
 
 impl ReviewActionKey {
     pub fn for_candidate(candidate: &Candidate) -> Result<Self, String> {
-        Self::for_parts(candidate.number, &candidate.head_sha, candidate.kind)
+        Self::for_parts(candidate.number, &candidate.head_sha, &candidate.skill_key)
     }
 
-    pub fn for_parts(pr_number: u64, head_sha: &str, kind: ReviewKind) -> Result<Self, String> {
+    pub fn for_parts(
+        pr_number: u64,
+        head_sha: &str,
+        skill_key: impl AsRef<str>,
+    ) -> Result<Self, String> {
+        let skill_key = skill_key.as_ref();
         if pr_number == 0 {
             return Err("review action key requires a positive PR number".to_string());
         }
         if head_sha.trim().is_empty() {
             return Err("review action key requires a non-empty head SHA".to_string());
         }
-        Self::new(format!("{pr_number}@{head_sha}:{kind}"))
+        Self::new(format!("{pr_number}@{head_sha}:{skill_key}"))
     }
 }
 
@@ -548,6 +807,14 @@ pub enum EngineKind {
     Cursor,
 }
 
+impl EngineKind {
+    /// Codex attaches an on-disk skill file (`UserInput::Skill`); Claude/Cursor only use the
+    /// rendered command prompt — path resolve must not gate those engines.
+    pub const fn requires_skill_path(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+}
+
 /// Per-turn reasoning effort accepted by the Codex app-server protocol.
 ///
 /// **Hard carrier**: project configuration cannot contain an arbitrary effort string, and the
@@ -623,9 +890,8 @@ pub struct PullRequestView {
     pub title: String,
     pub labels: Vec<String>,
     pub url: String,
-    /// The trigger-label mode this PR maps to. Typed at the Rust source so the
-    /// generated TypeScript projection cannot claim a narrower value domain.
-    pub kind: ReviewKind,
+    /// Skill identity key for the review action this PR maps to.
+    pub skill_key: String,
     /// Why this PR would be skipped (not dispatched), or `None` when it would
     /// dispatch. Serializes to `null` / a string for the frontend.
     pub skip_reason: Option<String>,
@@ -731,8 +997,14 @@ pub enum EventPayload {
     ReviewRequest {
         #[serde(rename = "prNumber")]
         pr_number: u64,
-        #[serde(rename = "reviewKind")]
-        review_kind: ReviewKind,
+        #[serde(rename = "skillName")]
+        skill_name: String,
+        #[serde(rename = "extraArgs")]
+        extra_args: String,
+        #[serde(rename = "skillPath")]
+        skill_path: String,
+        #[serde(rename = "commandTemplate")]
+        command_template: String,
         #[serde(rename = "requestId")]
         request_id: ExternalRequestId,
         origin: ExternalTriggerOrigin,
@@ -752,8 +1024,14 @@ enum EventPayloadWire {
     ReviewRequest {
         #[serde(rename = "prNumber")]
         pr_number: u64,
-        #[serde(rename = "reviewKind")]
-        review_kind: ReviewKind,
+        #[serde(rename = "skillName")]
+        skill_name: String,
+        #[serde(rename = "extraArgs")]
+        extra_args: String,
+        #[serde(rename = "skillPath")]
+        skill_path: String,
+        #[serde(rename = "commandTemplate")]
+        command_template: String,
         #[serde(rename = "requestId")]
         request_id: ExternalRequestId,
         origin: ExternalTriggerOrigin,
@@ -777,13 +1055,19 @@ impl<'de> Deserialize<'de> for EventPayload {
             },
             EventPayloadWire::ReviewRequest {
                 pr_number,
-                review_kind,
+                skill_name,
+                extra_args,
+                skill_path,
+                command_template,
                 request_id,
                 origin,
                 notify_on_completion,
             } => Self::ReviewRequest {
                 pr_number,
-                review_kind,
+                skill_name,
+                extra_args,
+                skill_path,
+                command_template,
                 request_id,
                 origin,
                 notify_on_completion,
@@ -801,7 +1085,10 @@ pub struct ObservationRef<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewRequestRef<'a> {
     pub pr_number: u64,
-    pub review_kind: ReviewKind,
+    pub skill_name: &'a str,
+    pub extra_args: &'a str,
+    pub skill_path: &'a str,
+    pub command_template: &'a str,
     pub request_id: &'a ExternalRequestId,
     pub origin: ExternalTriggerOrigin,
     pub notify_on_completion: bool,
@@ -853,7 +1140,10 @@ impl<'de> Deserialize<'de> for EventEnvelope {
             ),
             EventPayload::ReviewRequest {
                 pr_number,
-                review_kind,
+                skill_name,
+                extra_args,
+                skill_path,
+                command_template,
                 request_id,
                 origin,
                 notify_on_completion,
@@ -863,7 +1153,10 @@ impl<'de> Deserialize<'de> for EventEnvelope {
                 wire.project_id,
                 wire.repo,
                 pr_number,
-                review_kind,
+                skill_name,
+                extra_args,
+                skill_path,
+                command_template,
                 request_id,
                 origin,
                 notify_on_completion,
@@ -904,7 +1197,10 @@ impl EventEnvelope {
         project_id: impl Into<String>,
         repo: impl Into<String>,
         pr_number: u64,
-        review_kind: ReviewKind,
+        skill_name: impl Into<String>,
+        extra_args: impl Into<String>,
+        skill_path: impl Into<String>,
+        command_template: impl Into<String>,
         request_id: ExternalRequestId,
         origin: ExternalTriggerOrigin,
         notify_on_completion: bool,
@@ -920,7 +1216,10 @@ impl EventEnvelope {
             repo,
             EventPayload::ReviewRequest {
                 pr_number,
-                review_kind,
+                skill_name: skill_name.into(),
+                extra_args: extra_args.into(),
+                skill_path: skill_path.into(),
+                command_template: command_template.into(),
                 request_id,
                 origin,
                 notify_on_completion,
@@ -987,13 +1286,19 @@ impl EventEnvelope {
         match &self.payload {
             EventPayload::ReviewRequest {
                 pr_number,
-                review_kind,
+                skill_name,
+                extra_args,
+                skill_path,
+                command_template,
                 request_id,
                 origin,
                 notify_on_completion,
             } => Some(ReviewRequestRef {
                 pr_number: *pr_number,
-                review_kind: *review_kind,
+                skill_name,
+                extra_args,
+                skill_path,
+                command_template,
                 request_id,
                 origin: *origin,
                 notify_on_completion: *notify_on_completion,
@@ -1846,11 +2151,9 @@ pub enum ActionKind {
     /// The review-completion desktop notification (AB#1066) → `"notification"`.
     #[default]
     Notification,
-    /// Start a full review for a PR via the review funnel (AB#1069) → `"review"`.
-    Review,
-    /// Start a lightweight check for a PR via the review funnel (AB#1069) → `"check"`.
-    Check,
-    /// Interrupt an in-flight review/check session for a `(project, pr, kind)` (AB#1069) →
+    /// Run a configured skill for a PR via the review funnel → `"runSkill"`.
+    RunSkill,
+    /// Interrupt an in-flight skill session for a `(project, pr, skill_key)` (AB#1069) →
     /// `"stopReview"`. Idempotent: no live session is a benign no-op success, not a failure.
     StopReview,
     /// Reply to an inbound messaging event (#1559) → `"messagingReply"`.
@@ -1865,8 +2168,7 @@ impl ActionKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Notification => "notification",
-            Self::Review => "review",
-            Self::Check => "check",
+            Self::RunSkill => "runSkill",
             Self::StopReview => "stopReview",
             Self::MessagingReply => "messagingReply",
             Self::MessagingSend => "messagingSend",
@@ -1892,18 +2194,16 @@ impl OutboxProducerKey {
     }
 }
 
-/// The outbox payload for a [`ActionKind::Review`] / [`ActionKind::Check`] action (AB#1069): the PR
-/// the executor reviews via the review funnel (`review::commands::start_for_outbox`).
+/// The outbox payload for a [`ActionKind::RunSkill`] action: the PR the executor reviews via the
+/// review funnel (`review::commands::start_for_outbox`), plus the resolved [`SkillInvocation`].
 ///
 /// **Routing key is NOT here (AB#1069 F3).** The owning project is the OUTBOX ROW's single-source
 /// routing key ([`crate::outbox::OutboxAction::project_id`] / [`OutboxEntry::project_id`] — what the
 /// panel + `outbox:updated` events route by); the executor reads `action.project_id`, never a payload
 /// copy. Carrying `project_id` here too would be a dual source of truth: a drifted/forged payload
-/// could route a row shown under project A to project B's review. The action MODE (review vs check) is
-/// likewise the sealed [`ActionKind`] variant, not a field — so neither the project nor the kind can be
-/// forged in the persisted payload.
+/// could route a row shown under project A to project B's review.
 ///
-/// Backend-internal (read only by the `lib.rs` executor; a future Rule Engine, AB#1068, produces it),
+/// Backend-internal (read only by the `lib.rs` executor; the Rule Engine produces it),
 /// so NOT mirrored in `src/types.ts`, like [`Notification`] / [`Candidate`]. It IS persisted in the
 /// outbox `payload` column and replayed, so its camelCase shape must stay stable. serde camelCase;
 /// the golden locks it (Medium carrier).
@@ -1912,6 +2212,7 @@ impl OutboxProducerKey {
 pub enum ReviewActionPayload {
     Automatic {
         candidate: Candidate,
+        invocation: SkillInvocation,
     },
     Explicit {
         #[serde(rename = "prNumber")]
@@ -1919,14 +2220,21 @@ pub enum ReviewActionPayload {
         #[serde(rename = "requestId")]
         request_id: ExternalRequestId,
         origin: ExternalTriggerOrigin,
+        invocation: SkillInvocation,
     },
 }
 
 impl ReviewActionPayload {
     pub fn automatic_candidate(&self) -> Option<&Candidate> {
         match self {
-            Self::Automatic { candidate } => Some(candidate),
+            Self::Automatic { candidate, .. } => Some(candidate),
             Self::Explicit { .. } => None,
+        }
+    }
+
+    pub fn invocation(&self) -> &SkillInvocation {
+        match self {
+            Self::Automatic { invocation, .. } | Self::Explicit { invocation, .. } => invocation,
         }
     }
 }
@@ -1957,8 +2265,8 @@ pub enum ActionExecutionOutput {
 pub struct StopReviewActionPayload {
     /// The PR / MR number whose session to stop (re-validated `> 0` at the executor boundary).
     pub pr_number: u64,
-    /// Which session mode to stop. The enum keeps invalid modes out of the persisted payload.
-    pub kind: ReviewKind,
+    /// Which skill session to stop (`SkillInvocation::skill_key`).
+    pub skill_key: String,
 }
 
 /// The lifecycle state of one persisted outbox action (AB#1066, epic AB#1078): surfaced to the
@@ -2094,7 +2402,10 @@ mod tests {
             "p1",
             "octocat/hello",
             7,
-            ReviewKind::Check,
+            crate::model::DEFAULT_SKILL_NAME,
+            "--check",
+            crate::model::DEFAULT_SKILL_PATH,
+            crate::model::DEFAULT_COMMAND_TEMPLATE,
             request_id.clone(),
             ExternalTriggerOrigin::Http,
             true,
@@ -2104,7 +2415,16 @@ mod tests {
         let wire = serde_json::to_value(&event).expect("event serializes");
         assert_eq!(wire["dedupeKey"], "http:0123456789abcdef0123456789abcdef");
         assert_eq!(wire["payload"]["kind"], "reviewRequest");
-        assert_eq!(wire["payload"]["reviewKind"], "check");
+        assert_eq!(wire["payload"]["skillName"], "pr-review");
+        assert_eq!(wire["payload"]["extraArgs"], "--check");
+        assert_eq!(
+            wire["payload"]["skillPath"],
+            crate::model::DEFAULT_SKILL_PATH
+        );
+        assert_eq!(
+            wire["payload"]["commandTemplate"],
+            crate::model::DEFAULT_COMMAND_TEMPLATE
+        );
         assert_eq!(wire["payload"]["requestId"], request_id.as_str());
         assert_eq!(wire["payload"]["origin"], "http");
         assert_eq!(wire["payload"]["notifyOnCompletion"], true);
@@ -2149,13 +2469,27 @@ mod tests {
     #[test]
     fn typed_action_and_producer_keys_validate_and_frame_components() {
         assert_eq!(
-            ReviewActionKey::for_parts(7, "abc123", ReviewKind::Check)
-                .unwrap()
-                .as_str(),
-            "7@abc123:check"
+            ReviewActionKey::for_parts(
+                7,
+                "abc123",
+                SkillInvocation::skill_key("pr-review", "--check")
+            )
+            .unwrap()
+            .as_str(),
+            &format!(
+                "7@abc123:{}",
+                SkillInvocation::skill_key("pr-review", "--check")
+            )
         );
-        assert!(ReviewActionKey::for_parts(0, "abc123", ReviewKind::Review).is_err());
-        assert!(ReviewActionKey::for_parts(7, "", ReviewKind::Review).is_err());
+        assert!(ReviewActionKey::for_parts(
+            0,
+            "abc123",
+            SkillInvocation::skill_key("pr-review", "")
+        )
+        .is_err());
+        assert!(
+            ReviewActionKey::for_parts(7, "", SkillInvocation::skill_key("pr-review", "")).is_err()
+        );
 
         let inbox = InboxEventId::new(9).unwrap();
         let left = OutboxProducerKey::for_rule_action(inbox, "a:b", "c").unwrap();
@@ -2163,7 +2497,7 @@ mod tests {
         assert_ne!(left, right, "length framing prevents component collisions");
         assert!(OutboxProducerKey::for_dedupe("", "key").is_err());
         let nonce = ExternalRequestId::parse("00112233445566778899aabbccddeeff").unwrap();
-        assert!(OutboxProducerKey::for_manual("", ActionKind::Review, &nonce).is_err());
+        assert!(OutboxProducerKey::for_manual("", ActionKind::RunSkill, &nonce).is_err());
     }
 
     #[test]
@@ -2219,8 +2553,14 @@ mod tests {
                 author: "octocat".into(),
                 is_cross_repository: false,
                 is_draft: false,
-                kind: ReviewKind::Review,
+                skill_key: SkillInvocation::skill_key("pr-review", ""),
             },
+            invocation: SkillInvocation::build(
+                "pr-review",
+                Some("/tmp/skill.md".into()),
+                "/pr-review 7",
+                "",
+            ),
         };
         assert_eq!(
             serde_json::to_value(&automatic).unwrap()["kind"],
@@ -2231,6 +2571,12 @@ mod tests {
             pr_number: 7,
             request_id: ExternalRequestId::parse("0123456789abcdef0123456789abcdef").unwrap(),
             origin: ExternalTriggerOrigin::RemoteWeb,
+            invocation: SkillInvocation::build(
+                "pr-review",
+                Some("/tmp/skill.md".into()),
+                "/pr-review 7",
+                "",
+            ),
         };
         let wire = serde_json::to_value(&explicit).unwrap();
         assert_eq!(wire["kind"], "explicit");
@@ -2265,7 +2611,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: ReviewKind::Review,
+            skill_key: SkillInvocation::skill_key("pr-review", ""),
         };
 
         let v = serde_json::to_value(&candidate).expect("Candidate serializes");
@@ -2277,7 +2623,7 @@ mod tests {
         assert!(v.get("author").is_some());
         assert!(v.get("isCrossRepository").is_some());
         assert!(v.get("isDraft").is_some());
-        assert!(v.get("kind").is_some());
+        assert!(v.get("skillKey").is_some());
 
         // snake_case forms absent — a rename would surface here.
         assert!(v.get("head_sha").is_none());
@@ -2504,7 +2850,7 @@ mod tests {
             title: "Add feature".to_string(),
             labels: vec!["review".to_string()],
             url: "https://example.com/pr/1".to_string(),
-            kind: ReviewKind::Review,
+            skill_key: SkillInvocation::skill_key("pr-review", ""),
             skip_reason: Some("draft PR".to_string()),
         };
 
@@ -2515,7 +2861,7 @@ mod tests {
         assert!(v.get("title").is_some());
         assert!(v.get("labels").is_some());
         assert!(v.get("url").is_some());
-        assert!(v.get("kind").is_some());
+        assert!(v.get("skillKey").is_some());
         assert!(v.get("skipReason").is_some());
 
         // snake_case form absent — a rename of the one multi-word field
@@ -2532,7 +2878,7 @@ mod tests {
             title: "Ready".to_string(),
             labels: vec![],
             url: "https://example.com/pr/2".to_string(),
-            kind: ReviewKind::Check,
+            skill_key: SkillInvocation::skill_key("pr-review", "--check"),
             skip_reason: None,
         };
 
@@ -2555,7 +2901,7 @@ mod tests {
                 title: "Add feature".to_string(),
                 labels: vec!["review".to_string()],
                 url: "https://example.com/pr/1".to_string(),
-                kind: ReviewKind::Review,
+                skill_key: SkillInvocation::skill_key("pr-review", ""),
                 skip_reason: None,
             },
             presence: PrPresence::Current,
@@ -2569,7 +2915,7 @@ mod tests {
         assert!(v.get("title").is_some());
         assert!(v.get("labels").is_some());
         assert!(v.get("url").is_some());
-        assert!(v.get("kind").is_some());
+        assert!(v.get("skillKey").is_some());
         assert!(v.get("skipReason").is_some());
 
         // Retention keys present (camelCase).
@@ -3222,12 +3568,8 @@ mod tests {
             "notification"
         );
         assert_eq!(
-            serde_json::to_value(ActionKind::Review).expect("ActionKind serializes"),
-            "review"
-        );
-        assert_eq!(
-            serde_json::to_value(ActionKind::Check).expect("ActionKind serializes"),
-            "check"
+            serde_json::to_value(ActionKind::RunSkill).expect("ActionKind serializes"),
+            "runSkill"
         );
         assert_eq!(
             serde_json::to_value(ActionKind::StopReview).expect("ActionKind serializes"),
@@ -3464,15 +3806,34 @@ mod tests {
                 author: "octocat".to_string(),
                 is_cross_repository: false,
                 is_draft: false,
-                kind: ReviewKind::Review,
+                skill_key: SkillInvocation::skill_key("pr-review", ""),
             },
+            invocation: SkillInvocation::build(
+                "pr-review",
+                Some("/tmp/skill.md".into()),
+                "/pr-review 7",
+                "",
+            ),
         };
         let v = serde_json::to_value(&payload).expect("ReviewActionPayload serializes");
         // camelCase present, snake_case absent.
         assert!(v.get("candidate").is_some());
         assert_eq!(v["candidate"]["headSha"], "sha");
+        assert_eq!(
+            v["candidate"]["skillKey"],
+            SkillInvocation::skill_key("pr-review", "")
+        );
         assert!(v.get("prNumber").is_none());
         assert!(v["candidate"].get("head_sha").is_none());
+        // invocation is a camelCase object with the four SkillInvocation fields.
+        let inv = v.get("invocation").expect("invocation present");
+        assert_eq!(inv["skillName"], "pr-review");
+        assert_eq!(inv["skillPath"], "/tmp/skill.md");
+        assert_eq!(inv["command"], "/pr-review 7");
+        assert_eq!(inv["skillKey"], SkillInvocation::skill_key("pr-review", ""));
+        assert!(inv.get("skill_name").is_none());
+        assert!(inv.get("skill_path").is_none());
+        assert!(inv.get("skill_key").is_none());
         // F3: the routing key is the outbox ROW's project_id, NOT a payload field — assert it is
         // absent so a producer can't reintroduce a dual project source.
         assert!(v.get("projectId").is_none());
@@ -3490,11 +3851,11 @@ mod tests {
     fn stop_review_action_payload_wire_shape_is_camel_case() {
         let payload = StopReviewActionPayload {
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: SkillInvocation::skill_key("pr-review", ""),
         };
         let v = serde_json::to_value(&payload).expect("StopReviewActionPayload serializes");
         assert!(v.get("prNumber").is_some());
-        assert!(v.get("kind").is_some());
+        assert!(v.get("skillKey").is_some());
         assert!(v.get("pr_number").is_none());
         // F3: routing key is the row's project_id, not a payload field.
         assert!(v.get("projectId").is_none());
@@ -3502,5 +3863,91 @@ mod tests {
         let back: StopReviewActionPayload =
             serde_json::from_value(v).expect("StopReviewActionPayload round-trips");
         assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn render_command_substitutes_placeholders_and_appends_extra_args() {
+        assert_eq!(
+            SkillInvocation::render_command("/{skill} {pr}", "pr-review", 7, "o/r", ""),
+            "/pr-review 7"
+        );
+        assert_eq!(
+            SkillInvocation::render_command("/{skill} {pr}", "pr-review", 7, "o/r", "--check"),
+            "/pr-review 7 --check"
+        );
+        assert_eq!(
+            SkillInvocation::render_command("{skill}@{repo}#{pr}", "s", 9, "a/b", "  x  "),
+            "s@a/b#9 x"
+        );
+    }
+
+    #[test]
+    fn resolve_skill_path_rejects_absolute_and_escape() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let cargo_toml = manifest.join("Cargo.toml");
+        let abs_err = SkillInvocation::resolve_skill_path("/unused", cargo_toml.to_str().unwrap())
+            .expect_err("absolute rejected");
+        assert!(
+            abs_err.contains("absolute") || abs_err.contains("relative"),
+            "{abs_err}"
+        );
+
+        let repo = manifest.parent().unwrap();
+        let relative = SkillInvocation::resolve_skill_path(
+            repo.to_str().unwrap(),
+            ".codex/skills/pr-review/SKILL.md",
+        )
+        .expect("relative under repo");
+        assert!(relative.is_file());
+
+        let err = SkillInvocation::resolve_skill_path(repo.to_str().unwrap(), "../etc/passwd")
+            .expect_err("escape");
+        assert!(
+            err.contains("escape")
+                || err.contains("canonicalize")
+                || err.contains("..")
+                || err.contains("must be under"),
+            "{err}"
+        );
+
+        let not_allowlisted =
+            SkillInvocation::resolve_skill_path(repo.to_str().unwrap(), "Cargo.toml")
+                .expect_err("not allowlisted");
+        assert!(
+            not_allowlisted.contains("must be under"),
+            "{not_allowlisted}"
+        );
+    }
+
+    #[test]
+    fn skill_key_and_legacy_migrate_are_stable() {
+        assert_eq!(SkillInvocation::skill_key("pr-review", ""), "pr-review\0");
+        assert_eq!(
+            SkillInvocation::skill_key("pr-review", " --check "),
+            "pr-review\0--check"
+        );
+        assert_eq!(
+            SkillInvocation::migrate_legacy_skill_key("review"),
+            SkillInvocation::skill_key("pr-review", "")
+        );
+        assert_eq!(
+            SkillInvocation::migrate_legacy_skill_key("check"),
+            SkillInvocation::skill_key("pr-review", "--check")
+        );
+        assert_eq!(
+            SkillInvocation::display_label("pr-review\0--check"),
+            "pr-review --check"
+        );
+        assert_eq!(
+            SkillInvocation::migrate_legacy_dispatch_key("7@sha:review"),
+            format!("7@sha:{}", SkillInvocation::skill_key("pr-review", ""))
+        );
+        assert_eq!(
+            SkillInvocation::migrate_legacy_dispatch_key("7@sha:check"),
+            format!(
+                "7@sha:{}",
+                SkillInvocation::skill_key("pr-review", "--check")
+            )
+        );
     }
 }

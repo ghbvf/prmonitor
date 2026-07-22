@@ -37,12 +37,14 @@ use crate::model::{Candidate, ReviewActionKey};
 static LEDGER_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// One recorded dispatch — the cooldown source (mirrors `router.py`
-/// dispatch-events: `(pr, kind, dispatchedAtEpoch)`).
+/// dispatch-events: `(pr, skill_key, dispatchedAtEpoch)`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DispatchEvent {
     pub pr: u64,
-    pub kind: String,
+    /// Skill identity; legacy ledger JSON used `"kind"` (`review` / `check`).
+    #[serde(alias = "kind")]
+    pub skill_key: String,
     pub head_sha: String,
     pub key: String,
     pub dispatched_at_epoch: u64,
@@ -136,20 +138,24 @@ impl Ledger {
             let mut stmt = conn.prepare("SELECT key FROM dispatch_key WHERE project_id = ?1")?;
             let rows = stmt.query_map([project_id], |r| r.get::<_, String>(0))?;
             for k in rows {
-                dispatched.insert(k?);
+                dispatched.insert(crate::model::SkillInvocation::migrate_legacy_dispatch_key(
+                    &k?,
+                ));
             }
 
             let mut events = Vec::new();
             let mut stmt = conn.prepare(
-                "SELECT pr, kind, head_sha, key, dispatched_at_epoch \
+                "SELECT pr, skill_key, head_sha, key, dispatched_at_epoch \
                  FROM dispatch_event WHERE project_id = ?1 ORDER BY id",
             )?;
             let rows = stmt.query_map([project_id], |r| {
+                let skill_key: String = r.get(1)?;
+                let key: String = r.get(3)?;
                 Ok(DispatchEvent {
                     pr: r.get::<_, i64>(0)? as u64,
-                    kind: r.get(1)?,
+                    skill_key: crate::model::SkillInvocation::migrate_legacy_skill_key(&skill_key),
                     head_sha: r.get(2)?,
-                    key: r.get(3)?,
+                    key: crate::model::SkillInvocation::migrate_legacy_dispatch_key(&key),
                     dispatched_at_epoch: r.get::<_, i64>(4)? as u64,
                 })
             })?;
@@ -166,13 +172,14 @@ impl Ledger {
         self.dispatched.contains(key)
     }
 
-    /// Most-recent dispatch epoch for `(pr, kind)`, or `None`. `router.py` scans
+    /// Most-recent dispatch epoch for `(pr, skill_key)`, or `None`. `router.py` scans
     /// dispatch-events in reverse and takes the first match (= most recent); the
     /// `max` here is order-independent and equivalent.
-    pub fn last_dispatch_at(&self, pr: u64, kind: &str) -> Option<u64> {
+    pub fn last_dispatch_at(&self, pr: u64, skill_key: impl AsRef<str>) -> Option<u64> {
+        let skill_key = skill_key.as_ref();
         self.events
             .iter()
-            .filter(|e| e.pr == pr && e.kind == kind)
+            .filter(|e| e.pr == pr && e.skill_key == skill_key)
             .map(|e| e.dispatched_at_epoch)
             .max()
     }
@@ -235,7 +242,7 @@ impl Ledger {
                 let mut stmt = tx
                     .prepare(
                         "INSERT INTO dispatch_event \
-                         (project_id, pr, kind, head_sha, key, dispatched_at_epoch) \
+                         (project_id, pr, skill_key, head_sha, key, dispatched_at_epoch) \
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     )
                     .map_err(map_err)?;
@@ -243,7 +250,7 @@ impl Ledger {
                     stmt.execute(rusqlite::params![
                         project_id,
                         e.pr as i64,
-                        e.kind,
+                        e.skill_key,
                         e.head_sha,
                         e.key,
                         e.dispatched_at_epoch as i64
@@ -266,7 +273,7 @@ impl Ledger {
             self.dispatched.insert(key.as_str().to_string());
             self.events.push(DispatchEvent {
                 pr: cand.number,
-                kind: cand.kind.to_string(),
+                skill_key: cand.skill_key.to_string(),
                 head_sha: cand.head_sha.clone(),
                 key: key.into_inner(),
                 dispatched_at_epoch: epoch,
@@ -289,7 +296,8 @@ pub fn import_legacy_dispatched(
         .prepare("INSERT OR IGNORE INTO dispatch_key (project_id, key) VALUES (?1, ?2)")
         .map_err(map_err)?;
     for k in &keys {
-        stmt.execute(rusqlite::params![project_id, k])
+        let key = crate::model::SkillInvocation::migrate_legacy_dispatch_key(k);
+        stmt.execute(rusqlite::params![project_id, key])
             .map_err(map_err)?;
     }
     Ok(())
@@ -307,17 +315,19 @@ pub fn import_legacy_events(
     let mut stmt = tx
         .prepare(
             "INSERT INTO dispatch_event \
-             (project_id, pr, kind, head_sha, key, dispatched_at_epoch) \
+             (project_id, pr, skill_key, head_sha, key, dispatched_at_epoch) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .map_err(map_err)?;
     for e in &events {
+        let skill_key = crate::model::SkillInvocation::migrate_legacy_skill_key(&e.skill_key);
+        let key = crate::model::SkillInvocation::migrate_legacy_dispatch_key(&e.key);
         stmt.execute(rusqlite::params![
             project_id,
             e.pr as i64,
-            e.kind,
+            skill_key,
             e.head_sha,
-            e.key,
+            key,
             e.dispatched_at_epoch as i64
         ])
         .map_err(map_err)?;
@@ -329,23 +339,30 @@ pub fn import_legacy_events(
 mod tests {
     use super::*;
 
-    fn action_key(pr: u64, head: &str, kind: &str) -> String {
-        ReviewActionKey::for_parts(pr, head, kind.parse().unwrap())
-            .unwrap()
-            .into_inner()
+    fn action_key(pr: u64, head: &str, skill_key: impl AsRef<str>) -> String {
+        let skill_key = skill_key.as_ref();
+        ReviewActionKey::for_parts(
+            pr,
+            head,
+            crate::model::SkillInvocation::migrate_legacy_skill_key(skill_key),
+        )
+        .unwrap()
+        .into_inner()
     }
 
-    fn event(pr: u64, kind: &str, epoch: u64) -> DispatchEvent {
+    fn event(pr: u64, skill_key: impl AsRef<str>, epoch: u64) -> DispatchEvent {
+        let skill_key = skill_key.as_ref();
         DispatchEvent {
             pr,
-            kind: kind.parse().unwrap(),
+            skill_key: crate::model::SkillInvocation::migrate_legacy_skill_key(skill_key),
             head_sha: "sha".to_string(),
-            key: action_key(pr, "sha", kind),
+            key: action_key(pr, "sha", skill_key),
             dispatched_at_epoch: epoch,
         }
     }
 
-    fn cand(pr: u64, kind: &str) -> Candidate {
+    fn cand(pr: u64, skill_key: impl AsRef<str>) -> Candidate {
+        let skill_key = skill_key.as_ref();
         Candidate {
             number: pr,
             head_sha: "sha".to_string(),
@@ -353,7 +370,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: kind.parse().unwrap(),
+            skill_key: crate::model::SkillInvocation::migrate_legacy_skill_key(skill_key),
         }
     }
 
@@ -368,7 +385,7 @@ mod tests {
         let cands = [cand(12, "review"), cand(12, "check"), cand(13, "review")];
         ledger.stage_all(&cands, 1_700_000_000);
 
-        // One dedup key per candidate (distinct (pr, head, kind) tuples).
+        // One dedup key per candidate (distinct (pr, head, skill_key) tuples).
         assert!(ledger.has_dispatched(&action_key(12, "sha", "review")));
         assert!(ledger.has_dispatched(&action_key(12, "sha", "check")));
         assert!(ledger.has_dispatched(&action_key(13, "sha", "review")));
@@ -376,9 +393,27 @@ mod tests {
 
         // One cooldown event per candidate, all at the shared epoch.
         assert_eq!(ledger.events.len(), 3);
-        assert_eq!(ledger.last_dispatch_at(12, "review"), Some(1_700_000_000));
-        assert_eq!(ledger.last_dispatch_at(12, "check"), Some(1_700_000_000));
-        assert_eq!(ledger.last_dispatch_at(13, "review"), Some(1_700_000_000));
+        assert_eq!(
+            ledger.last_dispatch_at(
+                12,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            ledger.last_dispatch_at(
+                12,
+                crate::model::SkillInvocation::skill_key("pr-review", "--check")
+            ),
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            ledger.last_dispatch_at(
+                13,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
+            Some(1_700_000_000)
+        );
     }
 
     #[test]
@@ -402,13 +437,31 @@ mod tests {
 
         assert_eq!(ledger.dispatched.len(), 1); // same key deduped in the set.
         assert_eq!(ledger.events.len(), 2); // each stage appends a cooldown event.
-        assert_eq!(ledger.last_dispatch_at(12, "review"), Some(2_000)); // most recent.
+        assert_eq!(
+            ledger.last_dispatch_at(
+                12,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
+            Some(2_000)
+        ); // most recent.
     }
 
     #[test]
     fn dispatch_key_format() {
-        assert_eq!(action_key(42, "abc123", "review"), "42@abc123:review");
-        assert_eq!(action_key(7, "deadbeef", "check"), "7@deadbeef:check");
+        assert_eq!(
+            action_key(42, "abc123", "review"),
+            format!(
+                "42@abc123:{}",
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            )
+        );
+        assert_eq!(
+            action_key(7, "deadbeef", "check"),
+            format!(
+                "7@deadbeef:{}",
+                crate::model::SkillInvocation::skill_key("pr-review", "--check")
+            )
+        );
     }
 
     // SQLite store round-trip (#70, Medium carrier): staging a batch, `save_db` then
@@ -427,9 +480,15 @@ mod tests {
         assert!(back.has_dispatched(&action_key(12, "sha", "review")));
         assert!(back.has_dispatched(&action_key(12, "sha", "check")));
         assert_eq!(back.events.len(), 2);
-        assert_eq!(back.last_dispatch_at(12, "review"), Some(1_700_000_000));
+        assert_eq!(
+            back.last_dispatch_at(
+                12,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
+            Some(1_700_000_000)
+        );
 
-        // A different project's partition is empty — same (number, head, kind) is not
+        // A different project's partition is empty — same (number, head, skill_key) is not
         // visible across projects.
         let other = Ledger::load_db(&db, "beta").expect("load other");
         assert!(other.dispatched.is_empty());
@@ -476,14 +535,71 @@ mod tests {
         .expect("import");
 
         let back = Ledger::load_db(&db, "alpha").expect("load");
-        assert!(back.has_dispatched("12@sha:review"));
-        assert!(back.has_dispatched("13@sha:check"));
-        assert_eq!(back.last_dispatch_at(12, "review"), Some(1_700_000_000));
-        assert_eq!(back.last_dispatch_at(13, "check"), Some(1_700_000_100));
+        assert!(back.has_dispatched(&action_key(12, "sha", "review")));
+        assert!(back.has_dispatched(&action_key(13, "sha", "check")));
+        assert!(!back.has_dispatched("12@sha:review"));
+        assert!(!back.has_dispatched("13@sha:check"));
+        assert_eq!(
+            back.last_dispatch_at(
+                12,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
+            Some(1_700_000_000)
+        );
+        assert_eq!(
+            back.last_dispatch_at(
+                13,
+                crate::model::SkillInvocation::skill_key("pr-review", "--check")
+            ),
+            Some(1_700_000_100)
+        );
+    }
+
+    /// Migrate-on-read: a pre-v18 `dispatch_key` row `12@sha:review` must match the
+    /// new-format identity `12@sha:pr-review\0` after `load_db`.
+    #[test]
+    fn load_db_migrates_legacy_dispatch_key_on_read() {
+        let db = Database::open_in_memory().expect("open db");
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO dispatch_key (project_id, key) VALUES ('p1', '12@sha:review')",
+                [],
+            )?;
+            conn.execute(
+                "INSERT INTO dispatch_event \
+                 (project_id, pr, skill_key, head_sha, key, dispatched_at_epoch) \
+                 VALUES ('p1', 12, 'review', 'sha', '12@sha:review', 100)",
+                [],
+            )?;
+            Ok(())
+        })
+        .expect("seed legacy keys");
+
+        let ledger = Ledger::load_db(&db, "p1").expect("load");
+        let new_key = action_key(12, "sha", "review");
+        assert_eq!(
+            new_key,
+            format!(
+                "12@sha:{}",
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            )
+        );
+        assert!(
+            ledger.has_dispatched(&new_key),
+            "legacy 12@sha:review must migrate to {new_key}"
+        );
+        assert!(!ledger.has_dispatched("12@sha:review"));
+        assert_eq!(
+            ledger.last_dispatch_at(
+                12,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
+            Some(100)
+        );
     }
 
     // Ledger isolation (#35): two projects whose dedup sets are loaded from distinct
-    // store-key partitions do NOT collide even when an identical (number, head, kind)
+    // store-key partitions do NOT collide even when an identical (number, head, skill_key)
     // candidate was dispatched in one. `Ledger::load` is the partitioning seam (it
     // queries `WHERE project_id = ?1` on `dispatch_key`); here we simulate the two loaded
     // partitions directly (the live `load` needs a `tauri::AppHandle` to resolve the
@@ -506,7 +622,7 @@ mod tests {
         );
         assert!(
             !ledger_b.has_dispatched(&key),
-            "the SAME (number, head, kind) must NOT read as dispatched under project B"
+            "the SAME (number, head, skill_key) must NOT read as dispatched under project B"
         );
     }
 
@@ -551,10 +667,34 @@ mod tests {
                 event(13, "review", 500),
             ],
         };
-        assert_eq!(ledger.last_dispatch_at(12, "review"), Some(300));
-        assert_eq!(ledger.last_dispatch_at(12, "check"), Some(200));
-        assert_eq!(ledger.last_dispatch_at(13, "review"), Some(500));
-        assert_eq!(ledger.last_dispatch_at(99, "review"), None);
+        assert_eq!(
+            ledger.last_dispatch_at(
+                12,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
+            Some(300)
+        );
+        assert_eq!(
+            ledger.last_dispatch_at(
+                12,
+                crate::model::SkillInvocation::skill_key("pr-review", "--check")
+            ),
+            Some(200)
+        );
+        assert_eq!(
+            ledger.last_dispatch_at(
+                13,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
+            Some(500)
+        );
+        assert_eq!(
+            ledger.last_dispatch_at(
+                99,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
+            None
+        );
     }
 
     // Wire-shape lock for the persisted `ledger.json` events (Medium carrier per
@@ -568,7 +708,7 @@ mod tests {
 
         // camelCase keys present.
         assert!(v.get("pr").is_some());
-        assert!(v.get("kind").is_some());
+        assert!(v.get("skillKey").is_some());
         assert!(v.get("headSha").is_some());
         assert!(v.get("key").is_some());
         assert!(v.get("dispatchedAtEpoch").is_some());

@@ -263,9 +263,9 @@ fn http_client(timeout_secs: u64) -> AppResult<reqwest::Client> {
         .map_err(|e| AppError::new(format!("通知 HTTP client 初始化失败: {e}")))
 }
 
-fn webhook_body(kind: NotificationKind, note: &Notification) -> serde_json::Value {
+fn webhook_body(skill_key: NotificationKind, note: &Notification) -> serde_json::Value {
     let text = text_message(note);
-    match kind {
+    match skill_key {
         NotificationKind::Slack => json!({ "text": text }),
         NotificationKind::WeChatWork => json!({ "msgtype": "text", "text": { "content": text } }),
         NotificationKind::Feishu => json!({ "msg_type": "text", "content": { "text": text } }),
@@ -508,10 +508,10 @@ fn safe_http_transport_error(
 /// / inbox main flow. No `Box<dyn>`: each arm monomorphizes its concrete provider.
 pub async fn deliver<R: Runtime>(
     app: &AppHandle<R>,
-    kind: NotificationKind,
+    skill_key: NotificationKind,
     note: &Notification,
 ) -> AppResult<ActionExecutionResult> {
-    match kind {
+    match skill_key {
         NotificationKind::Desktop => DesktopNotifier { app }.deliver(note).await,
         NotificationKind::Email
         | NotificationKind::Slack

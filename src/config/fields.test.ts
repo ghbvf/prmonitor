@@ -39,7 +39,6 @@ function validProject(): Project {
     pollIntervalSecs: 120,
     authors: [],
     labelSource: "native",
-    skillRelPath: ".codex/skills/pr-review/SKILL.md",
     prCooldownSeconds: 1800,
     updateMode: "webhook-only",
     sourceKind: "github",
@@ -175,7 +174,7 @@ describe("PROJECT_GROUPS", () => {
 
   it("only the source fields and per-engine settings carry a visibleWhen predicate", () => {
     // sourceKind, repo, updateMode, labelSource, etc. must NOT be conditionally hidden —
-    // only the per-source connection fields (gated on sourceKind), skillRelPath +
+    // only the per-source connection fields (gated on sourceKind),
     // codexModel (gated on engineKind === codex, #718), claudeModel (gated on
     // engineKind === claude), and cursorModel (gated on engineKind === cursor) carry a
     // predicate.
@@ -194,7 +193,6 @@ describe("PROJECT_GROUPS", () => {
       "codexModel",
       "codexReasoningEffort",
       "cursorModel",
-      "skillRelPath",
     ]);
   });
 });
@@ -351,45 +349,9 @@ describe("validateStep — repoRoot", () => {
   });
 });
 
-describe("validateStep — skill", () => {
-  it("accepts a relative path", () => {
-    expect(validateStep("skill", validProject())).toBeNull();
-  });
-  it("rejects empty", () => {
-    expect(
-      validateStep("skill", { ...validProject(), skillRelPath: "" }),
-    ).toBeTruthy();
-  });
-  it("rejects an absolute path", () => {
-    expect(
-      validateStep("skill", { ...validProject(), skillRelPath: "/etc/x" }),
-    ).toBeTruthy();
-  });
-  it("skips the gate for a non-codex engine (#718)", () => {
-    // claude discovers `.claude/skills/` from cwd → skillRelPath is unused, so an empty
-    // path must NOT block (the field is also hidden via visibleWhen; backend skips it too).
-    expect(
-      validateStep("skill", {
-        ...validProject(),
-        engineKind: "claude",
-        skillRelPath: "",
-      }),
-    ).toBeNull();
-  });
-});
-
-describe("skillRelPath field is codex-only (#718)", () => {
-  it("is hidden for a claude project, shown for codex", () => {
-    const field = PROJECT_GROUPS.flatMap((g) => g.fields).find(
-      (f) => f.key === "skillRelPath",
-    );
-    expect(field?.visibleWhen).toBeDefined();
-    expect(field?.visibleWhen?.({ ...validProject(), engineKind: "codex" })).toBe(
-      true,
-    );
-    expect(
-      field?.visibleWhen?.({ ...validProject(), engineKind: "claude" }),
-    ).toBe(false);
+describe("skill step removed — skills live on rule actions", () => {
+  it("STEPS no longer includes skill", () => {
+    expect(STEPS).not.toContain("skill");
   });
 });
 
@@ -546,16 +508,15 @@ describe("validateStep — update (717 bitbucket gates)", () => {
 });
 
 describe("STEPS ordering", () => {
-  it("is the wizard sequence source→repo→repoRoot→skill→update→done (717 F8)", () => {
+  it("is the wizard sequence source→repo→repoRoot→update→done (skills live on rules)", () => {
     // `source` comes BEFORE `repo` so the source is chosen before validateStep("repo")
     // branches the repo-shape check on draft.sourceKind — otherwise a Bitbucket/Azure
     // bare slug would be checked against the default github owner/name rule and the user
-    // could never advance past the repo step.
+    // could never advance past the repo step. Skills are configured on rule actions.
     expect(STEPS).toEqual([
       "source",
       "repo",
       "repoRoot",
-      "skill",
       "update",
       "done",
     ]);
@@ -620,12 +581,9 @@ describe("errorToStep — routes backend AppError messages", () => {
   it("repo message → repo step (checked after repoRoot)", () => {
     expect(errorToStep("repo 必须是 owner/name 格式: not-a-repo")).toBe("repo");
   });
-  it("skill message → skill step", () => {
-    expect(errorToStep("skill 路径不存在: /x/y")).toBe("skill");
-    expect(errorToStep("skillRelPath 必须是相对路径: /x")).toBe("skill");
-  });
-  it("path-escape message (names both fields) → skill step, not repoRoot", () => {
-    expect(errorToStep("skillRelPath 不能逃逸 repoRoot: ../x")).toBe("skill");
+  it("skill message → null (skills live on rules, not an onboard step)", () => {
+    expect(errorToStep("skill 路径不存在: /x/y")).toBeNull();
+    expect(errorToStep("skillName 不能为空")).toBeNull();
   });
   it("interval messages → update step", () => {
     expect(errorToStep("pollIntervalSecs 必须大于 0")).toBe("update");

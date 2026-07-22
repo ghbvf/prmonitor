@@ -90,8 +90,8 @@ use crate::config::service::{
 };
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, LabelSource, ReviewKind,
-    SourceKind, WebhookTunnelMode,
+    Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, LabelSource, SourceKind,
+    WebhookTunnelMode,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -211,8 +211,8 @@ pub struct WebhookDelivery {
     pub repo: Option<String>,
     /// The PR number when known; else `None`.
     pub pr_number: Option<u64>,
-    /// The classified turn kind (`"review"` / `"check"`) when applicable; else `None`.
-    pub kind: Option<String>,
+    /// The classified turn skill_key (`"review"` / `"check"`) when applicable; else `None`.
+    pub skill_key: Option<String>,
     /// The terminal classification of this delivery.
     pub status: DeliveryStatus,
     /// A short human-readable (Chinese) note (skip reason / error); `None` → null.
@@ -356,7 +356,7 @@ pub enum IngestIntent {
     /// closed/merged PR, or an open PR whose trigger label was removed. The ingest
     /// refreshes an EXISTING row's status (no insert). The [`StatusOnlyKind`]
     /// SINGLE-SOURCES both the skip-reason text and the terminal [`DeliveryStatus`].
-    StatusOnly { kind: StatusOnlyKind },
+    StatusOnly { skill_key: StatusOnlyKind },
 }
 
 /// Which status-only outcome a non-dispatch [`IngestIntent::StatusOnly`] is (#61). The
@@ -1128,7 +1128,7 @@ async fn handle_webhook(
                     action: None,
                     repo: None,
                     pr_number: None,
-                    kind: None,
+                    skill_key: None,
                     status: DeliveryStatus::BadPayload,
                     message: Some("X-GitHub-Event 头不是合法 UTF-8".to_string()),
                 },
@@ -1167,7 +1167,7 @@ async fn handle_github_delivery(
                 action: None,
                 repo: None,
                 pr_number: None,
-                kind: None,
+                skill_key: None,
                 status: DeliveryStatus::Unauthorized,
                 message: Some("HMAC 校验失败（签名/密钥不匹配）".to_string()),
             },
@@ -1184,7 +1184,7 @@ async fn handle_github_delivery(
                 action: None,
                 repo: None,
                 pr_number: None,
-                kind: None,
+                skill_key: None,
                 status: DeliveryStatus::Ignored,
                 message: Some("非 pull_request 事件（已确认，不处理）".to_string()),
             },
@@ -1203,7 +1203,7 @@ async fn handle_github_delivery(
                     action: None,
                     repo: None,
                     pr_number: None,
-                    kind: None,
+                    skill_key: None,
                     status: DeliveryStatus::BadPayload,
                     message: Some("请求体不是合法 JSON".to_string()),
                 },
@@ -1252,7 +1252,7 @@ async fn handle_github_delivery(
                     action,
                     repo,
                     pr_number: None,
-                    kind: None,
+                    skill_key: None,
                     status: DeliveryStatus::WrongRepo,
                     message: Some("仓库未匹配任何已启用项目（已忽略）".to_string()),
                 },
@@ -1270,7 +1270,7 @@ async fn handle_github_delivery(
                     action,
                     repo: None,
                     pr_number: None,
-                    kind: None,
+                    skill_key: None,
                     status: DeliveryStatus::BadPayload,
                     message: Some("pull_request 载荷缺少必要字段".to_string()),
                 },
@@ -1317,7 +1317,7 @@ async fn handle_azure_delivery(
                 action: None,
                 repo: None,
                 pr_number: None,
-                kind: None,
+                skill_key: None,
                 status: DeliveryStatus::Unauthorized,
                 message: Some("Azure 鉴权失败（Authorization 缺失或不匹配）".to_string()),
             },
@@ -1336,7 +1336,7 @@ async fn handle_azure_delivery(
                     action: None,
                     repo: None,
                     pr_number: None,
-                    kind: None,
+                    skill_key: None,
                     status: DeliveryStatus::BadPayload,
                     message: Some("请求体不是合法 JSON".to_string()),
                 },
@@ -1361,7 +1361,7 @@ async fn handle_azure_delivery(
                 action: None,
                 repo: None,
                 pr_number: None,
-                kind: None,
+                skill_key: None,
                 status: DeliveryStatus::Ignored,
                 message: Some("非 PR 创建/更新事件（已确认，不处理）".to_string()),
             },
@@ -1387,7 +1387,7 @@ async fn handle_azure_delivery(
                             action: None,
                             repo: Some(repo),
                             pr_number: None,
-                            kind: None,
+                            skill_key: None,
                             status: DeliveryStatus::Refreshed,
                             message: Some("已触发 az 重新发现（读取当前标签）".to_string()),
                         },
@@ -1406,7 +1406,7 @@ async fn handle_azure_delivery(
                     action: None,
                     repo,
                     pr_number: None,
-                    kind: None,
+                    skill_key: None,
                     status: DeliveryStatus::WrongRepo,
                     message: Some("仓库/项目未匹配任何已启用 Azure 项目（已忽略）".to_string()),
                 },
@@ -1422,7 +1422,7 @@ async fn handle_azure_delivery(
                     action: None,
                     repo: None,
                     pr_number: None,
-                    kind: None,
+                    skill_key: None,
                     status: DeliveryStatus::BadPayload,
                     message: Some("Azure PR 载荷缺少必要字段".to_string()),
                 },
@@ -1650,7 +1650,7 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
     // the closed state (StatusOnly — list-only, never dispatched).
     if pr.get("state").and_then(Value::as_str) != Some("open") {
         return ParseResult::Routable(Box::new(event(IngestIntent::StatusOnly {
-            kind: StatusOnlyKind::ClosedOrMerged,
+            skill_key: StatusOnlyKind::ClosedOrMerged,
         })));
     }
 
@@ -1662,8 +1662,8 @@ fn parse_delivery(payload: &Value, routes: &[ProjectRoute]) -> ParseResult {
             author,
             is_cross_repository,
             is_draft,
-            // The rule engine stamps the concrete review/check action kind later.
-            kind: ReviewKind::Review,
+            // The rule engine stamps the concrete review/check action skill_key later.
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
         }),
         conflict: false,
     };
@@ -1968,7 +1968,7 @@ mod tests {
             labels: vec!["pr-review".to_string()],
             url: "https://example.com/pr/7".to_string(),
             intent: IngestIntent::StatusOnly {
-                kind: StatusOnlyKind::ClosedOrMerged,
+                skill_key: StatusOnlyKind::ClosedOrMerged,
             },
         }
     }
@@ -2054,7 +2054,7 @@ mod tests {
                     author: "octocat".to_string(),
                     is_cross_repository: false,
                     is_draft: false,
-                    kind: ReviewKind::Review,
+                    skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 }),
                 conflict: false,
             },
@@ -2249,10 +2249,10 @@ mod tests {
             IngestIntent::Track {
                 candidate: None, ..
             } => panic!("expected a dispatch candidate, got a conflict Track"),
-            IngestIntent::StatusOnly { kind } => {
+            IngestIntent::StatusOnly { skill_key } => {
                 panic!(
                     "expected a dispatch candidate, got StatusOnly: {}",
-                    kind.reason()
+                    skill_key.reason()
                 )
             }
         }
@@ -2273,7 +2273,10 @@ mod tests {
         assert_eq!(ev.action.as_deref(), Some("labeled"));
         let c = dispatch_candidate(&p, &single_route("needs-review", "needs-check"));
         assert_eq!(c.number, 42);
-        assert_eq!(c.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            c.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert_eq!(c.head_sha, "abc123");
         assert_eq!(c.head_ref, "feature");
         assert_eq!(c.author, "octocat");
@@ -2321,7 +2324,10 @@ mod tests {
         let ev = routable(&title_tagged, &routes);
         assert_eq!(ev.labels, vec!["needs-review".to_string()]);
         let c = dispatch_candidate(&title_tagged, &routes);
-        assert_eq!(c.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            c.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
     }
 
     #[test]
@@ -2330,7 +2336,10 @@ mod tests {
         let ev = routable(&p, &single_route("needs-review", "needs-check"));
         assert_eq!(ev.project_id, "default");
         let c = dispatch_candidate(&p, &single_route("needs-review", "needs-check"));
-        assert_eq!(c.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            c.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
     }
 
     #[test]
@@ -2412,8 +2421,8 @@ mod tests {
         // closed-state check precedes label classification, so `[]` doesn't shadow it).
         let empty_closed = pr_payload(&[], serde_json::json!({ "state": "closed" }));
         match routable(&empty_closed, &single_route("needs-review", "needs-check")).intent {
-            IngestIntent::StatusOnly { kind } => {
-                assert!(matches!(kind, StatusOnlyKind::ClosedOrMerged));
+            IngestIntent::StatusOnly { skill_key } => {
+                assert!(matches!(skill_key, StatusOnlyKind::ClosedOrMerged));
             }
             other => panic!("empty [] on closed PR: expected StatusOnly, got {other:?}"),
         }
@@ -2428,9 +2437,9 @@ mod tests {
         for state in ["closed", "merged"] {
             let p = pr_payload(&["needs-review"], serde_json::json!({ "state": state }));
             match routable(&p, &single_route("needs-review", "needs-check")).intent {
-                IngestIntent::StatusOnly { kind } => {
-                    assert!(matches!(kind, StatusOnlyKind::ClosedOrMerged));
-                    assert_eq!(kind.reason(), "PR 已关闭或合并");
+                IngestIntent::StatusOnly { skill_key } => {
+                    assert!(matches!(skill_key, StatusOnlyKind::ClosedOrMerged));
+                    assert_eq!(skill_key.reason(), "PR 已关闭或合并");
                 }
                 other => panic!("state {state}: expected StatusOnly, got {other:?}"),
             }
@@ -2438,8 +2447,8 @@ mod tests {
         // A payload with `state: null` is also non-open → StatusOnly { ClosedOrMerged }.
         let no_state = pr_payload(&["needs-review"], serde_json::json!({ "state": null }));
         match routable(&no_state, &single_route("needs-review", "needs-check")).intent {
-            IngestIntent::StatusOnly { kind } => {
-                assert!(matches!(kind, StatusOnlyKind::ClosedOrMerged))
+            IngestIntent::StatusOnly { skill_key } => {
+                assert!(matches!(skill_key, StatusOnlyKind::ClosedOrMerged))
             }
             other => panic!("null state: expected StatusOnly, got {other:?}"),
         }
@@ -3309,7 +3318,7 @@ mod tests {
             route("proj-b", "owner/b", "b-review", "b-check"),
         ];
 
-        // A payload for owner/b carrying B's review label → routed to proj-b, kind review.
+        // A payload for owner/b carrying B's review label → routed to proj-b, skill_key review.
         let mut for_b = pr_payload(&["b-review"], serde_json::json!({}));
         for_b.as_object_mut().unwrap().insert(
             "repository".to_string(),
@@ -3321,8 +3330,8 @@ mod tests {
             "routed to the matching project, not the first"
         );
         assert_eq!(
-            dispatch_candidate(&for_b, &routes).kind,
-            crate::model::ReviewKind::Review
+            dispatch_candidate(&for_b, &routes).skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
         );
 
         // The SAME repo with project A's label still routes to proj-b. Label-to-action
@@ -3480,7 +3489,7 @@ mod tests {
             action: Some("labeled".to_string()),
             repo: Some("owner/repo".to_string()),
             pr_number: Some(42),
-            kind: Some("review".to_string()),
+            skill_key: Some("review".to_string()),
             status: DeliveryStatus::ListUpdated,
             message: None,
         };
@@ -3492,7 +3501,7 @@ mod tests {
         assert!(v.get("action").is_some());
         assert!(v.get("repo").is_some());
         assert!(v.get("prNumber").is_some());
-        assert!(v.get("kind").is_some());
+        assert!(v.get("skillKey").is_some());
         assert!(v.get("status").is_some());
 
         // snake_case forms absent — a rename would surface here.
@@ -3518,12 +3527,12 @@ mod tests {
             action: None,
             repo: None,
             pr_number: None,
-            kind: None,
+            skill_key: None,
             status: DeliveryStatus::Ignored,
             message: None,
         };
         let v = serde_json::to_value(&d).expect("WebhookDelivery serializes");
-        for field in ["action", "repo", "prNumber", "kind", "message"] {
+        for field in ["action", "repo", "prNumber", "skill_key", "message"] {
             assert_eq!(
                 v[field],
                 serde_json::Value::Null,
@@ -3568,7 +3577,7 @@ mod tests {
                 action: None,
                 repo: None,
                 pr_number: Some(i),
-                kind: None,
+                skill_key: None,
                 status: DeliveryStatus::Ignored,
                 message: None,
             });

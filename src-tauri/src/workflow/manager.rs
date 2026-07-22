@@ -17,7 +17,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use crate::db::Database;
 use crate::error::AppResult;
 use crate::events::{StreamEvent, WorkflowEvent};
-use crate::model::{ReviewKind, ReviewReceiptId, ReviewReceiptStatus, SendNotificationResponse};
+use crate::model::{ReviewReceiptId, ReviewReceiptStatus, SendNotificationResponse};
 use crate::stream;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,7 +26,7 @@ pub struct ReviewNotifyRequest {
     pub receipt_id: ReviewReceiptId,
     pub reference: String,
     pub pr_number: u64,
-    pub kind: ReviewKind,
+    pub skill_key: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,13 +143,13 @@ impl WorkflowManager {
         receipt_id: ReviewReceiptId,
         reference: String,
         pr_number: u64,
-        kind: ReviewKind,
+        skill_key: String,
     ) -> AppResult<()> {
         let request = ReviewNotifyRequest {
             receipt_id,
             reference,
             pr_number,
-            kind,
+            skill_key,
         };
         crate::workflow::service::ensure_receipt_notify(&app, request)?;
         self.wake.notify_one();

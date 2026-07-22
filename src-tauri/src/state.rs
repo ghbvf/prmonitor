@@ -12,7 +12,7 @@ use crate::config::service::CliResolver;
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    ExternalRequestId, ExternalTriggerOrigin, ReviewKind, ReviewLifecycleDispatch, ReviewReceiptId,
+    ExternalRequestId, ExternalTriggerOrigin, ReviewLifecycleDispatch, ReviewReceiptId,
     ReviewReceiptSnapshot, SendNotificationRequest, SendNotificationResponse,
 };
 
@@ -31,7 +31,7 @@ pub type ExternalReviewSubmitSink = Arc<
     dyn Fn(
             String,
             u64,
-            ReviewKind,
+            String,
             ExternalRequestId,
             ExternalTriggerOrigin,
             bool,
@@ -85,7 +85,7 @@ impl ExternalReviewIngress {
         &self,
         reference: String,
         pr_number: u64,
-        kind: ReviewKind,
+        extra_args: String,
         request_id: ExternalRequestId,
         origin: ExternalTriggerOrigin,
         notify_on_completion: bool,
@@ -99,7 +99,7 @@ impl ExternalReviewIngress {
         sink(
             reference,
             pr_number,
-            kind,
+            extra_args,
             request_id,
             origin,
             notify_on_completion,

@@ -111,17 +111,6 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         hint: "GitHub 源: owner/name（如 ghbvf/prmonitor）；Azure 源: 裸仓库名（org/project 见下方）；Bitbucket 源: 裸仓库 slug（项目 Key 见下方）",
       },
       { key: "repoRoot", label: "本地路径", kind: "text", hint: "本地 clone 的绝对路径" },
-      {
-        key: "skillRelPath",
-        label: "Skill 路径",
-        kind: "text",
-        hint: "相对仓库根的 skill 路径，如 .codex/skills/pr-review/SKILL.md（仅 codex 引擎）",
-        // codex-only (#718): the claude engine discovers `.claude/skills/` from the
-        // repo cwd, so it needs no configured skill path. Hidden for a claude project,
-        // mirroring the source-conditional azure/bitbucket fields below; the backend
-        // `validate_project` likewise skips skillRelPath unless engineKind === codex.
-        visibleWhen: (p) => p.engineKind === "codex",
-      },
     ],
   },
   {
@@ -260,8 +249,8 @@ export const PROJECT_GROUPS: FieldGroup<ProjectFieldKey>[] = [
         label: "Claude 模型",
         kind: "text",
         hint: "claude -p 的 --model，如 claude-opus-4-1 / sonnet；留空=claude CLI 默认（仅 claude 引擎）",
-        // claude-only: mirrors skillRelPath's codex-only visibility. Hidden (value
-        // preserved) for a codex project; empty = the claude CLI's default model.
+        // claude-only: hidden (value preserved) for non-claude engines; empty =
+        // the claude CLI's default model.
         visibleWhen: (p) => p.engineKind === "claude",
       },
       {
@@ -377,8 +366,8 @@ export const GLOBAL_GROUPS: FieldGroup<GlobalFieldKey>[] = [
 // gated before the user picked the source, a valid Bitbucket/Azure bare slug would be
 // checked against the default github `owner/name` rule and the user could never advance.
 // Picking the source first means the repo step always validates against the right shape.
-export type StepId = "repo" | "repoRoot" | "skill" | "source" | "update" | "done";
-export const STEPS: StepId[] = ["source", "repo", "repoRoot", "skill", "update", "done"];
+export type StepId = "repo" | "repoRoot" | "source" | "update" | "done";
+export const STEPS: StepId[] = ["source", "repo", "repoRoot", "update", "done"];
 
 // Which per-project fields each onboarding step renders (818 F2/F3; 717). Single-sourced
 // here (not in OnboardingWizard.vue) so the wizard and these unit tests agree. Keys are
@@ -389,7 +378,6 @@ export const STEPS: StepId[] = ["source", "repo", "repoRoot", "skill", "update",
 export const STEP_FIELDS: Record<StepId, ProjectFieldKey[]> = {
   repo: ["repo"],
   repoRoot: ["repoRoot"],
-  skill: ["skillRelPath"],
   // source lists the azure + bitbucket connection fields too (717) — they only render
   // under their matching source via the FieldDef `visibleWhen` predicate (see
   // visibleStepFields).
@@ -442,9 +430,6 @@ const REPO_RE = /^[^/\s]+\/[^/\s]+$/;
 // A bare repo slug: one or more non-slash, non-whitespace chars (azure/bitbucket repos,
 // where the org/project key lives in its own field). Mirrors the backend bare-slug check.
 const BARE_SLUG_RE = /^[^/\s]+$/;
-// Windows drive-letter absolute path (C:\ or C:/).
-const WIN_ABS_RE = /^[A-Za-z]:[\\/]/;
-
 // Per-step frontend gate: null = ok, else a user-facing Chinese error string.
 // Mirrors the backend AppError checks so most failures are caught before the
 // round-trip; the backend remains the source of truth (see errorToStep). The draft
@@ -471,16 +456,6 @@ export function validateStep(step: StepId, draft: Project): string | null {
       return REPO_RE.test(draft.repo) ? null : "仓库需为 owner/name 格式";
     case "repoRoot":
       return draft.repoRoot.trim() !== "" ? null : "请填写本地 clone 的绝对路径";
-    case "skill": {
-      // codex-only (#718): the claude engine discovers `.claude/skills/` from cwd, so
-      // skillRelPath is unused — skip the gate (the field is hidden via visibleWhen and
-      // the backend `validate_project` skips it for a non-codex engine).
-      if (draft.engineKind !== "codex") return null;
-      const p = draft.skillRelPath;
-      if (p.trim() === "") return "请填写 skill 相对路径";
-      if (p.startsWith("/") || WIN_ABS_RE.test(p)) return "skill 必须是相对路径";
-      return null;
-    }
     case "source":
       // Azure source (818 F2): the backend `validate_project` requires a non-empty
       // org + project, so gate them here too (errors start with the field token so
@@ -546,10 +521,10 @@ export function validateStep(step: StepId, draft: Project): string | null {
 // in the message — `includes` would mis-route on the interpolated value (e.g. a
 // repoRoot path containing "skill", or a repo value containing "repoRoot").
 //
-// Order matters: `skill` first (the path-escape message "skillRelPath 不能逃逸
-// repoRoot" names both fields but is owned by the skill step); then `repoRoot`
-// before `repo` (since "repoRoot" itself starts with "repo"). Returns null for
-// unrecognized messages so the caller falls back to `done`.
+// Order matters: `repoRoot` before `repo` (since "repoRoot" itself starts with "repo").
+// Skill paths live on rule actions now, so skill* validation messages fall through to
+// null (→ done / Settings). Returns null for unrecognized messages so the caller falls
+// back to `done`.
 //
 // This is the downstream of the cross-end routing funnel (PR #41 F4, Medium): the
 // field tokens here mirror the message prefixes the backend emits. The upstream is
@@ -575,14 +550,13 @@ export function validateStep(step: StepId, draft: Project): string | null {
 // Bitbucket fields (`bitbucketHost` / `bitbucketProject` / `bitbucketToken`, 717): same
 // story — owned by the source step (visibleWhen sourceKind==="bitbucket", gated by
 // validateStep) so backend rejections route to source. `labelSource` and `updateMode`
-// (717) route to the update step: labelSource sits beside its labels-group siblings
-// (reviewLabel/checkLabel), and updateMode sits in the polling group — both surfaced in
+// (717) route to the update step: labelSource sits beside its labels-group siblings,
+// and updateMode sits in the polling group — both surfaced in
 // the update step, where the backend's Bitbucket-only constraints (labelSource must be
 // "title"; updateMode may not be webhook-only/hybrid) are also pre-gated by validateStep.
 // Locked by fields.test.ts.
 export function errorToStep(message: string): StepId | null {
   const m = message.trimStart();
-  if (m.startsWith("skill")) return "skill";
   if (m.startsWith("repoRoot")) return "repoRoot";
   if (m.startsWith("repo")) return "repo";
   if (m.startsWith("azureOrg") || m.startsWith("azureProject")) return "source";

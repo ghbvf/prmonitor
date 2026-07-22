@@ -126,7 +126,7 @@ fn ttl_secs(kind: ActionKind, notification_ttl_secs: u64) -> Option<u64> {
         ActionKind::Notification | ActionKind::MessagingReply | ActionKind::MessagingSend => {
             (notification_ttl_secs > 0).then_some(notification_ttl_secs)
         }
-        ActionKind::Review | ActionKind::Check | ActionKind::StopReview => None,
+        ActionKind::RunSkill | ActionKind::StopReview => None,
     }
 }
 
@@ -930,7 +930,8 @@ mod tests {
     #[test]
     fn blocked_review_preserves_attempt_and_unblock_returns_it_to_pending() {
         let db = Database::open_in_memory().expect("open db");
-        let id = store::enqueue(&db, "p1", ActionKind::Review, "review", "{}", 0).expect("enqueue");
+        let id =
+            store::enqueue(&db, "p1", ActionKind::RunSkill, "review", "{}", 0).expect("enqueue");
         let blocked: AppResult<ActionExecutionResult> = Ok(ActionExecutionResult::Blocked {
             message: "Codex is stopped".to_string(),
             observed_resume_generation: 7,
@@ -960,7 +961,8 @@ mod tests {
     #[test]
     fn resume_between_executor_and_block_record_is_reconciled() {
         let db = Database::open_in_memory().expect("open db");
-        let id = store::enqueue(&db, "p1", ActionKind::Review, "review", "{}", 0).expect("enqueue");
+        let id =
+            store::enqueue(&db, "p1", ActionKind::RunSkill, "review", "{}", 0).expect("enqueue");
         let blocked = Ok(ActionExecutionResult::Blocked {
             message: "Codex is stopped".to_string(),
             observed_resume_generation: 7,

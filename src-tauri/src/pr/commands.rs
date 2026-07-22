@@ -3,7 +3,7 @@
 use crate::config::service as config_service;
 use crate::error::AppResult;
 use crate::events::{PrEvent, StreamEvent};
-use crate::model::{Candidate, CliTool, PullRequestView, ReviewKind, SourceKind, UpdateMode};
+use crate::model::{Candidate, CliTool, PullRequestView, SourceKind, UpdateMode};
 
 use super::azure::{az_auth_status, AzStatus, AzureDevOpsCli};
 use super::bitbucket::BitbucketServer;
@@ -100,7 +100,7 @@ fn build_view_parts(
         title,
         labels,
         url,
-        kind: candidate.kind,
+        skill_key: candidate.skill_key,
         skip_reason,
     };
     (view, dispatchable)
@@ -510,7 +510,7 @@ fn webhook_view(
         title,
         labels,
         url,
-        kind: cand.kind,
+        skill_key: cand.skill_key,
         skip_reason,
     };
     (view, dispatchable)
@@ -553,7 +553,7 @@ struct IngestDecision {
 ///   `None`) → `dispatchable = Some(cand)`, `status = ListUpdated`, `message = None`.
 /// - `Track { candidate: None, conflict: .. }`: both trigger labels → a skipped "review"
 ///   row with the conflict reason; `write = Upsert`; no dispatch; `status = Gated`.
-/// - `StatusOnly { kind }`: refresh an EXISTING row's status (`write = UpdatePresent`),
+/// - `StatusOnly { skill_key }`: refresh an EXISTING row's status (`write = UpdatePresent`),
 ///   never insert / dispatch. Reason text + terminal status BOTH come from the type-locked
 ///   [`StatusOnlyKind`] (no string compare — see ai-robust.md).
 // The flat plain-data arg list (the row metadata + the gating inputs) is deliberate: this
@@ -609,7 +609,7 @@ fn decide_ingest(
                 title,
                 labels,
                 url,
-                kind: ReviewKind::Review,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 skip_reason: Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string()),
             };
             IngestDecision {
@@ -620,9 +620,11 @@ fn decide_ingest(
                 message: Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string()),
             }
         }
-        IngestIntent::StatusOnly { kind: status_kind } => {
+        IngestIntent::StatusOnly {
+            skill_key: status_kind,
+        } => {
             // Closed/merged or trigger-label-removed: refresh an existing row's status,
-            // never insert, never dispatch. `kind` from the current labels (check vs the
+            // never insert, never dispatch. `skill_key` from the current labels (check vs the
             // review default). The reason text + terminal delivery status both come from the
             // type-locked `StatusOnlyKind` (no string compare — see FIX 1 / ai-robust.md).
             let reason = status_kind.reason().to_string();
@@ -631,7 +633,7 @@ fn decide_ingest(
                 title,
                 labels,
                 url,
-                kind: ReviewKind::Review,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 skip_reason: Some(reason.clone()),
             };
             IngestDecision {
@@ -700,7 +702,7 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
                 action: action.clone(),
                 repo: Some(repo.clone()),
                 pr_number: Some(number),
-                kind: None,
+                skill_key: None,
                 status: DeliveryStatus::Gated,
                 message: Some(msg),
             },
@@ -800,7 +802,7 @@ pub(crate) async fn ingest_webhook<R: tauri::Runtime>(
             action,
             repo: Some(repo),
             pr_number: Some(number),
-            kind: Some(view.kind.to_string()),
+            skill_key: Some(view.skill_key.to_string()),
             status: final_status,
             message,
         },
@@ -997,12 +999,17 @@ pub async fn poll_status<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Candidate, ReviewActionKey, ReviewKind};
+    use crate::model::{Candidate, ReviewActionKey};
 
-    fn action_key(pr: u64, head: &str, kind: &str) -> String {
-        ReviewActionKey::for_parts(pr, head, kind.parse().unwrap())
-            .unwrap()
-            .into_inner()
+    fn action_key(pr: u64, head: &str, skill_key: impl AsRef<str>) -> String {
+        let skill_key = skill_key.as_ref();
+        ReviewActionKey::for_parts(
+            pr,
+            head,
+            crate::model::SkillInvocation::migrate_legacy_skill_key(skill_key),
+        )
+        .unwrap()
+        .into_inner()
     }
 
     fn params() -> MonitorParams {
@@ -1015,7 +1022,8 @@ mod tests {
 
     // AB#1070: the source-agnostic discovered row is now a `DiscoveredEvent` (normalized
     // `Event` + gating `Candidate`). `.candidate` still surfaces for the gating-only tests.
-    fn row(number: u64, kind: &str, conflict: bool) -> DiscoveredEvent {
+    fn row(number: u64, skill_key: impl AsRef<str>, conflict: bool) -> DiscoveredEvent {
+        let skill_key = skill_key.as_ref();
         use crate::model::{EventEnvelope, EventSubject, EventType, InboxDedupeKey};
         let candidate = Candidate {
             number,
@@ -1024,7 +1032,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: kind.parse().unwrap(),
+            skill_key: crate::model::SkillInvocation::migrate_legacy_skill_key(skill_key),
         };
         DiscoveredEvent {
             event: EventEnvelope::observation(
@@ -1069,7 +1077,10 @@ mod tests {
             0,
         );
         assert_eq!(view.number, 1);
-        assert_eq!(view.kind, ReviewKind::Review);
+        assert_eq!(
+            view.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert_eq!(view.title, "Real title");
         assert_eq!(view.url, "https://dev.azure.com/o/p/_git/r/pullrequest/1");
         assert_eq!(
@@ -1169,7 +1180,10 @@ mod tests {
     fn build_view_clean_row_has_no_skip_reason_and_is_dispatchable() {
         let (view, cand) = build_view(&row(1, "review", false), &params(), &Ledger::default(), 0);
         assert_eq!(view.number, 1);
-        assert_eq!(view.kind, ReviewKind::Review);
+        assert_eq!(
+            view.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         // AB#1070: display fields (title / url / labels) come from the `DiscoveredEvent.event`,
         // not the `Candidate` (which has no title/url/labels) — locks the event-as-display source.
         assert_eq!(view.title, "PR 1");
@@ -1179,7 +1193,10 @@ mod tests {
         // Clean row (skip_reason None) → surfaced as a dispatchable candidate.
         let cand = cand.expect("clean row yields a dispatchable candidate");
         assert_eq!(cand.number, 1);
-        assert_eq!(cand.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            cand.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
     }
 
     #[test]
@@ -1208,12 +1225,12 @@ mod tests {
         use std::collections::HashSet;
 
         let r = row(4, "review", false);
-        let key = action_key(4, &r.candidate.head_sha, "review");
+        let key = action_key(4, &r.candidate.head_sha, &r.candidate.skill_key);
         let ledger = Ledger {
             dispatched: HashSet::new(),
             events: vec![DispatchEvent {
                 pr: 4,
-                kind: "review".to_string(),
+                skill_key: r.candidate.skill_key.clone(),
                 head_sha: r.candidate.head_sha.clone(),
                 key,
                 dispatched_at_epoch: 1_000,
@@ -1252,7 +1269,7 @@ mod tests {
             // #3 dispatched 500s before `now` (1800s cooldown) → cooldown_skip drops it.
             events: vec![DispatchEvent {
                 pr: 3,
-                kind: "review".to_string(),
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 head_sha: cooled.head_sha.clone(),
                 key: action_key(3, &cooled.head_sha, "review"),
                 dispatched_at_epoch: 1_000,
@@ -1343,7 +1360,10 @@ mod tests {
             0,
         );
         assert_eq!(d.view.number, 1);
-        assert_eq!(d.view.kind, ReviewKind::Review);
+        assert_eq!(
+            d.view.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert_eq!(d.view.skip_reason, None);
         assert!(matches!(d.write, WriteKind::Upsert));
         assert!(matches!(d.status, DeliveryStatus::ListUpdated));
@@ -1388,7 +1408,7 @@ mod tests {
             dispatched: HashSet::new(),
             events: vec![DispatchEvent {
                 pr: 4,
-                kind: "review".to_string(),
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 head_sha: cand.head_sha.clone(),
                 key: action_key(4, &cand.head_sha, "review"),
                 dispatched_at_epoch: 1_000,
@@ -1444,7 +1464,10 @@ mod tests {
             0,
         );
         assert_eq!(d.view.number, 5);
-        assert_eq!(d.view.kind, ReviewKind::Review);
+        assert_eq!(
+            d.view.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert_eq!(
             d.view.skip_reason,
             Some(discover::BOTH_TRIGGER_LABELS_REASON.to_string())
@@ -1462,7 +1485,7 @@ mod tests {
         // A closed/merged PR → StatusOnly { ClosedOrMerged }: UpdatePresent (refresh an
         // existing row, never insert / dispatch), status NotOpen, reason "PR 已关闭或合并".
         let intent = IngestIntent::StatusOnly {
-            kind: StatusOnlyKind::ClosedOrMerged,
+            skill_key: StatusOnlyKind::ClosedOrMerged,
         };
         let d = decide_ingest(
             intent,
@@ -1475,7 +1498,10 @@ mod tests {
             0,
         );
         assert_eq!(d.view.number, 6);
-        assert_eq!(d.view.kind, ReviewKind::Review);
+        assert_eq!(
+            d.view.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert_eq!(d.view.skip_reason, Some("PR 已关闭或合并".to_string()));
         assert!(matches!(d.write, WriteKind::UpdatePresent));
         assert!(matches!(d.status, DeliveryStatus::NotOpen));
@@ -1485,10 +1511,10 @@ mod tests {
     #[test]
     fn decide_ingest_status_only_trigger_label_removed_is_no_trigger_label_update_present() {
         // An open PR with the trigger label removed → StatusOnly { TriggerLabelRemoved }:
-        // UpdatePresent, status NoTriggerLabel, reason "触发 label 已移除". The action kind is
+        // UpdatePresent, status NoTriggerLabel, reason "触发 label 已移除". The action skill_key is
         // no longer inferred from labels at ingest time.
         let intent = IngestIntent::StatusOnly {
-            kind: StatusOnlyKind::TriggerLabelRemoved,
+            skill_key: StatusOnlyKind::TriggerLabelRemoved,
         };
         let d = decide_ingest(
             intent,
@@ -1501,7 +1527,10 @@ mod tests {
             0,
         );
         assert_eq!(d.view.number, 7);
-        assert_eq!(d.view.kind, ReviewKind::Review);
+        assert_eq!(
+            d.view.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert_eq!(d.view.skip_reason, Some("触发 label 已移除".to_string()));
         assert!(matches!(d.write, WriteKind::UpdatePresent));
         assert!(matches!(d.status, DeliveryStatus::NoTriggerLabel));

@@ -8,14 +8,14 @@ use tokio::process::ChildStdin;
 use tokio::sync::broadcast;
 
 use super::manager::{CursorManager, CURSOR_ACP_MODEL_BUSY_MSG, CURSOR_ACP_UNAVAILABLE};
-use super::process::{self, review_prompt, text_prompt};
+use super::process::{self, text_prompt};
 use super::protocol::ServerNotification;
 use super::protocol::{SessionNewParams, SessionPromptResult};
 use super::rpc::RpcClient;
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, StreamEvent};
-use crate::model::{EngineKind, ReviewKind};
+use crate::model::EngineKind;
 use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, StartReviewOutcome};
 use crate::review::history_store::{self, HistoryItemKind};
 use crate::review::session::{
@@ -45,12 +45,20 @@ pub struct CursorEngine<'a, R: tauri::Runtime> {
 }
 
 impl<R: tauri::Runtime> ReviewEngine for CursorEngine<'_, R> {
+    fn requires_skill_path(&self) -> bool {
+        false
+    }
+
     async fn start(
         &self,
         _capability: &ReviewStartCapability,
         pr_number: u64,
-        kind: ReviewKind,
+        invocation: &crate::model::SkillInvocation,
     ) -> AppResult<StartReviewOutcome> {
+        debug_assert!(
+            !self.requires_skill_path() && invocation.skill_path.is_none(),
+            "Cursor is command-only"
+        );
         start_review(
             self.app,
             self.cursor,
@@ -60,7 +68,7 @@ impl<R: tauri::Runtime> ReviewEngine for CursorEngine<'_, R> {
             self.repo_root,
             self.cursor_model,
             pr_number,
-            kind,
+            invocation,
             self.url_ctx.clone(),
             self.outbox_claim_id,
         )
@@ -102,18 +110,18 @@ async fn start_review<R: tauri::Runtime>(
     repo_root: &str,
     cursor_model: &str,
     pr_number: u64,
-    kind: ReviewKind,
+    invocation: &crate::model::SkillInvocation,
     url_ctx: CommentUrlContext,
     outbox_claim_id: Option<i64>,
 ) -> AppResult<StartReviewOutcome> {
-    if !registry.try_reserve_pair(project_id, pr_number, kind) {
+    if !registry.try_reserve_pair(project_id, pr_number, &invocation.skill_key) {
         return Ok(StartReviewOutcome::Deduped);
     }
     let reservation = ReservationGuard {
         registry,
         project_id: project_id.to_string(),
         pr_number,
-        kind,
+        skill_key: invocation.skill_key.clone(),
         armed: true,
     };
 
@@ -151,7 +159,7 @@ async fn start_review<R: tauri::Runtime>(
         thread_id: session_id.clone(),
         turn_id: session_id.clone(),
         pr_number,
-        kind,
+        skill_key: invocation.skill_key.clone(),
         engine_kind: EngineKind::Cursor,
         status: SessionStatus::Starting,
         created_at_epoch,
@@ -171,7 +179,7 @@ async fn start_review<R: tauri::Runtime>(
         },
     );
 
-    let prompt_text = review_prompt(pr_number, kind);
+    let prompt_text = invocation.command.clone();
     let sub = client.subscribe();
     tauri::async_runtime::spawn(pump(
         client,
@@ -505,7 +513,7 @@ fn persist_session_status<R: tauri::Runtime>(
             thread_id: thread_id.to_string(),
             turn_id: thread_id.to_string(),
             pr_number,
-            kind: durable_info.kind,
+            skill_key: durable_info.skill_key.clone(),
             engine_kind: durable_info.engine_kind,
             status,
             created_at_epoch: durable_info.created_at_epoch,

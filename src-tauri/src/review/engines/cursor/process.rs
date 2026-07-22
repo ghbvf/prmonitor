@@ -253,11 +253,8 @@ where
 }
 
 /// Build the review skill prompt (mirrors Claude's `/pr-review` construction).
-pub fn review_prompt(pr_number: u64, kind: crate::model::ReviewKind) -> String {
-    match kind {
-        crate::model::ReviewKind::Review => format!("/pr-review {pr_number}"),
-        crate::model::ReviewKind::Check => format!("/pr-review {pr_number} --check"),
-    }
+pub fn review_prompt(_pr_number: u64, command: &str) -> String {
+    command.to_string()
 }
 
 /// Convenience: text-only prompt params.
@@ -378,12 +375,9 @@ mod tests {
 
     #[test]
     fn review_prompt_matches_kind() {
+        assert_eq!(review_prompt(42, "/pr-review 42"), "/pr-review 42");
         assert_eq!(
-            review_prompt(42, crate::model::ReviewKind::Review),
-            "/pr-review 42"
-        );
-        assert_eq!(
-            review_prompt(42, crate::model::ReviewKind::Check),
+            review_prompt(42, "/pr-review 42 --check"),
             "/pr-review 42 --check"
         );
     }

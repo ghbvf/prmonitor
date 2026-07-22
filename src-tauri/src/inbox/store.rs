@@ -325,7 +325,7 @@ pub fn get_review_receipt(
              FROM inbox_event i \
              LEFT JOIN rule_match rm ON rm.inbox_event_id=i.id \
              LEFT JOIN rule_match_action rma ON rma.rule_match_id=rm.id \
-             LEFT JOIN action_outbox o ON o.id=rma.action_outbox_id AND o.kind IN ('review','check') \
+             LEFT JOIN action_outbox o ON o.id=rma.action_outbox_id AND o.kind = 'runSkill' \
              LEFT JOIN review_session s ON s.thread_id=o.review_thread_id \
              WHERE i.id=?1 ORDER BY o.id LIMIT 1",
                 [receipt_id.get()],
@@ -517,7 +517,7 @@ struct RawRow {
 
 /// [`SourceKind`] from its DB wire string (reverse of [`source_as_wire`]), STRICT. Replay is a
 /// side-effectful path (it re-feeds GitHub through `ingest_webhook` / re-invokes the Azure
-/// refresher), so it must NOT silently default an unparseable stored `source` to a concrete kind
+/// refresher), so it must NOT silently default an unparseable stored `source` to a concrete skill_key
 /// (the old lenient `unwrap_or(Github)` would route a corrupt Azure/Bitbucket row down the GitHub
 /// re-feed). An unknown / corrupt value is an explicit [`AppError`] the replay surfaces and
 /// records as `Failed`. (Listing stays lenient by NOT reading `source` — `list_by_project` never
@@ -570,7 +570,8 @@ mod tests {
         .unwrap()
     }
 
-    fn candidate(number: u64, kind: &str) -> Candidate {
+    fn candidate(number: u64, skill_key: impl AsRef<str>) -> Candidate {
+        let skill_key = skill_key.as_ref();
         Candidate {
             number,
             head_sha: "sha".to_string(),
@@ -578,7 +579,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: kind.parse().unwrap(),
+            skill_key: crate::model::SkillInvocation::migrate_legacy_skill_key(skill_key),
         }
     }
 
@@ -680,7 +681,10 @@ mod tests {
             "p1",
             "owner/repo",
             7,
-            crate::model::ReviewKind::Review,
+            crate::model::DEFAULT_SKILL_NAME,
+            "",
+            crate::model::DEFAULT_SKILL_PATH,
+            crate::model::DEFAULT_COMMAND_TEMPLATE,
             request_id,
             crate::model::ExternalTriggerOrigin::Http,
             false,
@@ -692,7 +696,7 @@ mod tests {
             .expect("new");
         db.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO review_session (thread_id, project_id, pr_number, turn_id, kind, status, created_at, updated_at, comment_url, engine_kind, terminal_outcome, terminal_error) VALUES ('th-1','p1',7,'turn-1','review','failed',1,2,NULL,'codex','interrupted','engine stopped')",
+                "INSERT INTO review_session (thread_id, project_id, pr_number, turn_id, skill_key, status, created_at, updated_at, comment_url, engine_kind, terminal_outcome, terminal_error) VALUES ('th-1','p1',7,'turn-1','review','failed',1,2,NULL,'codex','interrupted','engine stopped')",
                 [],
             )?;
             conn.execute(
@@ -700,7 +704,7 @@ mod tests {
                 [inbox_id],
             )?;
             conn.execute(
-                "INSERT INTO action_outbox (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, created_at, updated_at, producer_key, review_thread_id) VALUES ('p1','review','review','{}','done',1,1,1,2,'receipt-test','th-1')",
+                "INSERT INTO action_outbox (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, created_at, updated_at, producer_key, review_thread_id) VALUES ('p1','runSkill','review','{}','done',1,1,1,2,'receipt-test','th-1')",
                 [],
             )?;
             let action_id = conn.last_insert_rowid();
@@ -795,7 +799,7 @@ mod tests {
         assert!(!requeue_failed(&db, i64::MAX).expect("reject unknown"));
     }
 
-    // `get_replayable` (AB#1065): returns the hydrated event, the source kind, the status, and
+    // `get_replayable` (AB#1065): returns the hydrated event, the source skill_key, the status, and
     // the stored `webhook_event_json`; an unknown id is `None`.
     #[test]
     fn get_replayable_returns_event_source_and_webhook_json() {
@@ -943,7 +947,7 @@ mod tests {
                   status, received_at_epoch, processed_at_epoch) \
                  VALUES ('external:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'github', 'pullRequest', \
                          'p1', 'owner/repo', \
-                         '{\"payload\":{\"kind\":\"reviewRequest\"}}', 'raw', \
+                         '{\"payload\":{\"skill_key\":\"reviewRequest\"}}', 'raw', \
                          'processed', 1, 2)",
                 [],
             )?;

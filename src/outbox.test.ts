@@ -54,8 +54,7 @@ describe("outboxKindLabel", () => {
 
   it("renders the known kinds (bilingual zh / en)", () => {
     expect(outboxKindLabel("notification")).toBe("通知 / Notification");
-    expect(outboxKindLabel("review")).toBe("评审 / Review");
-    expect(outboxKindLabel("check")).toBe("复查 / Check");
+    expect(outboxKindLabel("runSkill")).toBe("运行 Skill / Run Skill");
     expect(outboxKindLabel("stopReview")).toBe("停止评审 / Stop Review");
     expect(outboxKindLabel("messagingReply")).toBe("消息回复 / Messaging Reply");
     expect(outboxKindLabel("messagingSend")).toBe("消息发送 / Messaging Send");
@@ -66,8 +65,7 @@ describe("outboxKindLabel", () => {
     // messagingReply is the #1559 bot reply executor; messagingSend is active messaging egress.
     expect([...ACTION_KINDS]).toEqual([
       "notification",
-      "review",
-      "check",
+      "runSkill",
       "stopReview",
       "messagingReply",
       "messagingSend",

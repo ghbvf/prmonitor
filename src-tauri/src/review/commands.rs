@@ -5,7 +5,7 @@ use tauri::Manager;
 use crate::config::service as config_service;
 use crate::db::Database;
 use crate::error::{AppError, AppResult};
-use crate::model::{CliTool, EngineKind, ReviewKind, ReviewLifecycleDispatch, SourceKind};
+use crate::model::{CliTool, EngineKind, ReviewLifecycleDispatch, SkillInvocation, SourceKind};
 use crate::review::claim_store;
 use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, StartReviewOutcome};
 use crate::review::engines::claude::process::{claude_availability, ClaudeStatus};
@@ -189,7 +189,7 @@ enum StartTrigger {
 
 struct EngineStartRequest {
     pr_number: u64,
-    kind: ReviewKind,
+    invocation: SkillInvocation,
     trigger: StartTrigger,
     outbox_claim_id: Option<i64>,
 }
@@ -218,7 +218,7 @@ impl ReviewStartCapability {
     ) -> AppResult<StartReviewOutcome> {
         let EngineStartRequest {
             pr_number,
-            kind,
+            invocation,
             trigger,
             // AB#1204: the owning outbox row id on the OUTBOX path (`Some`), `None` on the manual
             // path. It reaches the engine's claim breadcrumb before the turn runs.
@@ -231,7 +231,7 @@ impl ReviewStartCapability {
         let url_ctx = comment_url_ctx_from(app, project);
         let outcome = match project.engine_kind {
             EngineKind::Codex => {
-                let skill_abs = skill_abs_path(&project.repo_root, &project.skill_rel_path);
+                let skill_abs = invocation.skill_path.as_deref().unwrap_or("");
                 // Codex stop-flag contract (PR #47 F1): an EXPLICIT trigger (UI / CLI / deeplink)
                 // overrides a prior `stop_codex` — `resume()` clears the user-stop flag BEFORE
                 // `engine.start()` reaches the `connection()` funnel (which refuses when stopped). An
@@ -251,7 +251,7 @@ impl ReviewStartCapability {
                     project_id: &project.id,
                     repo: &project.repo,
                     repo_root: &project.repo_root,
-                    skill_abs_path: &skill_abs,
+                    skill_abs_path: skill_abs,
                     codex_model: &project.codex_model,
                     codex_reasoning_effort: project.codex_reasoning_effort,
                     url_ctx,
@@ -261,7 +261,7 @@ impl ReviewStartCapability {
                     // AB#1204: `Some(outbox_id)` on the outbox path → claim breadcrumb at thread/start.
                     outbox_claim_id,
                 };
-                engine.start(self, pr_number, kind).await
+                engine.start(self, pr_number, &invocation).await
             }
             EngineKind::Claude => {
                 let claude_cli = config_service::resolve_cli(app, CliTool::Claude, false)?;
@@ -282,7 +282,7 @@ impl ReviewStartCapability {
                     // AB#1204: `Some(outbox_id)` on the outbox path → claim breadcrumb at thread/start.
                     outbox_claim_id,
                 };
-                engine.start(self, pr_number, kind).await
+                engine.start(self, pr_number, &invocation).await
             }
             EngineKind::Cursor => {
                 // Explicit trigger overrides a prior cursor stop (parity with Codex).
@@ -304,14 +304,14 @@ impl ReviewStartCapability {
                     session_info: None,
                     outbox_claim_id,
                 };
-                engine.start(self, pr_number, kind).await
+                engine.start(self, pr_number, &invocation).await
             }
         }?;
         if let StartReviewOutcome::Started(thread_id) = &outcome {
             if let Err(e) = state.review_lifecycle.fire(ReviewLifecycleDispatch {
                 project_id: project.id.clone(),
                 pr_number,
-                kind,
+                skill_key: invocation.skill_key.clone(),
                 thread_id: thread_id.clone(),
                 event: crate::model::ReviewLifecycleEvent::Started,
                 comment_url: None,
@@ -329,7 +329,7 @@ impl ReviewStartCapability {
 /// The MANUAL / explicit start path (AB#1042): the shared dispatch body behind BOTH
 /// [`start_review`] (project resolved by id)
 /// `reference`). Thin mapper over [`start_via_engine`]: `Started` → the session id; `Deduped` (the
-/// registry already has an in-flight review for this `(project_id, pr, kind)`) → a benign "already in
+/// registry already has an in-flight review for this `(project_id, pr, skill_key)`) → a benign "already in
 /// flight" error — a re-start does NOT double-start; stop the running one first to re-review. This
 /// `Deduped → Err` is correct for a USER action (a re-click deserves the message); the outbox path
 /// maps the same `Deduped` to a done-but-not-ledgered outcome instead (see
@@ -341,7 +341,7 @@ async fn dispatch_engine<R: tauri::Runtime>(
     state: &AppState,
     project: &config_service::Project,
     pr_number: u64,
-    kind: ReviewKind,
+    invocation: &SkillInvocation,
 ) -> AppResult<SessionId> {
     // Manual path: no outbox row, so `None` — the engine writes no AB#1204 claim breadcrumb.
     match capability
@@ -351,7 +351,7 @@ async fn dispatch_engine<R: tauri::Runtime>(
             project,
             EngineStartRequest {
                 pr_number,
-                kind,
+                invocation: invocation.clone(),
                 trigger: StartTrigger::Explicit,
                 outbox_claim_id: None,
             },
@@ -360,7 +360,8 @@ async fn dispatch_engine<R: tauri::Runtime>(
     {
         StartReviewOutcome::Started(session_id) => Ok(session_id),
         StartReviewOutcome::Deduped => Err(AppError::new(format!(
-            "PR {pr_number} 的 {kind} review 已在进行中"
+            "PR {pr_number} 的 {} review 已在进行中",
+            invocation.skill_key
         ))),
     }
 }
@@ -378,7 +379,7 @@ async fn dispatch_engine<R: tauri::Runtime>(
 /// The shared resume seam later moves blocked review actions back to `pending` and wakes the worker.
 /// Explicit review requests resume Codex before entering this same engine/session funnel.
 ///
-/// `kind` comes from the sealed action payload as [`ReviewKind`]. `pr_number` comes from the
+/// `skill_key` comes from the sealed action payload's [`SkillInvocation`]. `pr_number` comes from the
 /// persisted/replayed payload, so it is re-validated. `pub(crate)`
 /// so the composition root (`lib.rs`, outside the `review` module) can call it — it names only
 /// `config`/`state`/review-internal types, never `crate::outbox`, so the slice boundary holds.
@@ -397,7 +398,7 @@ async fn dispatch_engine<R: tauri::Runtime>(
 /// linkage failure rolls the transaction back, leaves the reservation guard armed, and returns a
 /// retryable error rather than exposing a false-live `Starting` session. The `Deduped` outcome (F5)
 /// deliberately writes NO breadcrumb — its claim row keeps a NULL `thread_id`, which is EXPECTED: an
-/// existing in-flight registry session for this `(project, pr, kind)` needs no new thread, and the
+/// existing in-flight registry session for this `(project, pr, skill_key)` needs no new thread, and the
 /// action's intent ("this PR is being reviewed") already holds. The next replay re-takes the same
 /// `Deduped → Ok` path; once the row terminalizes the composition root's `release_claim` drops the
 /// NULL-thread claim normally (idempotent) — see `release_claim_cleans_up_null_thread_claim` in
@@ -408,12 +409,16 @@ pub(crate) async fn start_for_outbox<R: tauri::Runtime>(
     state: &AppState,
     project_id: &str,
     pr_number: u64,
-    kind: ReviewKind,
+    invocation: &SkillInvocation,
     outbox_id: i64,
 ) -> AppResult<OutboxReviewStartOutcome> {
     // Fail-closed on a replayed payload: a `pr = 0` must not reach the engine.
     validate_pr_number(pr_number)?;
     let project = config_service::project_validated(app, project_id)?;
+    let invocation = invocation
+        .clone()
+        .materialize_for_engine(&project.repo_root, project.engine_kind)
+        .map_err(crate::error::AppError::new)?;
 
     // AB#1204 cross-restart dedup. Write-ahead a claim keyed by the OUTBOX ROW id BEFORE starting
     // (propagating error: a write failure retries the row, nothing started yet). `begin_claim`
@@ -422,9 +427,13 @@ pub(crate) async fn start_for_outbox<R: tauri::Runtime>(
     // enough to have posted its `pm:` comment. A fresh claim, or a claim with no thread (crashed
     // before `thread/start`, so no comment), falls through to a genuine start (at-least-once).
     let db = app.state::<Database>();
-    if let Some(prior_thread_id) =
-        claim_store::begin_claim(db.inner(), outbox_id, project_id, pr_number, kind)?
-    {
+    if let Some(prior_thread_id) = claim_store::begin_claim(
+        db.inner(),
+        outbox_id,
+        project_id,
+        pr_number,
+        &invocation.skill_key,
+    )? {
         if replayed_review_should_suppress(db.inner(), &prior_thread_id)? {
             return Ok(OutboxReviewStartOutcome::SuppressedReplay {
                 thread_id: prior_thread_id,
@@ -446,7 +455,7 @@ pub(crate) async fn start_for_outbox<R: tauri::Runtime>(
             &project,
             EngineStartRequest {
                 pr_number,
-                kind,
+                invocation: invocation.clone(),
                 trigger: StartTrigger::Auto,
                 outbox_claim_id: Some(outbox_id),
             },
@@ -455,7 +464,10 @@ pub(crate) async fn start_for_outbox<R: tauri::Runtime>(
     Ok(match outcome {
         StartReviewOutcome::Started(thread_id) => OutboxReviewStartOutcome::Started { thread_id },
         StartReviewOutcome::Deduped => {
-            match state.sessions.stop_target(project_id, pr_number, kind) {
+            match state
+                .sessions
+                .stop_target(project_id, pr_number, &invocation.skill_key)
+            {
                 crate::review::session::StopTarget::Live(thread_id) => {
                     OutboxReviewStartOutcome::ActiveDeduped { thread_id }
                 }
@@ -505,8 +517,8 @@ pub(crate) enum OutboxReviewStartOutcome {
     /// This row is a crash replay whose prior started review is already durably visible; no duplicate
     /// start was needed, but the candidate was reviewed and may be ledgered.
     SuppressedReplay { thread_id: String },
-    /// A live in-memory session already covers `(project, pr, kind)`. This makes the row `done`, but
-    /// it must NOT land this candidate's `(pr, head, kind)` ledger key because the active session may
+    /// A live in-memory session already covers `(project, pr, skill_key)`. This makes the row `done`, but
+    /// it must NOT land this candidate's `(pr, head, skill_key)` ledger key because the active session may
     /// be for a different head.
     ActiveDeduped { thread_id: String },
 }
@@ -733,7 +745,7 @@ pub async fn send_review_message<R: tauri::Runtime>(
     }
 }
 
-/// Start a review for `(project_id, pr_number)` (`kind` = `"review"` or `"check"`),
+/// Start a review for `(project_id, pr_number)` with a fully resolved [`SkillInvocation`],
 /// returning the session id (codex `threadId`). Output streams out-of-band via the
 /// `review:event` Tauri event ([`crate::events::ReviewEvent`]), each event stamped
 /// with `project_id` (#35) so the frontend routes it to the owning project.
@@ -743,16 +755,17 @@ pub(crate) async fn start_review_authorized<R: tauri::Runtime>(
     state: &AppState,
     project_id: String,
     pr_number: u64,
-    kind: ReviewKind,
+    invocation: SkillInvocation,
 ) -> AppResult<SessionId> {
     validate_pr_number(pr_number)?;
-    // Resolve the project being reviewed (#35) and re-check ITS filesystem-dependent
-    // paths so an absent / escaping `skillRelPath` (e.g. a hand-edited config) fails
-    // before we attach the skill path to the turn, rather than handing codex a bad path.
-    // `project_validated` is the per-project analogue of the old `load_validated`; the
-    // review slice still depends only on `config::service`, never `config::model`.
+    // Resolve the project being reviewed (#35) and materialise / confine the skill path for
+    // the project's engine. Relative paths from migration / rule config are resolved here —
+    // the sole confinement gate before attach (Codex) or command-only start (Claude/Cursor).
     let project = config_service::project_validated(&app, &project_id)?;
-    dispatch_engine(capability, &app, state, &project, pr_number, kind).await
+    let invocation = invocation
+        .materialize_for_engine(&project.repo_root, project.engine_kind)
+        .map_err(AppError::new)?;
+    dispatch_engine(capability, &app, state, &project, pr_number, &invocation).await
 }
 
 /// Interrupt a running review session by its `threadId` (#718): the shared stop body behind the
@@ -831,7 +844,7 @@ fn absorb_stop_toctou(result: AppResult<()>, still_active: bool) -> AppResult<()
 }
 
 /// The outbox action executor's stop-review entry (AB#1069): interrupt the in-flight session for
-/// `(project_id, pr_number, kind)`. Resolves the triple to a [`StopTarget`] (AB#1069 F4) and acts on
+/// `(project_id, pr_number, skill_key)`. Resolves the triple to a [`StopTarget`] (AB#1069 F4) and acts on
 /// each of the three states:
 /// - [`Absent`](StopTarget::Absent) → `Ok(())`. IDEMPOTENT for at-least-once execution — a crash-replay
 ///   or a stop fired after the review already self-completed finds nothing to stop, and that intent
@@ -845,24 +858,26 @@ fn absorb_stop_toctou(result: AppResult<()>, still_active: bool) -> AppResult<()
 ///   that vanished mid-stop (no longer `Live`) is the benign TOCTOU race → absorb to `Ok`; a still-`Live`
 ///   session means a genuine interrupt failure → propagate for retry (see [`absorb_stop_toctou`]).
 ///
-/// `pub(crate)` for the composition root; the persisted payload has already decoded `kind` into
-/// [`ReviewKind`], so invalid modes fail before this entry point.
+/// `pub(crate)` for the composition root; the persisted payload has already decoded `skill_key` into
+/// skill key, so invalid modes fail before this entry point.
 pub(crate) async fn stop_for_outbox<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     state: &AppState,
     project_id: &str,
     pr_number: u64,
-    kind: ReviewKind,
+    skill_key: impl AsRef<str>,
 ) -> AppResult<()> {
+    let skill_key = skill_key.as_ref();
     validate_pr_number(pr_number)?;
-    let thread_id = match state.sessions.stop_target(project_id, pr_number, kind) {
+    let thread_id = match state.sessions.stop_target(project_id, pr_number, skill_key) {
         StopTarget::Absent => return Ok(()), // nothing in flight → intent holds (idempotent)
         // A start is mid-flight (reserved, no thread_id yet): a RETRYABLE error so the stop is not
         // dropped — the next sweep finds it promoted (Live) or failed (Absent).
         StopTarget::Reserved => {
             return Err(AppError::new(format!(
-            "stop-review：PR {pr_number} 的 {kind} 评审正在启动（reserved，未 promote），稍后重试"
-        )))
+                "stop-review：PR {pr_number} 的 {} 评审正在启动（reserved，未 promote），稍后重试",
+                crate::model::SkillInvocation::display_label(skill_key)
+            )))
         }
         StopTarget::Live(thread_id) => thread_id,
     };
@@ -870,7 +885,7 @@ pub(crate) async fn stop_for_outbox<R: tauri::Runtime>(
     // Re-resolve (typed, not string-matched): if the session is no longer Live, a stop error was the
     // benign TOCTOU race; only a still-Live session's error is a real failure worth retrying.
     let still_live = matches!(
-        state.sessions.stop_target(project_id, pr_number, kind),
+        state.sessions.stop_target(project_id, pr_number, skill_key),
         StopTarget::Live(_)
     );
     absorb_stop_toctou(result, still_live)
@@ -911,19 +926,6 @@ pub fn get_pr_sessions<R: tauri::Runtime>(
 ) -> AppResult<Vec<SessionInfo>> {
     let db = app.state::<Database>();
     history_store::get_pr_sessions(db.inner(), &project_id, pr_number)
-}
-
-/// Resolve the absolute path to the pr-review skill file codex attaches to the
-/// turn. `repo_root` is an absolute dir and `skill_rel_path` a relative path under
-/// it (both config-validated), so the join is absolute and infallible.
-///
-/// Single source for codex start callsites. The review slice owns the codex skill-path concept, so
-/// it lives here (`pub(crate)`).
-pub(crate) fn skill_abs_path(repo_root: &str, skill_rel_path: &str) -> String {
-    std::path::Path::new(repo_root)
-        .join(skill_rel_path)
-        .to_string_lossy()
-        .into_owned()
 }
 
 #[cfg(test)]
@@ -997,7 +999,7 @@ mod tests {
 
     // AB#1069/#1379 acceptance lock: `Deduped` is still a successful outbox execution (done, no
     // retry/dead-letter), but it is NOT ledgerable because the active in-memory session is keyed
-    // only by `(project, pr, kind)` and may be reviewing a different head.
+    // only by `(project, pr, skill_key)` and may be reviewing a different head.
     #[test]
     fn outbox_start_outcome_distinguishes_ledgerable_from_active_deduped() {
         let started = outbox_start_outcome(StartReviewOutcome::Started("t1".to_string()));
@@ -1080,7 +1082,7 @@ mod tests {
                 thread_id: thread_id.to_string(),
                 turn_id: turn_id.to_string(),
                 pr_number: 7,
-                kind: ReviewKind::Review,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 engine_kind: EngineKind::Codex,
                 status,
                 created_at_epoch: 0,

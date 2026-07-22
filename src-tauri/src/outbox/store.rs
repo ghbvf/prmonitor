@@ -474,7 +474,7 @@ pub fn mark_blocked(db: &Database, id: i64, message: &str, now: u64) -> AppResul
 pub fn unblock_reviews(db: &Database, now: u64) -> AppResult<u64> {
     let now = sqlite_epoch("now", now)?;
     db.with_conn(|conn| conn.execute(
-        "UPDATE action_outbox SET status='pending', next_attempt_at=?1, last_error=NULL, updated_at=?1 WHERE status='blocked' AND kind IN ('review','check')",
+        "UPDATE action_outbox SET status='pending', next_attempt_at=?1, last_error=NULL, updated_at=?1 WHERE status='blocked' AND kind = 'runSkill'",
         [now],
     ).map(|n| n as u64))
 }
@@ -777,7 +777,7 @@ mod tests {
         let first = enqueue_deduped(
             &db,
             "p1",
-            ActionKind::Review,
+            ActionKind::RunSkill,
             "PR #7 review",
             "{}",
             "7@sha:review",
@@ -787,7 +787,7 @@ mod tests {
         let second = enqueue_deduped(
             &db,
             "p1",
-            ActionKind::Review,
+            ActionKind::RunSkill,
             "PR #7 review",
             "{}",
             "7@sha:review",
@@ -800,7 +800,7 @@ mod tests {
         let after_done = enqueue_deduped(
             &db,
             "p1",
-            ActionKind::Review,
+            ActionKind::RunSkill,
             "PR #7 review",
             "{}",
             "7@sha:review",
@@ -818,7 +818,7 @@ mod tests {
         let db = Database::open_in_memory().expect("open db");
         let row = EnqueueInput {
             project_id: "p1",
-            kind: ActionKind::Review,
+            kind: ActionKind::RunSkill,
             summary: "PR #7 review",
             payload: "{}",
             dedupe_key: Some("7@sha:review"),
@@ -1110,15 +1110,14 @@ mod tests {
     }
 
     // `ActionKind` wire is strict on the side-effectful path (AB#1066/AB#1069): every known kind
-    // round-trips (a `"review"` row is parsed + executed, NOT quarantined); an unknown value is an
+    // round-trips (a `"runSkill"` row is parsed + executed, NOT quarantined); an unknown value is an
     // explicit error (claim_due DEAD-LETTERS such a row rather than mis-routing). `"email"` stays
     // unknown by design — email/IM are NotificationKind channels, not ActionKinds (AB#1069).
     #[test]
     fn kind_wire_round_trips_known_and_errors_on_unknown() {
         for (kind, wire) in [
             (ActionKind::Notification, "notification"),
-            (ActionKind::Review, "review"),
-            (ActionKind::Check, "check"),
+            (ActionKind::RunSkill, "runSkill"),
             (ActionKind::StopReview, "stopReview"),
             (ActionKind::MessagingReply, "messagingReply"),
             (ActionKind::MessagingSend, "messagingSend"),
@@ -1142,8 +1141,8 @@ mod tests {
         let db = Database::open_in_memory().expect("open db");
         for (i, kind) in [
             ActionKind::Notification,
-            ActionKind::Review,
-            ActionKind::Check,
+            ActionKind::RunSkill,
+            ActionKind::RunSkill,
             ActionKind::StopReview,
             ActionKind::MessagingReply,
             ActionKind::MessagingSend,
@@ -1266,8 +1265,8 @@ mod tests {
         let first = enqueue_deduped(
             &db,
             "p1",
-            ActionKind::Review,
-            "review",
+            ActionKind::RunSkill,
+            "runSkill",
             "{}",
             "7@sha:review",
             1,
@@ -1281,8 +1280,8 @@ mod tests {
         let replay = enqueue_deduped(
             &db,
             "p1",
-            ActionKind::Review,
-            "review",
+            ActionKind::RunSkill,
+            "runSkill",
             "{}",
             "7@sha:review",
             200,

@@ -6,7 +6,7 @@
 //! [`crate::events::ReviewEvent`]s, never a concrete engine.
 
 use crate::error::AppResult;
-use crate::model::ReviewKind;
+use crate::model::SkillInvocation;
 
 /// Unforgeable in safe Rust: direct engine start authority is minted only by the composition root
 /// for the desktop command and durable outbox consumer. External adapters own only
@@ -30,7 +30,7 @@ impl ReviewStartCapability {
 /// Identifies a running review session.
 pub type SessionId = String;
 
-/// Outcome of [`ReviewEngine::start`]: a session started, or the `(pr, kind)` was
+/// Outcome of [`ReviewEngine::start`]: a session started, or the `(pr, skill_key)` was
 /// DEDUPED (already covered by an in-flight review) — both first-class, neither an
 /// error.
 ///
@@ -47,7 +47,7 @@ pub type SessionId = String;
 pub enum StartReviewOutcome {
     /// A review session started; carries its id (codex `threadId`).
     Started(SessionId),
-    /// The `(pr, kind)` was already reserved / in flight — no second review started.
+    /// The `(pr, skill_key)` was already reserved / in flight — no second review started.
     Deduped,
 }
 
@@ -55,15 +55,19 @@ pub enum StartReviewOutcome {
 /// out-of-band to the frontend; a running session can be interrupted.
 #[allow(async_fn_in_trait)]
 pub(crate) trait ReviewEngine {
+    /// Whether this engine needs a resolved on-disk skill path (Codex attaches `UserInput::Skill`).
+    /// Command-only engines (Claude / Cursor) return `false` so path resolve is not a gate.
+    fn requires_skill_path(&self) -> bool;
+
     /// Start a review. Returns
     /// [`StartReviewOutcome::Started`] with the session id, or
-    /// [`StartReviewOutcome::Deduped`] when the `(pr, kind)` was already covered by an
+    /// [`StartReviewOutcome::Deduped`] when the `(pr, skill_key)` was already covered by an
     /// in-flight review — a dedup is never confused with a start failure (`Err`).
     async fn start(
         &self,
         capability: &ReviewStartCapability,
         pr_number: u64,
-        kind: ReviewKind,
+        invocation: &SkillInvocation,
     ) -> AppResult<StartReviewOutcome>;
     /// Continue an EXISTING (terminal `Done`/`Failed`) session with a follow-up user
     /// `message`, streaming the reply through the SAME [`crate::events::ReviewEvent`]

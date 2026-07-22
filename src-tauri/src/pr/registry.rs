@@ -21,7 +21,7 @@ use tauri::Manager;
 use crate::config::service as config_service;
 use crate::db::{map_err, Database};
 use crate::error::AppResult;
-use crate::model::{PrPresence, PullRequestView, ReviewKind, TrackedPrView};
+use crate::model::{PrPresence, PullRequestView, TrackedPrView};
 
 /// Unbounded-growth cap, applied PER PROJECT (#35). Beyond this, [`TrackedPrs::prune`]
 /// drops the least recently seen records (never the recent working set) — see its doc.
@@ -56,7 +56,7 @@ pub struct TrackedPr {
     pub title: String,
     pub labels: Vec<String>,
     pub url: String,
-    pub kind: ReviewKind,
+    pub skill_key: String,
     pub skip_reason: Option<String>,
     pub first_seen_epoch: u64,
     pub last_seen_epoch: u64,
@@ -87,29 +87,20 @@ impl TrackedPrs {
     pub(crate) fn load_db(db: &Database, project_id: &str) -> AppResult<Self> {
         db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT number, title, labels_json, url, kind, skip_reason, \
+                "SELECT number, title, labels_json, url, skill_key, skip_reason, \
                  first_seen_epoch, last_seen_epoch, archived \
                  FROM tracked_pr WHERE project_id = ?1 ORDER BY number DESC",
             )?;
             let rows = stmt.query_map([project_id], |r| {
                 let labels_json: String = r.get(2)?;
-                let kind: String = r.get(4)?;
-                let kind = kind.parse().map_err(|message: String| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            message,
-                        )),
-                    )
-                })?;
+                let skill_key: String = r.get(4)?;
+                let skill_key = crate::model::SkillInvocation::migrate_legacy_skill_key(&skill_key);
                 Ok(TrackedPr {
                     number: r.get::<_, i64>(0)? as u64,
                     title: r.get(1)?,
                     labels: serde_json::from_str(&labels_json).unwrap_or_default(),
                     url: r.get(3)?,
-                    kind,
+                    skill_key,
                     skip_reason: r.get(5)?,
                     first_seen_epoch: r.get::<_, i64>(6)? as u64,
                     last_seen_epoch: r.get::<_, i64>(7)? as u64,
@@ -149,7 +140,7 @@ impl TrackedPrs {
             let mut stmt = tx
                 .prepare(
                     "INSERT INTO tracked_pr \
-                     (project_id, number, title, labels_json, url, kind, skip_reason, \
+                     (project_id, number, title, labels_json, url, skill_key, skip_reason, \
                       first_seen_epoch, last_seen_epoch, archived) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 )
@@ -162,7 +153,7 @@ impl TrackedPrs {
                     pr.title,
                     labels_json,
                     pr.url,
-                    pr.kind.as_str(),
+                    pr.skill_key.as_str(),
                     pr.skip_reason,
                     pr.first_seen_epoch as i64,
                     pr.last_seen_epoch as i64,
@@ -185,7 +176,7 @@ impl TrackedPrs {
                 existing.title = view.title.clone();
                 existing.labels = view.labels.clone();
                 existing.url = view.url.clone();
-                existing.kind = view.kind;
+                existing.skill_key = view.skill_key.clone();
                 existing.skip_reason = view.skip_reason.clone();
                 existing.last_seen_epoch = now;
                 // first_seen_epoch and archived are preserved across upserts.
@@ -195,7 +186,7 @@ impl TrackedPrs {
                     title: view.title.clone(),
                     labels: view.labels.clone(),
                     url: view.url.clone(),
-                    kind: view.kind,
+                    skill_key: view.skill_key.clone(),
                     skip_reason: view.skip_reason.clone(),
                     first_seen_epoch: now,
                     last_seen_epoch: now,
@@ -242,7 +233,7 @@ impl TrackedPrs {
         }
     }
 
-    /// Refreshes an EXISTING tracked row's display fields (title / labels / url / kind /
+    /// Refreshes an EXISTING tracked row's display fields (title / labels / url / skill_key /
     /// skip_reason) and bumps its `last_seen_epoch` to `now`, returning `true`. Returns
     /// `false` and inserts NOTHING when no row with `view.number` exists.
     ///
@@ -258,7 +249,7 @@ impl TrackedPrs {
             existing.title = view.title.clone();
             existing.labels = view.labels.clone();
             existing.url = view.url.clone();
-            existing.kind = view.kind;
+            existing.skill_key = view.skill_key.clone();
             existing.skip_reason = view.skip_reason.clone();
             existing.last_seen_epoch = now;
             // first_seen_epoch and archived are preserved (parity with the upsert hit).
@@ -328,7 +319,7 @@ pub fn import_legacy_tracked(
     let mut stmt = tx
         .prepare(
             "INSERT OR REPLACE INTO tracked_pr \
-             (project_id, number, title, labels_json, url, kind, skip_reason, \
+             (project_id, number, title, labels_json, url, skill_key, skip_reason, \
               first_seen_epoch, last_seen_epoch, archived) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )
@@ -341,7 +332,7 @@ pub fn import_legacy_tracked(
             pr.title,
             labels_json,
             pr.url,
-            pr.kind.as_str(),
+            pr.skill_key.as_str(),
             pr.skip_reason,
             pr.first_seen_epoch as i64,
             pr.last_seen_epoch as i64,
@@ -367,7 +358,7 @@ pub fn to_view_list(tracked: &TrackedPrs, now: u64, grace_secs: u64) -> Vec<Trac
                 title: p.title.clone(),
                 labels: p.labels.clone(),
                 url: p.url.clone(),
-                kind: p.kind,
+                skill_key: p.skill_key.clone(),
                 skip_reason: p.skip_reason.clone(),
             },
             presence: if now.saturating_sub(p.last_seen_epoch) <= grace_secs {
@@ -424,7 +415,7 @@ mod tests {
             title: title.to_string(),
             labels: vec!["review-label".to_string()],
             url: format!("https://x/{number}"),
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             skip_reason: None,
         }
     }
@@ -435,7 +426,7 @@ mod tests {
             title: format!("PR {number}"),
             labels: vec![],
             url: format!("https://x/{number}"),
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             skip_reason: None,
             first_seen_epoch: 0,
             last_seen_epoch: last_seen,
@@ -523,7 +514,7 @@ mod tests {
         db.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO tracked_pr \
-                 (project_id, number, title, labels_json, url, kind, skip_reason, \
+                 (project_id, number, title, labels_json, url, skill_key, skip_reason, \
                   first_seen_epoch, last_seen_epoch, archived) \
                  VALUES ('alpha', 7, 'PR 7', 'not-json', 'https://x/7', 'review', NULL, 1, 2, 0)",
                 [],
@@ -539,25 +530,22 @@ mod tests {
     }
 
     #[test]
-    fn load_db_rejects_unknown_review_kind() {
+    fn load_db_accepts_arbitrary_skill_key() {
         let db = Database::open_in_memory().expect("open db");
         db.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO tracked_pr \
-                 (project_id, number, title, labels_json, url, kind, skip_reason, \
+                 (project_id, number, title, labels_json, url, skill_key, skip_reason, \
                   first_seen_epoch, last_seen_epoch, archived) \
                  VALUES ('alpha', 7, 'PR 7', '[]', 'https://x/7', 'surprise', NULL, 1, 2, 0)",
                 [],
             )?;
             Ok(())
         })
-        .expect("seed invalid kind");
+        .expect("seed skill_key");
 
-        let error = TrackedPrs::load_db(&db, "alpha").expect_err("unknown kind must fail closed");
-        assert!(
-            error.message.contains("unsupported review kind"),
-            "{error:?}"
-        );
+        let loaded = TrackedPrs::load_db(&db, "alpha").expect("free-form skill_key loads");
+        assert_eq!(loaded.prs[0].skill_key, "surprise");
     }
 
     // Wire-shape lock for the persisted `prs.json` records (Medium carrier per
@@ -571,7 +559,7 @@ mod tests {
             title: "Add feature".to_string(),
             labels: vec!["review-label".to_string()],
             url: "https://x/12".to_string(),
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             skip_reason: Some("draft PR".to_string()),
             first_seen_epoch: 1_700_000_000,
             last_seen_epoch: 1_700_000_500,
@@ -584,7 +572,7 @@ mod tests {
         assert!(v.get("title").is_some());
         assert!(v.get("labels").is_some());
         assert!(v.get("url").is_some());
-        assert!(v.get("kind").is_some());
+        assert!(v.get("skillKey").is_some());
         assert!(v.get("skipReason").is_some());
         assert!(v.get("firstSeenEpoch").is_some());
         assert!(v.get("lastSeenEpoch").is_some());

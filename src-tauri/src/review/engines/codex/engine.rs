@@ -8,7 +8,6 @@ use super::CodexManager;
 use crate::config::service::ResolvedCli;
 use crate::error::AppResult;
 use crate::model::CodexReasoningEffort;
-use crate::model::ReviewKind;
 use crate::review::engine::{ReviewEngine, ReviewStartCapability, SessionId, StartReviewOutcome};
 use crate::review::session::{self, CommentUrlContext, SessionInfo, SessionRegistry};
 
@@ -50,7 +49,7 @@ pub struct CodexEngine<'a, R: tauri::Runtime> {
     /// at those construction sites).
     pub pr_number: u64,
     /// Full persisted session identity for the FOLLOW-UP path. It pins the creating engine,
-    /// original kind, timestamp, and URL metadata across app restarts/config edits.
+    /// original skill_key, timestamp, and URL metadata across app restarts/config edits.
     pub session_info: Option<SessionInfo>,
     /// The owning outbox row id for the AB#1204 cross-restart dedup claim — `Some(outbox_id)` ONLY
     /// on the OUTBOX executor's start path ([`crate::review::commands::start_for_outbox`]), `None`
@@ -63,12 +62,21 @@ pub struct CodexEngine<'a, R: tauri::Runtime> {
 }
 
 impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
+    fn requires_skill_path(&self) -> bool {
+        true
+    }
+
     async fn start(
         &self,
         _capability: &ReviewStartCapability,
         pr_number: u64,
-        kind: ReviewKind,
+        invocation: &crate::model::SkillInvocation,
     ) -> AppResult<StartReviewOutcome> {
+        debug_assert_eq!(
+            self.requires_skill_path(),
+            invocation.skill_path.is_some(),
+            "Codex requires a materialised skill path"
+        );
         session::start_review(
             self.app,
             self.codex,
@@ -76,12 +84,11 @@ impl<R: tauri::Runtime> ReviewEngine for CodexEngine<'_, R> {
             self.codex_cli,
             self.repo,
             self.repo_root,
-            self.skill_abs_path,
+            invocation,
             self.codex_model,
             self.codex_reasoning_effort,
             self.project_id,
             pr_number,
-            kind,
             // `&self` start can't move the field; clone the owned context for this turn.
             self.url_ctx.clone(),
             // AB#1204: outbox path passes `Some(outbox_id)` so the claim breadcrumb is written

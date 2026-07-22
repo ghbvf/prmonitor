@@ -1,11 +1,11 @@
 <script setup lang="ts">
 // A single PR row: number/title (click to open in the external browser), the
-// label badges, the trigger-label `kind` badge, and a muted "skipped" treatment
-// carrying `skipReason` when the PR would not dispatch. Clicking the row selects
-// the PR (for the Review panel); the title link opens the browser (`@click.stop`
-// so the two actions stay distinct).
+// label badges, the skill-key badge, and a muted "skipped" treatment carrying
+// `skipReason` when the PR would not dispatch. Clicking the row selects the PR
+// (for the Review panel); the title link opens the browser (`@click.stop` so the
+// two actions stay distinct).
 import { getTransport } from "../transport";
-import type { TrackedPrView } from "../types";
+import { skillKeyLabel, type TrackedPrView } from "../types";
 
 const props = defineProps<{ pr: TrackedPrView; selected: boolean }>();
 const emit = defineEmits<{
@@ -39,7 +39,7 @@ function open() {
       >
         #{{ pr.number }} — {{ pr.title }}
       </button>
-      <span class="badge kind">{{ pr.kind }}</span>
+      <span class="badge kind">{{ skillKeyLabel(pr.skillKey) }}</span>
       <button
         type="button"
         class="archive-btn"

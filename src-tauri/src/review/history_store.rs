@@ -15,12 +15,12 @@ use serde::{Deserialize, Serialize};
 use super::session::{SessionInfo, SessionStatus};
 use crate::db::Database;
 use crate::error::AppResult;
-use crate::model::{EngineKind, ReviewKind};
+use crate::model::EngineKind;
 
-/// The kind of a persisted history block (pr-review F7). The Rust write side can now ONLY
-/// express the two legal kinds, closing the gap where `kind: String` let `append_item`
+/// The skill_key of a persisted history block (pr-review F7). The Rust write side can now ONLY
+/// express the two legal kinds, closing the gap where `skill_key: String` let `append_item`
 /// persist an arbitrary string while the TS `StreamItem.kind` was already a union. Serde
-/// pins the wire strings (`"message"` / `"reasoning"`) the frontend mirrors; the DB `kind`
+/// pins the wire strings (`"message"` / `"reasoning"`) the frontend mirrors; the DB `skill_key`
 /// column stores the SAME strings via [`HistoryItemKind::as_wire`] (one source, locked
 /// equal to the serde form by `history_item_kind_wire_matches_serde`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,7 +36,7 @@ pub enum HistoryItemKind {
 }
 
 impl HistoryItemKind {
-    /// Pinned wire string stored in the `kind` column (== the serde form the frontend reads).
+    /// Pinned wire string stored in the `skill_key` column (== the serde form the frontend reads).
     fn as_wire(self) -> &'static str {
         match self {
             Self::Message => "message",
@@ -113,7 +113,7 @@ fn engine_kind_wire(engine_kind: EngineKind) -> String {
 }
 
 /// DB wire string → [`EngineKind`]. Unknown/corrupt rows fail the read (same contract as
-/// [`review_kind_from_wire`]) — silently mapping to Codex would route follow-up to the wrong
+/// [`skill_key_from_wire`]) — silently mapping to Codex would route follow-up to the wrong
 /// engine once more than one engine exists.
 fn engine_kind_from_wire(column: usize, value: String) -> rusqlite::Result<EngineKind> {
     serde_json::from_value(serde_json::Value::String(value)).map_err(|err| {
@@ -125,17 +125,14 @@ fn engine_kind_from_wire(column: usize, value: String) -> rusqlite::Result<Engin
     })
 }
 
-/// DB wire string → [`ReviewKind`]. Unlike historical lenient fallbacks, a corrupt kind fails the
-/// read: silently turning an unknown value into `review` would split session identity and dedupe.
-fn review_kind_from_wire(column: usize, value: String) -> rusqlite::Result<ReviewKind> {
-    value.parse().map_err(|message: String| {
+/// DB wire string → skill_key. Migrates legacy `"review"` / `"check"` values on load only.
+/// Unknown values fail the read (fail-closed) so session reserve/stop identity cannot drift.
+fn skill_key_from_wire(column: usize, value: String) -> rusqlite::Result<String> {
+    crate::model::SkillInvocation::parse_skill_key_wire(&value).map_err(|msg| {
         rusqlite::Error::FromSqlConversionFailure(
             column,
             rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                message,
-            )),
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, msg)),
         )
     })
 }
@@ -196,13 +193,13 @@ pub(super) fn upsert_session_in_tx(
     let engine_kind = engine_kind_wire(info.engine_kind);
     tx.execute(
             "INSERT INTO review_session \
-             (thread_id, project_id, pr_number, turn_id, kind, status, created_at, updated_at, comment_url, engine_kind) \
+             (thread_id, project_id, pr_number, turn_id, skill_key, status, created_at, updated_at, comment_url, engine_kind) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9) \
              ON CONFLICT(thread_id) DO UPDATE SET \
                project_id = excluded.project_id, \
                pr_number  = excluded.pr_number, \
                turn_id    = excluded.turn_id, \
-               kind       = excluded.kind, \
+               skill_key       = excluded.skill_key, \
                status     = excluded.status, \
                updated_at = excluded.updated_at, \
                comment_url = COALESCE(excluded.comment_url, comment_url), \
@@ -212,7 +209,7 @@ pub(super) fn upsert_session_in_tx(
                 info.project_id,
                 info.pr_number as i64,
                 info.turn_id,
-                info.kind.as_str(),
+                info.skill_key.as_str(),
                 status,
                 now,
                 // AB#1042: `comment_url` is None during start (Starting/Running upserts); the
@@ -281,8 +278,8 @@ pub fn set_status_and_comment_url(
 /// Appends a streamed delta to a session's history (#70), COALESCING by `(thread_id,
 /// item_id)`: the first delta for an item inserts a row; later deltas concatenate onto
 /// its `text`. Mirrors the frontend's `appendDelta` so thousands of deltas collapse into
-/// a handful of rows. `kind` is the typed [`HistoryItemKind`] (pr-review F7), stored as its
-/// pinned wire string so the write side cannot persist an illegal kind.
+/// a handful of rows. `skill_key` is the typed [`HistoryItemKind`] (pr-review F7), stored as its
+/// pinned wire string so the write side cannot persist an illegal skill_key.
 pub fn append_item(
     db: &Database,
     thread_id: &str,
@@ -344,12 +341,12 @@ pub fn get_pr_sessions(
 ) -> AppResult<Vec<SessionInfo>> {
     db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT thread_id, project_id, pr_number, turn_id, kind, status, created_at, comment_url, engine_kind \
+            "SELECT thread_id, project_id, pr_number, turn_id, skill_key, status, created_at, comment_url, engine_kind \
              FROM review_session \
              WHERE project_id = ?1 AND pr_number = ?2 ORDER BY created_at DESC, thread_id",
         )?;
         let rows = stmt.query_map(rusqlite::params![project_id, pr_number as i64], |r| {
-            let kind = review_kind_from_wire(4, r.get(4)?)?;
+            let skill_key = skill_key_from_wire(4, r.get(4)?)?;
             let status: String = r.get(5)?;
             let engine_kind: String = r.get(8)?;
             Ok(SessionInfo {
@@ -357,7 +354,7 @@ pub fn get_pr_sessions(
                 project_id: r.get(1)?,
                 pr_number: r.get::<_, i64>(2)? as u64,
                 turn_id: r.get(3)?,
-                kind,
+                skill_key,
                 status: status_from_wire(&status),
                 created_at_epoch: r.get::<_, i64>(6)? as u64,
                 // AB#1042: NULL (no comment) → None; a resolved terminal URL → Some.
@@ -377,12 +374,12 @@ pub fn get_pr_sessions(
 pub fn get_session(db: &Database, thread_id: &str) -> AppResult<Option<SessionInfo>> {
     db.with_conn(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT thread_id, project_id, pr_number, turn_id, kind, status, created_at, comment_url, engine_kind \
+            "SELECT thread_id, project_id, pr_number, turn_id, skill_key, status, created_at, comment_url, engine_kind \
              FROM review_session \
              WHERE thread_id = ?1",
         )?;
         let mut rows = stmt.query_map(rusqlite::params![thread_id], |r| {
-            let kind = review_kind_from_wire(4, r.get(4)?)?;
+            let skill_key = skill_key_from_wire(4, r.get(4)?)?;
             let status: String = r.get(5)?;
             let engine_kind: String = r.get(8)?;
             Ok(SessionInfo {
@@ -390,7 +387,7 @@ pub fn get_session(db: &Database, thread_id: &str) -> AppResult<Option<SessionIn
                 project_id: r.get(1)?,
                 pr_number: r.get::<_, i64>(2)? as u64,
                 turn_id: r.get(3)?,
-                kind,
+                skill_key,
                 status: status_from_wire(&status),
                 created_at_epoch: r.get::<_, i64>(6)? as u64,
                 // AB#1042: NULL (no comment) → None; a resolved terminal URL → Some.
@@ -426,7 +423,7 @@ mod tests {
             thread_id: thread.to_string(),
             turn_id: "t1".to_string(),
             pr_number: pr,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             status,
             created_at_epoch: 0,
             comment_url: None,
@@ -453,16 +450,20 @@ mod tests {
     }
 
     #[test]
-    fn review_kind_db_boundary_rejects_unknown_values() {
+    fn skill_key_db_boundary_migrates_legacy_values() {
         assert_eq!(
-            review_kind_from_wire(4, "review".to_string()).expect("review"),
-            ReviewKind::Review
+            skill_key_from_wire(4, "review".to_string()).expect("review"),
+            crate::model::SkillInvocation::skill_key("pr-review", "")
         );
         assert_eq!(
-            review_kind_from_wire(4, "check".to_string()).expect("check"),
-            ReviewKind::Check
+            skill_key_from_wire(4, "check".to_string()).expect("check"),
+            crate::model::SkillInvocation::skill_key("pr-review", "--check")
         );
-        assert!(review_kind_from_wire(4, "other".to_string()).is_err());
+        assert_eq!(
+            skill_key_from_wire(4, "pr-review\0--check".to_string()).expect("skill key"),
+            crate::model::SkillInvocation::skill_key("pr-review", "--check")
+        );
+        assert!(skill_key_from_wire(4, "other".to_string()).is_err());
     }
 
     // AB#1043: the local REST API's GET /reviews/{id} durable lookup. By-thread_id read
@@ -632,20 +633,20 @@ mod tests {
         // `User` (chat-continuation) is a Medium serde golden carrier alongside Message /
         // Reasoning: its DB-stored `as_wire` string MUST equal the serde form `"user"` the
         // frontend mirrors as `StreamItem.kind` `"user"`, and `from_wire` must round-trip it.
-        for kind in [
+        for item_kind in [
             HistoryItemKind::Message,
             HistoryItemKind::Reasoning,
             HistoryItemKind::User,
         ] {
-            let serde_wire = serde_json::to_value(kind).expect("serializes");
+            let serde_wire = serde_json::to_value(item_kind).expect("serializes");
             assert_eq!(
                 serde_wire,
-                kind.as_wire(),
+                item_kind.as_wire(),
                 "as_wire must equal the serde form"
             );
             assert_eq!(
-                HistoryItemKind::from_wire(kind.as_wire()),
-                kind,
+                HistoryItemKind::from_wire(item_kind.as_wire()),
+                item_kind,
                 "round-trips"
             );
         }
@@ -665,7 +666,7 @@ mod tests {
         db.with_conn(|conn| {
             conn.execute(
                 "INSERT INTO review_session \
-                 (thread_id, project_id, pr_number, turn_id, kind, status, created_at, updated_at) \
+                 (thread_id, project_id, pr_number, turn_id, skill_key, status, created_at, updated_at) \
                  VALUES ('old', 'alpha', 12, '', 'review', 'done', 100, 100), \
                         ('new', 'alpha', 12, '', 'review', 'running', 200, 200)",
                 [],
@@ -805,7 +806,7 @@ mod tests {
                 let t = format!("t{i:03}");
                 conn.execute(
                     "INSERT INTO review_session \
-                     (thread_id, project_id, pr_number, turn_id, kind, status, created_at, updated_at) \
+                     (thread_id, project_id, pr_number, turn_id, skill_key, status, created_at, updated_at) \
                      VALUES (?1, 'alpha', 7, '', 'review', 'done', ?2, ?2)",
                     rusqlite::params![t, i as i64],
                 )?;

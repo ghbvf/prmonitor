@@ -467,7 +467,7 @@ mod tests {
     #[test]
     fn create_is_idempotent_and_progress_is_cas() {
         let db = Database::open_in_memory().expect("db");
-        let input = serde_json::json!({"reference":"repo","prNumber":7,"kind":"review"});
+        let input = serde_json::json!({"reference":"repo","prNumber":7,"skill_key":"review"});
         let first = create_or_get(
             &db,
             NewWorkflow {
@@ -533,7 +533,7 @@ mod tests {
     #[test]
     fn terminal_workflow_does_not_block_new_dedupe_instance() {
         let db = Database::open_in_memory().expect("db");
-        let input = serde_json::json!({"reference":"repo","prNumber":7,"kind":"review"});
+        let input = serde_json::json!({"reference":"repo","prNumber":7,"skill_key":"review"});
         let first = create_or_get(
             &db,
             NewWorkflow {
@@ -597,7 +597,7 @@ mod tests {
         let db = Database::open_in_memory().expect("db");
         let receipt_id = ReviewReceiptId::new(17).expect("receipt");
         let input = serde_json::json!({
-            "receiptId": 17, "reference": "repo", "prNumber": 7, "kind": "review"
+            "receiptId": 17, "reference": "repo", "prNumber": 7, "skill_key": "review"
         });
         let create = |now| NewWorkflow {
             project_id: "repo",

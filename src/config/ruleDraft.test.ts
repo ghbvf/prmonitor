@@ -56,13 +56,16 @@ function rule(): RuleConfig {
     titleContains: "",
     bodyContains: "",
     actions: [{
-      id: "review",
-      kind: "review",
+      id: "runSkill",
+      kind: "runSkill",
       enabled: true,
-      target: { kind: "none" },
       dedupePolicy: "event",
       delaySecs: 0,
       level: "action",
+      skillName: "pr-review",
+      skillPath: ".codex/skills/pr-review/SKILL.md",
+      commandTemplate: "/{skill} {pr}",
+      extraArgs: "",
     }],
     allowActionKinds: [],
     denyActionKinds: [],
@@ -71,14 +74,17 @@ function rule(): RuleConfig {
 
 describe("rule draft helpers", () => {
   it("creates the complete ordered-action contract", () => {
-    expect(Object.keys(createRuleAction("review"))).toEqual([
+    expect(Object.keys(createRuleAction("runSkill"))).toEqual([
       "id",
       "kind",
       "enabled",
-      "target",
       "dedupePolicy",
       "delaySecs",
       "level",
+      "skillName",
+      "skillPath",
+      "commandTemplate",
+      "extraArgs",
     ]);
   });
 
@@ -93,7 +99,7 @@ describe("rule draft helpers", () => {
       eventType: "pullRequest",
       projectId: "p1",
       repo: "owner/repo",
-      actions: [expect.objectContaining({ id: "review", kind: "review" })],
+      actions: [expect.objectContaining({ id: "runSkill", kind: "runSkill", skillName: "pr-review" })],
       allowActionKinds: [],
       denyActionKinds: [],
     });
@@ -111,17 +117,35 @@ describe("rule draft helpers", () => {
     ]);
   });
 
-  it("toggles actions without duplicates and supports removal", () => {
+  it("toggles actions without duplicates and disables instead of deleting", () => {
     const base = rule();
-    const withCheck = toggleRuleAction(base, "check", true);
-    expect(withCheck.actions.map((action) => action.kind)).toEqual(["review", "check"]);
-    expect(toggleRuleAction(withCheck, "check", true).actions.map((action) => action.kind)).toEqual([
-      "review",
-      "check",
+    const withNotify = toggleRuleAction(base, "notify", true);
+    expect(withNotify.actions.map((action) => action.kind)).toEqual(["runSkill", "notify"]);
+    expect(toggleRuleAction(withNotify, "notify", true).actions.map((action) => action.kind)).toEqual([
+      "runSkill",
+      "notify",
     ]);
-    expect(toggleRuleAction(withCheck, "review", false).actions.map((action) => action.kind)).toEqual([
-      "check",
-    ]);
+    const disabledSkill = toggleRuleAction(withNotify, "runSkill", false);
+    expect(disabledSkill.actions.map((action) => action.kind)).toEqual(["runSkill", "notify"]);
+    expect(disabledSkill.actions.find((action) => action.kind === "runSkill")?.enabled).toBe(false);
+  });
+
+  it("preserves multiple runSkill actions when kind is unchecked", () => {
+    const base = rule();
+    const review = base.actions[0];
+    if (review.kind !== "runSkill") throw new Error("expected runSkill");
+    const multi: RuleConfig = {
+      ...base,
+      actions: [
+        { ...review, id: "review", extraArgs: "" },
+        { ...review, id: "check", extraArgs: "--check" },
+      ],
+    };
+    const disabled = toggleRuleAction(multi, "runSkill", false);
+    expect(disabled.actions.map((a) => a.id)).toEqual(["review", "check"]);
+    expect(disabled.actions.every((a) => a.kind === "runSkill" && !a.enabled)).toBe(true);
+    const reenabled = toggleRuleAction(disabled, "runSkill", true);
+    expect(reenabled.actions.every((a) => a.enabled)).toBe(true);
   });
 
   it("re-enables an existing disabled action without losing its settings", () => {

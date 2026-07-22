@@ -81,7 +81,8 @@ pub struct ReviewArgs {
     /// Target project by its configured project id. One of --repo / --project-id.
     #[arg(long = "project-id", group = "target")]
     pub project_id: Option<String>,
-    /// Re-check a prior fix round (`kind=check`) instead of a full review.
+    /// Re-check a prior fix round (`--check` / extra args on the default pr-review skill)
+    /// instead of a full review.
     #[arg(long)]
     pub check: bool,
     /// Block until the review reaches a terminal state, then print the comment URL.
@@ -217,21 +218,17 @@ impl ReviewArgs {
 
     /// `"check"` re-runs a prior fix round; otherwise a full `"review"` (the funnel whitelists
     /// exactly these two).
-    pub fn kind(&self) -> &'static str {
-        if self.check {
-            "check"
-        } else {
-            "review"
-        }
-    }
-
     /// Build the POST body — the SAME struct the server deserializes (Hard, single-source).
     fn review_request_body(&self, request_id: ExternalRequestId) -> ReviewRequestBody {
         ReviewRequestBody {
             project_id: self.project_id.clone(),
             repo: self.repo.clone(),
             pr: self.pr,
-            kind: self.kind().parse().expect("CLI kind is sealed"),
+            extra_args: if self.check {
+                "--check".to_string()
+            } else {
+                String::new()
+            },
             request_id,
         }
     }
@@ -1297,7 +1294,7 @@ mod tests {
         assert_eq!(a.project_id, None);
         assert!(!a.check && !a.watch && !a.exit_status);
         assert_eq!(a.json, None);
-        assert_eq!(a.kind(), "review");
+        assert!(!a.check);
         assert_eq!(a.reference(), "owner/name");
     }
 
@@ -1314,14 +1311,14 @@ mod tests {
         ])
         .expect("valid");
         assert_eq!(a.reference(), "p1");
-        assert_eq!(a.kind(), "check");
+        assert!(a.check);
         let body = a.review_request_body(
             ExternalRequestId::parse("0123456789abcdef0123456789abcdef").expect("request id"),
         );
         assert_eq!(body.project_id.as_deref(), Some("p1"));
         assert_eq!(body.repo, None);
         assert_eq!(body.pr, 3);
-        assert_eq!(body.kind, crate::model::ReviewKind::Check);
+        assert_eq!(body.extra_args, "--check");
         assert_eq!(body.request_id.as_str(), "0123456789abcdef0123456789abcdef");
     }
 

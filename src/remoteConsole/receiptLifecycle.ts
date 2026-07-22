@@ -1,7 +1,6 @@
 import type { ReviewSession } from "../review/types";
 import type {
   ExternalRequestId,
-  ReviewKind,
   ReviewReceiptId,
   ReviewReceiptSnapshot,
 } from "../types.generated";
@@ -34,8 +33,8 @@ export class RequestIdLifecycle {
 
   constructor(private readonly create: () => ExternalRequestId) {}
 
-  forOperation(projectId: string, prNumber: number, kind: ReviewKind): ExternalRequestId {
-    const operation = `${projectId}\n${prNumber}\n${kind}`;
+  forOperation(projectId: string, prNumber: number, extraArgs: string = ""): ExternalRequestId {
+    const operation = `${projectId}\n${prNumber}\n${extraArgs}`;
     if (this.operation !== operation || this.requestId === null) {
       this.operation = operation;
       this.requestId = this.create();

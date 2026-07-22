@@ -41,7 +41,7 @@ pub mod option_ids {
 ///
 /// Official ACP kinds: `read` / `edit` / `delete` / `move` / `search` / `execute` /
 /// `think` / `fetch` / `switch_mode` / `other`. We also accept `list` / `write` as
-/// common variants seen in the wild. Production `permission_reply` ignores kind.
+/// common variants seen in the wild. Production `permission_reply` ignores skill_key.
 pub mod tool_kinds {
     pub const READ: &str = "read";
     pub const SEARCH: &str = "search";
@@ -210,7 +210,7 @@ pub fn auto_response(method: &str, params: &Value) -> ApprovalReply {
     }
 }
 
-/// Option priority for `session/request_permission` (kind ignored).
+/// Option priority for `session/request_permission` (skill_key ignored).
 /// **Medium**: golden in `auto_response_locks_permission_and_cursor_extensions`.
 fn permission_reply(params: &Value) -> ApprovalReply {
     let options = params.get("options").and_then(Value::as_array);
@@ -265,11 +265,11 @@ impl ServerNotification {
             Some(u) => u,
             None => return Self::Other { method, params },
         };
-        let kind = update
+        let skill_key = update
             .get("sessionUpdate")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if kind == "agent_message_chunk" {
+        if skill_key == "agent_message_chunk" {
             let text = update
                 .pointer("/content/text")
                 .and_then(Value::as_str)
@@ -442,21 +442,21 @@ mod tests {
 
     #[test]
     fn auto_response_locks_permission_and_cursor_extensions() {
-        // Medium golden: unrestricted option priority (kind ignored).
+        // Medium golden: unrestricted option priority (skill_key ignored).
         // allow-always > allow-once > reject-once > Unhandled.
         let once_and_reject = serde_json::json!([
-            { "optionId": option_ids::ALLOW_ONCE, "name": "Allow once", "kind": "allow_once" },
-            { "optionId": option_ids::REJECT_ONCE, "name": "Reject", "kind": "reject_once" }
+            { "optionId": option_ids::ALLOW_ONCE, "name": "Allow once", "skill_key": "allow_once" },
+            { "optionId": option_ids::REJECT_ONCE, "name": "Reject", "skill_key": "reject_once" }
         ]);
         let all_three = serde_json::json!([
-            { "optionId": option_ids::ALLOW_ALWAYS, "name": "Allow always", "kind": "allow_always" },
-            { "optionId": option_ids::ALLOW_ONCE, "name": "Allow once", "kind": "allow_once" },
-            { "optionId": option_ids::REJECT_ONCE, "name": "Reject", "kind": "reject_once" }
+            { "optionId": option_ids::ALLOW_ALWAYS, "name": "Allow always", "skill_key": "allow_always" },
+            { "optionId": option_ids::ALLOW_ONCE, "name": "Allow once", "skill_key": "allow_once" },
+            { "optionId": option_ids::REJECT_ONCE, "name": "Reject", "skill_key": "reject_once" }
         ]);
 
         let read_once = serde_json::json!({
             "sessionId": "s1",
-            "toolCall": { "toolCallId": "c1", "kind": tool_kinds::READ },
+            "toolCall": { "toolCallId": "c1", "skill_key": tool_kinds::READ },
             "options": once_and_reject.clone()
         });
         assert_eq!(
@@ -468,7 +468,7 @@ mod tests {
 
         let execute_always = serde_json::json!({
             "sessionId": "s1",
-            "toolCall": { "toolCallId": "c1c", "kind": tool_kinds::EXECUTE },
+            "toolCall": { "toolCallId": "c1c", "skill_key": tool_kinds::EXECUTE },
             "options": all_three.clone()
         });
         assert_eq!(
@@ -480,7 +480,7 @@ mod tests {
 
         let execute_once = serde_json::json!({
             "sessionId": "s1",
-            "toolCall": { "toolCallId": "c1d", "kind": tool_kinds::EXECUTE },
+            "toolCall": { "toolCallId": "c1d", "skill_key": tool_kinds::EXECUTE },
             "options": once_and_reject.clone()
         });
         assert_eq!(
@@ -492,7 +492,7 @@ mod tests {
 
         let edit_once = serde_json::json!({
             "sessionId": "s1",
-            "toolCall": { "toolCallId": "c1e", "kind": tool_kinds::EDIT },
+            "toolCall": { "toolCallId": "c1e", "skill_key": tool_kinds::EDIT },
             "options": once_and_reject.clone()
         });
         assert_eq!(
@@ -504,7 +504,7 @@ mod tests {
 
         let switch_mode = serde_json::json!({
             "sessionId": "s1",
-            "toolCall": { "toolCallId": "c2", "kind": tool_kinds::SWITCH_MODE },
+            "toolCall": { "toolCallId": "c2", "skill_key": tool_kinds::SWITCH_MODE },
             "options": once_and_reject
         });
         assert_eq!(
@@ -516,9 +516,9 @@ mod tests {
 
         let only_reject = serde_json::json!({
             "sessionId": "s1",
-            "toolCall": { "toolCallId": "c3", "kind": tool_kinds::READ },
+            "toolCall": { "toolCallId": "c3", "skill_key": tool_kinds::READ },
             "options": [
-                { "optionId": option_ids::REJECT_ONCE, "name": "Reject", "kind": "reject_once" }
+                { "optionId": option_ids::REJECT_ONCE, "name": "Reject", "skill_key": "reject_once" }
             ]
         });
         assert_eq!(

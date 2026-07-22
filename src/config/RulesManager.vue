@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { AppConfig, RuleActionKind, RuleConfig } from "./types";
 import { RULE_ACTION_KINDS } from "./types";
-import { createDefaultRule, parseRuleCsv, toggleRuleAction } from "./ruleDraft";
+import { createDefaultRule, parseRuleCsv, removeRuleAction, toggleRuleAction } from "./ruleDraft";
 import type { EventType, SourceKind } from "../types";
 import { EVENT_TYPES, SOURCE_KINDS } from "../types.generated";
 
@@ -14,15 +14,32 @@ function assertNever(value: never): never {
 
 function actionLabel(kind: RuleActionKind): string {
   switch (kind) {
-    case "review":
-      return "Review";
-    case "check":
-      return "Check";
+    case "runSkill":
+      return "Run skill";
     case "notify":
       return "Notify";
     default:
       return assertNever(kind);
   }
+}
+
+function runSkillActions(rule: RuleConfig) {
+  return rule.actions.filter((action) => action.kind === "runSkill");
+}
+
+function runSkillTitle(action: Extract<import("./types").RuleActionConfig, { kind: "runSkill" }>) {
+  const name = action.skillName.trim() || "runSkill";
+  const extra = action.extraArgs.trim();
+  return extra ? `${name} ${extra}` : name;
+}
+
+function onSkillField(
+  action: Extract<import("./types").RuleActionConfig, { kind: "runSkill" }>,
+  key: "skillName" | "skillPath" | "commandTemplate" | "extraArgs",
+  event: Event,
+) {
+  action[key] = (event.target as HTMLInputElement).value;
+  emit("edit");
 }
 
 function addRule() {
@@ -70,6 +87,11 @@ function onCsv(rule: RuleConfig, key: "labelsAny" | "labelsAll", event: Event) {
 function toggleAction(rule: RuleConfig, kind: RuleActionKind, event: Event) {
   const checked = (event.target as HTMLInputElement).checked;
   rule.actions = toggleRuleAction(rule, kind, checked).actions;
+  emit("edit");
+}
+
+function removeAction(rule: RuleConfig, actionId: string) {
+  rule.actions = removeRuleAction(rule, actionId).actions;
   emit("edit");
 }
 
@@ -156,6 +178,53 @@ function hasAction(rule: RuleConfig, kind: RuleActionKind): boolean {
             <span>{{ actionLabel(kind) }}</span>
           </label>
         </div>
+
+        <div v-for="action in runSkillActions(rule)" :key="action.id" class="grid skill-fields">
+          <div class="skill-title">
+            <span>{{ runSkillTitle(action) }}</span>
+            <button type="button" class="delete" @click="removeAction(rule, action.id)">删除</button>
+          </div>
+          <label>
+            <span>Skill name</span>
+            <input
+              type="text"
+              :value="action.skillName"
+              placeholder="pr-review"
+              @input="onSkillField(action, 'skillName', $event)"
+            />
+          </label>
+          <label>
+            <span>Skill path</span>
+            <input
+              type="text"
+              :value="action.skillPath"
+              placeholder=".codex/skills/pr-review/SKILL.md"
+              @input="onSkillField(action, 'skillPath', $event)"
+            />
+          </label>
+          <label>
+            <span>Command template</span>
+            <input
+              type="text"
+              :value="action.commandTemplate"
+              placeholder="/{skill} {pr}"
+              title="Placeholders: {skill} {pr} {repo}"
+              @input="onSkillField(action, 'commandTemplate', $event)"
+            />
+            <small class="hint">Placeholders: {skill} {pr} {repo}</small>
+          </label>
+          <label>
+            <span>Extra args</span>
+            <input
+              type="text"
+              :value="action.extraArgs"
+              placeholder="--check"
+              title="Appended to the rendered command (e.g. --check)"
+              @input="onSkillField(action, 'extraArgs', $event)"
+            />
+            <small class="hint">Optional; e.g. --check for fix verification</small>
+          </label>
+        </div>
       </section>
     </div>
   </div>
@@ -226,6 +295,16 @@ function hasAction(rule: RuleConfig, kind: RuleActionKind): boolean {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--space-3);
+}
+.skill-fields .skill-title {
+  grid-column: 1 / -1;
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--color-text);
+}
+.hint {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-xs, 0.75rem);
 }
 label {
   display: flex;

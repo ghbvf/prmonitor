@@ -55,7 +55,7 @@ pub fn should_skip(cand: &Candidate, params: &MonitorParams, ledger: &Ledger) ->
     None
 }
 
-/// Cooldown skip reason: the same `(pr, kind)` dispatched within
+/// Cooldown skip reason: the same `(pr, skill_key)` dispatched within
 /// `pr_cooldown_seconds`. Mirrors `router.py` `recent_dispatch_reason` — a zero
 /// cooldown disables the gate.
 pub fn cooldown_skip(
@@ -67,11 +67,11 @@ pub fn cooldown_skip(
     if params.pr_cooldown_seconds == 0 {
         return None;
     }
-    let last = ledger.last_dispatch_at(cand.number, cand.kind.as_str())?;
+    let last = ledger.last_dispatch_at(cand.number, cand.skill_key.as_str())?;
     let remaining = cooldown_remaining(now, last, params.pr_cooldown_seconds)?;
     Some(format!(
         "recent {} dispatch within cooldown ({remaining}s remaining)",
-        cand.kind
+        cand.skill_key
     ))
 }
 
@@ -116,10 +116,15 @@ mod tests {
     use crate::pr::ledger::DispatchEvent;
     use std::collections::HashSet;
 
-    fn action_key(pr: u64, head: &str, kind: &str) -> String {
-        ReviewActionKey::for_parts(pr, head, kind.parse().unwrap())
-            .unwrap()
-            .into_inner()
+    fn action_key(pr: u64, head: &str, skill_key: impl AsRef<str>) -> String {
+        let skill_key = skill_key.as_ref();
+        ReviewActionKey::for_parts(
+            pr,
+            head,
+            crate::model::SkillInvocation::migrate_legacy_skill_key(skill_key),
+        )
+        .unwrap()
+        .into_inner()
     }
 
     fn params() -> MonitorParams {
@@ -130,7 +135,8 @@ mod tests {
         }
     }
 
-    fn cand(kind: &str) -> Candidate {
+    fn cand(skill_key: impl AsRef<str>) -> Candidate {
+        let skill_key = skill_key.as_ref();
         Candidate {
             number: 7,
             head_sha: "abc123def456".to_string(),
@@ -138,7 +144,7 @@ mod tests {
             author: "octocat".to_string(),
             is_cross_repository: false,
             is_draft: false,
-            kind: kind.parse().unwrap(),
+            skill_key: crate::model::SkillInvocation::migrate_legacy_skill_key(skill_key),
         }
     }
 
@@ -216,9 +222,9 @@ mod tests {
             dispatched: HashSet::new(),
             events: vec![DispatchEvent {
                 pr: c.number,
-                kind: "review".to_string(),
+                skill_key: c.skill_key.clone(),
                 head_sha: c.head_sha.clone(),
-                key: action_key(c.number, &c.head_sha, "review"),
+                key: action_key(c.number, &c.head_sha, &c.skill_key),
                 dispatched_at_epoch: 1_000,
             }],
         };
@@ -235,9 +241,9 @@ mod tests {
             dispatched: HashSet::new(),
             events: vec![DispatchEvent {
                 pr: c.number,
-                kind: "review".to_string(),
+                skill_key: c.skill_key.clone(),
                 head_sha: c.head_sha.clone(),
-                key: action_key(c.number, &c.head_sha, "review"),
+                key: action_key(c.number, &c.head_sha, &c.skill_key),
                 dispatched_at_epoch: 1_000,
             }],
         };
@@ -247,7 +253,7 @@ mod tests {
         let mut p = params();
         p.pr_cooldown_seconds = 0;
         assert_eq!(cooldown_skip(&c, &p, &ledger, 1_100), None);
-        // no matching event (different kind) → no cooldown.
+        // no matching event (different skill_key) → no cooldown.
         assert_eq!(
             cooldown_skip(&cand("check"), &params(), &ledger, 1_100),
             None

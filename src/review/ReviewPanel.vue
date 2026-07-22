@@ -4,7 +4,7 @@
 // (App.vue) so the pr slice and review slice stay decoupled.
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useProjects } from "../projects";
-import type { PullRequestView } from "../types";
+import { extraArgsFromSkillKey, skillKeyLabel, type PullRequestView } from "../types";
 import ReviewStream from "./ReviewStream.vue";
 import { useReviewStore } from "./useReviewStore";
 
@@ -140,8 +140,18 @@ onUnmounted(() => unlisten?.());
 
 function onStart() {
   if (props.selectedPr)
-    start(activeProjectId.value, props.selectedPr.number, props.selectedPr.kind);
+    start(
+      activeProjectId.value,
+      props.selectedPr.number,
+      extraArgsFromSkillKey(props.selectedPr.skillKey),
+    );
 }
+
+const startButtonLabel = computed(() => {
+  if (!props.selectedPr) return "开始 review";
+  const label = skillKeyLabel(props.selectedPr.skillKey);
+  return label === "—" ? "开始 review" : `开始 ${label}`;
+});
 </script>
 
 <template>
@@ -154,7 +164,7 @@ function onStart() {
           :disabled="selectedPr == null || running || !listenerReady"
           @click="onStart"
         >
-          开始 review
+          {{ startButtonLabel }}
         </button>
         <button type="button" :disabled="!running" @click="stop">停止</button>
       </div>
@@ -169,7 +179,7 @@ function onStart() {
         <span v-else>未开始</span>
       </template>
       <span v-else-if="selectedPr">
-        已选中 PR #{{ selectedPr.number }}（{{ selectedPr.kind }}）— 点「开始 review」
+        已选中 PR #{{ selectedPr.number }}（{{ skillKeyLabel(selectedPr.skillKey) }}）— 点「{{ startButtonLabel }}」
       </span>
       <span v-else class="muted">Select a PR to review.</span>
     </p>

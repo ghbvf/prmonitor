@@ -1,12 +1,12 @@
-//! Shared label resolution + trigger classification for every PR source (AB#717).
+//! Shared label resolution for every PR source (AB#717).
 //!
 //! A project's effective labels come from one of two places ([`LabelSource`]):
 //! the provider's own PR labels (`Native`), or bracketed segments parsed out of the
 //! PR title (`Title`, e.g. `[pr-status/need-fix]`). Bitbucket Server has no native
 //! PR labels, so it always uses `Title`; GitHub / Azure can use either.
 //!
-//! [`classify`] is the single home for the review/check/conflict decision that gh.rs
-//! and azure.rs previously each open-coded — both now feed their effective labels here.
+//! Trigger matching (which labels enqueue which rule actions) lives in the rule
+//! engine — sources only resolve effective labels and pass them through.
 
 use crate::model::LabelSource;
 
@@ -44,28 +44,6 @@ pub fn effective_labels(native: Vec<String>, title: &str, source: LabelSource) -
     match source {
         LabelSource::Native => native,
         LabelSource::Title => parse_title_labels(title),
-    }
-}
-
-/// Classifies a PR by its (already effective) labels against the project's trigger
-/// labels, returning `(kind, conflict)` or `None` when the PR carries neither trigger
-/// label (not monitored — dropped).
-///
-/// Mirrors the long-standing gh `merge_rows` / azure `parse_rows` semantics, now in one
-/// place: both labels → `("review", true)` (kept with the review row, marked conflict);
-/// only review → `("review", false)`; only check → `("check", false)`; neither → `None`.
-pub fn classify(
-    labels: &[String],
-    review_label: &str,
-    check_label: &str,
-) -> Option<(&'static str, bool)> {
-    let has_review = labels.iter().any(|n| n == review_label);
-    let has_check = labels.iter().any(|n| n == check_label);
-    match (has_review, has_check) {
-        (true, true) => Some(("review", true)),
-        (true, false) => Some(("review", false)),
-        (false, true) => Some(("check", false)),
-        (false, false) => None,
     }
 }
 
@@ -134,25 +112,5 @@ mod tests {
             effective_labels(v(&["area/ui"]), "Add [check] thing", LabelSource::Title),
             v(&["check"])
         );
-    }
-
-    #[test]
-    fn classify_quadrants() {
-        let review = "pr-status/needs-review";
-        let check = "pr-status/need-fix";
-        assert_eq!(
-            classify(&v(&[review, check]), review, check),
-            Some(("review", true))
-        );
-        assert_eq!(
-            classify(&v(&[review]), review, check),
-            Some(("review", false))
-        );
-        assert_eq!(
-            classify(&v(&[check]), review, check),
-            Some(("check", false))
-        );
-        assert_eq!(classify(&v(&["area/ui"]), review, check), None);
-        assert_eq!(classify(&[], review, check), None);
     }
 }

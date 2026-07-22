@@ -11,7 +11,6 @@ import type {
 import type {
   EngineKind,
   ExternalRequestId,
-  ReviewKind,
   ReviewReceiptId,
   ReviewReceiptSnapshot,
   SourceKind,
@@ -206,7 +205,7 @@ export function createExternalRequestId(): ExternalRequestId {
 export function requestRemoteReview(
   projectId: string,
   prNumber: number,
-  kind: ReviewKind,
+  extraArgs: string = "",
   requestId: ExternalRequestId = createExternalRequestId(),
 ): Promise<ReviewReceiptAccepted> {
   return receiptJson<unknown>(`${remoteApiBaseUrl()}/reviews`, {
@@ -214,7 +213,7 @@ export function requestRemoteReview(
     body: JSON.stringify({
       projectId,
       pr: prNumber,
-      kind,
+      extraArgs,
       requestId,
     }),
   }).then(parseReceiptAccepted);

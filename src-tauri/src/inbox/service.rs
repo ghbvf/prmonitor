@@ -418,11 +418,12 @@ mod tests {
         .unwrap()
     }
 
-    fn candidate(number: u64, kind: &str) -> Candidate {
+    fn candidate(number: u64, skill_key: impl AsRef<str>) -> Candidate {
+        let skill_key = skill_key.as_ref();
         Candidate {
             number,
-            kind: kind.parse().unwrap(),
-            head_sha: format!("head-{number}-{kind}"),
+            skill_key: crate::model::SkillInvocation::migrate_legacy_skill_key(skill_key),
+            head_sha: format!("head-{number}-{skill_key}"),
             head_ref: "main".to_string(),
             author: "octocat".to_string(),
             is_cross_repository: false,
@@ -437,7 +438,10 @@ mod tests {
             "p1",
             "owner/repo",
             7,
-            crate::model::ReviewKind::Review,
+            crate::model::DEFAULT_SKILL_NAME,
+            "",
+            crate::model::DEFAULT_SKILL_PATH,
+            crate::model::DEFAULT_COMMAND_TEMPLATE,
             crate::model::ExternalRequestId::parse("0123456789abcdef0123456789abcdef").unwrap(),
             crate::model::ExternalTriggerOrigin::Http,
             false,

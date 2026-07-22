@@ -30,7 +30,7 @@ use super::history_store::HistoryItemKind;
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 use crate::events::{ReviewEvent, StreamEvent};
-use crate::model::{EngineKind, ReviewKind, ReviewLifecycleDispatch, ReviewLifecycleEvent};
+use crate::model::{EngineKind, ReviewLifecycleDispatch, ReviewLifecycleEvent, SkillInvocation};
 use crate::review::engine::StartReviewOutcome;
 
 /// A review session is identified by its codex `threadId`.
@@ -40,7 +40,7 @@ pub type ThreadId = String;
 pub(crate) const CURSOR_ACP_STALE_SESSION_MSG: &str =
     "cursor ACP 进程已重启，会话已失效，请新开 review";
 
-/// The result of resolving a `(project, pr, kind)` for a stop-review action (AB#1069 F4): the
+/// The result of resolving a `(project, pr, skill_key)` for a stop-review action (AB#1069 F4): the
 /// three states an interrupt must tell apart, so a stop is never silently dropped.
 ///
 /// - [`Live`](Self::Live): a promoted in-flight session — interrupt it by `thread_id`.
@@ -57,10 +57,6 @@ pub enum StopTarget {
     Reserved,
     Absent,
 }
-
-/// The skill `name` attached to every review turn (matches the local project
-/// skill under `<repo_root>/<skillRelPath>`).
-const PR_REVIEW_SKILL: &str = "pr-review";
 
 /// Lifecycle of one review session (the state machine). Serialized camelCase for
 /// `list_review_sessions`; `Deserialize` so the persisted `review_session.status` wire
@@ -87,14 +83,14 @@ pub enum SessionStatus {
 pub struct SessionInfo {
     /// Owning project (#35): the routing key the UI filters its session list by.
     /// A PR number is unique only *within* a project, so a session is identified
-    /// to the user by `(project_id, pr_number, kind)` — `thread_id` stays the
+    /// to the user by `(project_id, pr_number, skill_key)` — `thread_id` stays the
     /// globally-unique registry key (codex assigns one per `thread/start`).
     pub project_id: String,
     pub thread_id: String,
     pub turn_id: String,
     pub pr_number: u64,
     /// The trigger-label mode the review was started in.
-    pub kind: ReviewKind,
+    pub skill_key: String,
     /// Engine that created this session. Follow-up chat must route back to this engine even
     /// if the project's current config changes later.
     pub engine_kind: EngineKind,
@@ -167,7 +163,7 @@ pub struct SessionRegistry {
 }
 
 /// The registry's single critical section: the session map AND the set of
-/// `(project_id, pr, kind)` triples RESERVED by an in-flight [`start_review`] that has
+/// `(project_id, pr, skill_key)` triples RESERVED by an in-flight [`start_review`] that has
 /// not yet inserted its `Starting` session. Both live under ONE mutex, so reserve /
 /// promote-to-session / [`SessionRegistry::active_pairs`] are mutually atomic — the
 /// reservation closes the window where a session exists conceptually (its
@@ -182,7 +178,7 @@ pub struct SessionRegistry {
 #[derive(Default)]
 struct RegistryState {
     sessions: HashMap<ThreadId, SessionInfo>,
-    reserved: HashSet<(String, u64, ReviewKind)>,
+    reserved: HashSet<(String, u64, String)>,
     /// Per-`thread_id` completion broadcast (AB#1042): a `watch::Sender` whose value goes
     /// `None` → `Some(CompletionOutcome)` exactly once, when the turn reaches a terminal
     /// state via [`finalize_turn`]. Get-or-create on BOTH ends ([`SessionRegistry::subscribe_completion`]
@@ -282,7 +278,7 @@ impl SessionRegistry {
         }
     }
 
-    /// Atomically reserve `(project_id, pr_number, kind)` for a dispatch about to start
+    /// Atomically reserve `(project_id, pr_number, skill_key)` for a dispatch about to start
     /// a review, BEFORE the async `thread/start` — so the triple is visible to a
     /// concurrent dispatch's guard the instant this returns, not only after the
     /// `Starting` insert. `true` = the caller now OWNS the reservation; `false` = the
@@ -293,12 +289,18 @@ impl SessionRegistry {
     /// makes the idempotency boundary atomic rather than a snapshot. `project_id` scopes
     /// the dedup (#35): the same PR number in two different projects reserves
     /// independently.
-    pub fn try_reserve_pair(&self, project_id: &str, pr_number: u64, kind: ReviewKind) -> bool {
+    pub fn try_reserve_pair(
+        &self,
+        project_id: &str,
+        pr_number: u64,
+        skill_key: impl AsRef<str>,
+    ) -> bool {
+        let skill_key = skill_key.as_ref();
         let mut st = self.inner.lock().unwrap();
         let covered_by_session = st.sessions.values().any(|s| {
             s.project_id == project_id
                 && s.pr_number == pr_number
-                && s.kind == kind
+                && s.skill_key == skill_key
                 && matches!(
                     s.status,
                     SessionStatus::Starting | SessionStatus::Running | SessionStatus::Interrupting
@@ -307,12 +309,12 @@ impl SessionRegistry {
         if covered_by_session
             || st
                 .reserved
-                .contains(&(project_id.to_string(), pr_number, kind))
+                .contains(&(project_id.to_string(), pr_number, skill_key.to_string()))
         {
             return false;
         }
         st.reserved
-            .insert((project_id.to_string(), pr_number, kind));
+            .insert((project_id.to_string(), pr_number, skill_key.to_string()));
         true
     }
 
@@ -321,15 +323,21 @@ impl SessionRegistry {
     /// before the insert). A successful start hands the reservation to the inserted
     /// session via [`Self::promote_reservation`], so the happy path never calls this.
     /// Idempotent (a missing triple is a no-op). Keyed by the full
-    /// `(project_id, pr, kind)` so it frees exactly the triple `try_reserve_pair` took.
+    /// `(project_id, pr, skill_key)` so it frees exactly the triple `try_reserve_pair` took.
     /// `pub(super)` so [`ReservationGuard`] (shared by codex / Claude / Cursor) can
     /// release on an early failure (#718).
-    pub(super) fn release_pair(&self, project_id: &str, pr_number: u64, kind: ReviewKind) {
-        self.inner
-            .lock()
-            .unwrap()
-            .reserved
-            .remove(&(project_id.to_string(), pr_number, kind));
+    pub(super) fn release_pair(
+        &self,
+        project_id: &str,
+        pr_number: u64,
+        skill_key: impl AsRef<str>,
+    ) {
+        let skill_key = skill_key.as_ref();
+        self.inner.lock().unwrap().reserved.remove(&(
+            project_id.to_string(),
+            pr_number,
+            skill_key.to_string(),
+        ));
     }
 
     /// Insert the just-started session as `Starting` AND drop its reservation in ONE
@@ -346,8 +354,11 @@ impl SessionRegistry {
     /// pump can finalize. [`finalize_turn`] reads it once via [`Self::take_url_context`].
     pub(super) fn promote_reservation(&self, info: SessionInfo, url_ctx: CommentUrlContext) {
         let mut st = self.inner.lock().unwrap();
-        st.reserved
-            .remove(&(info.project_id.clone(), info.pr_number, info.kind));
+        st.reserved.remove(&(
+            info.project_id.clone(),
+            info.pr_number,
+            info.skill_key.clone(),
+        ));
         st.url_contexts.insert(info.thread_id.clone(), url_ctx);
         st.sessions.insert(info.thread_id.clone(), info);
     }
@@ -531,10 +542,10 @@ impl SessionRegistry {
         self.inner.lock().unwrap().sessions.get(thread_id).cloned()
     }
 
-    /// The `(pr_number, kind)` of every in-flight session
+    /// The `(pr_number, skill_key)` of every in-flight session
     /// (`Starting`/`Running`/`Interrupting`) PLUS every RESERVED triple **belonging to
     /// `project_id`** — the auto-trigger registry guard's view, scoped to one project
-    /// (#35). A PR with an in-flight (or reserved) session of a given kind must not be
+    /// (#35). A PR with an in-flight (or reserved) session of a given skill_key must not be
     /// re-dispatched *within the same project*; a PR #7 in project A does NOT block a PR
     /// #7 in project B. A terminal (`Done`/`Failed`) session is finished and excluded.
     /// Including reservations is what lets a not-yet-`Starting` dispatch still block a
@@ -543,9 +554,9 @@ impl SessionRegistry {
     /// consumes only the pairs, so it never imports the session state machine. The
     /// returned pairs drop the project dimension because the caller already scopes its
     /// candidate batch to this project.
-    pub fn active_pairs(&self, project_id: &str) -> Vec<(u64, ReviewKind)> {
+    pub fn active_pairs(&self, project_id: &str) -> Vec<(u64, String)> {
         let st = self.inner.lock().unwrap();
-        let mut pairs: Vec<(u64, ReviewKind)> = st
+        let mut pairs: Vec<(u64, String)> = st
             .sessions
             .values()
             .filter(|s| {
@@ -557,7 +568,7 @@ impl SessionRegistry {
                             | SessionStatus::Interrupting
                     )
             })
-            .map(|s| (s.pr_number, s.kind))
+            .map(|s| (s.pr_number, s.skill_key.clone()))
             .collect();
         // A reserved triple has no session yet (its `thread/start` is mid-flight) but is
         // every bit as "in flight" — include it (scoped to this project) so the dispatch
@@ -567,12 +578,12 @@ impl SessionRegistry {
             st.reserved
                 .iter()
                 .filter(|(pid, _, _)| pid == project_id)
-                .map(|(_, pr, kind)| (*pr, *kind)),
+                .map(|(_, pr, skill_key)| (*pr, skill_key.clone())),
         );
         pairs
     }
 
-    /// Resolve `(project_id, pr_number, kind)` to a [`StopTarget`] for the outbox stop-review action
+    /// Resolve `(project_id, pr_number, skill_key)` to a [`StopTarget`] for the outbox stop-review action
     /// (AB#1069 F4): a [`Live`](StopTarget::Live) in-flight session (interrupt by `thread_id`), a bare
     /// [`Reserved`](StopTarget::Reserved) start mid-flight (no `thread_id` yet — the caller must retry
     /// so the stop is not dropped), or [`Absent`](StopTarget::Absent) (nothing to stop — idempotent).
@@ -582,12 +593,18 @@ impl SessionRegistry {
     /// promote-into-session swap is atomic under this same lock, so the two never both register, but
     /// checking sessions first is the correct precedence. Project-scoped (#35). Synchronous (no
     /// `.await` under the lock).
-    pub fn stop_target(&self, project_id: &str, pr_number: u64, kind: ReviewKind) -> StopTarget {
+    pub fn stop_target(
+        &self,
+        project_id: &str,
+        pr_number: u64,
+        skill_key: impl AsRef<str>,
+    ) -> StopTarget {
+        let skill_key = skill_key.as_ref();
         let st = self.inner.lock().unwrap();
         if let Some(s) = st.sessions.values().find(|s| {
             s.project_id == project_id
                 && s.pr_number == pr_number
-                && s.kind == kind
+                && s.skill_key == skill_key
                 && matches!(
                     s.status,
                     SessionStatus::Starting | SessionStatus::Running | SessionStatus::Interrupting
@@ -599,7 +616,7 @@ impl SessionRegistry {
         // interrupt yet. NOT `Absent` — dropping the stop here would let the start promote unimpeded.
         if st
             .reserved
-            .contains(&(project_id.to_string(), pr_number, kind))
+            .contains(&(project_id.to_string(), pr_number, skill_key.to_string()))
         {
             return StopTarget::Reserved;
         }
@@ -642,7 +659,7 @@ impl SessionRegistry {
     }
 }
 
-/// RAII release of a `(pr, kind)` reservation taken by
+/// RAII release of a `(pr, skill_key)` reservation taken by
 /// [`SessionRegistry::try_reserve_pair`]. [`Self::disarm`] is called once the
 /// reservation has been handed to a `Starting` session ([`SessionRegistry::promote_reservation`]);
 /// an UNdisarmed guard releases on drop, so NO early `?` / error / panic between the
@@ -654,7 +671,7 @@ pub(crate) struct ReservationGuard<'a> {
     pub(crate) registry: &'a SessionRegistry,
     pub(crate) project_id: String,
     pub(crate) pr_number: u64,
-    pub(crate) kind: ReviewKind,
+    pub(crate) skill_key: String,
     pub(crate) armed: bool,
 }
 
@@ -669,14 +686,14 @@ impl Drop for ReservationGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.registry
-                .release_pair(&self.project_id, self.pr_number, self.kind);
+                .release_pair(&self.project_id, self.pr_number, &self.skill_key);
         }
     }
 }
 
 /// Start a review for `pr_number` and stream its output. Returns
 /// [`StartReviewOutcome::Started`] with the codex `threadId`, or
-/// [`StartReviewOutcome::Deduped`] when the `(pr_number, kind)` is already covered by
+/// [`StartReviewOutcome::Deduped`] when the `(pr_number, skill_key)` is already covered by
 /// an in-flight (or reserved) review — not started. The dispatch path skips a
 /// `Deduped` (neither recorded nor a failure); the manual command surfaces it as a
 /// benign "already in flight".
@@ -695,12 +712,11 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
     codex_cli: &ResolvedCli,
     repo: &str,
     repo_root: &str,
-    skill_abs_path: &str,
+    invocation: &crate::model::SkillInvocation,
     codex_model: &str,
     codex_reasoning_effort: crate::model::CodexReasoningEffort,
     project_id: &str,
     pr_number: u64,
-    kind: ReviewKind,
     // The IMMUTABLE comment-URL source context (AB#1042), captured by the caller from the
     // project at start. Handed to the `Starting` session in `promote_reservation` so the
     // terminal `finalize_turn` resolves the URL against the project the review ran against.
@@ -710,13 +726,13 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
     // `thread/start` (below) — before `start_turn` runs the turn / posts a `pm:` comment.
     outbox_claim_id: Option<i64>,
 ) -> AppResult<StartReviewOutcome> {
-    // Atomic test-and-set BEFORE any `.await`: if this `(project_id, pr, kind)` is
+    // Atomic test-and-set BEFORE any `.await`: if this `(project_id, pr, skill_key)` is
     // already reserved or covered by an in-flight session, do NOT start a second review.
     // This is the idempotency boundary — atomic, not the old snapshot-then-act guard
     // that two concurrent webhook deliveries could both pass before either's `Starting`
     // landed. `project_id` scopes the dedup (#35) so the same PR in two projects starts
     // independently.
-    if !registry.try_reserve_pair(project_id, pr_number, kind) {
+    if !registry.try_reserve_pair(project_id, pr_number, &invocation.skill_key) {
         return Ok(StartReviewOutcome::Deduped);
     }
     // From here, ANY early return / `?` / panic before `promote_reservation` releases
@@ -726,7 +742,7 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
         registry,
         project_id: project_id.to_string(),
         pr_number,
-        kind,
+        skill_key: invocation.skill_key.clone(),
         armed: true,
     };
 
@@ -754,7 +770,7 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
         thread_id: thread_id.clone(),
         turn_id: String::new(),
         pr_number,
-        kind,
+        skill_key: invocation.skill_key.clone(),
         engine_kind: EngineKind::Codex,
         status: SessionStatus::Starting,
         created_at_epoch: super::history_store::now_epoch(),
@@ -764,15 +780,20 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
     commit_starting_session(app, registry, starting.clone(), url_ctx, outbox_claim_id)?;
     reservation.disarm();
 
-    let prompt = review_prompt(repo, &skill_command(pr_number, kind));
+    let prompt = review_prompt(repo, &invocation.skill_name, &invocation.command)?;
+    let skill_path = invocation
+        .skill_path
+        .as_ref()
+        .ok_or_else(|| AppError::new("Codex requires a resolved skill path"))?
+        .clone();
     let turn_id = match process::start_turn(
         &client,
         TurnStartParams {
             thread_id: thread_id.clone(),
             input: vec![
                 UserInput::Skill {
-                    name: PR_REVIEW_SKILL.to_string(),
-                    path: skill_abs_path.to_string(),
+                    name: invocation.skill_name.clone(),
+                    path: skill_path,
                 },
                 UserInput::Text { text: prompt },
             ],
@@ -795,7 +816,13 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
         Err(e) => {
             registry.set_status(&thread_id, SessionStatus::Failed);
             persist_status(app, &thread_id, SessionStatus::Failed);
-            fire_failed_lifecycle(app, project_id, pr_number, kind, &thread_id);
+            fire_failed_lifecycle(
+                app,
+                project_id,
+                pr_number,
+                invocation.skill_key.clone(),
+                &thread_id,
+            );
             return Err(e);
         }
     };
@@ -809,7 +836,7 @@ pub(crate) async fn start_review<R: tauri::Runtime>(
             thread_id: thread_id.clone(),
             turn_id,
             pr_number,
-            kind,
+            skill_key: invocation.skill_key.clone(),
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             // Same creation instant as the `Starting` row above — `upsert_session` keys
@@ -975,7 +1002,7 @@ pub(crate) async fn resume_turn<R: tauri::Runtime>(
             thread_id: thread_id.to_string(),
             turn_id,
             pr_number,
-            kind: durable_info.kind,
+            skill_key: durable_info.skill_key.clone(),
             engine_kind: durable_info.engine_kind,
             status: SessionStatus::Running,
             created_at_epoch: durable_info.created_at_epoch,
@@ -1298,7 +1325,7 @@ fn persist_delta<R: tauri::Runtime>(
     thread_id: &str,
     event: &ReviewEvent,
 ) {
-    let (project_id, item_id, kind, text) = match event {
+    let (project_id, item_id, skill_key, text) = match event {
         ReviewEvent::MessageDelta {
             project_id,
             item_id,
@@ -1314,7 +1341,9 @@ fn persist_delta<R: tauri::Runtime>(
         _ => return,
     };
     let db = app.state::<crate::db::Database>();
-    if let Err(e) = super::history_store::append_item(db.inner(), thread_id, item_id, kind, text) {
+    if let Err(e) =
+        super::history_store::append_item(db.inner(), thread_id, item_id, skill_key, text)
+    {
         eprintln!(
             "review history 持久化失败（{thread_id}/{item_id}）：{}",
             e.message
@@ -1540,20 +1569,23 @@ pub(super) async fn finalize_turn<R: tauri::Runtime>(
     );
     if let Some(event) = lifecycle_event_from_wire_status(wire_status) {
         let state = app.state::<crate::state::AppState>();
-        let kind = registry.get(thread_id).map(|info| info.kind).or_else(|| {
-            super::history_store::get_session(db.inner(), thread_id)
-                .ok()
-                .flatten()
-                .map(|info| info.kind)
-        });
-        let Some(kind) = kind else {
+        let skill_key = registry
+            .get(thread_id)
+            .map(|info| info.skill_key)
+            .or_else(|| {
+                super::history_store::get_session(db.inner(), thread_id)
+                    .ok()
+                    .flatten()
+                    .map(|info| info.skill_key)
+            });
+        let Some(skill_key) = skill_key else {
             eprintln!("review lifecycle terminal 缺少类型化 session（{thread_id}），跳过通知");
             return;
         };
         if let Err(e) = state.review_lifecycle.fire(ReviewLifecycleDispatch {
             project_id: project_id.to_string(),
             pr_number,
-            kind,
+            skill_key,
             thread_id: thread_id.to_string(),
             event,
             comment_url: comment_url.clone(),
@@ -1583,14 +1615,14 @@ fn fire_failed_lifecycle<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     project_id: &str,
     pr_number: u64,
-    kind: ReviewKind,
+    skill_key: String,
     thread_id: &str,
 ) {
     let state = app.state::<crate::state::AppState>();
     if let Err(e) = state.review_lifecycle.fire(ReviewLifecycleDispatch {
         project_id: project_id.to_string(),
         pr_number,
-        kind,
+        skill_key,
         thread_id: thread_id.to_string(),
         event: ReviewLifecycleEvent::Failed,
         comment_url: None,
@@ -1673,15 +1705,6 @@ fn should_resolve_url(wire_status: &str) -> bool {
     wire_status == "completed"
 }
 
-/// The skill command the review turn instructs codex to run: `/pr-review <N>` for
-/// a review, `/pr-review <N> --check` for a check.
-fn skill_command(pr_number: u64, kind: ReviewKind) -> String {
-    match kind {
-        ReviewKind::Review => format!("/{PR_REVIEW_SKILL} {pr_number}"),
-        ReviewKind::Check => format!("/{PR_REVIEW_SKILL} {pr_number} --check"),
-    }
-}
-
 fn review_turn_sandbox_policy() -> SandboxPolicy {
     SandboxPolicy::DangerFullAccess
 }
@@ -1697,15 +1720,18 @@ fn codex_follow_up_start_error(error: AppError) -> AppError {
 /// The turn's instruction text. Ported from `router.py:590-597`; the
 /// machine-block clause is dropped because prmonitor's pr-review skill posts plain
 /// `pm:` comments (no machine block — see #24).
-fn review_prompt(repo: &str, skill_command: &str) -> String {
-    format!(
-        "Use the attached local project skill `{PR_REVIEW_SKILL}` exactly. \
+fn review_prompt(repo: &str, skill_name: &str, skill_command: &str) -> AppResult<String> {
+    SkillInvocation::validate_prompt_token("skillName", skill_name).map_err(AppError::new)?;
+    SkillInvocation::validate_prompt_token("command", skill_command).map_err(AppError::new)?;
+    SkillInvocation::validate_prompt_token("repo", repo).map_err(AppError::new)?;
+    Ok(format!(
+        "Use the attached local project skill `{skill_name}` exactly. \
          Execute `{skill_command}` for repository `{repo}`. \
          Complete the full skill workflow, including posting the pm:pr-review \
          comment and actually applying the label transition required by the skill. \
          Do not stop at a label-transition suggestion. Do not use the built-in \
          Codex review command."
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -1839,7 +1865,7 @@ mod tests {
     fn should_resolve_url_only_for_completed() {
         // Only a `completed` turn posted a comment to resolve. `interrupted` maps to the
         // SAME terminal `Done` as `completed`, so the gate must key on the raw wire status,
-        // not the terminal kind — an interrupted/failed/empty turn resolves NO url.
+        // not the terminal skill_key — an interrupted/failed/empty turn resolves NO url.
         assert!(should_resolve_url("completed"));
         assert!(!should_resolve_url("interrupted"));
         assert!(!should_resolve_url("failed"));
@@ -1847,9 +1873,27 @@ mod tests {
     }
 
     #[test]
-    fn skill_command_matches_kind() {
-        assert_eq!(skill_command(7, ReviewKind::Review), "/pr-review 7");
-        assert_eq!(skill_command(7, ReviewKind::Check), "/pr-review 7 --check");
+    fn skill_command_render_matches_defaults() {
+        assert_eq!(
+            crate::model::SkillInvocation::render_command(
+                crate::model::DEFAULT_COMMAND_TEMPLATE,
+                crate::model::DEFAULT_SKILL_NAME,
+                7,
+                "owner/repo",
+                ""
+            ),
+            "/pr-review 7"
+        );
+        assert_eq!(
+            crate::model::SkillInvocation::render_command(
+                crate::model::DEFAULT_COMMAND_TEMPLATE,
+                crate::model::DEFAULT_SKILL_NAME,
+                7,
+                "owner/repo",
+                "--check"
+            ),
+            "/pr-review 7 --check"
+        );
     }
 
     #[test]
@@ -1870,12 +1914,18 @@ mod tests {
 
     #[test]
     fn review_prompt_names_skill_command_and_repo() {
-        let p = review_prompt("owner/name", "/pr-review 7");
+        let p = review_prompt("owner/name", "pr-review", "/pr-review 7").expect("prompt");
         assert!(p.contains("/pr-review 7"));
         assert!(p.contains("owner/name"));
         assert!(p.contains("pr-review"));
         // The dropped router.py machine-block clause must stay dropped.
         assert!(!p.to_lowercase().contains("machine block"));
+    }
+
+    #[test]
+    fn review_prompt_rejects_backtick_injection() {
+        assert!(review_prompt("owner/name", "pr-review", "/pr-review 7`; evil").is_err());
+        assert!(review_prompt("owner/name", "pr-`x", "/pr-review 7").is_err());
     }
 
     #[test]
@@ -1886,7 +1936,7 @@ mod tests {
             thread_id: "t1".to_string(),
             turn_id: "tn1".to_string(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 0,
@@ -1906,33 +1956,61 @@ mod tests {
     #[test]
     fn active_pairs_returns_only_in_flight_sessions() {
         let reg = SessionRegistry::default();
-        let info = |thread: &str, pr: u64, kind: ReviewKind, status| {
+        let info = |thread: &str, pr: u64, skill_key: String, status| {
             reg.insert(SessionInfo {
                 project_id: "p1".to_string(),
                 thread_id: thread.to_string(),
                 turn_id: String::new(),
                 pr_number: pr,
-                kind,
+                skill_key,
                 engine_kind: EngineKind::Codex,
                 status,
                 created_at_epoch: 0,
                 comment_url: None,
             });
         };
-        info("a", 1, ReviewKind::Review, SessionStatus::Starting);
-        info("b", 2, ReviewKind::Check, SessionStatus::Running);
-        info("c", 3, ReviewKind::Review, SessionStatus::Interrupting);
-        info("d", 4, ReviewKind::Review, SessionStatus::Done); // terminal → excluded
-        info("e", 5, ReviewKind::Check, SessionStatus::Failed); // terminal → excluded
+        info(
+            "a",
+            1,
+            crate::model::SkillInvocation::skill_key("pr-review", ""),
+            SessionStatus::Starting,
+        );
+        info(
+            "b",
+            2,
+            crate::model::SkillInvocation::skill_key("pr-review", "--check"),
+            SessionStatus::Running,
+        );
+        info(
+            "c",
+            3,
+            crate::model::SkillInvocation::skill_key("pr-review", ""),
+            SessionStatus::Interrupting,
+        );
+        info(
+            "d",
+            4,
+            crate::model::SkillInvocation::skill_key("pr-review", ""),
+            SessionStatus::Done,
+        ); // terminal → excluded
+        info(
+            "e",
+            5,
+            crate::model::SkillInvocation::skill_key("pr-review", "--check"),
+            SessionStatus::Failed,
+        ); // terminal → excluded
 
         let mut pairs = reg.active_pairs("p1");
         pairs.sort_by_key(|(pr_number, _)| *pr_number);
         assert_eq!(
             pairs,
             vec![
-                (1, ReviewKind::Review),
-                (2, ReviewKind::Check),
-                (3, ReviewKind::Review),
+                (1, crate::model::SkillInvocation::skill_key("pr-review", "")),
+                (
+                    2,
+                    crate::model::SkillInvocation::skill_key("pr-review", "--check")
+                ),
+                (3, crate::model::SkillInvocation::skill_key("pr-review", "")),
             ]
         );
     }
@@ -1943,46 +2021,84 @@ mod tests {
         // terminal / absent / wrong-project → Absent (the idempotency hinge — Absent → the executor
         // no-ops the stop instead of erroring).
         let reg = SessionRegistry::default();
-        let info = |thread: &str, project: &str, pr: u64, kind: ReviewKind, status| {
+        let info = |thread: &str, project: &str, pr: u64, skill_key: String, status| {
             reg.insert(SessionInfo {
                 project_id: project.to_string(),
                 thread_id: thread.to_string(),
                 turn_id: String::new(),
                 pr_number: pr,
-                kind,
+                skill_key,
                 engine_kind: EngineKind::Codex,
                 status,
                 created_at_epoch: 0,
                 comment_url: None,
             });
         };
-        info("a", "p1", 1, ReviewKind::Review, SessionStatus::Running);
-        info("b", "p1", 1, ReviewKind::Check, SessionStatus::Starting); // same PR, different kind
-        info("c", "p1", 2, ReviewKind::Review, SessionStatus::Done); // terminal → not stoppable
+        info(
+            "a",
+            "p1",
+            1,
+            crate::model::SkillInvocation::skill_key("pr-review", ""),
+            SessionStatus::Running,
+        );
+        info(
+            "b",
+            "p1",
+            1,
+            crate::model::SkillInvocation::skill_key("pr-review", "--check"),
+            SessionStatus::Starting,
+        ); // same PR, different skill_key
+        info(
+            "c",
+            "p1",
+            2,
+            crate::model::SkillInvocation::skill_key("pr-review", ""),
+            SessionStatus::Done,
+        ); // terminal → not stoppable
 
         // In-flight pair → Live(thread_id).
         assert_eq!(
-            reg.stop_target("p1", 1, ReviewKind::Review),
+            reg.stop_target(
+                "p1",
+                1,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
             StopTarget::Live("a".to_string())
         );
         // Kind is part of the key — review and check for the same PR are independent sessions.
         assert_eq!(
-            reg.stop_target("p1", 1, ReviewKind::Check),
+            reg.stop_target(
+                "p1",
+                1,
+                crate::model::SkillInvocation::skill_key("pr-review", "--check")
+            ),
             StopTarget::Live("b".to_string())
         );
         // Terminal session → Absent (finished, nothing to stop).
         assert_eq!(
-            reg.stop_target("p1", 2, ReviewKind::Review),
+            reg.stop_target(
+                "p1",
+                2,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
             StopTarget::Absent
         );
         // Absent pair → Absent.
         assert_eq!(
-            reg.stop_target("p1", 99, ReviewKind::Review),
+            reg.stop_target(
+                "p1",
+                99,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
             StopTarget::Absent
         );
         // Project-scoped (#35): another project's id never matches.
         assert_eq!(
-            reg.stop_target("p2", 1, ReviewKind::Review),
+            reg.stop_target(
+                "p2",
+                1,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
             StopTarget::Absent
         );
     }
@@ -1994,15 +2110,29 @@ mod tests {
         // `Reserved`, distinct from `Absent`, so the executor retries until promotion / start failure.
         // (`active_pairs` lumps reservations in as "taken"; `stop_target` keeps the distinction.)
         let reg = SessionRegistry::default();
-        assert!(reg.try_reserve_pair("p1", 7, ReviewKind::Review));
-        assert!(reg.active_pairs("p1").contains(&(7, ReviewKind::Review)));
+        assert!(reg.try_reserve_pair(
+            "p1",
+            7,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        ));
+        assert!(reg
+            .active_pairs("p1")
+            .contains(&(7, crate::model::SkillInvocation::skill_key("pr-review", ""))));
         assert_eq!(
-            reg.stop_target("p1", 7, ReviewKind::Review),
+            reg.stop_target(
+                "p1",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
             StopTarget::Reserved
         );
         // A different pair is still Absent.
         assert_eq!(
-            reg.stop_target("p1", 7, ReviewKind::Check),
+            reg.stop_target(
+                "p1",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "--check")
+            ),
             StopTarget::Absent
         );
     }
@@ -2010,7 +2140,7 @@ mod tests {
     // Characterization (AB#1069 → AB#1204): try_reserve_pair consults ONLY in-memory state and
     // STAYS that way BY DESIGN — it is the atomic within-process test-and-set whose "terminal
     // sessions don't block" semantics are what let a NEW commit re-review (a prior `Done` must NOT
-    // block). Making it consult a durable `(project, pr, kind)` check would over-block exactly that
+    // block). Making it consult a durable `(project, pr, skill_key)` check would over-block exactly that
     // legitimate re-review (the `review_session` table has no head_sha to tell commits apart).
     //
     // So the cross-restart duplicate window AB#1204 closes is NOT closed here — this assertion stays
@@ -2023,7 +2153,7 @@ mod tests {
     fn try_reserve_pair_is_in_memory_only_documents_restart_duplicate_window() {
         let reg = SessionRegistry::default(); // a fresh post-restart registry
         assert!(
-            reg.try_reserve_pair("p1", 7, ReviewKind::Review),
+            reg.try_reserve_pair("p1", 7, crate::model::SkillInvocation::skill_key("pr-review", "")),
             "a fresh (empty) registry reserves freely — try_reserve_pair stays in-memory by design; \
              the cross-restart guard (AB#1204) lives at the outbox executor, keyed by outbox_id"
         );
@@ -2033,22 +2163,44 @@ mod tests {
     fn try_reserve_pair_is_atomic_test_and_set() {
         let reg = SessionRegistry::default();
         assert!(
-            reg.try_reserve_pair("p1", 7, ReviewKind::Review),
+            reg.try_reserve_pair(
+                "p1",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
             "first reservation wins"
         );
         assert!(
-            !reg.try_reserve_pair("p1", 7, ReviewKind::Review),
+            !reg.try_reserve_pair(
+                "p1",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
             "second is rejected while reserved"
         );
         // A reservation shows up in active_pairs BEFORE any Starting session exists —
         // exactly the gap the old snapshot-then-act guard could not see.
-        assert!(reg.active_pairs("p1").contains(&(7, ReviewKind::Review)));
-        // A different kind for the same PR is independent (key is (project, pr, kind)).
-        assert!(reg.try_reserve_pair("p1", 7, ReviewKind::Check));
+        assert!(reg
+            .active_pairs("p1")
+            .contains(&(7, crate::model::SkillInvocation::skill_key("pr-review", ""))));
+        // A different skill_key for the same PR is independent (key is (project, pr, skill_key)).
+        assert!(reg.try_reserve_pair(
+            "p1",
+            7,
+            crate::model::SkillInvocation::skill_key("pr-review", "--check")
+        ));
         // Release frees it for a later cycle.
-        reg.release_pair("p1", 7, ReviewKind::Review);
+        reg.release_pair(
+            "p1",
+            7,
+            crate::model::SkillInvocation::skill_key("pr-review", ""),
+        );
         assert!(
-            reg.try_reserve_pair("p1", 7, ReviewKind::Review),
+            reg.try_reserve_pair(
+                "p1",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
             "reservable again after release"
         );
     }
@@ -2062,42 +2214,68 @@ mod tests {
             thread_id: "t1".to_string(),
             turn_id: "tn".to_string(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 0,
             comment_url: None,
         });
-        assert!(!reg.try_reserve_pair("p1", 7, ReviewKind::Review));
-        // A different kind is still reservable; a terminal session would not block
+        assert!(!reg.try_reserve_pair(
+            "p1",
+            7,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        ));
+        // A different skill_key is still reservable; a terminal session would not block
         // (covered by the active_pairs in-flight filter, exercised elsewhere).
-        assert!(reg.try_reserve_pair("p1", 7, ReviewKind::Check));
+        assert!(reg.try_reserve_pair(
+            "p1",
+            7,
+            crate::model::SkillInvocation::skill_key("pr-review", "--check")
+        ));
     }
 
     #[test]
     fn reservations_and_active_pairs_are_isolated_per_project() {
-        // #35: a PR number is unique only WITHIN a project. The same `(pr, kind)` in two
+        // #35: a PR number is unique only WITHIN a project. The same `(pr, skill_key)` in two
         // projects must reserve independently, and `active_pairs` must scope to its
         // project — a PR #7 review in project A must never block PR #7 in project B,
         // nor leak into B's active-pairs snapshot.
         let reg = SessionRegistry::default();
         assert!(
-            reg.try_reserve_pair("A", 7, ReviewKind::Review),
+            reg.try_reserve_pair(
+                "A",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
             "A reserves freely"
         );
         assert!(
-            reg.try_reserve_pair("B", 7, ReviewKind::Review),
-            "B reserves the same (pr, kind) independently of A"
+            reg.try_reserve_pair(
+                "B",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
+            "B reserves the same (pr, skill_key) independently of A"
         );
         // Re-reserving within the SAME project still dedups (the within-project guard).
         assert!(
-            !reg.try_reserve_pair("A", 7, ReviewKind::Review),
+            !reg.try_reserve_pair(
+                "A",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
             "dedup within a project is preserved"
         );
 
         // Each project's active_pairs sees ONLY its own reservation.
-        assert_eq!(reg.active_pairs("A"), vec![(7, ReviewKind::Review)]);
-        assert_eq!(reg.active_pairs("B"), vec![(7, ReviewKind::Review)]);
+        assert_eq!(
+            reg.active_pairs("A"),
+            vec![(7, crate::model::SkillInvocation::skill_key("pr-review", ""))]
+        );
+        assert_eq!(
+            reg.active_pairs("B"),
+            vec![(7, crate::model::SkillInvocation::skill_key("pr-review", ""))]
+        );
         assert!(
             reg.active_pairs("C").is_empty(),
             "a project with nothing in flight sees an empty snapshot"
@@ -2111,7 +2289,7 @@ mod tests {
                 thread_id: "tA".to_string(),
                 turn_id: String::new(),
                 pr_number: 9,
-                kind: ReviewKind::Review,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 engine_kind: EngineKind::Codex,
                 status: SessionStatus::Running,
                 created_at_epoch: 0,
@@ -2120,26 +2298,44 @@ mod tests {
             test_url_ctx(),
         );
         assert!(
-            reg.active_pairs("A").contains(&(9, ReviewKind::Review)),
+            reg.active_pairs("A")
+                .contains(&(9, crate::model::SkillInvocation::skill_key("pr-review", ""))),
             "A's session shows in A"
         );
         assert!(
-            !reg.active_pairs("B").contains(&(9, ReviewKind::Review)),
+            !reg.active_pairs("B")
+                .contains(&(9, crate::model::SkillInvocation::skill_key("pr-review", ""))),
             "A's session must not leak into B"
         );
         assert!(
-            reg.try_reserve_pair("B", 9, ReviewKind::Review),
+            reg.try_reserve_pair(
+                "B",
+                9,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
             "A's in-flight (9, review) session does not block B's (9, review)"
         );
 
         // Releasing A's reservation leaves B's untouched (full-triple keying).
-        reg.release_pair("A", 7, ReviewKind::Review);
+        reg.release_pair(
+            "A",
+            7,
+            crate::model::SkillInvocation::skill_key("pr-review", ""),
+        );
         assert!(
-            reg.try_reserve_pair("A", 7, ReviewKind::Review),
+            reg.try_reserve_pair(
+                "A",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
             "A reservable again after its own release"
         );
         assert!(
-            !reg.try_reserve_pair("B", 7, ReviewKind::Review),
+            !reg.try_reserve_pair(
+                "B",
+                7,
+                crate::model::SkillInvocation::skill_key("pr-review", "")
+            ),
             "B's reservation was not disturbed by A's release"
         );
     }
@@ -2147,14 +2343,18 @@ mod tests {
     #[test]
     fn promote_reservation_hands_off_without_a_gap() {
         let reg = SessionRegistry::default();
-        assert!(reg.try_reserve_pair("p1", 7, ReviewKind::Review));
+        assert!(reg.try_reserve_pair(
+            "p1",
+            7,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        ));
         reg.promote_reservation(
             SessionInfo {
                 project_id: "p1".to_string(),
                 thread_id: "t1".to_string(),
                 turn_id: String::new(),
                 pr_number: 7,
-                kind: ReviewKind::Review,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 engine_kind: EngineKind::Codex,
                 status: SessionStatus::Starting,
                 created_at_epoch: 0,
@@ -2164,13 +2364,17 @@ mod tests {
         );
         // After promotion the pair is covered by the Starting session, not the reserved
         // set — and a concurrent reserve still loses (continuous coverage, no gap).
-        assert!(!reg.try_reserve_pair("p1", 7, ReviewKind::Review));
+        assert!(!reg.try_reserve_pair(
+            "p1",
+            7,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        ));
         // The reservation was CONSUMED, not double-counted: exactly one active pair.
         let pairs = reg.active_pairs("p1");
         assert_eq!(
             pairs
                 .iter()
-                .filter(|p| **p == (7, ReviewKind::Review))
+                .filter(|p| **p == (7, crate::model::SkillInvocation::skill_key("pr-review", "")))
                 .count(),
             1
         );
@@ -2182,14 +2386,18 @@ mod tests {
         // its thread_id. A known id returns its snapshot; an unknown id is None (the caller
         // then falls through to the durable by-id read).
         let reg = SessionRegistry::default();
-        assert!(reg.try_reserve_pair("p1", 7, ReviewKind::Review));
+        assert!(reg.try_reserve_pair(
+            "p1",
+            7,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        ));
         reg.promote_reservation(
             SessionInfo {
                 project_id: "p1".to_string(),
                 thread_id: "t1".to_string(),
                 turn_id: String::new(),
                 pr_number: 7,
-                kind: ReviewKind::Review,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 engine_kind: EngineKind::Codex,
                 status: SessionStatus::Starting,
                 created_at_epoch: 0,
@@ -2212,7 +2420,11 @@ mod tests {
         // review ran against, independent of any later config change (which would never touch
         // this captured value).
         let reg = SessionRegistry::default();
-        assert!(reg.try_reserve_pair("p1", 7, ReviewKind::Review));
+        assert!(reg.try_reserve_pair(
+            "p1",
+            7,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        ));
         let ctx = CommentUrlContext {
             gh: None,
             source_kind: crate::model::SourceKind::Azure,
@@ -2226,7 +2438,7 @@ mod tests {
                 thread_id: "t1".to_string(),
                 turn_id: String::new(),
                 pr_number: 7,
-                kind: ReviewKind::Review,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 engine_kind: EngineKind::Codex,
                 status: SessionStatus::Starting,
                 created_at_epoch: 0,
@@ -2255,7 +2467,7 @@ mod tests {
     async fn concurrent_reservations_admit_exactly_one() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         // The end-to-end invariant the finding asks for: N concurrent dispatches for
-        // the SAME (pr, kind) → exactly ONE reserves (and so exactly one would start).
+        // the SAME (pr, skill_key) → exactly ONE reserves (and so exactly one would start).
         // `SessionRegistry: Clone` shares the `Arc<Mutex>`, faithful to production.
         let reg = SessionRegistry::default();
         let winners = Arc::new(AtomicUsize::new(0));
@@ -2264,7 +2476,11 @@ mod tests {
             let reg = reg.clone();
             let winners = Arc::clone(&winners);
             handles.push(tokio::spawn(async move {
-                if reg.try_reserve_pair("p1", 7, ReviewKind::Review) {
+                if reg.try_reserve_pair(
+                    "p1",
+                    7,
+                    crate::model::SkillInvocation::skill_key("pr-review", ""),
+                ) {
                     winners.fetch_add(1, Ordering::SeqCst);
                 }
             }));
@@ -2287,7 +2503,7 @@ mod tests {
             thread_id: "t1".to_string(),
             turn_id: "tn1".to_string(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 0,
@@ -2323,7 +2539,7 @@ mod tests {
                 thread_id: thread.to_string(),
                 turn_id: "tn".to_string(),
                 pr_number: 7,
-                kind: ReviewKind::Review,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 engine_kind: EngineKind::Codex,
                 status,
                 created_at_epoch: 0,
@@ -2379,7 +2595,7 @@ mod tests {
                 thread_id: "th-1".to_string(),
                 turn_id: String::new(),
                 pr_number: 7,
-                kind: ReviewKind::Review,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 engine_kind: EngineKind::Codex,
                 status: SessionStatus::Done,
                 created_at_epoch: 0,
@@ -2406,7 +2622,7 @@ mod tests {
             thread_id: "t1".to_string(),
             turn_id: "tn1".to_string(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 0,
@@ -2433,7 +2649,7 @@ mod tests {
             thread_id: "t1".to_string(),
             turn_id: "tn1".to_string(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 1_700_000_000,
@@ -2448,10 +2664,13 @@ mod tests {
         // `createdAtEpoch` (review F10) is the frontend sort key — pin its camelCase wire
         // key so a rename / drop surfaces here in lockstep with `ReviewSession` in TS.
         assert_eq!(v["createdAtEpoch"], 1_700_000_000_u64);
-        // `kind` ("review"/"check") is a frontend contract field (mirrored by
+        // `skill_key` ("review"/"check") is a frontend contract field (mirrored by
         // `ReviewSession.kind` in `src/review/types.ts`); pin it so a rename / drop
         // surfaces here in lockstep with the camelCase keys.
-        assert_eq!(v["kind"], "review");
+        assert_eq!(
+            v["skillKey"],
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert_eq!(v["engineKind"], "codex");
         assert_eq!(v["status"], "running");
         // AB#1042: `commentUrl` serializes camelCase; the snake_case form stays absent and
@@ -2472,7 +2691,7 @@ mod tests {
                 thread_id: "t1".to_string(),
                 turn_id: "tn1".to_string(),
                 pr_number: 7,
-                kind: ReviewKind::Review,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
                 engine_kind: EngineKind::Codex,
                 status: SessionStatus::Running,
                 created_at_epoch: 1_700_000_000,
@@ -2508,7 +2727,7 @@ mod tests {
             thread_id: "t1".to_string(),
             turn_id: String::new(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Starting,
             created_at_epoch: 0,
@@ -2621,7 +2840,7 @@ mod tests {
             thread_id: "c1".to_string(),
             turn_id: "c1".to_string(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Cursor,
             status: SessionStatus::Done,
             created_at_epoch: 0,
@@ -2651,7 +2870,7 @@ mod tests {
             thread_id: "c-run".to_string(),
             turn_id: "c-run".to_string(),
             pr_number: 42,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Cursor,
             status: SessionStatus::Running,
             created_at_epoch: 0,
@@ -2674,7 +2893,7 @@ mod tests {
             thread_id: "c2".to_string(),
             turn_id: "c2".to_string(),
             pr_number: 7,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Cursor,
             status: SessionStatus::Running,
             created_at_epoch: 0,
@@ -2738,7 +2957,7 @@ mod tests {
             thread_id: "t-run".to_string(),
             turn_id: "t-run".to_string(),
             pr_number: 1,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Cursor,
             status: SessionStatus::Running,
             created_at_epoch: 0,
@@ -2764,7 +2983,7 @@ mod tests {
             thread_id: "t-int".to_string(),
             turn_id: "t-int".to_string(),
             pr_number: 2,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Cursor,
             status: SessionStatus::Interrupting,
             created_at_epoch: 0,
@@ -2789,7 +3008,7 @@ mod tests {
             thread_id: "gen-keep".to_string(),
             turn_id: "gen-keep".to_string(),
             pr_number: 3,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Cursor,
             status: SessionStatus::Running,
             created_at_epoch: 0,
@@ -2857,7 +3076,7 @@ mod tests {
             thread_id: "c-done".to_string(),
             turn_id: "c-done".to_string(),
             pr_number: 1,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Cursor,
             status: SessionStatus::Done,
             created_at_epoch: 0,
@@ -2869,7 +3088,7 @@ mod tests {
             thread_id: "codex-run".to_string(),
             turn_id: "codex-run".to_string(),
             pr_number: 2,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Codex,
             status: SessionStatus::Running,
             created_at_epoch: 0,
@@ -2881,7 +3100,7 @@ mod tests {
             thread_id: "c-run".to_string(),
             turn_id: "c-run".to_string(),
             pr_number: 3,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Cursor,
             status: SessionStatus::Running,
             created_at_epoch: 0,
@@ -2903,7 +3122,7 @@ mod tests {
             thread_id: "watch-1".to_string(),
             turn_id: "watch-1".to_string(),
             pr_number: 9,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Cursor,
             status: SessionStatus::Interrupting,
             created_at_epoch: 0,
@@ -2939,7 +3158,7 @@ mod tests {
             thread_id: "watch-2".to_string(),
             turn_id: "watch-2".to_string(),
             pr_number: 9,
-            kind: ReviewKind::Review,
+            skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             engine_kind: EngineKind::Cursor,
             status: SessionStatus::Done,
             created_at_epoch: 0,

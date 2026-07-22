@@ -4,7 +4,7 @@
 //! comment the review subprocess posted, to hand back to a third-party trigger
 //! (CLI/deeplink, future). The app itself NEVER writes comments — the governance backstop
 //! (`slice_boundary_test::app_code_uses_no_gh_write_subcommands`) scans all of `src` for gh write
-//! subcommands. Reading is allowed, so this resolves the URL source-kind-aware:
+//! subcommands. Reading is allowed, so this resolves the URL source-skill_key-aware:
 //!
 //! - [`SourceKind::Github`]: shell out to read-only `gh pr view <pr> --repo <repo> --json
 //!   comments` (mirroring `pr::gh`'s subprocess discipline — `Command::new` + a wall-clock
@@ -43,7 +43,7 @@ const GH_MAX_STDOUT_BYTES: usize = 10 * 1024 * 1024;
 /// HTML comment, so matching `pm:` alone would never hit a real review comment.
 const PM_REVIEW_MARKER: &str = "<!-- pm:pr-review -->";
 
-/// Resolve the URL of this review's pr-review comment, source-kind-aware (AB#1042). Returns
+/// Resolve the URL of this review's pr-review comment, source-skill_key-aware (AB#1042). Returns
 /// `None` when the source has no resolver (Bitbucket) or the lookup yields nothing — the
 /// funnel treats `None` as "no URL", never an error. EXHAUSTIVE `match SourceKind` (Hard
 /// carrier): a new variant fails to compile until its arm is added.

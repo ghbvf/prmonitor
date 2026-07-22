@@ -52,7 +52,6 @@ export type {
   OutboxProducerKey,
   PullRequestView,
   ReviewActionKey,
-  ReviewKind,
   ReviewReceiptId,
 } from "./types.generated";
 
@@ -76,6 +75,32 @@ export type PrPresence = "current" | "stale";
 export interface TrackedPrView extends PullRequestView {
   presence: PrPresence;
   archived: boolean;
+}
+
+// Mirrors Rust `SkillInvocation::migrate_legacy_skill_key` (load-only legacy wire).
+function migrateLegacySkillKey(skillKey: string): string {
+  if (skillKey === "review") return "pr-review\0";
+  if (skillKey === "check") return "pr-review\0--check";
+  return skillKey;
+}
+
+// Human-readable skill identity (`pr-review` or `pr-review --check`), mirrors
+// Rust `SkillInvocation::display_label`.
+export function skillKeyLabel(skillKey: string): string {
+  const key = migrateLegacySkillKey(skillKey);
+  const nul = key.indexOf("\0");
+  if (nul < 0) return key || "—";
+  const name = key.slice(0, nul);
+  const extra = key.slice(nul + 1);
+  if (!name && !extra) return "—";
+  return extra ? `${name} ${extra}` : name;
+}
+
+// Extra args segment of a skill key (after `\0`), for manual start / remote review.
+export function extraArgsFromSkillKey(skillKey: string): string {
+  const key = migrateLegacySkillKey(skillKey);
+  const nul = key.indexOf("\0");
+  return nul >= 0 ? key.slice(nul + 1) : "";
 }
 
 // Whether a data-update mode runs the CLI poll loop (818). webhook-only / manual =
@@ -242,7 +267,9 @@ export function presentEvent(event: EventEnvelope): EventPresentation {
       return {
         eventType: "pullRequest",
         number: event.payload.prNumber,
-        title: `${event.payload.reviewKind === "review" ? "Review" : "Check"} request`,
+        title: event.payload.extraArgs.trim()
+          ? `${event.payload.skillName} ${event.payload.extraArgs.trim()} request`
+          : `${event.payload.skillName} request`,
       };
     default:
       return assertNever(event.payload);
@@ -367,14 +394,13 @@ export function outboxStatusLabel(s: OutboxStatus): string {
 // The kind of action an outbox entry performs — mirrors the Rust `ActionKind` enum's camelCase
 // serde form (locked by the model.rs golden test). Single-sourced as an `as const` array
 // (mirrors OUTBOX_STATUSES): the type is DERIVED from the array. `notification` (AB#1066) +
-// `review`/`check`/`stopReview` (AB#1069 action executor — reuse the review funnel) +
+// `runSkill`/`stopReview` (skill actions — reuse the review funnel) +
 // `messagingReply` (#1559 bot reply executor) + `messagingSend` active messaging sends.
 // Email/IM notification channels are still
 // `NotificationKind` variants under `notification`.
 export const ACTION_KINDS = [
   "notification",
-  "review",
-  "check",
+  "runSkill",
   "stopReview",
   "messagingReply",
   "messagingSend",
@@ -388,10 +414,8 @@ export function outboxKindLabel(k: ActionKind): string {
   switch (k) {
     case "notification":
       return "通知 / Notification";
-    case "review":
-      return "评审 / Review";
-    case "check":
-      return "复查 / Check";
+    case "runSkill":
+      return "运行 Skill / Run Skill";
     case "stopReview":
       return "停止评审 / Stop Review";
     case "messagingReply":
@@ -480,7 +504,7 @@ export function workflowStepLabel(s: WorkflowStep): string {
 export interface ReviewNotifyInput {
   reference: string;
   prNumber: number;
-  kind: string;
+  skillKey: string;
 }
 
 export interface ReviewNotifyState {

@@ -22,8 +22,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::config::service::ResolvedCli;
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, LabelSource, ReviewKind,
-    SourceKind,
+    Candidate, EventEnvelope, EventSubject, EventType, InboxDedupeKey, LabelSource, SourceKind,
 };
 
 use super::labels;
@@ -197,12 +196,11 @@ struct AzRow {
 /// `parse_pr_list` + `to_row` + `merge_rows` combined, including the `conflict`
 /// convention:
 ///
-/// - a PR carrying the `review_label` → `kind = "review"`, `conflict = false`;
-/// - a PR carrying the `check_label` → `kind = "check"`, `conflict = false`;
-/// - BOTH trigger labels present → `kind = "review"` (mirrors gh `merge_rows`, which
-///   keeps the review row and flips `conflict`), `conflict = true` — the row is KEPT so
-///   the list surfaces it with a skip reason (the trait [`parse_pr_list`] drops it
-///   before dispatch);
+/// - a PR carrying any configured trigger label is kept (default pr-review skill
+///   placeholder; the rule engine fills the real skill identity);
+/// - BOTH review and check trigger labels present → `conflict = true` (row kept so the
+///   list surfaces it with a skip reason; the trait [`parse_pr_list`] drops it before
+///   dispatch);
 /// - NEITHER trigger label → dropped (not a monitored PR).
 ///
 /// Display fields: `title` is captured verbatim; `labels` collects ALL label names (not
@@ -215,7 +213,7 @@ struct AzRow {
 /// `author`; `isDraft` → `is_draft`; `forkSource` present/non-null →
 /// `is_cross_repository`.
 ///
-/// Pure (no `az` call) so the classify / conflict / field-mapping / url-build semantics
+/// Pure (no `az` call) so the conflict / field-mapping / url-build semantics
 /// are unit-tested without a live Azure DevOps connection.
 fn parse_rows(
     json: &str,
@@ -240,7 +238,7 @@ fn parse_rows(
             .filter(|n| !n.is_empty())
             .collect();
         // AB#717: resolve effective labels (native vs title-parsed) then classify by
-        // rule-interest labels. The action kind is decided later by the rule engine.
+        // rule-interest labels. The action skill_key is decided later by the rule engine.
         let labels = labels::effective_labels(native, &pr.title, label_source);
         if !trigger_labels.is_empty()
             && !trigger_labels
@@ -293,7 +291,7 @@ fn parse_rows(
                 author,
                 is_cross_repository: pr.fork_source.is_some(),
                 is_draft: pr.is_draft,
-                kind: ReviewKind::Review,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", ""),
             },
             title: pr.title,
             body: pr.description,
@@ -774,7 +772,10 @@ mod tests {
         assert_eq!(row.candidate.head_sha, "abc123");
         assert_eq!(row.candidate.head_ref, "feature/widget"); // refs/heads/ stripped
         assert_eq!(row.candidate.author, "octocat@example.com"); // uniqueName preferred
-        assert_eq!(row.candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            row.candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert!(!row.candidate.is_cross_repository);
         assert!(!row.candidate.is_draft);
         // Display fields (the parity goal): real title, ALL labels, constructed url.
@@ -879,7 +880,10 @@ mod tests {
         let r = rows(&json).expect("parses");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].candidate.number, 5);
-        assert_eq!(r[0].candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            r[0].candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         assert_eq!(r[0].title, "Fix it");
         assert_eq!(
             r[0].url,
@@ -912,7 +916,10 @@ mod tests {
             "a conflict row is KEPT (not dropped) by parse_rows"
         );
         assert!(!r[0].conflict);
-        assert_eq!(r[0].candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            r[0].candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         // Both labels surface in the row's labels.
         assert_eq!(r[0].labels, vec![REVIEW.to_string(), CHECK.to_string()]);
 
@@ -1010,7 +1017,10 @@ mod tests {
         )
         .expect("parses");
         assert_eq!(r.len(), 1);
-        assert_eq!(r[0].candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            r[0].candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
         // Effective labels come from the title, NOT the native `area/ui`.
         assert_eq!(r[0].labels, vec![REVIEW.to_string()]);
 
@@ -1108,7 +1118,10 @@ mod tests {
         let r = rows(&json).expect("parses");
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].candidate.head_sha, "");
-        assert_eq!(r[0].candidate.kind, crate::model::ReviewKind::Review);
+        assert_eq!(
+            r[0].candidate.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
     }
 
     #[test]

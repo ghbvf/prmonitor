@@ -547,7 +547,7 @@ mod tests {
         assert_eq!(v["input"][1]["type"], "text");
         assert_eq!(v["input"][1]["text"], "do it");
 
-        // Sandbox policy: `type` key (not `kind`) + camelCase networkAccess.
+        // Sandbox policy: `type` key (not `skill_key`) + camelCase networkAccess.
         assert_eq!(v["sandboxPolicy"]["type"], "workspaceWrite");
         assert_eq!(v["sandboxPolicy"]["networkAccess"], true);
         assert_eq!(v["sandboxPolicy"]["writableRoots"][0], "/repo");

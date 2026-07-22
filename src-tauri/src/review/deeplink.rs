@@ -1,8 +1,8 @@
 //! Deeplink external-review transport (AB#1045), alongside the local REST API and CLI.
 //!
-//! A human / browser opens `prmonitor://review?pr=N&repo=R&kind=review&requestId=<32-lower-hex>` (Slack/Zoom-style
+//! A human / browser opens `prmonitor://review?pr=N&repo=R&skill_key=review&requestId=<32-lower-hex>` (Slack/Zoom-style
 //! `app://<action>?key=value`). `tauri-plugin-deep-link` surfaces it through `on_open_url`
-//! (wired in `lib.rs`); this module parses + validates the URL and hands `(reference, pr, kind)`
+//! (wired in `lib.rs`); this module parses + validates the URL and hands `(reference, pr, skill_key)`
 //! to the SAME funnel the other transports use — so engine selection + dedup stay single-source
 //! (the durable receipt path's `Hard` carriers, never re-implemented here).
 //!
@@ -34,7 +34,7 @@ use crate::config::service as config_service;
 use crate::error::{AppError, AppResult};
 use crate::model::{
     ExternalRequestId, ExternalTriggerOrigin, Notification, NotificationKind, NotificationLevel,
-    RedactedNotificationBody, ReviewKind, SendNotificationRequest,
+    RedactedNotificationBody, SendNotificationRequest,
 };
 use crate::review::notify;
 use crate::state::AppState;
@@ -49,9 +49,9 @@ const ACTION_REVIEW: &str = "review";
 const ACTION_NOTIFY: &str = "notify";
 const MAX_REVIEW_REFERENCE_CHARS: usize = 256;
 
-/// Default `kind` when the deeplink omits `?kind=` (parity with the CLI, where the absence of
+/// Default `skill_key` when the deeplink omits `?skill_key=` (parity with the CLI, where the absence of
 /// `--check` means a review). Kept distinct from [`ACTION_REVIEW`]: they coincide as `"review"`
-/// today, but the URL action and the review-turn kind are separate concepts.
+/// today, but the URL action and the review-turn skill_key are separate concepts.
 const DEFAULT_KIND: &str = "review";
 
 /// A validated deeplink request. `reference` is a project `id` OR a `repo`; exactly one of
@@ -60,7 +60,7 @@ const DEFAULT_KIND: &str = "review";
 pub(crate) struct ParsedReviewRequest {
     pub(crate) reference: String,
     pub(crate) pr_number: u64,
-    pub(crate) kind: ReviewKind,
+    pub(crate) skill_key: String,
     pub(crate) request_id: ExternalRequestId,
 }
 
@@ -75,13 +75,13 @@ const NOTIFY_DEEPLINK_DEDUPE_CAP: usize = 256;
 static SEEN_NOTIFY_DEEPLINK_KEYS: OnceLock<StdMutex<VecDeque<String>>> = OnceLock::new();
 
 /// Parse + validate a
-/// `prmonitor://review?pr=N&repo=R&kind=review&requestId=<32-lower-hex>` deeplink into the
+/// `prmonitor://review?pr=N&repo=R&skill_key=review&requestId=<32-lower-hex>` deeplink into the
 /// durable receipt-request inputs.
 ///
 /// Rejects (never panics) anything that isn't a well-formed review request: wrong scheme, wrong
-/// action, missing/non-numeric/zero `pr`, an unknown `kind`, or a reference that isn't EXACTLY one
+/// action, missing/non-numeric/zero `pr`, an unknown `skill_key`, or a reference that isn't EXACTLY one
 /// of `repo` / `projectId` (the same "exactly one" rule `local_api::resolve_reference` enforces).
-/// `kind` defaults to `"review"` when absent (parity with the CLI, where the absence of `--check`
+/// `skill_key` defaults to `"review"` when absent (parity with the CLI, where the absence of `--check`
 /// means a review). Unknown query keys are ignored (forward-compat) — only the validated fields
 /// are the contract.
 pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedReviewRequest> {
@@ -104,14 +104,14 @@ pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedReviewRequest>
     let mut pr_raw: Option<String> = None;
     let mut repo: Option<String> = None;
     let mut project_id: Option<String> = None;
-    let mut kind: Option<String> = None;
+    let mut skill_key: Option<String> = None;
     let mut request_id: Option<String> = None;
     for (key, value) in url.query_pairs() {
         let slot = match key.as_ref() {
             "pr" => &mut pr_raw,
             "repo" => &mut repo,
             "projectId" => &mut project_id,
-            "kind" => &mut kind,
+            "skill_key" => &mut skill_key,
             "requestId" => &mut request_id,
             // Ignore unknown params: the validated fields below are the contract, and tolerating
             // extras keeps a future `?foo=` from hard-failing existing links.
@@ -159,11 +159,12 @@ pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedReviewRequest>
         )));
     }
 
-    // `kind`: default "review"; otherwise the SAME whitelist the funnel enforces.
-    let kind = kind
-        .unwrap_or_else(|| DEFAULT_KIND.to_string())
-        .parse::<ReviewKind>()
-        .map_err(AppError::new)?;
+    // Legacy deeplink `kind=review|check` maps to skill keys; unknown values pass through.
+    let skill_key = crate::model::SkillInvocation::migrate_legacy_skill_key(
+        skill_key
+            .unwrap_or_else(|| DEFAULT_KIND.to_string())
+            .as_str(),
+    );
     let request_id = request_id
         .ok_or_else(|| AppError::new("deeplink 缺少 requestId 参数"))
         .and_then(|value| ExternalRequestId::parse(value).map_err(AppError::new))?;
@@ -171,7 +172,7 @@ pub(crate) fn parse_review_deeplink(url: &Url) -> AppResult<ParsedReviewRequest>
     Ok(ParsedReviewRequest {
         reference,
         pr_number,
-        kind,
+        skill_key,
         request_id,
     })
 }
@@ -450,7 +451,7 @@ async fn handle_review_one(app: AppHandle, url: Url) {
         // has no return channel, so a stderr line is the only surface. Log structured fields only
         // (scheme + action), NOT the full URL: its `repo`/`projectId` query values are
         // percent-decoded and may name private projects — kept symmetric with the trigger-failure
-        // log below (pr/kind only).
+        // log below (pr/skill_key only).
         Err(e) => {
             eprintln!(
                 "deeplink 拒绝（scheme={} action={:?}）: {}",
@@ -458,7 +459,7 @@ async fn handle_review_one(app: AppHandle, url: Url) {
                 url.host_str(),
                 e.message
             );
-            // Redacted FIXED text — never `e.message` (it echoes the raw `pr`/`kind` input). The
+            // Redacted FIXED text — never `e.message` (it echoes the raw `pr`/`skill_key` input). The
             // detail stays in the stderr log above; the notification center is an exposed/persisted
             // sink (codex --check 回归).
             notify_failure(
@@ -473,21 +474,29 @@ async fn handle_review_one(app: AppHandle, url: Url) {
     let ParsedReviewRequest {
         reference,
         pr_number,
-        kind,
+        skill_key,
         request_id,
     } = request;
 
     let state = app.state::<AppState>();
+    let extra_args = if skill_key == "check"
+        || skill_key
+            == crate::model::SkillInvocation::skill_key(crate::model::DEFAULT_SKILL_NAME, "--check")
+    {
+        "--check".to_string()
+    } else {
+        String::new()
+    };
     if let Err(e) = state.external_review.submit(
         reference,
         pr_number,
-        kind,
+        extra_args,
         request_id,
         ExternalTriggerOrigin::DeepLink,
         true,
     ) {
         eprintln!(
-            "deeplink receipt 入队失败（pr={pr_number} kind={kind}）: {}",
+            "deeplink receipt 入队失败（pr={pr_number} skill_key={skill_key}）: {}",
             e.message
         );
         notify_failure(
@@ -594,13 +603,13 @@ mod tests {
 
     #[test]
     fn parses_repo_pr_and_explicit_kind() {
-        let p = parse("prmonitor://review?pr=42&repo=octo/app&kind=check").expect("ok");
+        let p = parse("prmonitor://review?pr=42&repo=octo/app&skill_key=check").expect("ok");
         assert_eq!(
             p,
             ParsedReviewRequest {
                 reference: "octo/app".to_string(),
                 pr_number: 42,
-                kind: ReviewKind::Check,
+                skill_key: crate::model::SkillInvocation::skill_key("pr-review", "--check"),
                 request_id: ExternalRequestId::parse(REQUEST_ID).expect("request id"),
             }
         );
@@ -609,7 +618,7 @@ mod tests {
     #[test]
     fn complete_documented_review_url_parses_without_test_helper() {
         let url = Url::parse(&format!(
-            "prmonitor://review?pr=42&repo=octo/app&kind=review&requestId={REQUEST_ID}"
+            "prmonitor://review?pr=42&repo=octo/app&skill_key=review&requestId={REQUEST_ID}"
         ))
         .expect("url");
         let parsed = parse_review_deeplink(&url).expect("documented url");
@@ -620,7 +629,10 @@ mod tests {
     #[test]
     fn kind_defaults_to_review_when_absent() {
         let p = parse("prmonitor://review?pr=7&repo=octo/app").expect("ok");
-        assert_eq!(p.kind, ReviewKind::Review);
+        assert_eq!(
+            p.skill_key,
+            crate::model::SkillInvocation::skill_key("pr-review", "")
+        );
     }
 
     #[test]
@@ -798,8 +810,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_kind() {
-        assert!(parse("prmonitor://review?pr=7&repo=octo/app&kind=delete").is_err());
+    fn accepts_arbitrary_skill_key() {
+        let p = parse("prmonitor://review?pr=7&repo=octo/app&skill_key=delete")
+            .expect("free-form skill_key");
+        assert_eq!(p.skill_key, "delete");
     }
 
     #[test]

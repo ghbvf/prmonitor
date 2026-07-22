@@ -2,6 +2,7 @@
 import { onMounted, onUnmounted, ref } from "vue";
 import {
   assertNever,
+  skillKeyLabel,
   workflowStatusLabel,
   workflowStepLabel,
   type WorkflowInstance,
@@ -71,7 +72,7 @@ function workflowIdentity(entry: WorkflowInstance): string {
   const parts = [];
   parts.push(`PR #${input.prNumber}`);
   if (input.reference) parts.push(input.reference);
-  if (input.kind) parts.push(input.kind);
+  if (input.skillKey) parts.push(skillKeyLabel(input.skillKey));
   return parts.length ? parts.join(" · ") : `#${entry.id}`;
 }
 

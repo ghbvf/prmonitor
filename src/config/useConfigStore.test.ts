@@ -31,7 +31,6 @@ const cfg = (over: Partial<AppConfig> = {}): AppConfig => ({
       pollIntervalSecs: 120,
       authors: [],
       labelSource: "native",
-      skillRelPath: ".codex/skills/pr-review/SKILL.md",
       prCooldownSeconds: 1800,
       updateMode: "webhook-only",
       sourceKind: "github",

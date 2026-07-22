@@ -24,7 +24,7 @@ const entry = (id: number, projectId = "p1"): WorkflowInstance => ({
   type: "reviewNotify",
   status: "waiting",
   currentStep: "waitReview",
-  input: { reference: projectId, prNumber: id, kind: "review" },
+  input: { reference: projectId, prNumber: id, skillKey: "pr-review\0" },
   state: {},
   attemptCount: 0,
   nextWakeAt: 0,

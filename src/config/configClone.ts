@@ -1,6 +1,9 @@
 import type { ReviewLifecycleNotificationConfig, ReviewLifecycleTarget, RuleActionConfig, RuleConfig } from "./types";
 
 export function cloneRuleAction(action: RuleActionConfig): RuleActionConfig {
+  if (action.kind === "runSkill") {
+    return { ...action };
+  }
   return {
     ...action,
     target:

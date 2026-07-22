@@ -30,7 +30,7 @@ use crate::error::{AppError, AppResult};
 
 /// Current schema version. Bump + add an `apply_vN` step for every schema change; the
 /// migration runner replays only the steps newer than the DB's `user_version`.
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 
 /// `meta` guard key marking the one-time legacy JSON → SQLite import done (#70). Kept
 /// SEPARATE from `user_version` so the import runs exactly once even across future
@@ -250,6 +250,9 @@ fn run_migrations(conn: &Connection) -> AppResult<()> {
     if version < 17 {
         apply_v17(conn)?;
     }
+    if version < 18 {
+        apply_v18(conn)?;
+    }
     conn.pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(map_err)?;
     Ok(())
@@ -404,6 +407,357 @@ fn apply_v17(conn: &Connection) -> AppResult<()> {
     conn.execute_batch(SCHEMA_V17).map_err(map_err)?;
     Ok(())
 }
+
+/// v18: inline skills — identity columns store `skill_key` (not review/check `kind`);
+/// `action_outbox.kind` is `runSkill` (not `review`/`check`); review payloads carry
+/// `invocation` + candidate `skillKey`.
+///
+/// Steps are gated on column / table presence so partial-schema fixtures (e.g. a v16-only
+/// `human_input_request` database) can still advance `user_version` without requiring every
+/// historical table.
+fn apply_v18(conn: &Connection) -> AppResult<()> {
+    for table in [
+        "review_session",
+        "outbox_review_claim",
+        "dispatch_event",
+        "tracked_pr",
+    ] {
+        if !table_has_column(conn, table, "kind")? {
+            continue;
+        }
+        conn.execute(
+            &format!("ALTER TABLE {table} RENAME COLUMN kind TO skill_key"),
+            [],
+        )
+        .map_err(map_err)?;
+    }
+
+    if table_exists(conn, "dispatch_event")? {
+        conn.execute_batch(
+            r#"
+DROP INDEX IF EXISTS idx_dispatch_event_lookup;
+CREATE INDEX IF NOT EXISTS idx_dispatch_event_lookup
+    ON dispatch_event(project_id, pr, skill_key);
+"#,
+        )
+        .map_err(map_err)?;
+    }
+
+    let review_key = crate::model::SkillInvocation::skill_key(crate::model::DEFAULT_SKILL_NAME, "");
+    let check_key =
+        crate::model::SkillInvocation::skill_key(crate::model::DEFAULT_SKILL_NAME, "--check");
+    for table in [
+        "review_session",
+        "outbox_review_claim",
+        "dispatch_event",
+        "tracked_pr",
+    ] {
+        if !table_has_column(conn, table, "skill_key")? {
+            continue;
+        }
+        conn.execute(
+            &format!("UPDATE {table} SET skill_key = ?1 WHERE skill_key = 'review'"),
+            rusqlite::params![review_key.as_str()],
+        )
+        .map_err(map_err)?;
+        conn.execute(
+            &format!("UPDATE {table} SET skill_key = ?1 WHERE skill_key = 'check'"),
+            rusqlite::params![check_key.as_str()],
+        )
+        .map_err(map_err)?;
+    }
+
+    migrate_v18_dispatch_keys(conn)?;
+
+    if table_exists(conn, "action_outbox")? {
+        // Payloads first (kind still review/check under the v15 CHECK), then rebuild the
+        // outbox table mapping kind → runSkill under the new CHECK.
+        migrate_v18_action_outbox_payloads_only(conn)?;
+        conn.execute_batch(SCHEMA_V18).map_err(map_err)?;
+    }
+    Ok(())
+}
+
+/// Rewrite legacy `{pr}@{head}:review|check` composite keys in `dispatch_key` /
+/// `dispatch_event` to the skill-key identity (`pr-review\0` / `pr-review\0--check`).
+fn migrate_v18_dispatch_keys(conn: &Connection) -> AppResult<()> {
+    if table_exists(conn, "dispatch_key")? {
+        let mut stmt = conn
+            .prepare("SELECT project_id, key FROM dispatch_key")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(map_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_err)?;
+        drop(stmt);
+        for (project_id, key) in rows {
+            let migrated = crate::model::SkillInvocation::migrate_legacy_dispatch_key(&key);
+            if migrated == key {
+                continue;
+            }
+            // PRIMARY KEY is (project_id, key): delete+insert avoids a unique-constraint
+            // collision if the migrated form already exists.
+            conn.execute(
+                "DELETE FROM dispatch_key WHERE project_id = ?1 AND key = ?2",
+                rusqlite::params![project_id, key],
+            )
+            .map_err(map_err)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO dispatch_key (project_id, key) VALUES (?1, ?2)",
+                rusqlite::params![project_id, migrated],
+            )
+            .map_err(map_err)?;
+        }
+    }
+
+    if table_exists(conn, "dispatch_event")? {
+        let mut stmt = conn
+            .prepare("SELECT id, key FROM dispatch_event")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .map_err(map_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_err)?;
+        drop(stmt);
+        for (id, key) in rows {
+            let migrated = crate::model::SkillInvocation::migrate_legacy_dispatch_key(&key);
+            if migrated == key {
+                continue;
+            }
+            conn.execute(
+                "UPDATE dispatch_event SET key = ?1 WHERE id = ?2",
+                rusqlite::params![migrated, id],
+            )
+            .map_err(map_err)?;
+        }
+    }
+    Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> AppResult<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(map_err)?;
+    Ok(found.is_some())
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> AppResult<bool> {
+    if !table_exists(conn, table)? {
+        return Ok(false);
+    }
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(map_err)?;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(map_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_err)?;
+    Ok(names.iter().any(|n| n == column))
+}
+
+fn migrate_v18_action_outbox_payloads_only(conn: &Connection) -> AppResult<()> {
+    let mut stmt = conn
+        .prepare("SELECT id, kind, payload FROM action_outbox")
+        .map_err(map_err)?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(map_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_err)?;
+    drop(stmt);
+
+    for (id, kind, payload) in rows {
+        let new_payload = match kind.as_str() {
+            "review" | "check" => migrate_v18_review_payload(&kind, &payload),
+            "runSkill" => migrate_v18_review_payload("review", &payload),
+            "stopReview" => migrate_v18_stop_review_payload(&payload),
+            _ => continue,
+        };
+        if new_payload != payload {
+            conn.execute(
+                "UPDATE action_outbox SET payload = ?1 WHERE id = ?2",
+                rusqlite::params![new_payload, id],
+            )
+            .map_err(map_err)?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_v18_legacy_skill_key_value(wire: &str) -> String {
+    crate::model::SkillInvocation::migrate_legacy_skill_key(wire)
+}
+
+fn migrate_v18_build_invocation(skill_key: &str, pr_number: u64) -> serde_json::Value {
+    let (skill_name, extra_args) = match skill_key.split_once('\0') {
+        Some((name, extra)) => (name, extra),
+        None => (skill_key, ""),
+    };
+    let skill_name = if skill_name.is_empty() {
+        crate::model::DEFAULT_SKILL_NAME
+    } else {
+        skill_name
+    };
+    let command = crate::model::SkillInvocation::render_command(
+        crate::model::DEFAULT_COMMAND_TEMPLATE,
+        skill_name,
+        pr_number,
+        "",
+        extra_args,
+    );
+    // Leave skill_path unset (relative materialised at consume via materialize_for_engine).
+    let invocation = crate::model::SkillInvocation::build(
+        skill_name,
+        Some(crate::model::DEFAULT_SKILL_PATH.to_string()),
+        command,
+        extra_args,
+    );
+    serde_json::json!({
+        "skillName": invocation.skill_name,
+        "skillPath": invocation.skill_path,
+        "command": invocation.command,
+        "skillKey": invocation.skill_key,
+    })
+}
+
+fn migrate_v18_candidate_object(candidate: &mut serde_json::Value, fallback_kind: &str) -> String {
+    let Some(obj) = candidate.as_object_mut() else {
+        return migrate_v18_legacy_skill_key_value(fallback_kind);
+    };
+    let legacy = obj
+        .remove("kind")
+        .or_else(|| obj.get("skillKey").cloned())
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| fallback_kind.to_string());
+    let skill_key = migrate_v18_legacy_skill_key_value(&legacy);
+    obj.insert(
+        "skillKey".to_string(),
+        serde_json::Value::String(skill_key.clone()),
+    );
+    skill_key
+}
+
+fn migrate_v18_review_payload(legacy_kind: &str, payload: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return payload.to_string();
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return payload.to_string();
+    };
+    if obj.get("invocation").is_some() {
+        if let Some(candidate) = obj.get_mut("candidate") {
+            migrate_v18_candidate_object(candidate, legacy_kind);
+        }
+        return value.to_string();
+    }
+    let tag = obj
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("automatic");
+    match tag {
+        "explicit" => {
+            let pr_number = obj.get("prNumber").and_then(|v| v.as_u64()).unwrap_or(0);
+            let skill_key = migrate_v18_legacy_skill_key_value(legacy_kind);
+            obj.insert(
+                "invocation".to_string(),
+                migrate_v18_build_invocation(&skill_key, pr_number),
+            );
+        }
+        _ => {
+            let skill_key = if let Some(candidate) = obj.get_mut("candidate") {
+                migrate_v18_candidate_object(candidate, legacy_kind)
+            } else {
+                migrate_v18_legacy_skill_key_value(legacy_kind)
+            };
+            let pr_number = obj
+                .get("candidate")
+                .and_then(|c| c.get("number"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            obj.insert(
+                "invocation".to_string(),
+                migrate_v18_build_invocation(&skill_key, pr_number),
+            );
+        }
+    }
+    value.to_string()
+}
+
+fn migrate_v18_stop_review_payload(payload: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return payload.to_string();
+    };
+    let Some(obj) = value.as_object_mut() else {
+        return payload.to_string();
+    };
+    if let Some(legacy) = obj.remove("kind") {
+        let wire = legacy.as_str().unwrap_or("review");
+        obj.insert(
+            "skillKey".to_string(),
+            serde_json::Value::String(migrate_v18_legacy_skill_key_value(wire)),
+        );
+    } else if let Some(skill_key) = obj.get("skillKey").and_then(|v| v.as_str()) {
+        let migrated = migrate_v18_legacy_skill_key_value(skill_key);
+        obj.insert("skillKey".to_string(), serde_json::Value::String(migrated));
+    }
+    value.to_string()
+}
+
+/// Rebuild `action_outbox` so the kind CHECK accepts `runSkill` (not `review`/`check`).
+const SCHEMA_V18: &str = r#"
+PRAGMA foreign_keys=OFF;
+BEGIN;
+CREATE TABLE action_outbox_v18 (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id       TEXT    NOT NULL,
+    kind             TEXT    NOT NULL CHECK(kind IN ('notification','runSkill','stopReview','messagingReply','messagingSend')),
+    summary          TEXT    NOT NULL,
+    payload          TEXT    NOT NULL CHECK(json_valid(payload)),
+    status           TEXT    NOT NULL CHECK(status IN ('pending','blocked','done','dead')),
+    attempt_count    INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+    next_attempt_at  INTEGER NOT NULL,
+    last_error       TEXT,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    dedupe_key       TEXT,
+    producer_key     TEXT    NOT NULL CHECK(length(producer_key) > 0),
+    review_thread_id TEXT    CHECK(review_thread_id IS NULL OR kind = 'runSkill'),
+    FOREIGN KEY(review_thread_id) REFERENCES review_session(thread_id) ON DELETE SET NULL
+);
+INSERT INTO action_outbox_v18 (
+    id, project_id, kind, summary, payload, status, attempt_count, next_attempt_at,
+    last_error, created_at, updated_at, dedupe_key, producer_key, review_thread_id
+)
+SELECT id, project_id,
+       CASE WHEN kind IN ('review', 'check') THEN 'runSkill' ELSE kind END,
+       summary, payload, status, attempt_count, next_attempt_at,
+       last_error, created_at, updated_at, dedupe_key, producer_key, review_thread_id
+FROM action_outbox;
+DROP TABLE action_outbox;
+ALTER TABLE action_outbox_v18 RENAME TO action_outbox;
+CREATE INDEX idx_action_outbox_due ON action_outbox(status, next_attempt_at);
+CREATE INDEX idx_action_outbox_project ON action_outbox(project_id, id DESC);
+CREATE UNIQUE INDEX idx_action_outbox_dedupe
+    ON action_outbox(project_id, dedupe_key)
+    WHERE dedupe_key IS NOT NULL AND status IN ('pending','blocked');
+CREATE UNIQUE INDEX idx_action_outbox_producer_key ON action_outbox(producer_key);
+COMMIT;
+PRAGMA foreign_keys=ON;
+"#;
 
 /// v1 schema — the unified store (#70). `review_session` precedes `review_history_item`
 /// (the FK target must exist first under `foreign_keys=ON`). Per-project partitioning
@@ -967,6 +1321,188 @@ mod tests {
         conn
     }
 
+    fn database_at_v17() -> rusqlite::Connection {
+        let conn = database_at_v14();
+        apply_v15(&conn).expect("v15");
+        apply_v16(&conn).expect("v16");
+        apply_v17(&conn).expect("v17");
+        conn.pragma_update(None, "user_version", 17)
+            .expect("stamp v17");
+        conn
+    }
+
+    #[test]
+    fn migrate_v17_to_v18_rewrites_skill_identity_and_outbox_payloads() {
+        let conn = database_at_v17();
+        let review_key = crate::model::SkillInvocation::skill_key("pr-review", "");
+        let check_key = crate::model::SkillInvocation::skill_key("pr-review", "--check");
+
+        let review_payload = serde_json::json!({
+            "candidate": {
+                "number": 7,
+                "kind": "review",
+                "headSha": "sha",
+                "headRef": "main",
+                "author": "octocat",
+                "isCrossRepository": false,
+                "isDraft": false
+            }
+        });
+        let check_payload = serde_json::json!({
+            "candidate": {
+                "number": 8,
+                "kind": "check",
+                "headSha": "sha2",
+                "headRef": "main",
+                "author": "octocat",
+                "isCrossRepository": false,
+                "isDraft": false
+            }
+        });
+        let stop_payload = serde_json::json!({ "prNumber": 7, "kind": "review" });
+
+        conn.execute(
+            "INSERT INTO review_session (thread_id, project_id, pr_number, turn_id, kind, status, created_at, updated_at) \
+             VALUES ('th-1', 'p1', 7, 't1', 'review', 'running', 1, 1)",
+            [],
+        )
+        .expect("seed review_session");
+        conn.execute(
+            "INSERT INTO action_outbox (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, created_at, updated_at, producer_key) \
+             VALUES ('p1', 'review', 'run review', ?1, 'pending', 0, 1, 1, 1, 'producer:review')",
+            [review_payload.to_string()],
+        )
+        .expect("seed review outbox");
+        conn.execute(
+            "INSERT INTO action_outbox (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, created_at, updated_at, producer_key) \
+             VALUES ('p1', 'check', 'run check', ?1, 'pending', 0, 1, 1, 1, 'producer:check')",
+            [check_payload.to_string()],
+        )
+        .expect("seed check outbox");
+        conn.execute(
+            "INSERT INTO action_outbox (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, created_at, updated_at, producer_key) \
+             VALUES ('p1', 'stopReview', 'stop', ?1, 'pending', 0, 1, 1, 1, 'producer:stop')",
+            [stop_payload.to_string()],
+        )
+        .expect("seed stopReview outbox");
+        let review_outbox_id: i64 = conn
+            .query_row(
+                "SELECT id FROM action_outbox WHERE producer_key = 'producer:review'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("review outbox id");
+        conn.execute(
+            "INSERT INTO outbox_review_claim (outbox_id, project_id, pr_number, kind, thread_id, created_at) \
+             VALUES (?1, 'p1', 7, 'review', 'th-1', 1)",
+            [review_outbox_id],
+        )
+        .expect("seed claim");
+        conn.execute(
+            "INSERT INTO dispatch_key (project_id, key) VALUES ('p1', '12@sha:review')",
+            [],
+        )
+        .expect("seed dispatch_key");
+        conn.execute(
+            "INSERT INTO dispatch_event (project_id, pr, kind, head_sha, key, dispatched_at_epoch) \
+             VALUES ('p1', 12, 'review', 'sha', '12@sha:review', 100)",
+            [],
+        )
+        .expect("seed dispatch_event");
+        conn.execute(
+            "INSERT INTO tracked_pr (project_id, number, title, labels_json, url, kind, first_seen_epoch, last_seen_epoch) \
+             VALUES ('p1', 12, 't', '[]', 'http://x', 'check', 1, 1)",
+            [],
+        )
+        .expect("seed tracked_pr");
+
+        run_migrations(&conn).expect("v17 -> v18");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .expect("read version");
+        assert_eq!(version, SCHEMA_VERSION);
+
+        assert!(table_has_column(&conn, "review_session", "skill_key"));
+        assert!(!table_has_column(&conn, "review_session", "kind"));
+        let session_key: String = conn
+            .query_row(
+                "SELECT skill_key FROM review_session WHERE thread_id = 'th-1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("session skill_key");
+        assert_eq!(session_key, review_key);
+
+        let claim_key: String = conn
+            .query_row(
+                "SELECT skill_key FROM outbox_review_claim WHERE outbox_id = ?1",
+                [review_outbox_id],
+                |r| r.get(0),
+            )
+            .expect("claim skill_key");
+        assert_eq!(claim_key, review_key);
+
+        let tracked_key: String = conn
+            .query_row(
+                "SELECT skill_key FROM tracked_pr WHERE project_id = 'p1' AND number = 12",
+                [],
+                |r| r.get(0),
+            )
+            .expect("tracked skill_key");
+        assert_eq!(tracked_key, check_key);
+
+        let dispatch_key: String = conn
+            .query_row(
+                "SELECT key FROM dispatch_key WHERE project_id = 'p1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("dispatch key");
+        assert_eq!(dispatch_key, format!("12@sha:{review_key}"));
+
+        let (event_skill, event_key): (String, String) = conn
+            .query_row(
+                "SELECT skill_key, key FROM dispatch_event WHERE project_id = 'p1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("dispatch event");
+        assert_eq!(event_skill, review_key);
+        assert_eq!(event_key, format!("12@sha:{review_key}"));
+
+        for producer in ["producer:review", "producer:check"] {
+            let (kind, payload): (String, String) = conn
+                .query_row(
+                    "SELECT kind, payload FROM action_outbox WHERE producer_key = ?1",
+                    [producer],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .expect("outbox row");
+            assert_eq!(kind, "runSkill");
+            let v: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+            let inv = v.get("invocation").expect("invocation");
+            assert!(inv.get("skillName").is_some());
+            assert!(inv.get("skillPath").is_some());
+            assert!(inv.get("command").is_some());
+            assert!(inv.get("skillKey").is_some());
+            assert!(v["candidate"].get("skillKey").is_some());
+            assert!(v["candidate"].get("kind").is_none());
+        }
+
+        let stop_payload_s: String = conn
+            .query_row(
+                "SELECT payload FROM action_outbox WHERE producer_key = 'producer:stop'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("stop payload");
+        let stop_v: serde_json::Value = serde_json::from_str(&stop_payload_s).expect("stop json");
+        assert_eq!(stop_v["skillKey"], review_key);
+        assert!(stop_v.get("kind").is_none());
+        assert_eq!(stop_v["prNumber"], 7);
+    }
+
     #[test]
     fn v15_quarantines_malformed_legacy_outbox_payload() {
         let conn = database_at_v14();
@@ -1081,7 +1617,7 @@ mod tests {
         ).expect("seed legacy notification");
 
         run_migrations(&conn).expect("v14 -> current");
-        assert_eq!(SCHEMA_VERSION, 17);
+        assert_eq!(SCHEMA_VERSION, 18);
         for column in ["producer_key", "review_thread_id"] {
             assert!(
                 table_has_column(&conn, "action_outbox", column),
@@ -1141,7 +1677,7 @@ mod tests {
         assert!(legacy_notification_status.1.unwrap().contains("schema v15"));
 
         conn.execute(
-            "INSERT INTO review_session (thread_id, project_id, pr_number, kind, status, created_at, updated_at) VALUES ('thread-1','p1',7,'review','running',42,42)",
+            "INSERT INTO review_session (thread_id, project_id, pr_number, skill_key, status, created_at, updated_at) VALUES ('thread-1','p1',7,'review','running',42,42)",
             [],
         ).expect("seed review session");
         conn.execute(
@@ -1149,7 +1685,7 @@ mod tests {
             [],
         ).expect("blocked is valid");
         assert!(conn.execute(
-            "INSERT INTO action_outbox (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, created_at, updated_at, producer_key) VALUES ('p1','review','duplicate','{}','done',0,42,42,42,'producer:1')",
+            "INSERT INTO action_outbox (project_id, kind, summary, payload, status, attempt_count, next_attempt_at, created_at, updated_at, producer_key) VALUES ('p1','runSkill','duplicate','{}','done',0,42,42,42,'producer:1')",
             [],
         ).is_err(), "producer key unique across every status");
         assert!(conn
@@ -1280,7 +1816,7 @@ mod tests {
                 version, SCHEMA_VERSION,
                 "fresh open stamps the current schema"
             );
-            assert_eq!(SCHEMA_VERSION, 17, "current schema is v17");
+            assert_eq!(SCHEMA_VERSION, 18, "current schema is v18");
             assert!(
                 review_session_has_comment_url(conn),
                 "fresh v0 → v2 has the comment_url column"
@@ -2278,7 +2814,7 @@ mod tests {
                     "INSERT INTO review_session \
                      (thread_id, project_id, pr_number, turn_id, kind, status, created_at, \
                       updated_at, comment_url, engine_kind) \
-                     VALUES (?1, 'project-a', ?2, 'turn', 'review', 'running', ?3, ?3, NULL, 'codex')",
+                     VALUES (?1, 'project-a', ?2, 'turn', 'pr-review', 'running', ?3, ?3, NULL, 'codex')",
                 )
                 .map_err(map_err)?;
             for i in 0..rows {

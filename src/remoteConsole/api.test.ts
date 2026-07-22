@@ -101,12 +101,12 @@ describe("remote console api", () => {
       });
 
     await expect(
-      api.requestRemoteReview("p1", 42, "review", externalRequestId(reviewId)),
+      api.requestRemoteReview("p1", 42, "", externalRequestId(reviewId)),
     ).resolves.toEqual({
       receiptId: 11,
       statusUrl: "/api/reviews/11",
     });
-    await api.requestRemoteReview("p1", 42, "check", externalRequestId(checkId));
+    await api.requestRemoteReview("p1", 42, "--check", externalRequestId(checkId));
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       "/api/reviews",
@@ -116,14 +116,14 @@ describe("remote console api", () => {
           authorization: "Bearer local-api-secret",
           "content-type": "application/json",
         }),
-        body: JSON.stringify({ projectId: "p1", pr: 42, kind: "review", requestId: reviewId }),
+        body: JSON.stringify({ projectId: "p1", pr: 42, extraArgs: "", requestId: reviewId }),
       }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
       "/api/reviews",
       expect.objectContaining({
-        body: JSON.stringify({ projectId: "p1", pr: 42, kind: "check", requestId: checkId }),
+        body: JSON.stringify({ projectId: "p1", pr: 42, extraArgs: "--check", requestId: checkId }),
       }),
     );
     expect(request).not.toHaveBeenCalledWith("request_review", expect.anything());
