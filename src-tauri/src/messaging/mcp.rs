@@ -45,16 +45,23 @@ use crate::model::MessagingProviderKind;
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AskViaMessagingInput {
+    /// Short machine tag only (≤128 UTF-8 bytes). Put rationale in `message`, not here.
     pub purpose: String,
+    /// Card / popup title (≤256 UTF-8 bytes).
     pub title: String,
+    /// Full question background and instructions (≤8KiB UTF-8 bytes).
     pub message: String,
+    /// 1-3 questions. Each `options` MUST be `string[]` (plain labels), never `{label,description}` objects.
     pub questions: Vec<HumanQuestion>,
+    /// Optional JSON metadata blob (object/array/string/null); keep small (≤16KiB serialized).
     #[serde(default)]
     pub context: Value,
+    /// Wait budget in seconds (1..=3600). Default 3600.
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     /// Optional explicit selector; omitted uses the first enabled matching integration.
     pub integration_id: Option<String>,
+    /// Optional Feishu/DingTalk conversation id; omitted uses the first allowed conversation.
     pub conversation_id: Option<String>,
 }
 
@@ -113,7 +120,7 @@ impl<R: tauri::Runtime> PrmonitorMcp<R> {
 impl<R: tauri::Runtime> PrmonitorMcp<R> {
     #[tool(
         name = "ask_via_feishu",
-        description = "Ask 1-3 human questions through both Feishu and a Codex elicitation popup; the first answer wins atomically."
+        description = "Ask 1-3 human questions through both Feishu and a Codex elicitation popup; the first answer wins atomically. Constraints: purpose is a short tag ≤128 UTF-8 bytes (put long rationale in message); questions[].options MUST be string[] plain labels, not {label,description} objects."
     )]
     async fn ask_via_feishu(
         &self,
@@ -126,7 +133,7 @@ impl<R: tauri::Runtime> PrmonitorMcp<R> {
 
     #[tool(
         name = "ask_via_dingtalk",
-        description = "Ask 1-3 human questions through both DingTalk interactive cards and a Codex elicitation popup; the first answer wins atomically."
+        description = "Ask 1-3 human questions through both DingTalk interactive cards and a Codex elicitation popup; the first answer wins atomically. Constraints: purpose is a short tag ≤128 UTF-8 bytes (put long rationale in message); questions[].options MUST be string[] plain labels, not {label,description} objects."
     )]
     async fn ask_via_dingtalk(
         &self,

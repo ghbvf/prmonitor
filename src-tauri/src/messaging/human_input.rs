@@ -142,8 +142,11 @@ impl FromStr for HumanAnswerSource {
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct HumanQuestion {
+    /// Stable id within this request (≤64 bytes; `[A-Za-z0-9._:-]`).
     pub id: String,
+    /// Question text shown on the card / popup (≤1024 UTF-8 bytes).
     pub question: String,
+    /// Plain string labels only (`string[]`). Do NOT pass `{label, description}` objects — that fails deserialization with "map, expected a string".
     #[serde(default)]
     pub options: Vec<String>,
 }
