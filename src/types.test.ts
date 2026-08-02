@@ -23,7 +23,6 @@ import {
   workflowStatusLabel,
   workflowStepLabel,
   skillKeyLabel,
-  extraArgsFromSkillKey,
   type ExternalRequestId,
   type InboxEventId,
   type OutboxProducerKey,
@@ -183,7 +182,5 @@ describe("skillKeyLabel", () => {
     expect(skillKeyLabel("check")).toBe("pr-review --check");
     expect(skillKeyLabel("pr-review\0")).toBe("pr-review");
     expect(skillKeyLabel("pr-review\0--check")).toBe("pr-review --check");
-    expect(extraArgsFromSkillKey("check")).toBe("--check");
-    expect(extraArgsFromSkillKey("pr-review\0")).toBe("");
   });
 });

@@ -4,7 +4,7 @@
 // (App.vue) so the pr slice and review slice stay decoupled.
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useProjects } from "../projects";
-import { extraArgsFromSkillKey, skillKeyLabel, type PullRequestView } from "../types";
+import type { PullRequestView } from "../types";
 import ReviewStream from "./ReviewStream.vue";
 import { useReviewStore } from "./useReviewStore";
 
@@ -28,7 +28,8 @@ const {
 } = useReviewStore();
 
 // Follow-up chat composer (#chat). Local UI state: the draft text and whether the
-// composer is collapsed to a thin header bar.
+// composer is collapsed to a thin header bar. Collapse hides only the textarea /
+// hint — the Review/Check/Stop/Send toolbar stays visible.
 const draft = ref("");
 const collapsed = ref(false);
 
@@ -80,9 +81,14 @@ const canChat = computed(
     activeThreadId.value != null && !running.value && listenerReady.value,
 );
 
+const canStart = computed(
+  () => props.selectedPr != null && !running.value && listenerReady.value,
+);
+
 function onSend() {
   const text = draft.value.trim();
-  if (!text || !canChat.value || activeThreadId.value == null) return;
+  if (collapsed.value || !text || !canChat.value || activeThreadId.value == null)
+    return;
   // `sendMessage` re-checks the same guard, so a race that flipped `running` between
   // the click and here is still safe (it no-ops). Clear the draft optimistically.
   sendMessage(activeProjectId.value, activeThreadId.value, text);
@@ -138,36 +144,22 @@ onMounted(async () => {
 });
 onUnmounted(() => unlisten?.());
 
-function onStart() {
-  if (props.selectedPr)
-    start(
-      activeProjectId.value,
-      props.selectedPr.number,
-      extraArgsFromSkillKey(props.selectedPr.skillKey),
-    );
+// Explicit Review / Check (mirrors RemoteWebConsoleApp): user intent overrides the
+// selected PR's discovery skillKey.
+function onReview() {
+  if (props.selectedPr) start(activeProjectId.value, props.selectedPr.number, "");
 }
 
-const startButtonLabel = computed(() => {
-  if (!props.selectedPr) return "开始 review";
-  const label = skillKeyLabel(props.selectedPr.skillKey);
-  return label === "—" ? "开始 review" : `开始 ${label}`;
-});
+function onCheck() {
+  if (props.selectedPr)
+    start(activeProjectId.value, props.selectedPr.number, "--check");
+}
 </script>
 
 <template>
   <section class="review-panel">
     <header class="head">
       <h2>Review</h2>
-      <div class="actions">
-        <button
-          type="button"
-          :disabled="selectedPr == null || running || !listenerReady"
-          @click="onStart"
-        >
-          {{ startButtonLabel }}
-        </button>
-        <button type="button" :disabled="!running" @click="stop">停止</button>
-      </div>
     </header>
 
     <p class="status">
@@ -179,7 +171,7 @@ const startButtonLabel = computed(() => {
         <span v-else>未开始</span>
       </template>
       <span v-else-if="selectedPr">
-        已选中 PR #{{ selectedPr.number }}（{{ skillKeyLabel(selectedPr.skillKey) }}）— 点「{{ startButtonLabel }}」
+        已选中 PR #{{ selectedPr.number }} — 点 Review 或 Check
       </span>
       <span v-else class="muted">Select a PR to review.</span>
     </p>
@@ -198,7 +190,7 @@ const startButtonLabel = computed(() => {
 
     <!-- Follow-up chat composer (#chat). Pinned to the panel bottom; collapses to a thin
          header bar via the toggle; frozen (disabled) while a turn is running or no session
-         is focused. -->
+         is focused. Toolbar (Review/Check/Stop/Send) stays visible when collapsed. -->
     <div class="composer" :class="{ collapsed }">
       <div class="composer-head">
         <span class="composer-title">对话 / Chat</span>
@@ -214,8 +206,6 @@ const startButtonLabel = computed(() => {
       </div>
 
       <template v-if="!collapsed">
-        <!-- No focused session: show ONLY the hint. The disabled input row would be
-             visually redundant, so it isn't rendered until a session is focused. -->
         <p v-if="activeThreadId == null" class="muted hint">
           运行 review 后可对话 / Run a review to chat
         </p>
@@ -232,16 +222,28 @@ const startButtonLabel = computed(() => {
             "
             @keydown="onKeydown"
           ></textarea>
-          <button
-            type="button"
-            class="send"
-            :disabled="!canChat || draft.trim().length === 0"
-            @click="onSend"
-          >
-            发送 / Send
-          </button>
         </div>
       </template>
+
+      <div class="composer-toolbar">
+        <div class="toolbar-actions">
+          <button type="button" :disabled="!canStart" @click="onReview">
+            Review
+          </button>
+          <button type="button" :disabled="!canStart" @click="onCheck">
+            Check
+          </button>
+          <button type="button" :disabled="!running" @click="stop">停止</button>
+        </div>
+        <button
+          type="button"
+          class="send"
+          :disabled="collapsed || !canChat || draft.trim().length === 0"
+          @click="onSend"
+        >
+          发送 / Send
+        </button>
+      </div>
     </div>
   </section>
 </template>
@@ -270,27 +272,8 @@ const startButtonLabel = computed(() => {
 .error {
   flex-shrink: 0;
 }
-.head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
-}
 .head h2 {
   margin: 0;
-}
-.actions {
-  display: flex;
-  gap: var(--space-3);
-}
-.actions button {
-  padding: var(--space-2) var(--space-5);
-  font: inherit;
-  cursor: pointer;
-}
-.actions button:disabled {
-  cursor: default;
-  opacity: 0.5;
 }
 .status {
   margin: var(--space-4) 0 0;
@@ -352,14 +335,24 @@ const startButtonLabel = computed(() => {
   opacity: 0.5;
   cursor: default;
 }
-.composer .send {
-  align-self: flex-end;
+.composer-toolbar {
+  margin-top: var(--space-3);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.toolbar-actions {
+  display: flex;
+  gap: var(--space-3);
+}
+.composer-toolbar button {
   padding: var(--space-2) var(--space-5);
   font: inherit;
   cursor: pointer;
 }
-.composer .send:disabled {
-  opacity: 0.5;
+.composer-toolbar button:disabled {
   cursor: default;
+  opacity: 0.5;
 }
 </style>

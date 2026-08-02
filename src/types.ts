@@ -96,13 +96,6 @@ export function skillKeyLabel(skillKey: string): string {
   return extra ? `${name} ${extra}` : name;
 }
 
-// Extra args segment of a skill key (after `\0`), for manual start / remote review.
-export function extraArgsFromSkillKey(skillKey: string): string {
-  const key = migrateLegacySkillKey(skillKey);
-  const nul = key.indexOf("\0");
-  return nul >= 0 ? key.slice(nul + 1) : "";
-}
-
 // Whether a data-update mode runs the CLI poll loop (818). webhook-only / manual =
 // push-driven / on-demand (no CLI polling); pull-only / hybrid = the loop runs. Lives
 // at the shared `src/` contract root (next to its `assertNever` carrier) because BOTH
