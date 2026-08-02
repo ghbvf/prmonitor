@@ -4,7 +4,7 @@
 // (App.vue) so the pr slice and review slice stay decoupled.
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useProjects } from "../projects";
-import { skillKeyLabel, type PullRequestView } from "../types";
+import type { PullRequestView } from "../types";
 import ReviewStream from "./ReviewStream.vue";
 import { useReviewStore } from "./useReviewStore";
 
@@ -87,7 +87,8 @@ const canStart = computed(
 
 function onSend() {
   const text = draft.value.trim();
-  if (!text || !canChat.value || activeThreadId.value == null) return;
+  if (collapsed.value || !text || !canChat.value || activeThreadId.value == null)
+    return;
   // `sendMessage` re-checks the same guard, so a race that flipped `running` between
   // the click and here is still safe (it no-ops). Clear the draft optimistically.
   sendMessage(activeProjectId.value, activeThreadId.value, text);
@@ -170,8 +171,7 @@ function onCheck() {
         <span v-else>未开始</span>
       </template>
       <span v-else-if="selectedPr">
-        已选中 PR #{{ selectedPr.number }}（{{ skillKeyLabel(selectedPr.skillKey) }}）—
-        点 Review 或 Check
+        已选中 PR #{{ selectedPr.number }} — 点 Review 或 Check
       </span>
       <span v-else class="muted">Select a PR to review.</span>
     </p>
@@ -238,7 +238,7 @@ function onCheck() {
         <button
           type="button"
           class="send"
-          :disabled="!canChat || draft.trim().length === 0"
+          :disabled="collapsed || !canChat || draft.trim().length === 0"
           @click="onSend"
         >
           发送 / Send
@@ -271,12 +271,6 @@ function onCheck() {
 .status,
 .error {
   flex-shrink: 0;
-}
-.head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
 }
 .head h2 {
   margin: 0;

@@ -133,5 +133,24 @@ describe("ReviewPanel composer toolbar", () => {
       "停止",
       "发送 / Send",
     ]);
+    expect(wrapper.get(".send").attributes("disabled")).toBeDefined();
+  });
+
+  it("disables Review/Check while running and wires Stop", async () => {
+    storeState.running.value = true;
+    storeState.activeThreadId.value = "thread-1";
+    const wrapper = mount(ReviewPanel, { props: { selectedPr: pr() } });
+    await flushPromises();
+
+    const toolbar = wrapper.get(".composer-toolbar");
+    const review = toolbar.findAll("button").find((b) => b.text() === "Review")!;
+    const check = toolbar.findAll("button").find((b) => b.text() === "Check")!;
+    const stop = toolbar.findAll("button").find((b) => b.text() === "停止")!;
+    expect(review.attributes("disabled")).toBeDefined();
+    expect(check.attributes("disabled")).toBeDefined();
+    expect(stop.attributes("disabled")).toBeUndefined();
+
+    await stop.trigger("click");
+    expect(mocks.stop).toHaveBeenCalledOnce();
   });
 });
