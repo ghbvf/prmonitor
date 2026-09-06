@@ -93,6 +93,7 @@ pub struct ResolvedCli {
     program: PathBuf,
     source: CliResolutionSource,
     enhanced_path: OsString,
+    config_env: Option<(&'static str, OsString)>,
     fingerprint: String,
 }
 
@@ -100,7 +101,23 @@ impl ResolvedCli {
     pub fn command(&self) -> ManagedCommand {
         let mut command = Command::new(&self.program);
         command.env("PATH", &self.enhanced_path);
+        if let Some((variable, directory)) = &self.config_env {
+            command.env(variable, directory);
+        }
         ManagedCommand { inner: command }
+    }
+
+    // Bind only the selected tool's override. Empty config deliberately leaves the inherited
+    // environment untouched. The private capability keeps PATH and account configuration together.
+    fn with_config_dir(mut self, tools: &CliToolsConfig, tool: CliTool) -> Self {
+        if let Some((variable, directory)) = tools.config_dir(tool) {
+            if !directory.is_empty() {
+                self.config_env = Some((variable, OsString::from(directory)));
+                self.fingerprint
+                    .push_str(&format!("\0{variable}={directory}"));
+            }
+        }
+        self
     }
 
     pub fn fingerprint(&self) -> &str {
@@ -341,11 +358,10 @@ fn resolve_with_inputs(
 
     if !configured.is_auto() {
         let program = PathBuf::from(configured.as_str());
-        return Ok(resolved(
-            program,
-            CliResolutionSource::Custom,
-            enhanced_path,
-        ));
+        return Ok(
+            resolved(program, CliResolutionSource::Custom, enhanced_path)
+                .with_config_dir(tools, tool),
+        );
     }
 
     let sources = [
@@ -364,7 +380,7 @@ fn resolve_with_inputs(
     ];
     for (path, source) in sources {
         if let Some(program) = find_on_path(path, tool, &inputs.path_extensions) {
-            return Ok(resolved(program, source, enhanced_path));
+            return Ok(resolved(program, source, enhanced_path).with_config_dir(tools, tool));
         }
     }
 
@@ -388,6 +404,7 @@ fn resolved(program: PathBuf, source: CliResolutionSource, enhanced_path: OsStri
         program,
         source,
         enhanced_path,
+        config_env: None,
         fingerprint,
     }
 }
@@ -807,6 +824,133 @@ mod tests {
 
     fn auto_tools() -> CliToolsConfig {
         CliToolsConfig::default()
+    }
+
+    #[test]
+    fn config_dirs_validate_and_round_trip() {
+        let root = TestDir::new("配置 目录");
+        for key in ["codexHome", "claudeConfigDir"] {
+            for bad in [
+                "relative/config".to_string(),
+                root.0.join("missing").to_string_lossy().into_owned(),
+                root.executable("file").to_string_lossy().into_owned(),
+            ] {
+                let tools: CliToolsConfig =
+                    serde_json::from_value(serde_json::json!({key: bad})).unwrap();
+                assert!(tools.validate().is_err(), "must reject {key}");
+            }
+            let tools: CliToolsConfig =
+                serde_json::from_value(serde_json::json!({key: root.0})).unwrap();
+            tools.validate().unwrap();
+            assert_eq!(
+                serde_json::to_value(tools).unwrap()[key],
+                serde_json::json!(root.0)
+            );
+        }
+        let old: CliToolsConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        let wire = serde_json::to_value(old).unwrap();
+        assert_eq!(wire["codexHome"], "");
+        assert_eq!(wire["claudeConfigDir"], "");
+    }
+
+    #[test]
+    fn config_dirs_bind_only_target_command_and_fingerprint() {
+        let root = TestDir::new("config-binding");
+        for name in ["codex", "claude", "gh"] {
+            let filename = if cfg!(windows) {
+                format!("{name}.exe")
+            } else {
+                name.to_string()
+            };
+            root.executable(&filename);
+        }
+        let paths = inputs(Some(&root.0), None, vec![]);
+        let baseline = CliToolsConfig::default();
+        for (tool, key, variable) in [
+            (CliTool::Codex, "codexHome", "CODEX_HOME"),
+            (CliTool::Claude, "claudeConfigDir", "CLAUDE_CONFIG_DIR"),
+        ] {
+            let configured: CliToolsConfig =
+                serde_json::from_value(serde_json::json!({key: root.0})).unwrap();
+            let before = resolve_with_inputs(&baseline, tool, &paths).unwrap();
+            let after = resolve_with_inputs(&configured, tool, &paths).unwrap();
+            assert_ne!(before.fingerprint(), after.fingerprint());
+            let command = after.command();
+            let envs: Vec<_> = command.inner.as_std().get_envs().collect();
+            assert!(envs.contains(&(OsStr::new(variable), Some(root.0.as_os_str()))));
+            let other = if tool == CliTool::Codex {
+                CliTool::Claude
+            } else {
+                CliTool::Codex
+            };
+            for unaffected in [other, CliTool::Gh] {
+                let before = resolve_with_inputs(&baseline, unaffected, &paths).unwrap();
+                let after = resolve_with_inputs(&configured, unaffected, &paths).unwrap();
+                assert_eq!(before.fingerprint(), after.fingerprint());
+                assert!(!after
+                    .command()
+                    .inner
+                    .as_std()
+                    .get_envs()
+                    .any(|(key, _)| key == variable));
+            }
+            assert!(
+                !before
+                    .command()
+                    .inner
+                    .as_std()
+                    .get_envs()
+                    .any(|(key, _)| key == variable),
+                "empty config must inherit rather than override/remove"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_dirs_reach_spawned_cli_on_auto_and_custom_paths() {
+        let root = TestDir::new("spawn-config");
+        let account = root.0.join("工作 account");
+        fs::create_dir(&account).unwrap();
+        for (tool, name, key, path_key, variable) in [
+            (
+                CliTool::Codex,
+                "codex",
+                "codexHome",
+                "codexPath",
+                "CODEX_HOME",
+            ),
+            (
+                CliTool::Claude,
+                "claude",
+                "claudeConfigDir",
+                "claudePath",
+                "CLAUDE_CONFIG_DIR",
+            ),
+        ] {
+            let program = root.executable(name);
+            fs::write(
+                &program,
+                format!("#!/bin/sh\nprintf '%s' \"${variable}\"\n"),
+            )
+            .unwrap();
+            for custom in [false, true] {
+                let mut wire = serde_json::json!({key: account});
+                if custom {
+                    wire[path_key] = serde_json::json!(program);
+                }
+                let configured: CliToolsConfig = serde_json::from_value(wire).unwrap();
+                let cli =
+                    resolve_with_inputs(&configured, tool, &inputs(Some(&root.0), None, vec![]))
+                        .unwrap();
+                let output = cli.command().output().await.unwrap();
+                assert!(output.status.success());
+                assert_eq!(
+                    String::from_utf8(output.stdout).unwrap(),
+                    account.to_string_lossy()
+                );
+            }
+        }
     }
 
     #[test]

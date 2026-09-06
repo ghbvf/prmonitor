@@ -222,7 +222,7 @@ watch(
 );
 
 // A successful config save replaces these values in the shared Pinia store without changing the
-// engine set. Re-probe the affected engine so a stale module-level status cannot survive a CLI path
+// engine set. Re-probe the affected engine so a stale module-level status cannot survive a CLI path or config directory
 // change. The resident-engine probe reads the lifecycle snapshot first, so this never kills or
 // restarts an already-running app-server; a cold manager uses the newly configured path.
 watch(
@@ -231,13 +231,18 @@ watch(
       configStore.config?.cliTools.codexPath,
       configStore.config?.cliTools.claudePath,
       configStore.config?.cliTools.agentPath,
+      configStore.config?.cliTools.codexHome,
+      configStore.config?.cliTools.claudeConfigDir,
     ] as const,
-  ([codexPath, claudePath, agentPath], [previousCodexPath, previousClaudePath, previousAgentPath]) => {
+  (
+    [codexPath, claudePath, agentPath, codexHome, claudeConfigDir],
+    [previousCodexPath, previousClaudePath, previousAgentPath, previousCodexHome, previousClaudeConfigDir],
+  ) => {
     const kinds = usedEngineKinds.value;
-    if (codexPath !== previousCodexPath && kinds.includes("codex")) {
+    if ((codexPath !== previousCodexPath || codexHome !== previousCodexHome) && kinds.includes("codex")) {
       void refreshCodexStatus();
     }
-    if (claudePath !== previousClaudePath && kinds.includes("claude")) {
+    if ((claudePath !== previousClaudePath || claudeConfigDir !== previousClaudeConfigDir) && kinds.includes("claude")) {
       void refreshClaudeStatus();
     }
     if (agentPath !== previousAgentPath && kinds.includes("cursor")) {

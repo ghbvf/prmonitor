@@ -7,6 +7,7 @@ import {
   CLI_TOOL_META,
   cliProbeSnapshotMatches,
   cliToolsPathErrors,
+  cliToolsConfigDirErrors,
   cloneCliTools,
   isCliToolsSaveError,
   probeStatusesByTool,
@@ -42,6 +43,8 @@ describe("CLI tool metadata", () => {
       claudePath: "",
       agentPath: "",
       cloudflaredPath: "",
+      codexHome: "",
+      claudeConfigDir: "",
     });
     expect("cloudflaredBin" in DEFAULT_CLI_TOOLS_CONFIG).toBe(false);
     expect(cloneCliTools(DEFAULT_CLI_TOOLS_CONFIG)).not.toBe(DEFAULT_CLI_TOOLS_CONFIG);
@@ -158,5 +161,24 @@ describe("CLI probe presentation state", () => {
     const probed = cloneCliTools(DEFAULT_CLI_TOOLS_CONFIG);
     expect(cliProbeSnapshotMatches(probed, cloneCliTools(probed))).toBe(true);
     expect(cliProbeSnapshotMatches(probed, { ...probed, ghPath: "/usr/local/bin/gh" })).toBe(false);
+  });
+});
+
+describe("CLI config directories", () => {
+  it("validates directories separately from executable paths", () => {
+    const config = { ...DEFAULT_CLI_TOOLS_CONFIG, codexHome: "relative", claudeConfigDir: "/accounts/工作 dir" };
+    expect(cliToolsPathErrors(config, "macos")).toEqual({});
+    expect(Object.keys(cliToolsConfigDirErrors(config, "macos"))).toEqual(["codex"]);
+    expect(cliToolsConfigDirErrors({ ...config, codexHome: "C:\\Users\\account" }, "windows")).toHaveProperty("claude");
+    expect(isCliToolsSaveError("CLI 配置目录 claudeConfigDir 必须为已存在的目录")).toBe(true);
+  });
+
+  it.each(["codexHome", "claudeConfigDir"] as const)("marks %s changes stale and clones saved values", (key) => {
+    const original = { ...DEFAULT_CLI_TOOLS_CONFIG, [key]: "/accounts/one" };
+    const copy = cloneCliTools(original);
+    expect(copy[key]).toBe("/accounts/one");
+    copy[key] = "/accounts/two";
+    expect(cliProbeSnapshotMatches(original, copy)).toBe(false);
+    expect(original[key]).toBe("/accounts/one");
   });
 });

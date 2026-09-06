@@ -5,13 +5,15 @@ import type { CliToolProbeStatus, CliToolsConfig } from "./types";
 interface CliToolMeta {
   label: string;
   pathKey: keyof CliToolsConfig;
+  configDirKey?: "codexHome" | "claudeConfigDir";
+  configDirEnv?: string;
 }
 
 export const CLI_TOOL_META: Record<CliTool, CliToolMeta> = {
   gh: { label: "GitHub CLI (gh)", pathKey: "ghPath" },
   az: { label: "Azure CLI (az)", pathKey: "azPath" },
-  codex: { label: "Codex CLI", pathKey: "codexPath" },
-  claude: { label: "Claude CLI", pathKey: "claudePath" },
+  codex: { label: "Codex CLI", pathKey: "codexPath", configDirKey: "codexHome", configDirEnv: "CODEX_HOME" },
+  claude: { label: "Claude CLI", pathKey: "claudePath", configDirKey: "claudeConfigDir", configDirEnv: "CLAUDE_CONFIG_DIR" },
   agent: { label: "Cursor Agent (agent)", pathKey: "agentPath" },
   cloudflared: { label: "Cloudflare Tunnel (cloudflared)", pathKey: "cloudflaredPath" },
 };
@@ -56,9 +58,25 @@ export function cliToolsPathErrors(
   return errors;
 }
 
+export function cliToolsConfigDirErrors(
+  config: CliToolsConfig,
+  platform: string | undefined = import.meta.env.TAURI_ENV_PLATFORM,
+): Partial<Record<CliTool, string>> {
+  const errors: Partial<Record<CliTool, string>> = {};
+  if (!platform) return errors;
+  for (const tool of CLI_TOOLS) {
+    const key = CLI_TOOL_META[tool].configDirKey;
+    if (key && config[key] !== "" && !isAbsoluteCliPath(config[key], platform)) {
+      errors[tool] = "配置目录请输入当前系统的绝对路径；最终以后端校验为准。";
+    }
+  }
+  return errors;
+}
+
 export function isCliToolsSaveError(message: string): boolean {
   return (
     message.includes("CLI 路径") ||
+    message.includes("CLI 配置目录") ||
     message.includes("cliTools") ||
     CLI_TOOLS.some((tool) => message.includes(CLI_TOOL_META[tool].pathKey))
   );
@@ -68,10 +86,17 @@ export function cliProbeSnapshotMatches(
   probed: CliToolsConfig,
   current: CliToolsConfig,
 ): boolean {
-  return CLI_TOOLS.every(
-    (tool) =>
-      probed[CLI_TOOL_META[tool].pathKey] === current[CLI_TOOL_META[tool].pathKey],
-  );
+  return CLI_TOOLS.every((tool) => cliToolSnapshotMatches(tool, probed, current));
+}
+
+export function cliToolSnapshotMatches(
+  tool: CliTool,
+  probed: CliToolsConfig,
+  current: CliToolsConfig,
+): boolean {
+  const { pathKey, configDirKey } = CLI_TOOL_META[tool];
+  return probed[pathKey] === current[pathKey] &&
+    (!configDirKey || probed[configDirKey] === current[configDirKey]);
 }
 
 export function probeStatusesByTool(

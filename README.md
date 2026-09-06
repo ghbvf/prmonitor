@@ -51,6 +51,26 @@ the change as pending until that resident process is stopped/restarted, exits na
 restarts. The removed `cloudflaredBin` setting is intentionally not migrated—configure
 `cliTools.cloudflaredPath` or leave it empty for automatic discovery.
 
+### Codex and Claude account configuration directories
+
+In Third-party CLI settings, set Codex's **configuration directory** (`cliTools.codexHome`,
+passed as `CODEX_HOME`) or Claude's (`cliTools.claudeConfigDir`, passed as `CLAUDE_CONFIG_DIR`).
+Use an existing absolute directory, not a configuration file. Empty values inherit the app's
+launch environment and the CLI defaults. Each override applies only to its corresponding CLI.
+
+Prepare each account with the CLI before selecting its directory, for example on macOS/Linux:
+
+```sh
+CODEX_HOME="/absolute/path/account-a" codex login
+CLAUDE_CONFIG_DIR="/absolute/path/account-b" claude auth login
+```
+
+Change the directory and save to switch configurations. Claude uses it for the next task.
+For Codex, wait for current work to finish, then use the existing Stop/Start controls; the settings
+panel shows a pending restart while the old process is running. Saving does not interrupt tasks.
+The app stores only directory paths; authentication remains managed by the CLI, including any
+credential backend or API-key environment overrides configured there.
+
 ## Messaging long connection and Codex MCP
 
 Feishu and DingTalk inbound messages use official long connections (Feishu WebSocket /

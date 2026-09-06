@@ -85,8 +85,12 @@ export type RemoteAccessConfig = { entrypoints: Array<RemoteEntrypoint>, tunnels
 
 export type CliPath = string;
 
-export type CliToolsConfig = { ghPath: CliPath, azPath: CliPath, codexPath: CliPath, claudePath: CliPath, agentPath: CliPath, cloudflaredPath: CliPath, };
-export const DEFAULT_CLI_TOOLS_CONFIG: CliToolsConfig = {"ghPath":"","azPath":"","codexPath":"","claudePath":"","agentPath":"","cloudflaredPath":""};
+export type CliToolsConfig = { ghPath: CliPath, azPath: CliPath, codexPath: CliPath, claudePath: CliPath, agentPath: CliPath, cloudflaredPath: CliPath,
+/**
+ * Empty inherits the CLI environment/default; otherwise an existing absolute directory.
+ */
+codexHome: string, claudeConfigDir: string, };
+export const DEFAULT_CLI_TOOLS_CONFIG: CliToolsConfig = {"ghPath":"","azPath":"","codexPath":"","claudePath":"","agentPath":"","cloudflaredPath":"","codexHome":"","claudeConfigDir":""};
 
 export type CliToolProbeStatus = { tool: CliTool, configuredPath: string, resolvedPath: string | null, source: CliResolutionSource | null, available: boolean, pendingRestart: boolean, message: string, };
 

@@ -47,6 +47,39 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllEnvs());
 
 describe("CliToolsManager", () => {
+  it("edits only Codex/Claude config directories and passes them to probing", async () => {
+    probeCliTools.mockResolvedValue([]);
+    const config = draft();
+    const wrapper = mount(CliToolsManager, { props: { draft: config } });
+    await flushPromises();
+    expect(wrapper.find("#cli-config-dir-agent").exists()).toBe(false);
+    await wrapper.get("#cli-config-dir-codex").setValue("/accounts/工作 codex");
+    await wrapper.get("#cli-config-dir-claude").setValue("/accounts/claude");
+    expect(wrapper.text()).toContain("当前探测结果已过期");
+    await wrapper.get("button").trigger("click");
+    expect(probeCliTools).toHaveBeenLastCalledWith({
+      ...DEFAULT_CLI_TOOLS_CONFIG,
+      codexHome: "/accounts/工作 codex",
+      claudeConfigDir: "/accounts/claude",
+    }, true);
+    expect(wrapper.emitted("edit")).toHaveLength(2);
+  });
+
+  it("keeps config directory errors local and invalidates obsolete row failures", async () => {
+    probeCliTools.mockResolvedValue([{ ...status("codex"), available: false, message: "CLI 配置目录 CODEX_HOME 必须为已存在的目录绝对路径" }]);
+    const config = draft();
+    config.cliTools.codexHome = "/missing";
+    const wrapper = mount(CliToolsManager, { props: { draft: config } });
+    await flushPromises();
+    expect(wrapper.get("#cli-config-dir-codex").attributes("aria-invalid")).toBe("true");
+    await wrapper.get("#cli-config-dir-codex").setValue("/accounts/valid");
+    expect(wrapper.get("#cli-config-dir-codex").attributes("aria-invalid")).toBe("false");
+    await wrapper.get("#cli-config-dir-claude").setValue("relative");
+    expect(wrapper.text()).toContain("配置目录请输入当前系统的绝对路径");
+    await wrapper.get("button").trigger("click");
+    expect(probeCliTools).toHaveBeenLastCalledWith(expect.objectContaining({ codexHome: "/accounts/valid", claudeConfigDir: "relative" }), true);
+  });
+
   it("keeps a relative-path error local while probing the other tools", async () => {
     probeCliTools.mockResolvedValue([]);
     const config = draft();
@@ -73,7 +106,7 @@ describe("CliToolsManager", () => {
     await flushPromises();
 
     expect(wrapper.text()).toContain("实际路径：/opt/bin/codex");
-    expect(wrapper.text()).toContain("新路径将在相关进程重启后生效");
+    expect(wrapper.text()).toContain("新路径或配置目录将在相关进程重启后生效");
     await wrapper.get("#cli-path-codex").setValue("/custom/bin/codex");
     expect(wrapper.text()).toContain("当前探测结果已过期");
   });
@@ -130,7 +163,7 @@ describe("CliToolsManager", () => {
 
     expect(wrapper.get("#cli-path-codex").attributes("aria-invalid")).toBe("true");
     expect(wrapper.text()).toContain("旧常驻进程仍在运行");
-    expect(wrapper.text()).not.toContain("新路径将在相关进程重启后生效");
+    expect(wrapper.text()).not.toContain("新路径或配置目录将在相关进程重启后生效");
 
     await wrapper.get("#cli-path-gh").setValue("/custom/gh");
     expect(

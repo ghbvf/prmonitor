@@ -9,6 +9,8 @@ import {
   CLI_TOOL_META,
   cliProbeSnapshotMatches,
   cliToolsPathErrors,
+  cliToolsConfigDirErrors,
+  cliToolSnapshotMatches,
   cloneCliTools,
   probeStatusesByTool,
 } from "./cliTools";
@@ -25,6 +27,7 @@ const probing = ref(false);
 const probeError = ref<string | null>(null);
 let latestProbe = 0;
 const pathErrors = computed(() => cliToolsPathErrors(props.draft.cliTools));
+const configDirErrors = computed(() => cliToolsConfigDirErrors(props.draft.cliTools));
 const stale = computed(
   () =>
     probedSnapshot.value !== null &&
@@ -41,6 +44,19 @@ function sourceLabel(source: CliResolutionSource | null): string {
 
 function onPathInput(tool: CliTool, event: Event) {
   props.draft.cliTools[CLI_TOOL_META[tool].pathKey] = (event.target as HTMLInputElement).value;
+  probeError.value = null;
+  emit("edit");
+}
+
+function configDirFor(tool: CliTool): string {
+  const key = CLI_TOOL_META[tool].configDirKey;
+  return key ? props.draft.cliTools[key] : "";
+}
+
+function onConfigDirInput(tool: CliTool, event: Event) {
+  const key = CLI_TOOL_META[tool].configDirKey;
+  if (!key) return;
+  props.draft.cliTools[key] = (event.target as HTMLInputElement).value;
   probeError.value = null;
   emit("edit");
 }
@@ -71,11 +87,10 @@ async function probe(refreshPath: boolean) {
   }
 }
 
-function customPathUnavailable(tool: CliTool): boolean {
-  const pathKey = CLI_TOOL_META[tool].pathKey;
+function currentRowUnavailable(tool: CliTool): boolean {
   return (
-    pathFor(tool) !== "" &&
-    probedSnapshot.value?.[pathKey] === pathFor(tool) &&
+    probedSnapshot.value !== null &&
+    cliToolSnapshotMatches(tool, probedSnapshot.value, props.draft.cliTools) &&
     statuses.value[tool]?.available === false
   );
 }
@@ -102,7 +117,7 @@ watch(
     </header>
 
     <p v-if="stale" class="notice" role="status" aria-live="polite">
-      路径已修改，当前探测结果已过期。
+      路径或配置目录已修改，当前探测结果已过期。
     </p>
     <p v-if="probeError" class="error" role="alert">{{ probeError }}</p>
 
@@ -114,14 +129,32 @@ watch(
           type="text"
           :value="pathFor(tool)"
           :placeholder="`自动探测 ${tool}`"
-          :aria-invalid="Boolean(pathErrors[tool]) || customPathUnavailable(tool)"
+          :aria-invalid="Boolean(pathErrors[tool]) || (pathFor(tool) !== '' && currentRowUnavailable(tool))"
           :aria-describedby="`cli-feedback-${tool}`"
           spellcheck="false"
           @input="onPathInput(tool, $event)"
         />
+        <template v-if="CLI_TOOL_META[tool].configDirKey">
+          <label :for="`cli-config-dir-${tool}`">配置目录（{{ CLI_TOOL_META[tool].configDirEnv }}）</label>
+          <input
+            :id="`cli-config-dir-${tool}`"
+            type="text"
+            :value="configDirFor(tool)"
+            placeholder="留空继承环境或使用 CLI 默认目录"
+            :aria-invalid="Boolean(configDirErrors[tool]) || (configDirFor(tool) !== '' && currentRowUnavailable(tool))"
+            :aria-describedby="`cli-dir-help-${tool} cli-feedback-${tool}`"
+            spellcheck="false"
+            @input="onConfigDirInput(tool, $event)"
+          />
+          <p :id="`cli-dir-help-${tool}`" class="message">
+            填写已存在的配置文件夹绝对路径，并先在该目录完成 CLI 登录。切换账号时修改此目录。
+            {{ tool === "codex" ? "保存后，使用底部 Codex 停止/启动按钮使新目录生效。" : "保存后，下一次 Claude 任务使用新目录。" }}
+          </p>
+        </template>
         <div :id="`cli-feedback-${tool}`" class="tool-feedback" role="status" aria-live="polite">
           <p v-if="pathErrors[tool]" class="error" role="alert">{{ pathErrors[tool] }}</p>
-          <template v-else-if="statuses[tool]">
+          <p v-if="configDirErrors[tool]" class="error" role="alert">{{ configDirErrors[tool] }}</p>
+          <template v-if="!pathErrors[tool] && !configDirErrors[tool] && statuses[tool]">
             <p
               :class="statuses[tool]?.available ? 'available' : 'error'"
               :role="statuses[tool]?.available ? undefined : 'alert'"
@@ -139,10 +172,10 @@ watch(
               v-if="statuses[tool]?.pendingRestart && statuses[tool]?.available"
               class="notice"
             >
-              新路径将在相关进程重启后生效。
+              新路径或配置目录将在相关进程重启后生效。
             </p>
           </template>
-          <p v-else class="message">尚未探测</p>
+          <p v-else-if="!pathErrors[tool] && !configDirErrors[tool]" class="message">尚未探测</p>
         </div>
       </div>
     </div>

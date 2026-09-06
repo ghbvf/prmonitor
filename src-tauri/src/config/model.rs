@@ -68,6 +68,9 @@ pub struct CliToolsConfig {
     pub claude_path: CliPath,
     pub agent_path: CliPath,
     pub cloudflared_path: CliPath,
+    /// Empty inherits the CLI environment/default; otherwise an existing absolute directory.
+    pub codex_home: String,
+    pub claude_config_dir: String,
 }
 
 /// One row returned by the composition-level CLI probe command.
@@ -96,6 +99,14 @@ impl CliToolsConfig {
         }
     }
 
+    pub(super) fn config_dir(&self, tool: CliTool) -> Option<(&'static str, &str)> {
+        match tool {
+            CliTool::Codex => Some(("CODEX_HOME", &self.codex_home)),
+            CliTool::Claude => Some(("CLAUDE_CONFIG_DIR", &self.claude_config_dir)),
+            CliTool::Gh | CliTool::Az | CliTool::Agent | CliTool::Cloudflared => None,
+        }
+    }
+
     pub(super) fn validate(&self) -> AppResult<()> {
         for tool in CliTool::iter() {
             self.validate_tool(tool)?;
@@ -106,6 +117,15 @@ impl CliToolsConfig {
     /// Validate only the selected probe row. Persisting still calls [`Self::validate`] and checks
     /// all managed CLI rows; a draft error in one row must not hide the probe result for its siblings.
     pub(super) fn validate_tool(&self, tool: CliTool) -> AppResult<()> {
+        if let Some((variable, directory)) = self.config_dir(tool) {
+            if !directory.is_empty()
+                && (!Path::new(directory).is_absolute() || !Path::new(directory).is_dir())
+            {
+                return Err(AppError::new(format!(
+                    "CLI 配置目录 {variable} 必须为已存在的目录绝对路径: {directory}"
+                )));
+            }
+        }
         let path = self.path(tool);
         if path.is_auto() {
             return Ok(());

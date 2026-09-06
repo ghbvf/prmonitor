@@ -89,6 +89,21 @@ describe("StatusBar CLI path invalidation", () => {
     expect(probes.stopCursorServer).not.toHaveBeenCalled();
   });
 
+  it("refreshes account directory changes without stopping active work", async () => {
+    const configStore = useConfigStore();
+    configStore.config = config();
+    mount(StatusBar);
+    await flushPromises();
+    configStore.config.cliTools.codexHome = "/accounts/codex";
+    await nextTick();
+    expect(probes.refreshCodexStatus).toHaveBeenCalledOnce();
+    expect(probes.stopCodexServer).not.toHaveBeenCalled();
+    configStore.config.cliTools.claudeConfigDir = "/accounts/claude";
+    await nextTick();
+    expect(probes.refreshClaudeStatus).toHaveBeenCalledOnce();
+    expect(probes.refreshCursorStatus).not.toHaveBeenCalled();
+  });
+
   it("cursor engine button toggles start/stop via onEngineButton", async () => {
     const { useReviewStore } = await import("./review/useReviewStore");
     const store = useReviewStore() as {

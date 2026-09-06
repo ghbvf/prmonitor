@@ -20,6 +20,8 @@ const REVIEW_LIFECYCLE_NOTIFICATION_CONFIG: ReviewLifecycleNotificationConfig = 
 // This slice test only needs an empty CLI-path payload to hydrate project state.
 // Keep the fixture local so the PR slice has no runtime dependency on config defaults.
 const CLI_TOOLS_CONFIG_FIXTURE = {
+  codexHome: "",
+  claudeConfigDir: "",
   ghPath: "",
   azPath: "",
   codexPath: "",

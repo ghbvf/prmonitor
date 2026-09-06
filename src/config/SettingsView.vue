@@ -26,7 +26,12 @@ import ProjectsManager from "./ProjectsManager.vue";
 import ReviewLifecycleNotificationsManager from "./ReviewLifecycleNotificationsManager.vue";
 import RemoteAccessManager from "./RemoteAccessManager.vue";
 import RulesManager from "./RulesManager.vue";
-import { cliToolsPathErrors, cloneCliTools, isCliToolsSaveError } from "./cliTools";
+import {
+  cliToolsConfigDirErrors,
+  cliToolsPathErrors,
+  cloneCliTools,
+  isCliToolsSaveError,
+} from "./cliTools";
 // The webhook control panel lives in the `pr` slice; mounting it here would be a
 // config→pr edge. Instead we expose a `webhook` scoped slot (saved config + live
 // draft + saving flag) and let the composition root (App.vue) fill it — keeping
@@ -181,9 +186,12 @@ function onEdit() {
 }
 
 async function onSave() {
-  if (Object.keys(cliToolsPathErrors(draft.cliTools)).length > 0) {
+  if (
+    Object.keys(cliToolsPathErrors(draft.cliTools)).length > 0 ||
+    Object.keys(cliToolsConfigDirErrors(draft.cliTools)).length > 0
+  ) {
     store.savedOk = false;
-    store.error = "CLI 路径必须使用绝对路径；留空则自动探测。";
+    store.error = "CLI 路径和配置目录必须使用绝对路径；留空使用环境或默认值。";
     activeGroupId.value = CLI_TOOLS_NAV_ID;
     return;
   }

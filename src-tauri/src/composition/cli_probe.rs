@@ -50,7 +50,7 @@ pub(crate) fn probe_cli_tools(
                         available: true,
                         pending_restart,
                         message: if pending_restart {
-                            "路径已变更，将在常驻进程下次启动时生效".to_string()
+                            "路径或配置目录已变更，将在常驻进程下次启动时生效".to_string()
                         } else {
                             "已解析".to_string()
                         },
@@ -136,6 +136,7 @@ mod tests {
             agent_path: path("agent"),
             // Correct basename but deliberately absent: this row alone must be unavailable.
             cloudflared_path: path("cloudflared"),
+            ..CliToolsConfig::default()
         };
         let rows = probe_cli_tools(
             &CliResolver::default(),
@@ -200,6 +201,44 @@ mod tests {
                 .unwrap()
                 .pending_restart
         );
+        let mut configured = cli_tools.clone();
+        let previous = resolve_cli_from(&resolver, &configured, CliTool::Codex, false).unwrap();
+        configured.codex_home = root.to_string_lossy().into_owned();
+        let active = ActiveCliFingerprints {
+            codex: Some(previous.fingerprint().to_string()),
+            ..Default::default()
+        };
+        let rows = probe_cli_tools(&resolver, &configured, false, &active);
+        assert!(
+            rows.iter()
+                .find(|row| row.tool == CliTool::Codex)
+                .unwrap()
+                .pending_restart
+        );
+        let restarted = resolve_cli_from(&resolver, &configured, CliTool::Codex, false).unwrap();
+        let active = ActiveCliFingerprints {
+            codex: Some(restarted.fingerprint().to_string()),
+            ..Default::default()
+        };
+        let rows = probe_cli_tools(&resolver, &configured, false, &active);
+        assert!(
+            !rows
+                .iter()
+                .find(|row| row.tool == CliTool::Codex)
+                .unwrap()
+                .pending_restart
+        );
+        configured.claude_config_dir = "relative/config".to_string();
+        let rows = probe_cli_tools(&resolver, &configured, false, &active);
+        assert!(
+            rows.iter()
+                .find(|row| row.tool == CliTool::Codex)
+                .unwrap()
+                .available
+        );
+        let claude = rows.iter().find(|row| row.tool == CliTool::Claude).unwrap();
+        assert!(!claude.available);
+        assert!(claude.message.contains("CLAUDE_CONFIG_DIR"));
         let _ = fs::remove_dir_all(root);
     }
 }
